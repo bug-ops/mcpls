@@ -1,6 +1,7 @@
 //! LSP server configuration types.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 
 use ignore::WalkBuilder;
@@ -151,6 +152,44 @@ impl ServerHeuristics {
     }
 }
 
+/// Whether mcpls may replace a server entry's `command` and `args` at startup.
+///
+/// Records provenance and consent, not the chosen server: only the generated
+/// default TypeScript entry carries [`Self::Auto`], so a hand-written entry
+/// is never rewritten.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerSelection;
+///
+/// assert_eq!(ServerSelection::default(), ServerSelection::Explicit);
+/// assert_eq!(serde_json::to_string(&ServerSelection::Auto).unwrap(), "\"auto\"");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerSelection {
+    /// Start exactly the configured `command` and `args`.
+    #[default]
+    Explicit,
+    /// Start the native TypeScript server (`tsc --lsp --stdio`) instead of
+    /// the configured `typescript-language-server` when a TypeScript 7
+    /// install outside every workspace root is found. Valid only on
+    /// `typescript-language-server` entries.
+    Auto,
+}
+
+impl ServerSelection {
+    /// Whether this is the default [`Self::Explicit`] selection, so the
+    /// serializer omits the key from entries that carry it.
+    // serde needs `&self` here despite Self being a trivially-Copy 1-byte enum.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[must_use]
+    pub(crate) const fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+}
+
 /// Configuration for a single LSP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -247,6 +286,13 @@ pub struct LspServerConfig {
     /// tracker's assumptions -- see [`IndexingPolicy::Disabled`].
     #[serde(default, skip_serializing_if = "IndexingPolicy::is_auto")]
     pub indexing: IndexingPolicy,
+
+    /// Whether mcpls may swap `command` and `args` for the native TypeScript
+    /// server at startup. Only the generated default TypeScript entry is
+    /// `auto`; a file without the key is `explicit`, and `command` and `args`
+    /// are used as written.
+    #[serde(default, skip_serializing_if = "ServerSelection::is_explicit")]
+    pub selection: ServerSelection,
 }
 
 /// Maximum allowed value, in seconds, for both [`LspServerConfig::timeout_seconds`]
@@ -368,6 +414,33 @@ impl BuiltinServer {
         matches!(self, Self::Pyright | Self::TypescriptLanguageServer)
     }
 
+    /// Whether `command` launches this builtin: its file stem is this
+    /// server's executable name, so an absolute path or a Windows `.cmd` shim
+    /// matches. Case-insensitive on Windows.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::BuiltinServer;
+    ///
+    /// let tsls = BuiltinServer::TypescriptLanguageServer;
+    /// assert!(tsls.matches_command("typescript-language-server"));
+    /// assert!(tsls.matches_command("/usr/local/bin/typescript-language-server"));
+    /// assert!(tsls.matches_command("typescript-language-server.cmd"));
+    /// assert!(!tsls.matches_command("tsc"));
+    /// ```
+    #[must_use]
+    pub fn matches_command(self, command: &str) -> bool {
+        let Some(stem) = Path::new(command).file_stem().and_then(OsStr::to_str) else {
+            return false;
+        };
+        if cfg!(windows) {
+            stem.eq_ignore_ascii_case(self.command())
+        } else {
+            stem == self.command()
+        }
+    }
+
     /// Look up a builtin by its exact executable name.
     ///
     /// # Examples
@@ -435,6 +508,7 @@ impl LspServerConfig {
             name: None,
             handles: None,
             indexing: IndexingPolicy::Auto,
+            selection: ServerSelection::Explicit,
         }
     }
 
@@ -471,16 +545,21 @@ impl LspServerConfig {
     ///
     /// `initialization_options` stays `None` here; at startup mcpls fills in
     /// the tsserver pin when it can resolve the server's bundled tsserver (see
-    /// [`Self::initialization_options`]).
+    /// [`Self::initialization_options`]). The entry is [`ServerSelection::Auto`],
+    /// so mcpls may start the native TypeScript server instead when TypeScript 7
+    /// is installed outside the workspace.
     #[must_use]
     pub fn typescript() -> Self {
-        Self::builtin(
-            const { LanguageId::from_static("typescript") },
-            BuiltinServer::TypescriptLanguageServer,
-            &["--stdio"],
-            &["**/*.ts", "**/*.tsx"],
-            ["package.json", "tsconfig.json", "jsconfig.json"],
-        )
+        Self {
+            selection: ServerSelection::Auto,
+            ..Self::builtin(
+                const { LanguageId::from_static("typescript") },
+                BuiltinServer::TypescriptLanguageServer,
+                &["--stdio"],
+                &["**/*.ts", "**/*.tsx"],
+                ["package.json", "tsconfig.json", "jsconfig.json"],
+            )
+        }
     }
 
     /// Create a default configuration for gopls.
@@ -532,6 +611,47 @@ mod tests {
 
     use super::*;
     use crate::config::ToolRouter;
+
+    #[test]
+    fn test_matches_command_accepts_stem_and_rejects_other_servers() {
+        let tsls = BuiltinServer::TypescriptLanguageServer;
+        for command in [
+            "typescript-language-server",
+            "/usr/local/bin/typescript-language-server",
+            "typescript-language-server.cmd",
+        ] {
+            assert!(tsls.matches_command(command), "{command}");
+        }
+        for command in ["tsc", "", "rust-analyzer", "typescript-language-server-x"] {
+            assert!(!tsls.matches_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn test_selection_serde_and_defaults() {
+        assert!(ServerSelection::default().is_explicit());
+        assert_eq!(
+            serde_json::from_str::<ServerSelection>("\"auto\"").unwrap(),
+            ServerSelection::Auto
+        );
+        assert!(serde_json::from_str::<ServerSelection>("\"native\"").is_err());
+        assert_eq!(
+            LspServerConfig::typescript().selection,
+            ServerSelection::Auto
+        );
+        assert_eq!(
+            LspServerConfig::rust_analyzer().selection,
+            ServerSelection::Explicit
+        );
+    }
+
+    #[test]
+    fn test_selection_key_is_written_only_for_auto() {
+        let typescript = toml::to_string(&LspServerConfig::typescript()).unwrap();
+        assert!(typescript.contains("selection = \"auto\""), "{typescript}");
+        let rust = toml::to_string(&LspServerConfig::rust_analyzer()).unwrap();
+        assert!(!rust.contains("selection"), "{rust}");
+    }
 
     #[test]
     fn test_early_exit_hint_only_for_rust_analyzer() {
@@ -602,6 +722,7 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -777,6 +898,7 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         };
 
         let tmp = TempDir::new().unwrap();

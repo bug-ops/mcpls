@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::bridge::resources::ResourceUriError;
-use crate::bridge::{InvalidClientPath, InvalidPosition, InvalidRange};
+use crate::bridge::{InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange};
 use crate::config::{BuiltinServer, LanguageId, ServerId, ToolKind};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
@@ -647,6 +647,8 @@ pub enum BackgroundTask {
     ListenResolution,
     /// The blocking canonicalization of a client path.
     PathValidation,
+    /// Opening and verifying a file on the blocking pool.
+    FileOpen,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -656,6 +658,7 @@ impl fmt::Display for BackgroundTask {
             Self::LspReceiver => "LSP receiver",
             Self::ListenResolution => "listen URI resolution",
             Self::PathValidation => "path validation",
+            Self::FileOpen => "file open",
         })
     }
 }
@@ -749,7 +752,7 @@ pub enum Error {
 
     /// No LSP server configured for the given language.
     #[error("no LSP server configured for language: {0}")]
-    NoServerForLanguage(String),
+    NoServerForLanguage(LanguageId),
 
     /// A server is configured for the language, but no server claims this
     /// specific tool (either no server lists it in `handles` and there is no
@@ -758,7 +761,7 @@ pub enum Error {
     #[error("no server handles tool '{tool}' for language '{language_id}'")]
     NoServerForTool {
         /// Language ID the request was for.
-        language_id: String,
+        language_id: LanguageId,
         /// Tool that no server claims.
         tool: ToolKind,
     },
@@ -902,6 +905,10 @@ pub enum Error {
     /// A client-supplied range is malformed or too large.
     #[error(transparent)]
     InvalidRangeInput(#[from] InvalidRange),
+
+    /// A client-supplied hierarchy item has an invalid range.
+    #[error(transparent)]
+    InvalidHierarchyItemInput(#[from] InvalidHierarchyItem),
 
     /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
     #[error(transparent)]
@@ -1061,7 +1068,8 @@ pub enum Error {
     /// for reading can block indefinitely waiting for a peer. A Unix domain
     /// socket special file is not covered by this variant -- `open(2)` on
     /// one fails outright (`ENXIO`) before the file-type check that produces
-    /// this error ever runs, so it surfaces as [`Self::FileIo`] instead.
+    /// this error ever runs, so it surfaces as [`Self::FileIo`] from a
+    /// document read and as [`Self::Io`] from the config loader.
     #[error("not a regular file: {0}")]
     NotARegularFile(PathBuf),
 
@@ -1325,6 +1333,7 @@ impl Error {
             | Self::ResourceUri(_)
             | Self::InvalidPositionInput(_)
             | Self::InvalidRangeInput(_)
+            | Self::InvalidHierarchyItemInput(_)
             | Self::ListenFilterTooLarge { .. }
             | Self::DocumentNotFound(_)
             | Self::FileSizeLimitExceeded { .. } => McpErrorKind::InvalidParams,
@@ -1742,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_error_display_no_server_for_language() {
-        let err = Error::NoServerForLanguage("rust".to_string());
+        let err = Error::NoServerForLanguage(LanguageId::from_static("rust"));
         assert_eq!(
             err.to_string(),
             "no LSP server configured for language: rust"
@@ -2283,9 +2292,9 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_unretained_variants_stay_internal() {
         let internal_errors = vec![
-            Error::NoServerForLanguage("python".to_string()),
+            Error::NoServerForLanguage(LanguageId::from_static("python")),
             Error::NoServerForTool {
-                language_id: "rust".to_string(),
+                language_id: LanguageId::from_static("rust"),
                 tool: crate::config::ToolKind::Hover,
             },
             Error::CapabilityNotSupported {

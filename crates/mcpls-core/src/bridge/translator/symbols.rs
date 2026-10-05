@@ -670,6 +670,7 @@ mod tests {
             name: Some("pyright".to_string()),
             handles: Some(vec![ToolKind::Hover]),
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         }];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);

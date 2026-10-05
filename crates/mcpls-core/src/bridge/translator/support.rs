@@ -21,7 +21,7 @@ use super::routing::{
     lookup_workspace_route,
 };
 use crate::bridge::{ClientPath, lock_std};
-use crate::config::{ServerId, ToolKind, ToolRouter};
+use crate::config::{LanguageId, ServerId, ToolKind, ToolRouter};
 use crate::error::Result;
 
 /// Whether one route of a tool would be dispatched to a capable server.
@@ -89,18 +89,14 @@ pub struct ToolSupportSnapshot {
 
 impl ToolSupportSnapshot {
     /// Every configured language, sorted.
-    pub(crate) fn languages(&self) -> Vec<String> {
-        self.router
-            .configured_languages()
-            .into_iter()
-            .map(String::from)
-            .collect()
+    pub(crate) fn languages(&self) -> Vec<LanguageId> {
+        self.router.configured_languages()
     }
 
     /// Support for a per-document `tool` on files of `language`, gated on the
     /// tool's primary capability.
     #[cfg(test)]
-    pub(crate) fn document_support(&self, language: &str, tool: ToolKind) -> RouteSupport {
+    pub(crate) fn document_support(&self, language: &LanguageId, tool: ToolKind) -> RouteSupport {
         self.document_support_gated(language, tool, Capability::for_tool(tool))
     }
 
@@ -110,12 +106,12 @@ impl ToolSupportSnapshot {
     /// on the `Rename` route, passes its own.
     pub(crate) fn document_support_gated(
         &self,
-        language: &str,
+        language: &LanguageId,
         tool: ToolKind,
         capability: Option<Capability>,
     ) -> RouteSupport {
         let lookup = lookup_route(
-            &LanguageCandidates::new(language.to_string()),
+            &LanguageCandidates::new(language.clone()),
             |lang| self.router.resolve(lang, tool).cloned(),
             |id| self.registered.contains(id).then_some(()),
             |id| self.expected.contains(id),
@@ -206,12 +202,12 @@ impl Translator {
     /// # Errors
     ///
     /// Returns the same path-validation errors as every document tool.
-    pub(crate) async fn language_for_path(&self, path: &ClientPath) -> Result<String> {
+    pub(crate) async fn language_for_path(&self, path: &ClientPath) -> Result<LanguageId> {
         let validated = self.validate_path(path).await?;
         Ok(self
             .language_candidates(validated.as_path())
             .language()
-            .to_string())
+            .clone())
     }
 }
 
@@ -222,7 +218,6 @@ mod tests {
 
     use super::super::testing::translator_with_capabilities;
     use super::*;
-    use crate::config::LanguageId;
     use crate::test_lsp::client_path;
 
     fn rust_caps(hover: bool) -> ServerCapabilities {
@@ -299,13 +294,17 @@ mod tests {
         let server = ServerId::from("rust");
         let snap = snapshot(&["rust"], &[], &[("rust", rename_only)]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Rename),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Rename),
             RouteSupport::Supported {
                 server: server.clone()
             }
         );
         assert_eq!(
-            snap.document_support_gated("rust", ToolKind::Rename, Some(Capability::PrepareRename)),
+            snap.document_support_gated(
+                &LanguageId::from_static("rust"),
+                ToolKind::Rename,
+                Some(Capability::PrepareRename)
+            ),
             RouteSupport::CapabilityNotAdvertised {
                 server: server.clone(),
                 capability: Capability::PrepareRename,
@@ -313,7 +312,11 @@ mod tests {
         );
         let snap = snapshot(&["rust"], &[], &[("rust", with_prepare)]);
         assert_eq!(
-            snap.document_support_gated("rust", ToolKind::Rename, Some(Capability::PrepareRename)),
+            snap.document_support_gated(
+                &LanguageId::from_static("rust"),
+                ToolKind::Rename,
+                Some(Capability::PrepareRename)
+            ),
             RouteSupport::Supported { server }
         );
     }
@@ -334,7 +337,7 @@ mod tests {
     fn registered_server_with_capability_is_supported() {
         let snap = snapshot(&["rust"], &[], &[("rust", rust_caps(true))]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Supported {
                 server: ServerId::from("rust")
             }
@@ -345,14 +348,14 @@ mod tests {
     fn registered_server_without_capability_is_not_advertised() {
         let snap = snapshot(&["rust"], &[], &[("rust", rust_caps(false))]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::CapabilityNotAdvertised {
                 server: ServerId::from("rust"),
                 capability: Capability::Hover,
             }
         );
         assert_eq!(
-            snap.document_support("rust", ToolKind::Diagnostics),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Diagnostics),
             RouteSupport::Supported {
                 server: ServerId::from("rust")
             }
@@ -363,7 +366,7 @@ mod tests {
     fn client_without_server_capabilities_is_initializing() {
         let snap = snapshot(&["rust"], &[], &[]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Initializing
         );
     }
@@ -372,7 +375,7 @@ mod tests {
     fn expected_but_unregistered_server_is_initializing() {
         let snap = snapshot(&[], &["rust"], &[]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Initializing
         );
         assert_eq!(
@@ -412,7 +415,7 @@ mod tests {
         let check = |step: &str| {
             let snap = translator.tool_support_snapshot();
             assert_ne!(
-                snap.document_support("rust", ToolKind::Hover),
+                snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
                 RouteSupport::NoServer,
                 "document route, {step}"
             );
@@ -437,7 +440,7 @@ mod tests {
         assert_eq!(
             translator
                 .tool_support_snapshot()
-                .document_support("rust", ToolKind::Hover),
+                .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Supported { server: id }
         );
     }
@@ -455,7 +458,7 @@ mod tests {
         };
         assert_eq!(snap.languages(), ["rust"]);
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::NoServer
         );
     }
@@ -482,11 +485,11 @@ mod tests {
         let (translator, _fake) = translator_with_capabilities(&dir, &id, rust_caps(true));
         let snap = translator.tool_support_snapshot();
         assert_eq!(
-            snap.document_support("rust", ToolKind::Hover),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Supported { server: id.clone() }
         );
         assert_eq!(
-            snap.document_support("rust", ToolKind::Rename),
+            snap.document_support(&LanguageId::from_static("rust"), ToolKind::Rename),
             RouteSupport::CapabilityNotAdvertised {
                 server: id,
                 capability: Capability::Rename,

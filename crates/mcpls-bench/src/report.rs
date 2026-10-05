@@ -1,6 +1,7 @@
 //! Measurement records and their summary statistics.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -461,6 +462,44 @@ impl TargetRecord {
     }
 }
 
+/// The machine a run executed on, so reports from two machines can be told apart.
+///
+/// Only values the standard library reports are recorded; CPU model and RAM
+/// are not derived and must be noted by hand when results are published.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_bench::report::HostRecord;
+///
+/// let host = HostRecord::detect();
+/// assert_eq!(host.os, std::env::consts::OS);
+/// assert_eq!(host.arch, std::env::consts::ARCH);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRecord {
+    /// Operating system family (`std::env::consts::OS`).
+    pub os: String,
+    /// CPU architecture (`std::env::consts::ARCH`).
+    pub arch: String,
+    /// Parallelism available to the process, which affinity masks and cgroup
+    /// limits can set below the machine's logical CPU count; `None` when it
+    /// cannot be determined.
+    pub available_parallelism: Option<NonZeroUsize>,
+}
+
+impl HostRecord {
+    /// Records the host the current process runs on.
+    #[must_use]
+    pub fn detect() -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            available_parallelism: std::thread::available_parallelism().ok(),
+        }
+    }
+}
+
 /// The full machine-readable result of `mcpls-bench run`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReport {
@@ -470,6 +509,8 @@ pub struct RunReport {
     pub source: SourceRecord,
     /// What was measured.
     pub target: TargetRecord,
+    /// The machine the run executed on.
+    pub host: HostRecord,
     /// Other recorded executables.
     pub runtime: Vec<PinRecord>,
     /// Run parameters.
@@ -656,6 +697,24 @@ pub fn summarize(runs: &[RunRecord]) -> Vec<RegionSummary> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_record_detect_reports_the_compile_target() {
+        let host = HostRecord::detect();
+        assert_eq!(host.os, std::env::consts::OS);
+        assert_eq!(host.arch, std::env::consts::ARCH);
+        assert_eq!(
+            host.available_parallelism,
+            std::thread::available_parallelism().ok()
+        );
+    }
+
+    #[test]
+    fn host_record_round_trips_through_json() {
+        let host = HostRecord::detect();
+        let json = serde_json::to_string(&host).unwrap();
+        assert_eq!(serde_json::from_str::<HostRecord>(&json).unwrap(), host);
+    }
 
     fn sample(region: Region, outcome: Outcome, us: u64, iteration: u32) -> Sample {
         Sample {

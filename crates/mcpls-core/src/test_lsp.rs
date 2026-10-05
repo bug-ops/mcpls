@@ -310,11 +310,27 @@ pub fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
     }
 }
 
+/// Creates a FIFO at `path`, panicking when `mkfifo` fails.
+#[cfg(unix)]
+pub fn make_fifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo must succeed to set up this test");
+}
+
 /// Extension map shared by routing tests: `.rs` and `.tsx`.
-pub fn test_extensions() -> std::collections::HashMap<String, String> {
+pub fn test_extensions() -> std::collections::HashMap<String, crate::config::LanguageId> {
     std::collections::HashMap::from([
-        ("rs".to_string(), "rust".to_string()),
-        ("tsx".to_string(), "typescriptreact".to_string()),
+        (
+            "rs".to_string(),
+            crate::config::LanguageId::from_static("rust"),
+        ),
+        (
+            "tsx".to_string(),
+            crate::config::LanguageId::from_static("typescriptreact"),
+        ),
     ])
 }
 

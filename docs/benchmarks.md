@@ -1,7 +1,3 @@
-
-Both targets pin only the top-level package or commit. Their transitive
-dependencies (Python packages resolved by `uvx`, npm packages resolved by `npx`)
-float, so two runs on different days can differ in more than the pinned version.
 # Benchmarks
 
 `mcpls-bench` (crate `crates/mcpls-bench`, `publish = false`) measures mcpls
@@ -234,13 +230,11 @@ Notes:
   `vscode-tsls` with a long `--ready-timeout-secs` (for example 1800) and on
   dedicated hardware; it is not part of the scheduled workflow.
 - `httpx-pyright`: through mcpls every request to pyright-langserver 1.1.408
-  times out after 60 s, so the scenario is unvalidated end to end. The cause is
-  an existing mcpls bug, not the harness: mcpls advertises
-  `workspace.workspaceFolders` but never sends `workspace/didChangeConfiguration`,
-  so pyright waits for a configuration push and blocks every request until
-  shutdown. A raw client that sends `workspace/didChangeConfiguration` with
-  `{ settings: null }` after `initialized` gets the hover in 0.5 s. The scenario
-  stays blocked on that fix (#578).
+  timed out after 60 s because mcpls never sent
+  `workspace/didChangeConfiguration`, so pyright waited for a configuration push
+  and blocked every request until shutdown. That bug is fixed (#578), but the
+  scenario has not been re-run end to end since, so it is still unvalidated
+  through mcpls.
 - `fmt-clangd`: clangd reports out-of-line members under their qualified name,
   so the symbol probe asks for `buffered_file::close`.
 - The `symbol` field of a hover, definition or references probe is the
@@ -287,6 +281,10 @@ expected substring", not "answered identically".
 | `serena` | `uvx --from git+https://github.com/oraios/serena@<sha> serena start-mcp-server` with the `ide` context | v1.7.0 | web dashboard, browser and GUI log window are switched off by flags; `.serena/` is cleaned before and after every run; no hover tool, so `hover` is `unsupported` |
 | `lsmcp` | `npx -y @mizchi/lsmcp@0.10.0 -p typescript` | 0.10.0 | `.lsmcp/` is cleaned; the reference count is approximate (`.ts:` occurrences); TypeScript scenarios only |
 
+Both targets pin only the top-level package or commit. Their transitive
+dependencies (Python packages resolved by `uvx`, npm packages resolved by `npx`)
+float, so two runs on different days can differ in more than the pinned version.
+
 Both were run once against `react-hook-form-tsls` on the machine that wrote
 them, to check the flow; no numbers are kept or published. lsmcp did not exit
 on its own after stdin closed, so those runs end `killed`.
@@ -301,16 +299,35 @@ report as a workflow artifact for 30 days. Nothing is published or committed.
 Shared CI runners are noisy: use these reports to spot regressions in memory and
 shutdown behaviour, not to quote latencies.
 
+## Publishing results
+
+No results are published yet. A result may be quoted or added to the README
+only when it was produced by this procedure on two different machines:
+
+1. Build `mcpls` and `mcpls-bench` in release mode from the same commit on both
+   machines, and use the same pinned scenario commits.
+2. Run the same scenario with the same `--runs` and `--iterations` on each
+   machine; use at least 2 iterations and enough runs for `p95_us` to appear.
+3. Keep each JSON report. Its `host` record (`os`, `arch`,
+   `available_parallelism`) identifies the machine; `available_parallelism` is
+   what the process may use, which an affinity mask or a cgroup limit can set
+   below the logical CPU count. The report does not record the CPU model or the
+   amount of RAM: write them down by hand next to the numbers.
+4. Review each report for absolute local paths (see
+   [Trust model](#trust-model)) before sharing it.
+5. Publish figures only where both machines agree on the ordering of the
+   results, and state both machines.
+
 ## Not done yet
 
-Out of scope for the change that introduced the items above; tracked for a
-follow-up:
+The harness, scenarios, targets and `bench.yml` exist, but the following have
+not been run or published. They are tracked in
+[#592](https://github.com/bug-ops/mcpls/issues/592):
 
-- reproduction of any result on a second machine;
-- published results and a speed section in the README;
-- validated end-to-end runs of the scenarios marked "no" above (their language
-  servers were not installed where they were written) and of `httpx-pyright`
-  through mcpls;
+- reproduction of any result on a second machine, published results and a speed
+  section in the README;
+- full runs of the scenarios marked "no" above and of `httpx-pyright` through
+  mcpls;
 - scheduled runs on Windows and macOS, and a `vscode-tsls` scale run on
   dedicated hardware;
 - published Serena and lsmcp comparison results, and running the Windows path
@@ -376,7 +393,8 @@ the file that defines the symbol.
 
 The JSON report is `mcpls_bench::report::RunReport`: `scenario`, `source`
 (`pinned` commit or `unpinned` path), `target` (`mcpls` with `binary`, `build`
-and `server`, or `external`), `runtime` pin records, `params`, `runs` (each with
+and `server`, or `external`), `host` (`os`, `arch`,
+`available_parallelism`), `runtime` pin records, `params`, `runs` (each with
 `warmup`, `ready`, `truncated_after_timeout`, `samples`, `memory`, `stderr_log`,
 `shutdown`), `aborted`, `summary` (per region: `ok`, `not_ok`, `unsupported`, `first` and
 `steady` min/median/p95/max) and `memory_summary`. A sample is

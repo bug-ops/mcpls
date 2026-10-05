@@ -7,7 +7,7 @@ use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, WorkspacePath, lock_std};
-use crate::config::{NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
+use crate::config::{LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
 
@@ -450,22 +450,22 @@ impl schemars::JsonSchema for Capability {
 /// wins over the `typescript` fallback in both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LanguageCandidates {
-    language: String,
-    base: Option<&'static str>,
+    language: LanguageId,
+    base: Option<LanguageId>,
 }
 
 impl LanguageCandidates {
-    pub(super) fn new(language: String) -> Self {
+    pub(super) fn new(language: LanguageId) -> Self {
         let base = base_language_id(&language);
         Self { language, base }
     }
 
-    pub(super) fn language(&self) -> &str {
+    pub(super) const fn language(&self) -> &LanguageId {
         &self.language
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.language.as_str()).chain(self.base)
+    pub(super) fn iter(&self) -> impl Iterator<Item = &LanguageId> {
+        std::iter::once(&self.language).chain(self.base.as_ref())
     }
 }
 
@@ -485,7 +485,7 @@ pub(super) enum RouteLookup<T> {
     /// The router names a server that is neither registered, expected nor
     /// recorded as failed.
     Dangling {
-        language: String,
+        language: LanguageId,
         server_id: ServerId,
     },
     /// No candidate language has a route for the tool.
@@ -509,20 +509,20 @@ pub(super) fn lookup_route<T>(
     startup_failure: impl Fn(&ServerId) -> Option<ServerSpawnFailure>,
 ) -> RouteLookup<T> {
     for language in candidates.iter() {
-        let Some(server_id) = resolve(language) else {
+        let Some(server_id) = resolve(language.as_str()) else {
             continue;
         };
         return if let Some(found) = registered(&server_id) {
             RouteLookup::Registered(server_id, found)
         } else if is_expected(&server_id) {
             RouteLookup::Initializing(server_id)
-        } else if let Some(catch_all) = pending_catch_all(language) {
+        } else if let Some(catch_all) = pending_catch_all(language.as_str()) {
             RouteLookup::Initializing(catch_all)
         } else if let Some(failure) = startup_failure(&server_id) {
             RouteLookup::Failed(Box::new(failure))
         } else {
             RouteLookup::Dangling {
-                language: language.to_string(),
+                language: language.clone(),
                 server_id,
             }
         };
@@ -752,9 +752,11 @@ impl Translator {
                 }
                 let has_language = {
                     let router = lock_std(&self.router);
-                    candidates.iter().any(|lang| router.has_language(lang))
+                    candidates
+                        .iter()
+                        .any(|lang| router.has_language(lang.as_str()))
                 };
-                let language = candidates.language().to_string();
+                let language = candidates.language().clone();
                 if has_language {
                     Err(Error::NoServerForTool {
                         language_id: language,
@@ -783,7 +785,7 @@ impl Translator {
         tool: ToolKind,
     ) -> Option<ServerSpawnFailure> {
         candidates.iter().find_map(|lang| {
-            let id = self.configured_router.resolve(lang, tool)?;
+            let id = self.configured_router.resolve(lang.as_str(), tool)?;
             self.startup_failure(id)
         })
     }
@@ -1280,6 +1282,7 @@ mod tests {
             name: Some(name.to_string()),
             handles,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -1713,7 +1716,7 @@ mod tests {
         fs::write(&test_file, "echo hello").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("nu".to_string(), "nushell".to_string());
+        extension_map.insert("nu".to_string(), LanguageId::from_static("nushell"));
 
         let translator = Translator::new().with_extensions(extension_map);
 
@@ -1734,7 +1737,7 @@ mod tests {
         fs::write(&test_file, "content").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("rs".to_string(), "rust".to_string());
+        extension_map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let translator = Translator::new().with_extensions(extension_map);
 
@@ -1755,7 +1758,10 @@ mod tests {
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
+        extension_map.insert(
+            "tsx".to_string(),
+            LanguageId::from_static("typescriptreact"),
+        );
 
         let translator = Translator::new()
             .with_extensions(extension_map)
@@ -1781,7 +1787,10 @@ mod tests {
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("tsx".to_string(), "typescriptreact".to_string());
+        extension_map.insert(
+            "tsx".to_string(),
+            LanguageId::from_static("typescriptreact"),
+        );
 
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
@@ -1797,6 +1806,7 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         };
 
         let translator = Translator::new()
@@ -2082,7 +2092,10 @@ mod tests {
         fs::write(&test_file, "export const Component = () => <div />").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("jsx".to_string(), "javascriptreact".to_string());
+        extension_map.insert(
+            "jsx".to_string(),
+            LanguageId::from_static("javascriptreact"),
+        );
 
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
@@ -2098,6 +2111,7 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         };
         let translator = Translator::new()
             .with_extensions(extension_map)
@@ -2146,8 +2160,14 @@ mod tests {
         };
 
         let extension_map = config.build_effective_extension_map();
-        assert_eq!(extension_map.get("nu"), Some(&"nushell".to_string()));
-        assert_eq!(extension_map.get("rs"), Some(&"rust".to_string()));
+        assert_eq!(
+            extension_map.get("nu"),
+            Some(&LanguageId::from_static("nushell"))
+        );
+        assert_eq!(
+            extension_map.get("rs"),
+            Some(&LanguageId::from_static("rust"))
+        );
 
         // serve() starts in protocol-only mode when no LSP servers are configured;
         // it may return a transport error but must not report a startup failure.
@@ -2171,8 +2191,8 @@ mod tests {
         // on an unrelated in-flight request.
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), "lang_a".to_string());
-        extensions.insert("bb".to_string(), "lang_b".to_string());
+        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
+        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
 
         let mut translator =
             Translator::new()
@@ -2262,7 +2282,7 @@ mod tests {
         // so they can't both observe "not open yet" and both send didOpen.
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), "lang_a".to_string());
+        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
 
         let mut translator =
             Translator::new()
@@ -2326,7 +2346,7 @@ mod tests {
         use crate::bridge::state::ResourceLimits;
 
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), "lang_a".to_string());
+        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
 
         let mut translator = Translator::new()
             .with_extensions(extensions)
@@ -2549,7 +2569,7 @@ mod tests {
     async fn test_prepare_document_releases_in_flight_guard_when_ensure_open_fails() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("bb".to_string(), "lang_b".to_string());
+        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
 
         let mut translator =
             Translator::new()
@@ -2596,8 +2616,8 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), "lang_a".to_string());
-        extensions.insert("bb".to_string(), "lang_b".to_string());
+        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
+        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
 
         let mut translator = Translator::new()
             .with_extensions(extensions)
@@ -2671,7 +2691,7 @@ mod tests {
     async fn test_dispatch_routes_hover_and_diagnostics_to_different_servers() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("py".to_string(), "python".to_string());
+        extensions.insert("py".to_string(), LanguageId::from_static("python"));
 
         let pyright_id = ServerId::from("pyright");
         let pylsp_id = ServerId::from("pylsp");
@@ -2690,6 +2710,7 @@ mod tests {
                 name: Some("pyright".to_string()),
                 handles: Some(vec![ToolKind::Hover]),
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
@@ -2705,6 +2726,7 @@ mod tests {
                 name: Some("pylsp".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
@@ -2960,7 +2982,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(hierarchy_item(item)).await;
+        let result = translator
+            .handle_incoming_calls(checked_hierarchy_item(item))
+            .await;
 
         assert_matches!(
             result,
@@ -2999,7 +3023,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(hierarchy_item(item)).await;
+        let result = translator
+            .handle_outgoing_calls(checked_hierarchy_item(item))
+            .await;
 
         assert_matches!(
             result,

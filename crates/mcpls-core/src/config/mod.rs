@@ -12,8 +12,7 @@ mod server;
 mod settings;
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
 
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
@@ -24,7 +23,7 @@ pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRout
 use serde::{Deserialize, Serialize};
 pub use server::{
     BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,
-    MAX_TIMEOUT_SECONDS, ServerHeuristics,
+    MAX_TIMEOUT_SECONDS, ServerHeuristics, ServerSelection,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
 
@@ -32,7 +31,7 @@ use crate::bridge::{
     DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits, join_relative_root, probe_root,
 };
 use crate::error::{Error, Result};
-use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
+use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
 
 /// Maps file extensions to LSP language identifiers.
 ///
@@ -482,13 +481,12 @@ impl WorkspaceConfig {
     ///
     /// A `HashMap` where keys are file extensions (without the dot) and values
     /// are the corresponding language IDs to report to LSP servers.
-    // TODO(#633): type extension-map values and detected language ids as LanguageId
     #[must_use]
-    pub fn build_extension_map(&self) -> HashMap<String, String> {
+    pub fn build_extension_map(&self) -> HashMap<String, LanguageId> {
         let mut map = HashMap::new();
         for mapping in &self.language_extensions {
             for ext in &mapping.extensions {
-                map.insert(ext.clone(), mapping.language_id.to_string());
+                map.insert(ext.clone(), mapping.language_id.clone());
             }
         }
         map
@@ -504,13 +502,11 @@ impl WorkspaceConfig {
     ///
     /// The language ID if found, `None` otherwise.
     #[must_use]
-    pub fn language_for_extension(&self, extension: &str) -> Option<String> {
-        for mapping in &self.language_extensions {
-            if mapping.extensions.contains(&extension.to_string()) {
-                return Some(mapping.language_id.to_string());
-            }
-        }
-        None
+    pub fn language_for_extension(&self, extension: &str) -> Option<LanguageId> {
+        self.language_extensions
+            .iter()
+            .find(|mapping| mapping.extensions.iter().any(|e| e == extension))
+            .map(|mapping| mapping.language_id.clone())
     }
 
     /// Maps the configured `max_documents`/`max_file_size` onto the bridge
@@ -550,10 +546,12 @@ fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
     }
 }
 
-fn language_id_for_pattern_extension(server_language_id: &LanguageId, extension: &str) -> String {
-    react_variant_language_id(server_language_id.as_str(), extension)
-        .unwrap_or(server_language_id.as_str())
-        .to_string()
+fn language_id_for_pattern_extension(
+    server_language_id: &LanguageId,
+    extension: &str,
+) -> LanguageId {
+    react_variant_language_id(server_language_id, extension)
+        .unwrap_or_else(|| server_language_id.clone())
 }
 
 /// Build default language extension mappings.
@@ -748,18 +746,14 @@ pub enum ProjectConfigStatus {
 /// realistically stays in the low kilobytes even with dozens of configured
 /// servers.
 ///
-/// Enforced via a bounded read (`Read::take`), not a `std::fs::metadata`
-/// pre-check: `metadata().len()` reports `0` for character devices, FIFOs,
-/// and many procfs entries regardless of how much data they can actually
-/// produce (e.g. `/dev/zero`), so a path pointing at one of those would
-/// sail past a size-only pre-check and still block `read_to_string` on an
-/// effectively infinite read -- the exact "slow/infinite device" case #309
-/// named. A pure metadata check is also TOCTOU-able for a regular file that
-/// grows between the check and the read. Reading `MAX_CONFIG_FILE_BYTES +
-/// 1` bytes, one past the cap, is what distinguishes "exactly at the
-/// boundary" (allowed) from "over" (rejected) without needing a second
-/// syscall.
-const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// The path is opened through [`RegularFile`], which rejects anything but a
+/// regular file (a FIFO, a device such as `/dev/zero`, ...) on the open
+/// handle, so `metadata().len()` is meaningful. The read is still capped at
+/// `MAX_CONFIG_FILE_BYTES + 1` bytes because a regular file can grow between
+/// the stat and the read; reaching that one-past-the-cap length is what
+/// distinguishes "exactly at the boundary" (allowed) from "over" (rejected).
+const MAX_CONFIG_FILE_BYTES: NonZeroU64 =
+    NonZeroU64::new(8 * 1024 * 1024).expect("the config file limit must be non-zero");
 
 /// Rebases the relative `roots` of the config at `config_path` per `base`,
 /// keeping every spelling as written: nothing is canonicalized here.
@@ -845,7 +839,7 @@ impl ServerConfig {
     /// Starts with workspace mappings and overlays mappings inferred from
     /// configured LSP server `file_patterns`.
     #[must_use]
-    pub fn build_effective_extension_map(&self) -> HashMap<String, String> {
+    pub fn build_effective_extension_map(&self) -> HashMap<String, LanguageId> {
         let mut map = self.workspace.build_extension_map();
 
         for server in &self.lsp_servers {
@@ -1016,35 +1010,23 @@ impl ServerConfig {
     /// [`load_from`](Self::load_from)) uses
     /// [`RelativeRootBase::ConfigDir`], preserving #345's original behavior.
     fn load_from_with_root_base(path: &Path, relative_root_base: RelativeRootBase) -> Result<Self> {
-        let file = std::fs::File::open(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let file = RegularFile::open(path).map_err(|e| match e {
+            OpenRegularFileError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Error::ConfigNotFound(path.to_path_buf())
-            } else {
-                Error::Io(e)
             }
+            OpenRegularFileError::Io(e) => Error::Io(e),
+            OpenRegularFileError::NotRegular => Error::NotARegularFile(path.to_path_buf()),
         })?;
-
-        // Bounded read, not a `metadata().len()` pre-check -- see
-        // `MAX_CONFIG_FILE_BYTES`'s doc for why the pre-check alone is
-        // bypassable.
-        let mut buf = Vec::new();
-        file.take(bounded_read_cap(MAX_CONFIG_FILE_BYTES))
-            .read_to_end(&mut buf)
-            .map_err(Error::Io)?;
-        let content = match check_bounded_utf8(buf, MAX_CONFIG_FILE_BYTES) {
-            BoundedReadOutcome::Ok(s) => s,
-            BoundedReadOutcome::TooLarge { size } => {
-                return Err(Error::FileSizeLimitExceeded {
-                    size,
-                    max: MAX_CONFIG_FILE_BYTES,
-                });
-            }
-            BoundedReadOutcome::InvalidUtf8(e) => {
-                return Err(Error::InvalidConfig(format!(
-                    "config file is not valid UTF-8: {e}"
-                )));
-            }
-        };
+        let buf = file
+            .read_bounded(MAX_CONFIG_FILE_BYTES)
+            .map_err(|e| match e {
+                ReadBoundedError::TooLarge { size, max } => {
+                    Error::FileSizeLimitExceeded { size, max }
+                }
+                ReadBoundedError::Io(e) => Error::Io(e),
+            })?;
+        let content = String::from_utf8(buf)
+            .map_err(|e| Error::InvalidConfig(format!("config file is not valid UTF-8: {e}")))?;
 
         let mut config: Self = toml::from_str(&content)?;
         config.validate()?;
@@ -1127,6 +1109,15 @@ impl ServerConfig {
             if server.command.is_empty() {
                 return Err(Error::InvalidConfig(format!(
                     "command cannot be empty for language '{}'",
+                    server.language_id
+                )));
+            }
+            if server.selection == ServerSelection::Auto
+                && !BuiltinServer::TypescriptLanguageServer.matches_command(&server.command)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "selection = \"auto\" is only valid for typescript-language-server entries \
+                     (language '{}'); remove `selection` to use `command` as written",
                     server.language_id
                 )));
             }
@@ -1949,6 +1940,65 @@ mod tests {
     }
 
     #[test]
+    fn test_default_config_keeps_typescript_selection_auto_through_toml() {
+        let text = toml::to_string(&ServerConfig::default()).unwrap();
+        assert_eq!(text.matches("selection = \"auto\"").count(), 1, "{text}");
+        let reloaded: ServerConfig = toml::from_str(&text).unwrap();
+        for server in &reloaded.lsp_servers {
+            let expected = if server.language_id == "typescript" {
+                ServerSelection::Auto
+            } else {
+                ServerSelection::Explicit
+            };
+            assert_eq!(server.selection, expected, "{}", server.language_id);
+        }
+    }
+
+    #[test]
+    fn test_entry_without_selection_key_is_explicit() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [[lsp_servers]]
+            language_id = "typescript"
+            command = "typescript-language-server"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.lsp_servers[0].selection, ServerSelection::Explicit);
+    }
+
+    #[test]
+    fn test_validate_accepts_auto_selection_for_tsls_command_spellings() {
+        for command in [
+            "typescript-language-server",
+            "/opt/node/bin/typescript-language-server",
+            "typescript-language-server.cmd",
+        ] {
+            let mut typescript = LspServerConfig::typescript();
+            typescript.command = command.to_string();
+            let config = ServerConfig {
+                lsp_servers: vec![typescript],
+                ..ServerConfig::default()
+            };
+            assert!(config.validate().is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_auto_selection_on_other_servers() {
+        let mut rust = LspServerConfig::rust_analyzer();
+        rust.selection = ServerSelection::Auto;
+        let config = ServerConfig {
+            lsp_servers: vec![rust],
+            ..ServerConfig::default()
+        };
+        assert_matches!(
+            config.validate(),
+            Err(Error::InvalidConfig(msg)) if msg.contains("selection")
+        );
+    }
+
+    #[test]
     fn test_load_from_nonexistent_file() {
         let result = ServerConfig::load_from(Path::new("/nonexistent/config.toml"));
         assert!(result.is_err());
@@ -1981,13 +2031,13 @@ mod tests {
 
         // One byte over the cap; content doesn't need to be valid TOML since
         // the size check runs before parsing.
-        let oversized = "#".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() + 1);
+        let oversized = "#".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES.get()).unwrap() + 1);
         fs::write(&config_path, &oversized).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
+            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES.get()
         );
     }
 
@@ -2000,9 +2050,9 @@ mod tests {
         // exactly the cap -- the boundary itself must not be rejected.
         let mut toml_content = "[workspace]\n# ".to_string();
         toml_content.push_str(
-            &"a".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap() - toml_content.len()),
+            &"a".repeat(usize::try_from(MAX_CONFIG_FILE_BYTES.get()).unwrap() - toml_content.len()),
         );
-        assert_eq!(toml_content.len() as u64, MAX_CONFIG_FILE_BYTES);
+        assert_eq!(toml_content.len() as u64, MAX_CONFIG_FILE_BYTES.get());
         fs::write(&config_path, &toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
@@ -2011,10 +2061,8 @@ mod tests {
 
     /// #309 S1: `std::fs::metadata` reports `len() == 0` for character
     /// devices regardless of how much data they can actually produce --
-    /// `/dev/zero` is the canonical example. A size check based on metadata
-    /// alone would pass and let `load_from` block on an effectively
-    /// infinite read; the bounded `Read::take` must still reject it via
-    /// `MAX_CONFIG_FILE_BYTES`, not hang or OOM.
+    /// `/dev/zero` is the canonical example. The shared open-and-verify
+    /// (#632) rejects it as not a regular file before any read.
     #[cfg(unix)]
     #[test]
     fn test_load_from_rejects_infinite_special_file() {
@@ -2026,10 +2074,35 @@ mod tests {
         );
 
         let result = ServerConfig::load_from(path);
-        assert_matches!(
-            result,
-            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
-        );
+        assert_matches!(result, Err(Error::NotARegularFile(ref p)) if p == path);
+    }
+
+    /// #632: a FIFO config path (`--config <(...)`) is rejected at once
+    /// instead of blocking on a writer.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_from_rejects_fifo_without_blocking() {
+        let tmp_dir = TempDir::new().unwrap();
+        let fifo = tmp_dir.path().join("config.fifo");
+        crate::test_lsp::make_fifo(&fifo);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(ServerConfig::load_from(&path)).unwrap());
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("loading a FIFO config must not block"));
+        assert_matches!(result, Err(Error::NotARegularFile(ref p)) if *p == fifo);
+    }
+
+    #[test]
+    fn test_load_from_rejects_directory_as_not_regular() {
+        let tmp_dir = TempDir::new().unwrap();
+        let result = ServerConfig::load_from(tmp_dir.path());
+        #[cfg(unix)]
+        assert_matches!(result, Err(Error::NotARegularFile(_)));
+        #[cfg(not(unix))]
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2329,10 +2402,10 @@ mod tests {
         };
 
         let map = workspace.build_extension_map();
-        assert_eq!(map.get("cpp"), Some(&"cpp".to_string()));
-        assert_eq!(map.get("cc"), Some(&"cpp".to_string()));
-        assert_eq!(map.get("cxx"), Some(&"cpp".to_string()));
-        assert_eq!(map.get("nu"), Some(&"nushell".to_string()));
+        assert_eq!(map.get("cpp"), Some(&LanguageId::from_static("cpp")));
+        assert_eq!(map.get("cc"), Some(&LanguageId::from_static("cpp")));
+        assert_eq!(map.get("cxx"), Some(&LanguageId::from_static("cpp")));
+        assert_eq!(map.get("nu"), Some(&LanguageId::from_static("nushell")));
         assert_eq!(map.get("unknown"), None);
     }
 
@@ -2378,13 +2451,14 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
-        assert_eq!(map.get("c"), Some(&"cpp".to_string()));
-        assert_eq!(map.get("h"), Some(&"cpp".to_string()));
+        assert_eq!(map.get("c"), Some(&LanguageId::from_static("cpp")));
+        assert_eq!(map.get("h"), Some(&LanguageId::from_static("cpp")));
     }
 
     #[test]
@@ -2406,13 +2480,17 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
-        assert_eq!(map.get("ts"), Some(&"typescript".to_string()));
-        assert_eq!(map.get("tsx"), Some(&"typescriptreact".to_string()));
+        assert_eq!(map.get("ts"), Some(&LanguageId::from_static("typescript")));
+        assert_eq!(
+            map.get("tsx"),
+            Some(&LanguageId::from_static("typescriptreact"))
+        );
     }
 
     #[test]
@@ -2434,13 +2512,17 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
-        assert_eq!(map.get("js"), Some(&"javascript".to_string()));
-        assert_eq!(map.get("jsx"), Some(&"javascriptreact".to_string()));
+        assert_eq!(map.get("js"), Some(&LanguageId::from_static("javascript")));
+        assert_eq!(
+            map.get("jsx"),
+            Some(&LanguageId::from_static("javascriptreact"))
+        );
     }
 
     #[test]
@@ -2462,13 +2544,14 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
         };
 
         let map = config.build_effective_extension_map();
         // Default C/C++ mappings remain unchanged when patterns cannot be parsed.
-        assert_eq!(map.get("h"), Some(&"c".to_string()));
+        assert_eq!(map.get("h"), Some(&LanguageId::from_static("c")));
     }
 
     #[test]
@@ -2495,15 +2578,15 @@ mod tests {
 
         assert_eq!(
             workspace.language_for_extension("hpp"),
-            Some("cpp".to_string())
+            Some(LanguageId::from_static("cpp"))
         );
         assert_eq!(
             workspace.language_for_extension("hh"),
-            Some("cpp".to_string())
+            Some(LanguageId::from_static("cpp"))
         );
         assert_eq!(
             workspace.language_for_extension("py"),
-            Some("python".to_string())
+            Some(LanguageId::from_static("python"))
         );
         assert_eq!(workspace.language_for_extension("unknown"), None);
     }
@@ -2515,15 +2598,15 @@ mod tests {
         assert!(!map.is_empty());
         assert_eq!(
             workspace.language_for_extension("rs"),
-            Some("rust".to_string())
+            Some(LanguageId::from_static("rust"))
         );
         assert_eq!(
             workspace.language_for_extension("py"),
-            Some("python".to_string())
+            Some(LanguageId::from_static("python"))
         );
         assert_eq!(
             workspace.language_for_extension("cpp"),
-            Some("cpp".to_string())
+            Some(LanguageId::from_static("cpp"))
         );
     }
 

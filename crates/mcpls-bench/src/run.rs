@@ -21,9 +21,9 @@ use crate::prepare::{absolute, repo_dir, verify_prepared};
 use crate::probe::Incorrect;
 use crate::process_tree::{ProcessGroup, SHUTDOWN_GRACE, SessionEnd, TreeWatch};
 use crate::report::{
-    BinaryRecord, BuildProfile, MemoryCheckpoint, MemoryRecord, Micros, Outcome, ReadyRecord,
-    Region, RunParams, RunRecord, RunReport, Sample, SourceRecord, TargetRecord, summarize,
-    summarize_memory,
+    BinaryRecord, BuildProfile, HostRecord, MemoryCheckpoint, MemoryRecord, Micros, Outcome,
+    ReadyRecord, Region, RunParams, RunRecord, RunReport, Sample, SourceRecord, TargetRecord,
+    summarize, summarize_memory,
 };
 use crate::scenario::{Executable, Probe, Scenario};
 use crate::stderr_log::{DRAIN_GRACE, StderrDrain, StderrLogCap};
@@ -91,6 +91,7 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Ser
         name: None,
         handles: None,
         indexing: IndexingPolicy::Auto,
+        selection: mcpls_core::config::ServerSelection::Explicit,
     }];
     config
 }
@@ -161,6 +162,7 @@ pub async fn run(
             |commit| SourceRecord::Pinned { commit },
         ),
         target: target_record,
+        host: HostRecord::detect(),
         runtime,
         params: RunParams {
             runs: options.runs,

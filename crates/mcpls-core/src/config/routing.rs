@@ -601,6 +601,7 @@ mod tests {
             name: name.map(str::to_string),
             handles,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -693,6 +694,7 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
@@ -708,6 +710,7 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();

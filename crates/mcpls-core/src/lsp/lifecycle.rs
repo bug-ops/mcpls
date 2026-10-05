@@ -1406,6 +1406,7 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             workspace_roots: vec![PathBuf::from("/workspace")],
             initialization_options: Some(init_opts),
@@ -2378,6 +2379,7 @@ sleep 5
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -2514,6 +2516,7 @@ sleep 5
                 name: Some("pyright-diag".to_string()),
                 handles: Some(vec![ToolKind::Diagnostics]),
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
@@ -2529,6 +2532,7 @@ sleep 5
                 name: Some("pylsp".to_string()),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
@@ -2548,7 +2552,7 @@ sleep 5
         translator.settle_started(fake_lsp_server_with_config(configs[1].clone()));
 
         assert!(
-            translator.is_diagnostics_route("python", &pylsp_id),
+            translator.is_diagnostics_route(&LanguageId::from_static("python"), &pylsp_id),
             "pylsp must inherit the diagnostics route once pyright-diag is known dead"
         );
     }

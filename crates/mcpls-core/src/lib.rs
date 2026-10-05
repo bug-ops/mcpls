@@ -618,14 +618,19 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
                 return None;
             }
 
+            let lsp_config = lsp::tsserver_pin::with_selected_typescript_server(
+                lsp_config,
+                &workspace_roots,
+                |key| std::env::var_os(key),
+            );
             Some(ServerInitConfig {
-                server_config: lsp_config.clone(),
-                workspace_roots: workspace_roots.canonical().to_vec(),
                 initialization_options: lsp::tsserver_pin::pinned_initialization_options(
-                    lsp_config,
+                    &lsp_config,
                     &workspace_roots,
                     |key| std::env::var_os(key),
                 ),
+                server_config: lsp_config.into_owned(),
+                workspace_roots: workspace_roots.canonical().to_vec(),
                 position_encodings: config.workspace.position_encodings.clone(),
                 redactions: Arc::clone(&startup_redactions),
             })
@@ -1180,8 +1185,7 @@ impl StartupSettler<'_> {
             .respawn_lock(&server.init_config().server_config.id());
         let serialized = respawn_lock.lock().await;
         let (id, language) = self.translator.settle_started(server);
-        let (role_tx, role_rx) =
-            tokio::sync::watch::channel(self.diagnostics_role(language.as_str(), &id));
+        let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
         let pump = self.pumps.spawn(diagnostics_pump(
@@ -1220,7 +1224,7 @@ impl StartupSettler<'_> {
         publish_startup_failures(self.translator, &self.pump_shared.subs).await;
     }
 
-    fn diagnostics_role(&self, language: &str, id: &ServerId) -> DiagnosticsRole {
+    fn diagnostics_role(&self, language: &LanguageId, id: &ServerId) -> DiagnosticsRole {
         DiagnosticsRole::from_route(self.translator.is_diagnostics_route(language, id))
     }
 
@@ -1228,7 +1232,7 @@ impl StartupSettler<'_> {
     /// value once every server has settled.
     async fn recompute_roles(&self) {
         for (id, (language, role_tx)) in &self.roles {
-            let role = self.diagnostics_role(language.as_str(), id);
+            let role = self.diagnostics_role(language, id);
             role_tx.send_if_modified(|current| {
                 let changed = *current != role;
                 *current = role;
@@ -1240,7 +1244,7 @@ impl StartupSettler<'_> {
             .iter()
             .filter(|(id, language)| {
                 self.translator.startup_failure(id).is_none()
-                    && self.translator.is_diagnostics_route(language.as_str(), id)
+                    && self.translator.is_diagnostics_route(language, id)
             })
             .count();
         self.notification_cache
@@ -1447,6 +1451,7 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
             };
@@ -1615,6 +1620,7 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
             };
@@ -2063,7 +2069,7 @@ mod tests {
             }
         }
 
-        fn support(translator: &Translator, language: &str) -> RouteSupport {
+        fn support(translator: &Translator, language: &LanguageId) -> RouteSupport {
             translator
                 .tool_support_snapshot()
                 .document_support(language, ToolKind::Hover)
@@ -2107,13 +2113,16 @@ mod tests {
 
                 wait_until("the fast server to register", || {
                     !matches!(
-                        support(&startup.translator, "rust"),
+                        support(&startup.translator, &LanguageId::from_static("rust")),
                         RouteSupport::Initializing
                     )
                 })
                 .await;
                 assert_eq!(
-                    support(&startup.translator, "typescriptreact"),
+                    support(
+                        &startup.translator,
+                        &LanguageId::from_static("typescriptreact")
+                    ),
                     RouteSupport::Initializing,
                     "slow_first: {slow_first}"
                 );
@@ -2121,7 +2130,10 @@ mod tests {
                 std::fs::write(&gate, "").unwrap();
                 wait_until("the slow server to register", || {
                     !matches!(
-                        support(&startup.translator, "typescriptreact"),
+                        support(
+                            &startup.translator,
+                            &LanguageId::from_static("typescriptreact")
+                        ),
                         RouteSupport::Initializing
                     )
                 })
@@ -2155,7 +2167,10 @@ mod tests {
             })
             .await;
             assert_eq!(
-                support(&startup.translator, "typescriptreact"),
+                support(
+                    &startup.translator,
+                    &LanguageId::from_static("typescriptreact")
+                ),
                 RouteSupport::Initializing
             );
             let failure = startup

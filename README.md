@@ -100,7 +100,7 @@ uv tool install ty@latest
 npm install -g typescript-language-server typescript@6
 ```
 
-`typescript-language-server` needs a JavaScript-based TypeScript (5.x or 6.x): TypeScript 7 ships no `tsserver`. Installing `typescript@6` globally replaces a global TypeScript 7 `tsc`; to keep both, install TypeScript 7 into a separate prefix. To run the TypeScript 7 native server instead, see the [configuration guide](docs/user-guide/configuration.md#typescript-7-native-server).
+`typescript-language-server` needs a JavaScript-based TypeScript (5.x or 6.x): TypeScript 7 ships no `tsserver`. Installing `typescript@6` globally replaces a global TypeScript 7 `tsc`; to keep both, install TypeScript 7 into a separate prefix. mcpls can start the TypeScript 7 native server automatically when it is installed outside the workspace (new generated configs only; an existing config needs `selection = "auto"` added), or you can configure it explicitly (remove `selection` when editing `command` and `args`): see the [configuration guide](docs/user-guide/configuration.md#typescript-7-native-server).
 
 **Go (gopls):**
 ```bash
@@ -446,6 +446,7 @@ flowchart TB
 - [Configuration Reference](docs/user-guide/configuration.md)
 - [Tools Reference](docs/user-guide/tools-reference.md)
 - [Troubleshooting](docs/user-guide/troubleshooting.md)
+- [Benchmarks](docs/benchmarks.md) — the `mcpls-bench` latency harness; no results are published yet
 - [Agent Skill](skills/mcpls/) — packaged [Agent Skill](https://agentskills.io/specification) teaching an AI coding agent to install, configure, and run the mcpls CLI
 
 ## Development

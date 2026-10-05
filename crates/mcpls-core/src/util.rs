@@ -54,65 +54,135 @@ pub fn check_bounded_utf8(buf: Vec<u8>, max: u64) -> BoundedReadOutcome {
     }
 }
 
-/// Why [`read_regular_file_bounded`] did not return the file's bytes.
+/// Why [`RegularFile::open`] refused a path.
 #[derive(thiserror::Error, Debug)]
-pub enum BoundedFileError {
-    /// Opening or reading the file failed.
+pub enum OpenRegularFileError {
+    /// Opening the path or reading its metadata failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// The path is not a regular file (a FIFO, device, directory, ...).
     #[error("not a regular file")]
     NotRegular,
+}
+
+/// Why [`RegularFile::read_bounded`] did not return the file's bytes.
+#[derive(thiserror::Error, Debug)]
+pub enum ReadBoundedError {
+    /// Reading the open file failed.
+    #[error(transparent)]
+    Io(std::io::Error),
     /// The file is larger than the allowed number of bytes.
     #[error("larger than {max} bytes")]
     TooLarge {
+        /// The file's stat length, or the bytes read when the stat length
+        /// understated them.
+        size: u64,
         /// The byte limit that was exceeded.
         max: u64,
     },
 }
 
-/// Reads the regular file at `path` if it is at most `max` bytes, without ever
-/// blocking on a special file.
+/// Why [`read_regular_file_bounded`] did not return the file's bytes.
+#[derive(thiserror::Error, Debug)]
+pub enum BoundedFileError {
+    /// The path could not be opened as a regular file.
+    #[error(transparent)]
+    Open(#[from] OpenRegularFileError),
+    /// The open file could not be read within the limit.
+    #[error(transparent)]
+    Read(#[from] ReadBoundedError),
+}
+
+/// An open handle proven to refer to a regular file.
 ///
+/// The type is checked on the handle itself, not on a separately stat'd path,
+/// so an atomic replace between check and open cannot swap in something else.
 /// On Unix the open uses `O_NONBLOCK`, so opening a FIFO (or a symlink to
-/// one) returns at once instead of waiting for a writer, and the file type is
-/// then checked on the open handle rather than on a separately stat'd path.
-/// `O_NOCTTY` keeps a symlink to a tty from becoming the controlling terminal.
-/// On Windows the handle must report `FILE_TYPE_DISK`, which rejects device
-/// names such as `NUL`; Win32 has no non-blocking open, so the open itself
-/// can still wait on a hostile path (see #442).
+/// one) returns at once instead of waiting for a writer, and `O_NOCTTY` keeps
+/// a symlink to a tty from becoming the controlling terminal. On Windows the
+/// handle must report `FILE_TYPE_DISK`, which rejects device names such as
+/// `NUL`; Win32 has no non-blocking open, so the open itself can still wait on
+/// a hostile path (see #442).
+#[derive(Debug)]
+pub struct RegularFile {
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
+}
+
+impl RegularFile {
+    /// Opens `path` and verifies on the open handle that it is a regular file.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenRegularFileError::NotRegular`] for anything but a regular file
+    /// and [`OpenRegularFileError::Io`] for open or metadata failures.
+    pub fn open(path: &Path) -> Result<Self, OpenRegularFileError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        let file = options.open(path)?;
+        // Must precede metadata(): GetFileInformationByHandle may fail for non-disk handles.
+        #[cfg(windows)]
+        if !winapi_util::file::typ(&file).is_ok_and(|file_type| file_type.is_disk()) {
+            return Err(OpenRegularFileError::NotRegular);
+        }
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(OpenRegularFileError::NotRegular);
+        }
+        Ok(Self { file, metadata })
+    }
+
+    /// Splits into the open handle and its metadata.
+    #[must_use]
+    pub fn into_parts(self) -> (std::fs::File, std::fs::Metadata) {
+        (self.file, self.metadata)
+    }
+
+    /// Reads the file if it is at most `max` bytes.
+    ///
+    /// The stat length is checked first, then the read itself is capped at
+    /// `max + 1` bytes, so a file that grows after the stat is still bounded.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadBoundedError::TooLarge`] past `max` bytes and
+    /// [`ReadBoundedError::Io`] when the read fails.
+    pub fn read_bounded(self, max: NonZeroU64) -> Result<Vec<u8>, ReadBoundedError> {
+        let max = max.get();
+        let size = self.metadata.len();
+        if size > max {
+            return Err(ReadBoundedError::TooLarge { size, max });
+        }
+        let mut buf = Vec::new();
+        self.file
+            .take(bounded_read_cap(max))
+            .read_to_end(&mut buf)
+            .map_err(ReadBoundedError::Io)?;
+        let read = buf.len() as u64;
+        if read > max {
+            return Err(ReadBoundedError::TooLarge { size: read, max });
+        }
+        Ok(buf)
+    }
+}
+
+/// Reads the regular file at `path` if it is at most `max` bytes, without ever
+/// blocking on a special file. See [`RegularFile`] for the open semantics.
 ///
 /// # Errors
 ///
-/// [`BoundedFileError::NotRegular`] for anything but a regular file,
-/// [`BoundedFileError::TooLarge`] past `max` bytes, and
-/// [`BoundedFileError::Io`] for open or read failures.
+/// [`BoundedFileError::Open`] when the path is not a regular file or cannot
+/// be opened and [`BoundedFileError::Read`] when it is too large or unreadable.
 pub fn read_regular_file_bounded(
     path: &Path,
     max: NonZeroU64,
 ) -> Result<Vec<u8>, BoundedFileError> {
-    let max = max.get();
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    let file = options.open(path)?;
-    #[cfg(windows)]
-    if !winapi_util::file::typ(&file).is_ok_and(|file_type| file_type.is_disk()) {
-        return Err(BoundedFileError::NotRegular);
-    }
-    if !file.metadata()?.is_file() {
-        return Err(BoundedFileError::NotRegular);
-    }
-    let mut buf = Vec::new();
-    file.take(bounded_read_cap(max)).read_to_end(&mut buf)?;
-    if buf.len() as u64 > max {
-        return Err(BoundedFileError::TooLarge { max });
-    }
-    Ok(buf)
+    Ok(RegularFile::open(path)?.read_bounded(max)?)
 }
 
 /// Marker appended to a truncated string; the returned string can be up to
@@ -260,13 +330,73 @@ mod tests {
     }
 
     #[test]
+    fn regular_file_open_into_parts_returns_handle_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let (_handle, metadata) = RegularFile::open(&path).unwrap().into_parts();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 3);
+    }
+
+    #[test]
+    fn regular_file_open_missing_path_is_io_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_matches!(
+            RegularFile::open(&dir.path().join("missing")),
+            Err(OpenRegularFileError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_open_rejects_directory_and_fifo_as_not_regular() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_matches!(
+            RegularFile::open(dir.path()),
+            Err(OpenRegularFileError::NotRegular)
+        );
+        let fifo = dir.path().join("fifo");
+        crate::test_lsp::make_fifo(&fifo);
+        assert_matches!(
+            RegularFile::open(&fifo),
+            Err(OpenRegularFileError::NotRegular)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_open_follows_symlink_to_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"abc").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (_handle, metadata) = RegularFile::open(&link).unwrap().into_parts();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn regular_file_open_rejects_nul_device_as_not_regular() {
+        assert_matches!(
+            RegularFile::open(Path::new("NUL")),
+            Err(OpenRegularFileError::NotRegular)
+        );
+    }
+
+    #[test]
     fn read_regular_file_bounded_rejects_oversize() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.json");
         std::fs::write(&path, b"{ }").unwrap();
         assert_matches!(
             read_regular_file_bounded(&path, limit(2)),
-            Err(BoundedFileError::TooLarge { max: 2 })
+            Err(BoundedFileError::Read(ReadBoundedError::TooLarge {
+                size: 3,
+                max: 2
+            }))
         );
     }
 
@@ -275,10 +405,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = read_regular_file_bounded(dir.path(), limit(10));
         #[cfg(unix)]
-        assert_matches!(result, Err(BoundedFileError::NotRegular));
+        assert_matches!(
+            result,
+            Err(BoundedFileError::Open(OpenRegularFileError::NotRegular))
+        );
         // Windows refuses to open a directory as a file before the type check runs.
         #[cfg(windows)]
-        assert_matches!(result, Err(BoundedFileError::Io(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied);
+        assert_matches!(result, Err(BoundedFileError::Open(OpenRegularFileError::Io(ref e))) if e.kind() == std::io::ErrorKind::PermissionDenied);
     }
 
     #[cfg(unix)]
@@ -286,11 +419,7 @@ mod tests {
     fn read_regular_file_bounded_does_not_block_on_fifo_or_symlink_to_it() {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("fifo");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mkfifo must succeed to set up this test");
+        crate::test_lsp::make_fifo(&fifo);
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&fifo, &link).unwrap();
 
@@ -303,7 +432,10 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap_or_else(|_| panic!("reading a FIFO must not block"));
         for outcome in outcomes {
-            assert_matches!(outcome, Err(BoundedFileError::NotRegular));
+            assert_matches!(
+                outcome,
+                Err(BoundedFileError::Open(OpenRegularFileError::NotRegular))
+            );
         }
     }
 
