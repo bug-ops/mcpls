@@ -300,6 +300,19 @@ impl Servers {
         });
     }
 
+    /// Notes `failure` for an expected server without ending its expectation,
+    /// so lookups keep reporting it as initializing until the router has been
+    /// re-derived; [`Self::record_failure`] then settles it.
+    pub(super) fn announce_failure(&mut self, failure: &ServerSpawnFailure) {
+        if let Some(slot) = self.0.get_mut(&failure.server_id)
+            && matches!(slot.status, ServerStatus::Expected { .. })
+        {
+            slot.status = ServerStatus::Expected {
+                prior_failure: Some(failure.clone()),
+            };
+        }
+    }
+
     /// Records `failure` for its server unless that server is running. An
     /// expected server becomes failed. Returns whether the server was
     /// expected.

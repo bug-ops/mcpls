@@ -372,11 +372,14 @@ impl Translator {
     /// As [`Self::settle_started`], with the failure recorded.
     pub(crate) fn settle_failed(&self, failure: &ServerSpawnFailure) {
         let id = failure.server_id.clone();
+        // The router moves off the failed server before it stops being
+        // expected, so no lookup reports a stale `ServerFailedToStart`.
+        lock_std(&self.servers).announce_failure(failure);
+        self.rebind_router_to_settled();
         let was_expected = lock_std(&self.servers).record_failure(failure);
         if !was_expected {
             tracing::error!("LSP server '{id}' settled twice or was never expected");
         }
-        self.rebind_router_to_settled();
         self.warn_failed_routes(&id);
     }
 
@@ -935,6 +938,46 @@ mod tests {
         translator.settle_started(crate::lsp::fake_lsp_server_with_config(c.clone()));
         let (served_by, _) = translator.client_for_file(&path, ToolKind::Hover).unwrap();
         assert_eq!(served_by, c.id());
+    }
+
+    /// The window inside `settle_failed`: once the failure is noted but the
+    /// router has not moved yet, a lookup still reads the server as
+    /// initializing (retryable), never as a failed start, although a
+    /// catch-all is registered and serves the call right after the rebind.
+    #[tokio::test]
+    async fn test_settle_failed_window_reads_initializing_not_failed() {
+        let configs = [
+            named_config("a", "rust", Some(vec![ToolKind::Hover])),
+            named_config("b", "rust", None),
+        ];
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::from_configs(&configs).unwrap());
+        translator.set_expected_servers(
+            configs
+                .iter()
+                .map(crate::config::LspServerConfig::id)
+                .collect(),
+        );
+        translator.settle_started(crate::lsp::fake_lsp_server_with_config(configs[1].clone()));
+        let path = PathBuf::from("/ws/main.rs");
+
+        lock_std(&translator.servers).announce_failure(&spawn_failure(&configs[0]));
+
+        let err = translator
+            .client_for_file(&path, ToolKind::Hover)
+            .unwrap_err();
+        std::assert_matches!(&err, Error::ServerInitializing { server_id } if *server_id == configs[0].id());
+        assert_eq!(
+            translator
+                .tool_support_snapshot()
+                .document_support("rust", ToolKind::Hover),
+            RouteSupport::Initializing
+        );
+
+        translator.settle_failed(&spawn_failure(&configs[0]));
+        let (served_by, _) = translator.client_for_file(&path, ToolKind::Hover).unwrap();
+        assert_eq!(served_by, configs[1].id());
     }
 
     /// A settlement that finds an earlier failure keeps it and records only

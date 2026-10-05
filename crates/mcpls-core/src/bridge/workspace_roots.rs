@@ -112,8 +112,17 @@ pub enum Unresolved {
     ParentComponent,
 }
 
+/// Canonicalizes `path` on disk. A dangling symlink is `NotFound` for
+/// `canonicalize` but exists as a link, so falling back to its parent would
+/// admit a path whose write lands outside the workspace; it is refused.
 fn canonicalize_on_disk(path: &Path) -> io::Result<PathBuf> {
-    dunce::canonicalize(path)
+    dunce::canonicalize(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound && std::fs::symlink_metadata(path).is_ok() {
+            io::Error::other("dangling symlink")
+        } else {
+            error
+        }
+    })
 }
 
 /// Canonicalizes the longest existing ancestor of `path` with `canonicalize`
@@ -1270,6 +1279,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, base) = canonical_tempdir();
+        let probe = base.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_bypasses_modes = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if root_bypasses_modes {
+            return;
+        }
         let sealed = base.join("sealed");
         std::fs::create_dir(&sealed).unwrap();
         let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
@@ -1281,5 +1298,22 @@ mod tests {
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(!admitted, "an unreadable ancestor must not be skipped over");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_admits_edit_uri_refuses_a_dangling_symlink() {
+        let (_dir, base) = canonical_tempdir();
+        let outside = tempfile::tempdir().unwrap();
+        let target = dunce::canonicalize(outside.path()).unwrap().join("x");
+        std::os::unix::fs::symlink(&target, base.join("evil.rs")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("nodir"), base.join("evil_dir")).unwrap();
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+
+        for name in ["evil.rs", "evil_dir/file.rs"] {
+            let uri = Uri::from(format!("file://{}", base.join(name).display()).as_str());
+            assert!(!roots.admits_edit_uri(&uri).await, "{name}");
+        }
+        assert!(!target.exists());
     }
 }
