@@ -100,12 +100,10 @@ pub(super) async fn enforce_body_inactivity(
             inner: body,
             timeout: timeout.get(),
             sleep: Box::pin(tokio::time::sleep(timeout.get())),
-            total: Box::pin(tokio::time::sleep_until(
-                super::connection_io::deadline_after(
-                    tokio::time::Instant::now(),
-                    body_deadline(timeout),
-                ),
-            )),
+            total: Box::pin(tokio::time::sleep_until(super::saturating_deadline(
+                tokio::time::Instant::now(),
+                body_deadline(timeout),
+            ))),
             expired: std::sync::Arc::clone(&expired),
         })
     };

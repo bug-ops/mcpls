@@ -105,6 +105,23 @@ pub use lease::{LeaseWindow, ListenLease};
 pub(crate) use shutdown::ShutdownSignal;
 pub(crate) use stdio::run_stdio;
 
+/// Longest delay a transport deadline may be pushed out to: 30 years, which
+/// no process outlives and `Instant` arithmetic still represents.
+#[cfg(feature = "transport-http")]
+const FAR_FUTURE: std::time::Duration = std::time::Duration::from_hours(262_800);
+
+/// `now + after`, saturating at [`FAR_FUTURE`] so an absurd configured duration
+/// cannot overflow `Instant`; falls back to `now` only if even that overflows.
+#[cfg(feature = "transport-http")]
+fn saturating_deadline(
+    now: tokio::time::Instant,
+    after: std::time::Duration,
+) -> tokio::time::Instant {
+    now.checked_add(after)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -115,6 +132,25 @@ mod tests {
     fn test_transport_stdio_variant() {
         let t = Transport::Stdio;
         assert!(matches!(t, Transport::Stdio));
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_saturating_deadline_adds_the_delay() {
+        let now = tokio::time::Instant::now();
+        let after = std::time::Duration::from_secs(5);
+
+        assert_eq!(saturating_deadline(now, after), now + after);
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_saturating_deadline_saturates_instead_of_overflowing() {
+        let now = tokio::time::Instant::now();
+
+        let deadline = saturating_deadline(now, std::time::Duration::MAX);
+
+        assert_eq!(deadline, now + FAR_FUTURE);
     }
 
     #[cfg(feature = "transport-http")]

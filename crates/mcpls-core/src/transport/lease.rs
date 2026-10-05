@@ -151,7 +151,10 @@ impl ListenLeaseSlot {
     pub fn start(&self) {
         if self
             .deadline
-            .set(super::liveness::after(self.window.draw()))
+            .set(super::saturating_deadline(
+                Instant::now(),
+                self.window.draw(),
+            ))
             .is_ok()
         {
             self.waker.wake();
