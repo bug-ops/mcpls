@@ -1,13 +1,15 @@
 //! Logging initialization and configuration.
 
 use std::borrow::Cow;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use mcpls_core::{escape_control, needs_control_escape};
+use thiserror::Error;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::field::RecordFields;
-use tracing_subscriber::filter::Directive;
+use tracing_subscriber::filter::{Directive, LevelFilter};
 use tracing_subscriber::fmt::format::{FormatFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent};
 use tracing_subscriber::prelude::*;
@@ -22,9 +24,62 @@ const SESSION_ID_LOG_CAPS: [&str; 2] = [
     "rmcp::transport::worker=debug",
 ];
 
-fn build_filter(level: &str) -> Result<EnvFilter> {
-    let filter = EnvFilter::try_new(level)
-        .or_else(|_| EnvFilter::try_new("info"))
+/// A validated `--log-level` / `MCPLS_LOG` value.
+///
+/// Accepts the `tracing` filter syntax, but a bare comma-separated word must
+/// be a level (`trace`, `debug`, `info`, `warn`, `error`, `off`, any case):
+/// `EnvFilter` would otherwise read a misspelt level as a target name and
+/// silently disable every other log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFilter(String);
+
+/// Why a log filter string was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum InvalidLogFilter {
+    /// The string is empty.
+    #[error("log filter must not be empty")]
+    Empty,
+    /// A bare word that is not a level.
+    #[error(
+        "invalid log level '{0}' (expected one of: trace, debug, info, warn, error, off, or a `target=level` directive)"
+    )]
+    NotALevel(String),
+    /// The `tracing` filter syntax is malformed.
+    #[error("invalid log filter: {0}")]
+    Syntax(String),
+}
+
+impl LogFilter {
+    /// The filter text, already validated.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for LogFilter {
+    type Err = InvalidLogFilter;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(InvalidLogFilter::Empty);
+        }
+        EnvFilter::builder()
+            .parse(s)
+            .map_err(|err| InvalidLogFilter::Syntax(err.to_string()))?;
+        let bare_non_level = s.split(',').map(str::trim).find(|directive| {
+            !directive.contains(['=', '[', ']', '{', '}'])
+                && directive.parse::<LevelFilter>().is_err()
+        });
+        if let Some(word) = bare_non_level {
+            return Err(InvalidLogFilter::NotALevel(word.to_owned()));
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+fn build_filter(level: &LogFilter) -> Result<EnvFilter> {
+    let filter = EnvFilter::builder()
+        .parse(level.as_str())
         .context("failed to parse log level")?;
     SESSION_ID_LOG_CAPS.iter().try_fold(filter, |filter, cap| {
         let directive: Directive = cap
@@ -173,16 +228,15 @@ fn json_format() -> fmt::format::Format<fmt::format::Json> {
 /// JSON instead of the default compact human-readable format, for
 /// consumption by structured-logging pipelines.
 ///
-/// An invalid `level` falls back to `"info"` rather than erroring.
-///
 /// rmcp's session-id-bearing log targets are capped regardless of `level`; a
 /// more specific directive (for example `rmcp::...::session::local=info`)
 /// overrides the cap and re-exposes session ids.
 ///
 /// # Errors
 ///
-/// Returns an error if the fallback `"info"` filter itself fails to parse.
-pub fn init(level: &str, log_json: bool) -> Result<()> {
+/// Returns an error if the filter or one of the built-in session-id caps fails
+/// to parse.
+pub fn init(level: &LogFilter, log_json: bool) -> Result<()> {
     let filter = build_filter(level)?;
 
     // Use stderr for logs so stdout remains clean for MCP protocol
@@ -224,6 +278,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    fn filter(text: &str) -> LogFilter {
+        text.parse().unwrap()
+    }
 
     #[derive(Clone, Default)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
@@ -406,7 +464,7 @@ mod tests {
         let buf = SharedBuf::default();
         let writer = buf.clone();
         let subscriber = tracing_subscriber::registry()
-            .with(build_filter("trace").unwrap())
+            .with(build_filter(&filter("trace")).unwrap())
             .with(
                 fmt::layer()
                     .with_writer(move || writer.clone())
@@ -436,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_init_with_valid_trace_level() {
-        let result = init("trace", false);
+        let result = init(&filter("trace"), false);
         assert!(
             result.is_ok(),
             "Should initialize successfully with trace level"
@@ -445,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_init_with_valid_debug_level() {
-        let result = init("debug", false);
+        let result = init(&filter("debug"), false);
         assert!(
             result.is_ok(),
             "Should initialize successfully with debug level"
@@ -454,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_init_with_valid_info_level() {
-        let result = init("info", false);
+        let result = init(&filter("info"), false);
         assert!(
             result.is_ok(),
             "Should initialize successfully with info level"
@@ -463,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_init_with_valid_warn_level() {
-        let result = init("warn", false);
+        let result = init(&filter("warn"), false);
         assert!(
             result.is_ok(),
             "Should initialize successfully with warn level"
@@ -472,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_init_with_valid_error_level() {
-        let result = init("error", false);
+        let result = init(&filter("error"), false);
         assert!(
             result.is_ok(),
             "Should initialize successfully with error level"
@@ -480,26 +538,39 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_invalid_level_falls_back_to_info() {
-        let result = init("invalid_log_level", false);
-        assert!(
-            result.is_ok(),
-            "Should fall back to info level for invalid input"
+    fn test_log_filter_rejects_misspelt_level_and_empty() {
+        assert_eq!(
+            "debgu".parse::<LogFilter>(),
+            Err(InvalidLogFilter::NotALevel("debgu".into()))
         );
+        assert_eq!(
+            "mcpls=debug,warnn".parse::<LogFilter>(),
+            Err(InvalidLogFilter::NotALevel("warnn".into()))
+        );
+        assert_eq!("".parse::<LogFilter>(), Err(InvalidLogFilter::Empty));
+        assert!(matches!(
+            "foo=bar=baz".parse::<LogFilter>(),
+            Err(InvalidLogFilter::Syntax(_))
+        ));
     }
 
     #[test]
-    fn test_init_with_empty_string_falls_back_to_info() {
-        let result = init("", false);
-        assert!(
-            result.is_ok(),
-            "Should fall back to info level for empty string"
-        );
+    fn test_log_filter_accepts_levels_and_directives() {
+        for accepted in [
+            "DEBUG",
+            "off",
+            "3",
+            "mcpls_core=debug,info",
+            "info,rmcp::transport::streamable_http_server::session::local=info",
+            "mcpls[span]=debug",
+        ] {
+            assert!(accepted.parse::<LogFilter>().is_ok(), "{accepted}");
+        }
     }
 
     #[test]
     fn test_init_with_crate_specific_filter() {
-        let result = init("mcpls=debug,info", false);
+        let result = init(&filter("mcpls=debug,info"), false);
         assert!(
             result.is_ok(),
             "Should support crate-specific filter syntax"
@@ -508,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_init_with_module_specific_filter() {
-        let result = init("mcpls::logging=trace", false);
+        let result = init(&filter("mcpls::logging=trace"), false);
         assert!(
             result.is_ok(),
             "Should support module-specific filter syntax"
@@ -517,10 +588,10 @@ mod tests {
 
     #[test]
     fn test_init_idempotent() {
-        let result1 = init("debug", false);
+        let result1 = init(&filter("debug"), false);
         assert!(result1.is_ok(), "First initialization should succeed");
 
-        let result2 = init("info", false);
+        let result2 = init(&filter("info"), false);
         assert!(
             result2.is_ok(),
             "Second initialization should succeed (ignored)"
@@ -529,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_init_with_uppercase_level() {
-        let result = init("DEBUG", false);
+        let result = init(&filter("DEBUG"), false);
         assert!(
             result.is_ok(),
             "Should handle uppercase log levels (fallback to info if not recognized)"
@@ -538,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_init_with_numeric_level() {
-        let result = init("3", false);
+        let result = init(&filter("3"), false);
         assert!(
             result.is_ok(),
             "Should handle numeric levels or fall back to info"
@@ -547,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_init_with_log_json_enabled() {
-        let result = init("info", true);
+        let result = init(&filter("info"), true);
         assert!(
             result.is_ok(),
             "Should initialize successfully with JSON logging enabled"

@@ -257,7 +257,7 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 |----------|-------------|---------|
 | `MCPLS_CONFIG` | Path to configuration file | Auto-detected |
 | `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory | `false` |
-| `MCPLS_LOG` | Log level (trace, debug, info, warn, error) | `info` |
+| `MCPLS_LOG` | Log level (trace, debug, info, warn, error, off) or `target=level` directives; unknown levels are rejected at startup | `info` |
 | `MCPLS_LOG_JSON` | Output logs as JSON | `false` |
 
 > [!NOTE]
