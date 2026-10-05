@@ -12,6 +12,10 @@ use crate::bridge::{
 };
 use crate::config::ServerId;
 
+/// Schema description of the opt-in `context` input shared by every tool that
+/// can attach enclosing symbols.
+const CONTEXT_DESCRIPTION: &str = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call.";
+
 /// Shared position parameters (file path plus 1-based line/character) used by
 /// every tool that operates at a single point in a file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -217,9 +221,7 @@ pub struct ReferencesParams {
     #[serde(default)]
     pub include_declaration: bool,
     /// Optional extra context for each returned item.
-    #[schemars(
-        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
-    )]
+    #[schemars(description = CONTEXT_DESCRIPTION)]
     #[serde(default)]
     pub context: ResultContext,
 }
@@ -233,9 +235,7 @@ pub struct NavigationParams {
     #[serde(flatten)]
     pub target: SymbolTargetParams,
     /// Optional extra context for each returned item.
-    #[schemars(
-        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
-    )]
+    #[schemars(description = CONTEXT_DESCRIPTION)]
     #[serde(default)]
     pub context: ResultContext,
 }
@@ -250,6 +250,29 @@ impl From<PositionParams> for NavigationParams {
     }
 }
 
+/// Parameters for the `go_to_declaration` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(description = "Parameters for navigating from a position to its declaration.")]
+pub struct DeclarationParams {
+    /// The position to navigate from.
+    #[serde(flatten)]
+    pub position: PositionParams,
+    /// Optional extra context for each returned item.
+    #[schemars(description = CONTEXT_DESCRIPTION)]
+    #[serde(default)]
+    pub context: ResultContext,
+}
+
+#[cfg(test)]
+impl From<PositionParams> for DeclarationParams {
+    fn from(position: PositionParams) -> Self {
+        Self {
+            position,
+            context: ResultContext::None,
+        }
+    }
+}
+
 /// Parameters for the `get_diagnostics` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Parameters for getting diagnostics (errors, warnings) for a file.")]
@@ -258,9 +281,7 @@ pub struct DiagnosticsParams {
     #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
     /// Optional extra context for each returned item.
-    #[schemars(
-        description = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call."
-    )]
+    #[schemars(description = CONTEXT_DESCRIPTION)]
     #[serde(default)]
     pub context: ResultContext,
 }

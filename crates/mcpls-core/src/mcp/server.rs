@@ -32,10 +32,11 @@ use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionR
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
-    DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams, FormatRangeParams,
-    InlayHintsParams, NavigationParams, PositionParams, RangeParams, ReferencesParams,
-    RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams, SymbolTargetInput,
-    SymbolTargetParams, ToolSupportParams, TypeHierarchyWalkParams, WorkspaceSymbolParams,
+    DeclarationParams, DiagnosticsParams, DocumentSymbolsParams, FormatDocumentParams,
+    FormatRangeParams, InlayHintsParams, NavigationParams, PositionParams, RangeParams,
+    ReferencesParams, RenameParams, RestartServerParams, ServerLogsParams, ServerMessagesParams,
+    SymbolTargetInput, SymbolTargetParams, ToolSupportParams, TypeHierarchyWalkParams,
+    WorkspaceSymbolParams,
 };
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
@@ -1283,22 +1284,26 @@ impl McplsServer {
 
     /// Go to declaration location.
     #[tool(
-        description = concat!("Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
+        description = concat!("Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Go to Declaration"
     )]
     async fn go_to_declaration(
         &self,
-        Parameters(PositionParams {
-            file_path,
-            line,
-            character,
-        }): Parameters<PositionParams>,
+        Parameters(DeclarationParams {
+            position:
+                PositionParams {
+                    file_path,
+                    line,
+                    character,
+                },
+            context,
+        }): Parameters<DeclarationParams>,
     ) -> Result<Json<LocationsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
         self.structured_result(
             self.context
                 .translator
-                .handle_declaration(file_path, parse_position(line, character)?)
+                .handle_declaration(file_path, parse_position(line, character)?, context)
                 .await,
         )
     }
@@ -2375,7 +2380,7 @@ mod tests {
                     .await
                     .map(|_| ()),
                 server
-                    .go_to_declaration(Parameters(position(line, character)))
+                    .go_to_declaration(Parameters(position(line, character).into()))
                     .await
                     .map(|_| ()),
                 server
@@ -5967,7 +5972,7 @@ sleep 0.3
         );
     }
 
-    /// Only the five enrichment tools declare `context`, with exactly the
+    /// Only the six enrichment tools declare `context`, with exactly the
     /// two closed values; `get_cached_diagnostics` must not.
     #[test]
     fn test_context_param_is_declared_only_on_enrichment_tools() {
@@ -5987,6 +5992,7 @@ sleep 0.3
                 "get_definition",
                 "get_diagnostics",
                 "get_references",
+                "go_to_declaration",
                 "go_to_implementation",
                 "go_to_type_definition",
             ])
@@ -6332,7 +6338,7 @@ sleep 0.3
                 .await
                 .map(|_| ()),
             McpTool::GoToDeclaration => server
-                .go_to_declaration(Parameters(position()))
+                .go_to_declaration(Parameters(position().into()))
                 .await
                 .map(|_| ()),
             McpTool::GoToTypeDefinition => server

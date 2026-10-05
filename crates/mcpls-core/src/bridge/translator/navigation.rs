@@ -14,7 +14,7 @@ use super::dto::{
     DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
     ReferencesResult,
 };
-use super::enclosing::{ContextualLocation, Contextualized, ResultContext};
+use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
@@ -753,27 +753,27 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
+        context: ResultContext,
     ) -> Result<LocationsResult> {
-        let NormalizedLocations {
-            locations,
-            truncated,
-            positions_degraded,
-        } = self
+        let normalized = self
             .handle_goto::<lsp_types::DeclarationRequest, _>(
                 &file_path,
                 position,
                 Capability::Declaration,
             )
             .await?;
+        let truncated = normalized.truncated;
+        let Contextualized {
+            items: locations,
+            enrichment,
+            positions_degraded,
+        } = self.contextualize(normalized, context).await;
 
         Ok(LocationsResult {
-            locations: locations
-                .into_iter()
-                .map(ContextualLocation::from)
-                .collect(),
+            locations,
             truncated,
             positions_degraded,
-            enrichment: None,
+            enrichment,
         })
     }
 }
@@ -1855,7 +1855,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = client_path(&path);
-            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_declaration(path, pos(1, 1), ResultContext::None)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1908,7 +1912,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = client_path(&path);
-            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_declaration(path, pos(1, 1), ResultContext::None)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1961,7 +1969,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let path = client_path(&path);
-            tokio::spawn(async move { translator.handle_declaration(path, pos(1, 1)).await })
+            tokio::spawn(async move {
+                translator
+                    .handle_declaration(path, pos(1, 1), ResultContext::None)
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -2005,7 +2017,7 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let err = translator
-            .handle_declaration(client_path(&path), pos(1, 1))
+            .handle_declaration(client_path(&path), pos(1, 1), ResultContext::None)
             .await
             .unwrap_err();
 

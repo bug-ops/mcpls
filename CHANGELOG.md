@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `go_to_declaration` accepts `context: "enclosing_symbol"` like the other location tools, and `Translator::handle_declaration` takes a `ResultContext`. (#PR)
 - **Breaking:** `prepare_rename` and `format_range` reject a line beyond the end of the tracked document as invalid params before the LSP request (new `Error::PositionBeyondDocument`); characters past a line end are still forwarded and clamped by the server. (#PR)
 - **Breaking:** a `prepare_rename` server error `-32001` (`UnknownErrorCode`, clangd's "no symbol here") now reads as `not_renameable` with the server's text. (#PR)
 - **Breaking:** `tab_size` of `format_document` and `format_range` is the typed `TabSize` (1 to 32, `MAX_TAB_SIZE`); other values are rejected as invalid params, and `handle_format_document` and `handle_format_range` take a `TabSize`. (#PR)

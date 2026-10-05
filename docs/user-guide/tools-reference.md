@@ -59,11 +59,12 @@ neither blocks or filters the result, they just tell the caller when to apply ex
 
 ### Enclosing-Symbol Context
 
-`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and
-`get_diagnostics` accept an optional `context` parameter: `"none"` (the default) or
-`"enclosing_symbol"`. With the default, the response is exactly what it was before the parameter
-existed and mcpls issues no extra LSP request. `get_cached_diagnostics` does not accept it, because
-it promises no new analysis. `go_to_declaration` does not accept it either (#608); other tools ignore an unknown `context` field. With `symbol_name` addressing the context applies to the returned locations as usual.
+`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition`,
+`go_to_declaration` and `get_diagnostics` accept an optional `context` parameter: `"none"` (the
+default) or `"enclosing_symbol"`. With the default, the response is exactly what it was before the
+parameter existed and mcpls issues no extra LSP request. `get_cached_diagnostics` does not accept
+it, because it promises no new analysis. Other tools ignore an unknown `context` field. With
+`symbol_name` addressing the context applies to the returned locations as usual.
 
 With `"enclosing_symbol"`, each location or diagnostic gains an `enclosing_symbol` field naming the
 innermost symbol of its file that contains it, found with one `textDocument/documentSymbol` request
@@ -1289,7 +1290,8 @@ without a declaration concept may return the definition; an empty result is vali
 {
   "file_path": "/path/to/file.cpp",
   "line": 10,
-  "character": 5
+  "character": 5,
+  "context": "none"
 }
 ```
 
@@ -1298,11 +1300,13 @@ without a declaration concept may return the definition; an empty result is vali
 | `file_path` | string | Yes | Absolute path to the file |
 | `line` | integer | Yes | Line number (1-based) |
 | `character` | integer | Yes | Character position (1-based) |
+| `context` | string | No | `none` (default) or `enclosing_symbol`; see [Enclosing-Symbol Context](#enclosing-symbol-context) |
 
 ### Returns
 
 Locations in the same shape as [go_to_implementation](#go_to_implementation), including
-`truncated` and `positions_degraded`.
+`truncated`, `positions_degraded` and, with `context: "enclosing_symbol"`, `enclosing_symbol` and `enrichment`.
+`go_to_declaration` takes a position only, not `symbol_name` addressing.
 
 ---
 

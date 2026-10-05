@@ -29,8 +29,8 @@ related:
 
 > [!important] Resolved
 > Shipped as an opt-in `context` input (`none` | `enclosing_symbol`, default `none`) on
-> `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and
-> `get_diagnostics`. Default output and LSP traffic are unchanged (golden test).
+> `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition`,
+> `go_to_declaration` (#608) and `get_diagnostics`. Default output and LSP traffic are unchanged (golden test).
 
 Resolutions of the open questions in section 9:
 
@@ -65,7 +65,7 @@ tools declare `context` in their schemas, and an unknown `context` field sent to
 ignored rather than rejected (`#[serde(flatten)]` position structs are incompatible with
 `deny_unknown_fields`); schema absence is the contract.
 
-Out of scope, recorded: `go_to_declaration` (#608) (added after this spec; it shares the location shape and can adopt `context` later), `get_cached_diagnostics`, hit-line snippets, grouping by symbol, call
+Added later (#608): `go_to_declaration` takes `context` like its location-shaped siblings, on a position only (no `symbol_name` addressing). Out of scope, recorded: `get_cached_diagnostics`, hit-line snippets, grouping by symbol, call
 hierarchy and workspace-symbol enrichment, cross-call symbol-tree caching.
 
 ## 1. Overview
@@ -237,7 +237,7 @@ Use EARS notation. Prefix with FR-NNN.
 |----|------------|----------|
 | FR-001 | WHEN a caller requests enclosing-symbol context on `get_references` THE SYSTEM SHALL attach to each returned location the innermost symbol of its file whose range contains the location's range, expressed as an ordered name path (outermost ancestor first), the symbol kind, and the symbol range | must |
 | FR-002 | WHEN a caller requests enclosing-symbol context on `get_definition` THE SYSTEM SHALL do the same for each returned definition location | must |
-| FR-003 | WHEN a caller requests enclosing-symbol context on `go_to_implementation` or `go_to_type_definition` THE SYSTEM SHALL behave as for `get_definition` (all three share one location result shape and one enrichment path) | should |
+| FR-003 | WHEN a caller requests enclosing-symbol context on `go_to_implementation`, `go_to_type_definition` or `go_to_declaration` THE SYSTEM SHALL behave as for `get_definition` (all four share one location result shape and one enrichment path) | should |
 | FR-004 | WHEN a caller requests enclosing-symbol context on `get_diagnostics` THE SYSTEM SHALL attach the enclosing symbol to each diagnostic, using the diagnostic's range | must |
 | FR-005 | WHEN a caller requests enclosing-symbol context on `get_cached_diagnostics` THE SYSTEM SHALL either behave as for FR-004 or refuse the option with a clear input error `[NEEDS CLARIFICATION: that tool promises "no new analysis" and no extra LSP traffic; is enrichment, which needs a documentSymbol request, acceptable there, or should it be limited to files whose symbol tree is already available?]` | should |
 | FR-006 | WHEN a location or diagnostic lies inside no symbol of its file THE SYSTEM SHALL report that explicitly as "top level / no enclosing symbol", distinguishable from every not-computed or unavailable state | must |

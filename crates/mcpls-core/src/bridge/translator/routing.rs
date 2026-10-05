@@ -3417,7 +3417,11 @@ mod tests {
         fs::write(&path, "fn main() {}").unwrap();
 
         let result = translator
-            .handle_declaration(client_path(&path), Position::at(1, 1))
+            .handle_declaration(
+                client_path(&path),
+                Position::at(1, 1),
+                crate::bridge::ResultContext::None,
+            )
             .await;
 
         assert_matches!(
