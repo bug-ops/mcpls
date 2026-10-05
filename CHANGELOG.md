@@ -42,10 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `go_to_declaration` accepts `context: "enclosing_symbol"` like the other location tools, and `Translator::handle_declaration` takes a `ResultContext`. (#PR)
-- **Breaking:** `prepare_rename` and `format_range` reject a line beyond the end of the tracked document as invalid params before the LSP request (new `Error::PositionBeyondDocument`); characters past a line end are still forwarded and clamped by the server. (#PR)
-- **Breaking:** a `prepare_rename` server error `-32001` (`UnknownErrorCode`, clangd's "no symbol here") now reads as `not_renameable` with the server's text. (#PR)
-- **Breaking:** `tab_size` of `format_document` and `format_range` is the typed `TabSize` (1 to 32, `MAX_TAB_SIZE`); other values are rejected as invalid params, and `handle_format_document` and `handle_format_range` take a `TabSize`. (#PR)
+- **Breaking:** `go_to_declaration` accepts `context: "enclosing_symbol"` like the other location tools, and `Translator::handle_declaration` takes a `ResultContext`. (#640)
+- **Breaking:** `prepare_rename` and `format_range` reject a line beyond the end of the tracked document as invalid params before the LSP request (new `Error::PositionBeyondDocument`); characters past a line end are still forwarded and clamped by the server. (#640)
+- **Breaking:** a `prepare_rename` server error `-32001` (`UnknownErrorCode`, clangd's "no symbol here") now reads as `not_renameable` with the server's text. (#640)
+- **Breaking:** `tab_size` of `format_document` and `format_range` is the typed `TabSize` (1 to 32, `MAX_TAB_SIZE`); other values are rejected as invalid params, and `handle_format_document` and `handle_format_range` take a `TabSize`. (#640)
 - `lib.rs` split into `runtime/` and `transport.rs` into submodules; no behavior change. (#638)
 - Log targets move to `mcpls_core::runtime::*` and `mcpls_core::transport::*`; `Transport` implements `Debug`. (#638)
 - Connection I/O deadlines saturate at 30 years instead of one. (#638)
@@ -144,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#PR)
+- `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#640)
 - The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
 - `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
 - Language servers start concurrently and each is usable as soon as its own `initialize` completes. (#590)
