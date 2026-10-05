@@ -7,22 +7,24 @@
 //! requests to a plain `typescript`/`javascript` server when no dedicated
 //! `typescriptreact`/`javascriptreact` server is configured).
 
+use super::LanguageId;
+
 struct ReactVariant {
-    base: &'static str,
+    base: LanguageId,
     extension: &'static str,
-    variant: &'static str,
+    variant: LanguageId,
 }
 
 const REACT_LANGUAGE_VARIANTS: &[ReactVariant] = &[
     ReactVariant {
-        base: "javascript",
+        base: LanguageId::from_static("javascript"),
         extension: "jsx",
-        variant: "javascriptreact",
+        variant: LanguageId::from_static("javascriptreact"),
     },
     ReactVariant {
-        base: "typescript",
+        base: LanguageId::from_static("typescript"),
         extension: "tsx",
-        variant: "typescriptreact",
+        variant: LanguageId::from_static("typescriptreact"),
     },
 ];
 
@@ -32,20 +34,21 @@ const REACT_LANGUAGE_VARIANTS: &[ReactVariant] = &[
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::react_variant_language_id;
+/// use mcpls_core::config::{LanguageId, react_variant_language_id};
 ///
+/// let typescript = LanguageId::new("typescript").unwrap();
 /// assert_eq!(
-///     react_variant_language_id("typescript", "tsx"),
-///     Some("typescriptreact")
+///     react_variant_language_id(&typescript, "tsx"),
+///     Some(LanguageId::new("typescriptreact").unwrap())
 /// );
-/// assert_eq!(react_variant_language_id("typescript", "ts"), None);
+/// assert_eq!(react_variant_language_id(&typescript, "ts"), None);
 /// ```
 #[must_use]
-pub fn react_variant_language_id(base: &str, extension: &str) -> Option<&'static str> {
+pub fn react_variant_language_id(base: &LanguageId, extension: &str) -> Option<LanguageId> {
     REACT_LANGUAGE_VARIANTS
         .iter()
-        .find(|v| v.base == base && v.extension == extension)
-        .map(|v| v.variant)
+        .find(|v| v.base == *base && v.extension == extension)
+        .map(|v| v.variant.clone())
 }
 
 /// Inverse of [`react_variant_language_id`]: map a React variant language id
@@ -54,17 +57,18 @@ pub fn react_variant_language_id(base: &str, extension: &str) -> Option<&'static
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::base_language_id;
+/// use mcpls_core::config::{LanguageId, base_language_id};
 ///
-/// assert_eq!(base_language_id("typescriptreact"), Some("typescript"));
-/// assert_eq!(base_language_id("typescript"), None);
+/// let react = LanguageId::new("typescriptreact").unwrap();
+/// assert_eq!(base_language_id(&react), Some(LanguageId::new("typescript").unwrap()));
+/// assert_eq!(base_language_id(&LanguageId::new("typescript").unwrap()), None);
 /// ```
 #[must_use]
-pub fn base_language_id(variant: &str) -> Option<&'static str> {
+pub fn base_language_id(variant: &LanguageId) -> Option<LanguageId> {
     REACT_LANGUAGE_VARIANTS
         .iter()
-        .find(|v| v.variant == variant)
-        .map(|v| v.base)
+        .find(|v| v.variant == *variant)
+        .map(|v| v.base.clone())
 }
 
 #[cfg(test)]
@@ -75,22 +79,27 @@ mod tests {
     fn test_forward_and_inverse_agree_for_every_row() {
         for variant in REACT_LANGUAGE_VARIANTS {
             assert_eq!(
-                react_variant_language_id(variant.base, variant.extension),
-                Some(variant.variant)
+                react_variant_language_id(&variant.base, variant.extension),
+                Some(variant.variant.clone())
             );
-            assert_eq!(base_language_id(variant.variant), Some(variant.base));
+            assert_eq!(
+                base_language_id(&variant.variant),
+                Some(variant.base.clone())
+            );
         }
     }
 
     #[test]
     fn test_forward_unknown_pair_returns_none() {
-        assert_eq!(react_variant_language_id("python", "py"), None);
-        assert_eq!(react_variant_language_id("typescript", "ts"), None);
+        let id = |s: &'static str| LanguageId::from_static(s);
+        assert_eq!(react_variant_language_id(&id("python"), "py"), None);
+        assert_eq!(react_variant_language_id(&id("typescript"), "ts"), None);
     }
 
     #[test]
     fn test_inverse_unknown_variant_returns_none() {
-        assert_eq!(base_language_id("python"), None);
-        assert_eq!(base_language_id("javascript"), None);
+        let id = |s: &'static str| LanguageId::from_static(s);
+        assert_eq!(base_language_id(&id("python")), None);
+        assert_eq!(base_language_id(&id("javascript")), None);
     }
 }

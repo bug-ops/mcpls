@@ -8,8 +8,8 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    CallHierarchyPrepareResult, HierarchyItem, IncomingCall, IncomingCallsResult, OutgoingCall,
-    OutgoingCallsResult, Position, PositionDegradation, Range,
+    CallHierarchyPrepareResult, CheckedHierarchyItem, HierarchyItem, IncomingCall,
+    IncomingCallsResult, OutgoingCall, OutgoingCallsResult, Position, PositionDegradation, Range,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
@@ -123,7 +123,10 @@ impl Translator {
     /// Returns an error if the LSP request fails, the routed server does not
     /// advertise `callHierarchyProvider` support, or the server is still
     /// indexing the workspace after `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_incoming_calls(&self, item: HierarchyItem) -> Result<IncomingCallsResult> {
+    pub async fn handle_incoming_calls(
+        &self,
+        item: CheckedHierarchyItem,
+    ) -> Result<IncomingCallsResult> {
         let walk = self.walk_calls(item, CallDirection::Incoming).await?;
         Ok(IncomingCallsResult {
             calls: walk
@@ -147,7 +150,10 @@ impl Translator {
     /// # Errors
     ///
     /// See [`Self::handle_incoming_calls`].
-    pub async fn handle_outgoing_calls(&self, item: HierarchyItem) -> Result<OutgoingCallsResult> {
+    pub async fn handle_outgoing_calls(
+        &self,
+        item: CheckedHierarchyItem,
+    ) -> Result<OutgoingCallsResult> {
         let walk = self.walk_calls(item, CallDirection::Outgoing).await?;
         Ok(OutgoingCallsResult {
             calls: walk
@@ -164,11 +170,15 @@ impl Translator {
     }
 
     /// Resolves, gates and queries one level of calls around `item`.
-    async fn walk_calls(&self, item: HierarchyItem, direction: CallDirection) -> Result<CallWalk> {
+    async fn walk_calls(
+        &self,
+        item: CheckedHierarchyItem,
+        direction: CallDirection,
+    ) -> Result<CallWalk> {
         // `gen-lsp-types`'s `Uri` is an opaque string wrapper with no validating
         // parse, so constructing it is infallible; `parse_file_uri` still
         // validates the `file://` scheme and rejects what it can't use.
-        let item_uri = lsp_types::Uri::from(item.uri.as_str());
+        let item_uri = lsp_types::Uri::from(item.uri());
         // Same ToolKind/route as `handle_call_hierarchy_prepare`; gated through
         // the same chokepoint as every whole-workspace tool (#423).
         let path = self.parse_file_uri(&item_uri).await?;
@@ -339,7 +349,7 @@ mod tests {
         let uri = Url::from_file_path(&path).unwrap().to_string();
 
         let err = translator
-            .handle_incoming_calls(hierarchy_item(call_hierarchy_item_json(&uri)))
+            .handle_incoming_calls(checked_hierarchy_item(call_hierarchy_item_json(&uri)))
             .await
             .unwrap_err();
 
@@ -374,7 +384,7 @@ mod tests {
         let uri = Url::from_file_path(&path).unwrap().to_string();
 
         let err = translator
-            .handle_outgoing_calls(hierarchy_item(call_hierarchy_item_json(&uri)))
+            .handle_outgoing_calls(checked_hierarchy_item(call_hierarchy_item_json(&uri)))
             .await
             .unwrap_err();
 
@@ -433,7 +443,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_incoming_calls(hierarchy_item(item)).await;
+        let result = translator
+            .handle_incoming_calls(checked_hierarchy_item(item))
+            .await;
 
         assert_matches!(
             result,
@@ -477,7 +489,9 @@ mod tests {
             }
         });
 
-        let result = translator.handle_outgoing_calls(hierarchy_item(item)).await;
+        let result = translator
+            .handle_outgoing_calls(checked_hierarchy_item(item))
+            .await;
 
         assert_matches!(
             result,
@@ -575,9 +589,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
-            )
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(checked_hierarchy_item(item))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -671,10 +687,8 @@ mod tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
-            )
+            let item = checked_hierarchy_item(serde_json::to_value(item).unwrap());
+            tokio::spawn(async move { translator.handle_incoming_calls(item).await })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -788,9 +802,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_outgoing_calls(hierarchy_item(item)).await },
-            )
+            tokio::spawn(async move {
+                translator
+                    .handle_outgoing_calls(checked_hierarchy_item(item))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -896,9 +912,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
-            )
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(checked_hierarchy_item(item))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1002,9 +1020,11 @@ mod tests {
         let handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_outgoing_calls(hierarchy_item(item)).await },
-            )
+            tokio::spawn(async move {
+                translator
+                    .handle_outgoing_calls(checked_hierarchy_item(item))
+                    .await
+            })
         };
 
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -1134,9 +1154,11 @@ mod tests {
         let incoming_handle = {
             let translator = Arc::clone(&translator);
             let item = serde_json::to_value(item).unwrap();
-            tokio::spawn(
-                async move { translator.handle_incoming_calls(hierarchy_item(item)).await },
-            )
+            tokio::spawn(async move {
+                translator
+                    .handle_incoming_calls(checked_hierarchy_item(item))
+                    .await
+            })
         };
 
         let request = read_framed_message(&mut wire).await;
@@ -1209,13 +1231,13 @@ mod tests {
                 match direction {
                     Direction::Incoming => serde_json::to_value(
                         translator
-                            .handle_incoming_calls(hierarchy_item(item))
+                            .handle_incoming_calls(checked_hierarchy_item(item))
                             .await
                             .unwrap(),
                     ),
                     Direction::Outgoing => serde_json::to_value(
                         translator
-                            .handle_outgoing_calls(hierarchy_item(item))
+                            .handle_outgoing_calls(checked_hierarchy_item(item))
                             .await
                             .unwrap(),
                     ),

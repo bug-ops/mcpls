@@ -112,7 +112,7 @@ pub struct Translator {
     workspace_roots: WorkspaceRoots,
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
-    extension_map: Arc<HashMap<String, String>>,
+    extension_map: Arc<HashMap<String, LanguageId>>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
     /// Locked independently so a rebind (called from the background init task
     /// as each server settles) never contends with an in-flight LSP round
@@ -429,8 +429,8 @@ impl Translator {
     /// each pump's diagnostics role and the diagnostics-route count, without
     /// exposing the router's lock guard outside this module.
     #[must_use]
-    pub fn is_diagnostics_route(&self, language_id: &str, id: &ServerId) -> bool {
-        lock_std(&self.router).resolve(language_id, ToolKind::Diagnostics) == Some(id)
+    pub fn is_diagnostics_route(&self, language_id: &LanguageId, id: &ServerId) -> bool {
+        lock_std(&self.router).resolve(language_id.as_str(), ToolKind::Diagnostics) == Some(id)
     }
 
     /// Negotiated [`PositionEncoding`] of the registered server `id`, or the
@@ -484,7 +484,7 @@ impl Translator {
     /// Only called during single-owner setup, before the translator is
     /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
-    pub fn with_extensions(mut self, extension_map: HashMap<String, String>) -> Self {
+    pub fn with_extensions(mut self, extension_map: HashMap<String, LanguageId>) -> Self {
         self.extension_map = Arc::new(extension_map);
         self.rebuild_document_tracker();
         self
@@ -938,7 +938,7 @@ mod tests {
             assert_eq!(
                 translator
                     .tool_support_snapshot()
-                    .document_support("rust", ToolKind::Hover),
+                    .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
                 RouteSupport::Initializing
             );
             assert!(
@@ -986,7 +986,7 @@ mod tests {
         assert_eq!(
             translator
                 .tool_support_snapshot()
-                .document_support("rust", ToolKind::Hover),
+                .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Initializing
         );
 
@@ -1020,7 +1020,7 @@ mod tests {
         assert_matches!(
             translator
                 .tool_support_snapshot()
-                .document_support("rust", ToolKind::Hover),
+                .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Supported { server } | RouteSupport::CapabilityNotAdvertised { server, .. }
                 if server == configs[1].id()
         );
@@ -1294,19 +1294,22 @@ mod tests {
     #[test]
     fn test_translator_with_custom_extensions() {
         let mut extension_map = HashMap::new();
-        extension_map.insert("nu".to_string(), "nushell".to_string());
-        extension_map.insert("customext".to_string(), "customlang".to_string());
+        extension_map.insert("nu".to_string(), LanguageId::from_static("nushell"));
+        extension_map.insert(
+            "customext".to_string(),
+            LanguageId::from_static("customlang"),
+        );
 
         let translator = Translator::new().with_extensions(extension_map.clone());
 
         assert_eq!(translator.extension_map.len(), 2);
         assert_eq!(
             translator.extension_map.get("nu"),
-            Some(&"nushell".to_string())
+            Some(&LanguageId::from_static("nushell"))
         );
         assert_eq!(
             translator.extension_map.get("customext"),
-            Some(&"customlang".to_string())
+            Some(&LanguageId::from_static("customlang"))
         );
     }
 
@@ -1370,7 +1373,10 @@ mod tests {
             max_file_size: 0,
         };
         let translator = Translator::new()
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]))
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]))
             .with_resource_limits(limits);
 
         let dir = TempDir::new().unwrap();

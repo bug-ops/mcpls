@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--http-allowed-host`, `MCPLS_HTTP_ALLOWED_HOSTS` and `HttpConfig::with_allowed_hosts` extend the loopback `Host` allowlist with the typed `AllowedHost`; the bound IP is allowed automatically, ports 80 and 443 must be omitted. (#597, #614)
 - Per-server `settings` table pushed after `initialized` and served on `workspace/configuration`; new `LspSettings` and `InvalidLspSettings`. (#598, #614)
 - `HttpConfig::write_stall_timeout` and `WriteStallTimeout` (30 s) free the connection permit of a peer that stops reading. (#600, #614)
+- The generated default TypeScript entry (`selection = "auto"`) starts the native `tsc --lsp --stdio` when TypeScript 7 is installed outside the workspace and no JavaScript tsserver can be pinned; new `ServerSelection`, `NativeTsc`, `TypescriptServerChoice` and `TsserverKept`. (#639)
+- `mcpls-bench` reports record the host (`os`, `arch`, `available_parallelism`), and `docs/benchmarks.md` describes how to publish results; no numbers are published. (#639)
 
 ### Changed
 
@@ -131,6 +133,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `Translator::set_expected_servers` no longer marks a registered server expected. (#637)
 - An idle HTTP session close is bounded, and an unresolvable internal URI is classified as an internal error. (#637)
 - `Translator` keeps each server's state in one slot and its lifecycle in one phase. (#637)
+- **Breaking:** `Translator::handle_incoming_calls`, `handle_outgoing_calls`, `handle_supertypes` and `handle_subtypes` take the new `CheckedHierarchyItem`; a hierarchy item with a zero, oversized or reversed range is rejected with `-32602`, and `Error` gains `InvalidHierarchyItemInput`. (#639)
+- **Breaking:** detected and mapped language ids are `LanguageId` (`build_extension_map`, `build_effective_extension_map`, `language_for_extension`, `DocumentTracker::new`, `Translator::with_extensions` and `is_diagnostics_route`, `react_variant_language_id`, `base_language_id`), and `Error::NoServerForLanguage` and `NoServerForTool` carry a `LanguageId`. (#639)
+- **Breaking:** a config file must be a regular file: `--config /dev/null` and `--config <(...)` are rejected as `NotARegularFile`; documents and the config loader share one open-and-verify. (#639)
+- **Breaking:** `LspServerConfig` gains `selection`; generated configs carry `selection = "auto"` on the TypeScript entry, so add it to an existing config to opt in, and older mcpls versions reject the key. (#639)
 
 ### Fixed
 

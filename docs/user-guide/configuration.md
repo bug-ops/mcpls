@@ -412,6 +412,16 @@ slow to be useful as a gate; every other server config field still applies.
 
 Each `[[lsp_servers]]` section defines a language server.
 
+### `selection`
+
+**Type**: String (`"explicit"` or `"auto"`)
+**Default**: `"explicit"`
+
+Set to `"auto"` to let mcpls replace `command` and `args` with the native TypeScript 7 server at
+startup. Valid only on a `typescript-language-server` entry, and written only on the generated
+default `typescript` entry. See [TypeScript 7 (native server)](#typescript-7-native-server) for the
+selection rules; remove the key to run `command` as written.
+
 ### `language_id`
 
 **Type**: String
@@ -941,12 +951,25 @@ preferences.importModuleSpecifierPreference = "relative"
 ### TypeScript 7 (native server)
 
 TypeScript 7 is the native port of the compiler. Its npm package ships no `lib/tsserver.js`, so
-`typescript-language-server` cannot use it. You have two options:
+`typescript-language-server` cannot use it. You have three options:
 
 1. Keep `typescript-language-server` and install a JavaScript-based TypeScript next to it
    (`npm install -g typescript-language-server typescript@6`). Installing `typescript@6` globally replaces a global TypeScript 7 `tsc`.
-2. Run the TypeScript 7 native server, `tsc --lsp --stdio`. Edit the existing `typescript` entry
-   of your config file (or remove it first) so that its `command` and `args` are:
+2. Let mcpls choose. The generated default `typescript` entry carries `selection = "auto"`
+   (add the key to an existing entry to opt in; it is valid only on a
+   `typescript-language-server` command). At startup mcpls then starts the native server,
+   `tsc --lsp --stdio`, when TypeScript 7 is installed outside every workspace root and no
+   JavaScript tsserver next to `typescript-language-server` can be pinned. An
+   `initialization_options.tsserver.path` you set always keeps `typescript-language-server`. It looks next to
+   `typescript-language-server`, then for `tsc` on `PATH`; only a `typescript/bin/tsc` of a
+   TypeScript 7 install is accepted, never one inside the workspace (symlinks included). Otherwise
+   `typescript-language-server` is kept (also when `tsc` needs `node` and `node` is not on `PATH`), and the choice and its reason are logged at info level.
+   When the native server is chosen, mcpls replaces the entry's `command` and `args`; remove
+   `selection` to keep your own. A TypeScript 6 install next to `typescript-language-server` wins over a
+   TypeScript 7 one. Windows is unchanged: `tsc` there is a `.cmd` shim, so use option 3.
+3. Run the TypeScript 7 native server explicitly. Edit the existing `typescript` entry
+   of your config file (or remove it first) so that its `command` and `args` are as below, and
+   remove its `selection` key (`selection = "auto"` is rejected on any other command):
 
 ```toml
 [[lsp_servers]]

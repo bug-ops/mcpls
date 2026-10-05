@@ -128,7 +128,7 @@ pub(super) fn translator_with_capabilities(
     capabilities: lsp_types::ServerCapabilities,
 ) -> (Translator, FakeServer) {
     let mut extensions = HashMap::new();
-    extensions.insert("rs".to_string(), "rust".to_string());
+    extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
 
     let mut translator =
         Translator::new()
@@ -157,7 +157,7 @@ pub(super) fn translator_with_capabilities_and_encoding(
     position_encoding: lsp_types::PositionEncodingKind,
 ) -> (Translator, FakeServer) {
     let mut extensions = HashMap::new();
-    extensions.insert("rs".to_string(), "rust".to_string());
+    extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
 
     let mut translator =
         Translator::new()
@@ -261,6 +261,7 @@ mod sh_servers {
                 name: Some(id.to_string()),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             workspace_roots: vec![],
             initialization_options: None,
@@ -361,6 +362,13 @@ pub(super) use sh_servers::{
     pid_is_running, stub_server_config, write_crash_after_init_script,
     write_protocol_server_script, write_responder_script, write_slow_exit_server_script,
 };
+
+/// A validated hierarchy item parsed from JSON, panicking on a malformed or
+/// out-of-range one.
+pub(super) fn checked_hierarchy_item(json: serde_json::Value) -> super::dto::CheckedHierarchyItem {
+    super::dto::CheckedHierarchyItem::from_client(hierarchy_item(json))
+        .expect("fixture hierarchy item is valid")
+}
 
 /// A hierarchy item parsed from JSON, panicking on a malformed one.
 pub(super) fn hierarchy_item(json: serde_json::Value) -> super::dto::HierarchyItem {

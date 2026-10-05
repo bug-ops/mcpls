@@ -198,8 +198,7 @@ THEN the response contains the error with correct 1-based position and message
 ## 3. Functional Requirements
 
 Scoping: FR-001 to FR-006 and FR-008 to FR-010 correct the defect and are the committed minimum.
-FR-007 and FR-011 to FR-013 are the automatic-selection extension, gated on the open decisions in
-section 9.
+FR-007 and FR-011 to FR-013 are the automatic-selection extension, delivered by #634 (section 9).
 
 | ID | Requirement | Priority |
 |----|------------|----------|
@@ -323,14 +322,13 @@ containing `export function f(a: string): number { return a.length; }` plus a de
 
 > [!success] Resolved
 > All questions of the draft are answered below and by the live checks of #615 (L1-L8). Automatic
-> selection (FR-007, FR-011 to FR-013) stays open as a follow-up.
+> selection (FR-007, FR-011 to FR-013) is implemented by #634.
 
 ### Resolutions (implemented for #615)
 
-Delivered scope: guidance only (FR-001 to FR-006, FR-008 to FR-010). Automatic selection
-(FR-007, FR-011 to FR-013) is deferred to a follow-up: the default config is written to disk, so
-the provenance of the default entry is lost and a `flavor = "auto"` key written into the generated
-entry is needed first; files without the key are treated as explicit.
+Delivered scope of #615: guidance only (FR-001 to FR-006, FR-008 to FR-010). Automatic selection
+(FR-007, FR-011 to FR-013) was deferred because the default config is written to disk, so the
+provenance of the default entry is lost; #634 delivers it (see "Resolutions (implemented for #634)").
 
 - Install hint: `npm install -g typescript-language-server typescript@6` (verified live with TypeScript 6.0.3).
 - Native-package signal: `package.json` major version 7 or later and no `lib/tsserver.js`. Pre-release versions use their leading digits (`7.0.1-rc` is 7). `@typescript/native-preview` is not detected.
@@ -341,6 +339,19 @@ entry is needed first; files without the key are treated as explicit.
 - Live results (2026-10-05, TypeScript 6.0.3 and 7.0.2): hover, definition, references and `get_diagnostics` (pull, `textDocument/diagnostic`) are correct on the native server; it accepts `initialize`, the configuration push and shutdown (FR-008, FR-009); type hierarchy is reported as not advertised (FR-010). `bin/tsc` resolves its platform binary from the `typescript` package's own path, not from the cwd or workspace, then `execve`s into it (needs `node` on `PATH`). Neither the native `tsc` nor `typescript-language-server` loads tsconfig `plugins`.
 - Consent for a workspace-local `tsc` is the user's own `[[lsp_servers]]` entry; the existing project-config trust gate already covers a project-local `mcpls.toml`.
 - Explicit native entry: replace the existing `typescript` entry; adding a second entry fails with "duplicate server id" (unnamed) or "two catch-all servers" (named).
+
+### Resolutions (implemented for #634)
+
+Delivered scope: automatic selection (FR-007, FR-011 to FR-013).
+
+- Provenance is a typed key, `selection = "explicit" | "auto"` (`ServerSelection`), written as `selection = "auto"` only on the generated TypeScript entry. A file without the key is explicit (US-005). It is named `selection`, not `flavor`, because it records consent to replace `command` and `args`, not the chosen flavor. `validate` accepts `auto` only when the command's file stem is `typescript-language-server` (`BuiltinServer::matches_command`, shared with the tsserver pin), so an absolute path or a `.cmd` shim stays valid.
+- Candidates: the `bin/tsc` of a TypeScript 7 `typescript` package next to the server, else a `tsc` on the child's `PATH`. `NativeTsc::from_candidate` is the single gate: the canonical path must be `typescript/bin/tsc` of a native install, outside every workspace root (shared containment predicate, symlinks included, FR-011), an executable regular file, with a UTF-8 path.
+- Precedence deviates from FR-007's literal "instead of": a pinned `typescript-language-server` with a JavaScript TypeScript next to it wins over an out-of-workspace TypeScript 7, and an `initialization_options.tsserver.path` set by the user always keeps it, because the install hint installs `typescript@6`, so `auto` fires only off the documented install path.
+- When the native server is chosen, `command` and `args` are replaced (`--lsp --stdio`); user edits to them are dropped, so remove `selection` to keep them. `initialization_options` and the rest of the entry are unchanged; no `tsserver.path` pin is generated for the native command (FR-009).
+- "Not runnable" is checked cheaply: an executable bit, and `node` on the effective `PATH` when `bin/tsc` has a `node` shebang (`TsserverKept::NodeNotOnPath`). A wrong-platform package is not detected; its spawn failure surfaces through the existing typed errors.
+- The choice and its reason are logged at info level (FR-012). Any failed selection keeps `typescript-language-server` and never aborts startup (FR-013). Selection runs once per startup; respawn and restart reuse the stored config.
+- Unix only: on Windows `bin/tsc` is a script and npm installs `.cmd` shims, so the flavor stays `typescript-language-server` (`TsserverKept::UnsupportedPlatform`, #604).
+- Existing on-disk configs lack the key and never auto-select; adding `selection = "auto"` opts in, and older mcpls versions reject the key.
 
 ## 10. See Also
 

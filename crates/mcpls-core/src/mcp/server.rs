@@ -41,14 +41,14 @@ use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_SUBSCRIPTIONS, ResolvedResource, make_uri, parse_uri,
 };
 use crate::bridge::{
-    AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, ClientPath,
-    CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo, DiagnosticsResult,
-    DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
-    FormatDocumentResult, HoverResult, IncomingCallsResult, IndexingState, InlayHintsResult,
-    LocationsResult, NotificationCache, OutgoingCallsResult, Position, PositionEncoding,
-    PositionRange, PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator,
-    TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
+    ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
+    DiagnosticsResult, DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
+    FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, IndexingState,
+    InlayHintsResult, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
+    PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
+    RestartServerResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget,
+    Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -280,6 +280,11 @@ fn parse_target(
 /// Parses a client-supplied 1-based position, so a bad value is `-32602`.
 fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
     Position::from_client(line, character).map_err(|e| map_bridge_error(e.into()))
+}
+
+/// Parses a client-supplied hierarchy item, so a bad range is `-32602`.
+fn parse_hierarchy_item(item: HierarchyItem) -> Result<CheckedHierarchyItem, McpError> {
+    CheckedHierarchyItem::from_client(item).map_err(|e| map_bridge_error(e.into()))
 }
 
 /// Parses a client-supplied ordered range.
@@ -956,7 +961,12 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<IncomingCallsResult>, McpError> {
-        self.structured_result(self.context.translator.handle_incoming_calls(item).await)
+        self.structured_result(
+            self.context
+                .translator
+                .handle_incoming_calls(parse_hierarchy_item(item)?)
+                .await,
+        )
     }
 
     /// Get outgoing calls (callees).
@@ -968,7 +978,12 @@ impl McplsServer {
         &self,
         Parameters(CallHierarchyCallsParams { item }): Parameters<CallHierarchyCallsParams>,
     ) -> Result<Json<OutgoingCallsResult>, McpError> {
-        self.structured_result(self.context.translator.handle_outgoing_calls(item).await)
+        self.structured_result(
+            self.context
+                .translator
+                .handle_outgoing_calls(parse_hierarchy_item(item)?)
+                .await,
+        )
     }
 
     /// Prepare type hierarchy at a position.
@@ -1002,7 +1017,12 @@ impl McplsServer {
         &self,
         Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
     ) -> Result<Json<TypeHierarchyResult>, McpError> {
-        self.structured_result(self.context.translator.handle_supertypes(item).await)
+        self.structured_result(
+            self.context
+                .translator
+                .handle_supertypes(parse_hierarchy_item(item)?)
+                .await,
+        )
     }
 
     /// Get the subtypes (derived types) of a type hierarchy item.
@@ -1014,7 +1034,12 @@ impl McplsServer {
         &self,
         Parameters(TypeHierarchyWalkParams { item }): Parameters<TypeHierarchyWalkParams>,
     ) -> Result<Json<TypeHierarchyResult>, McpError> {
-        self.structured_result(self.context.translator.handle_subtypes(item).await)
+        self.structured_result(
+            self.context
+                .translator
+                .handle_subtypes(parse_hierarchy_item(item)?)
+                .await,
+        )
     }
 
     /// Check whether the symbol at a position can be renamed.
@@ -1315,7 +1340,7 @@ impl McplsServer {
         self.structured_result(file_language.map(|file_language| {
             let languages =
                 file_language.map_or_else(|| snapshot.languages(), |language| vec![language]);
-            ToolSupportReport::build(&snapshot, languages, self.context.mcp.tool_prefix.as_ref())
+            ToolSupportReport::build(&snapshot, &languages, self.context.mcp.tool_prefix.as_ref())
         }))
     }
 
@@ -1584,6 +1609,7 @@ const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
         | Error::InvalidUri(..)
         | Error::InvalidPositionInput(..)
         | Error::InvalidRangeInput(..)
+        | Error::InvalidHierarchyItemInput(..)
         | Error::ResourceUri(..)
         | Error::PathToUri(..)
         | Error::ServerTerminated
@@ -2136,7 +2162,7 @@ mod tests {
     /// `INTERNAL_ERROR` code, unchanged.
     #[test]
     fn test_map_bridge_error_other_variant_uses_internal_error_code() {
-        let err = crate::error::Error::NoServerForLanguage("python".to_string());
+        let err = crate::error::Error::NoServerForLanguage(LanguageId::from_static("python"));
         let mcp_err = map_bridge_error(err);
 
         assert_eq!(mcp_err.code, ErrorCode::INTERNAL_ERROR);
@@ -2424,6 +2450,96 @@ mod tests {
             );
             assert!(parsed.is_err());
         }
+    }
+
+    /// #636: a hierarchy item with a zero, oversized or reversed range is
+    /// `-32602` for every walking tool, before any server is asked.
+    #[tokio::test]
+    async fn test_hierarchy_tools_reject_out_of_range_item_as_invalid_params() {
+        let server = create_test_server();
+        let item_json = |range: (u32, u32), selection: (u32, u32)| {
+            let at = |(line, character): (u32, u32)| serde_json::json!({"line": line, "character": character});
+            serde_json::from_value::<crate::bridge::HierarchyItem>(serde_json::json!({
+                "name": "x", "kind": 5, "uri": "file:///ws/a.rs",
+                "range": {"start": at(range), "end": at((1_000, 1))},
+                "selectionRange": {"start": at(selection), "end": at(selection)},
+            }))
+            .unwrap()
+        };
+        for (range, selection) in [
+            ((0, 1), (1, 1)),
+            ((1, 0), (1, 1)),
+            ((1, 1_000_001), (1, 1)),
+            ((1, 1), (0, 1)),
+            ((1, 1), (1, 0)),
+            ((1, 1), (1, 1_000_001)),
+            ((1, 1), (4_294_967_295, 1)),
+            ((1, 1), (1, 4_294_967_295)),
+        ] {
+            let results = [
+                server
+                    .get_incoming_calls(Parameters(CallHierarchyCallsParams {
+                        item: item_json(range, selection),
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_outgoing_calls(Parameters(CallHierarchyCallsParams {
+                        item: item_json(range, selection),
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_supertypes(Parameters(TypeHierarchyWalkParams {
+                        item: item_json(range, selection),
+                    }))
+                    .await
+                    .map(|_| ()),
+                server
+                    .get_subtypes(Parameters(TypeHierarchyWalkParams {
+                        item: item_json(range, selection),
+                    }))
+                    .await
+                    .map(|_| ()),
+            ];
+            for result in results {
+                let err = result.unwrap_err();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::INVALID_PARAMS,
+                    "{range:?} {selection:?}"
+                );
+            }
+        }
+    }
+
+    /// #636: an inverted `range` or `selectionRange` is `-32602`, while a
+    /// valid item gets past input validation (no `-32602`).
+    #[tokio::test]
+    async fn test_hierarchy_tools_reject_inverted_range_and_accept_valid_item() {
+        let server = create_test_server();
+        let uri = url::Url::from_file_path(std::env::temp_dir().join("a.rs")).unwrap();
+        let item = |range_end: (u32, u32), selection_end: (u32, u32)| {
+            let at = |(line, character): (u32, u32)| serde_json::json!({"line": line, "character": character});
+            serde_json::from_value::<crate::bridge::HierarchyItem>(serde_json::json!({
+                "name": "x", "kind": 5, "uri": uri.as_str(),
+                "range": {"start": at((5, 1)), "end": at(range_end)},
+                "selectionRange": {"start": at((5, 1)), "end": at(selection_end)},
+            }))
+            .unwrap()
+        };
+        let call = |item| async {
+            server
+                .get_incoming_calls(Parameters(CallHierarchyCallsParams { item }))
+                .await
+                .map(|_| ())
+        };
+        for (range_end, selection_end) in [((4, 1), (5, 1)), ((9, 1), (4, 1))] {
+            let err = call(item(range_end, selection_end)).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{range_end:?}");
+        }
+        let err = call(item((9, 1), (5, 4))).await.unwrap_err();
+        assert_ne!(err.code, ErrorCode::INVALID_PARAMS, "{err:?}");
     }
 
     /// #617: a zero or oversized line, or a malformed range, is `-32602` for
@@ -2815,7 +2931,10 @@ mod tests {
                 server_id.clone(),
                 LanguageId::from_static("rust"),
             )]))
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -2888,7 +3007,10 @@ mod tests {
                 server_id.clone(),
                 LanguageId::from_static("rust"),
             )]))
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -2959,7 +3081,10 @@ mod tests {
                 server_id.clone(),
                 LanguageId::from_static("rust"),
             )]))
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -3046,7 +3171,10 @@ mod tests {
                 server_id.clone(),
                 LanguageId::from_static("rust"),
             )]))
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -3352,7 +3480,10 @@ mod tests {
                 server_id.clone(),
                 LanguageId::from_static("rust"),
             )]))
-            .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+            .with_extensions(HashMap::from([(
+                "rs".to_string(),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
@@ -3517,12 +3648,12 @@ mod tests {
             "kind": 12,
             "uri": uri,
             "range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 10}
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
             },
             "selectionRange": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 10}
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
             }
         });
         let params = Parameters(CallHierarchyCallsParams {
@@ -3541,12 +3672,12 @@ mod tests {
             "kind": 12,
             "uri": uri,
             "range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 10}
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
             },
             "selectionRange": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 10}
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
             }
         });
         let params = Parameters(CallHierarchyCallsParams {
@@ -4004,7 +4135,10 @@ mod tests {
                     owner.clone(),
                     LanguageId::from_static("rust"),
                 )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+                .with_extensions(HashMap::from([(
+                    "rs".to_string(),
+                    LanguageId::from_static("rust"),
+                )])),
         );
         let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
@@ -4066,7 +4200,10 @@ mod tests {
                     owner.clone(),
                     LanguageId::from_static("rust"),
                 )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+                .with_extensions(HashMap::from([(
+                    "rs".to_string(),
+                    LanguageId::from_static("rust"),
+                )])),
         );
         let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
@@ -4122,7 +4259,10 @@ mod tests {
                     owner.clone(),
                     LanguageId::from_static("rust"),
                 )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+                .with_extensions(HashMap::from([(
+                    "rs".to_string(),
+                    LanguageId::from_static("rust"),
+                )])),
         );
         let _fake = register_fake_client(&translator, &owner);
         let temp_dir = TempDir::new().unwrap();
@@ -4215,6 +4355,7 @@ sleep 0.3
                 name: Some("rust".to_string()),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
+                selection: crate::config::ServerSelection::Explicit,
             },
             workspace_roots: vec![],
             initialization_options: None,
@@ -4232,7 +4373,10 @@ sleep 0.3
                     LanguageId::from_static("rust"),
                 )]))
                 .with_notification_cache(Arc::clone(&notification_cache))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())])),
+                .with_extensions(HashMap::from([(
+                    "rs".to_string(),
+                    LanguageId::from_static("rust"),
+                )])),
         );
         translator.register_server_complete(seed);
 
@@ -5597,8 +5741,8 @@ sleep 0.3
         let id = ServerId::from("rust");
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([
-                ("rs".to_string(), "rust".to_string()),
-                ("py".to_string(), "python".to_string()),
+                ("rs".to_string(), LanguageId::from_static("rust")),
+                ("py".to_string(), LanguageId::from_static("python")),
             ]))
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
@@ -5967,8 +6111,8 @@ sleep 0.3
                 |(id, language, _)| (ServerId::from(*id), LanguageId::new(*language).unwrap()),
             )))
             .with_extensions(std::collections::HashMap::from([
-                ("rs".to_string(), "rust".to_string()),
-                ("py".to_string(), "python".to_string()),
+                ("rs".to_string(), LanguageId::from_static("rust")),
+                ("py".to_string(), LanguageId::from_static("python")),
             ]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -6019,8 +6163,8 @@ sleep 0.3
         let item = || {
             let uri = url::Url::from_file_path(file).unwrap().to_string();
             let range = serde_json::json!({
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 10}
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 10}
             });
             CallHierarchyCallsParams {
                 item: serde_json::from_value(serde_json::json!({
@@ -6244,7 +6388,11 @@ sleep 0.3
                 let (reported, expected_refusal) = match tool.spec().backend {
                     ToolBackend::Local => (None, false),
                     ToolBackend::Document(kind) => (
-                        Some(snapshot.document_support_gated("rust", kind, tool.capability())),
+                        Some(snapshot.document_support_gated(
+                            &LanguageId::from_static("rust"),
+                            kind,
+                            tool.capability(),
+                        )),
                         tool.capability()
                             .is_some_and(|cap| !cap.is_supported(&caps)),
                     ),
@@ -6470,9 +6618,11 @@ sleep 0.3
                     .is_err_and(|e| e.message.contains(CAPABILITY_REFUSAL));
                 let reported = match tool.spec().backend {
                     ToolBackend::Local => continue,
-                    ToolBackend::Document(kind) => {
-                        snapshot.document_support_gated("rust", kind, tool.capability())
-                    }
+                    ToolBackend::Document(kind) => snapshot.document_support_gated(
+                        &LanguageId::from_static("rust"),
+                        kind,
+                        tool.capability(),
+                    ),
                     ToolBackend::Workspace(kind) => snapshot.workspace_support(kind),
                 };
                 assert_eq!(

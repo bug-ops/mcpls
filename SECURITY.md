@@ -62,6 +62,14 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   resolved once at startup. The pin narrows one vector. It does not make an
   untrusted workspace safe.
 
+- **Automatic native `tsc` selection.** An entry with `selection = "auto"` (the
+  generated TypeScript default) may start `tsc --lsp --stdio` from a TypeScript 7
+  install. mcpls accepts only a `typescript/bin/tsc` that canonicalizes to a path
+  outside every workspace root, so a workspace `node_modules` is never selected. The
+  native server loads no tsconfig plugins (checked live). This
+  does not make an untrusted workspace safe. Remove `selection` to run `command` as
+  written.
+
 - **Explicitly configured workspace binaries.** A server `command` you configure,
   for example a TypeScript 7 `tsc` for the native server (`tsc --lsp --stdio`),
   is run as written. A `tsc` from the workspace's `node_modules`, or one that

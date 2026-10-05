@@ -348,7 +348,7 @@ impl Translator {
         // the cache, and `clear_server_diagnostics` is scoped to one server's
         // own entries (#266), so a crashed rust-analyzer never wipes a
         // healthy pyright's cached diagnostics.
-        let diagnostics_route = self.is_diagnostics_route(language_id.as_str(), id);
+        let diagnostics_route = self.is_diagnostics_route(&language_id, id);
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
@@ -1327,6 +1327,7 @@ sleep 1
                     name: Some("hover-only".to_string()),
                     handles: Some(vec![ToolKind::Hover]),
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 },
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
@@ -1342,6 +1343,7 @@ sleep 1
                     name: Some("diag-catchall".to_string()),
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 },
             ];
             let router = ToolRouter::from_configs(configs.iter()).unwrap();
@@ -1413,7 +1415,10 @@ sleep 1
                     id.clone(),
                     LanguageId::from_static("rust"),
                 )]))
-                .with_extensions(HashMap::from([("rs".to_string(), "rust".to_string())]));
+                .with_extensions(HashMap::from([(
+                    "rs".to_string(),
+                    LanguageId::from_static("rust"),
+                )]));
             translator.set_workspace_roots(
                 WorkspaceRoots::from_configured(&[workspace.to_path_buf()]).unwrap(),
             );

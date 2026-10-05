@@ -298,6 +298,7 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         name: Some(name.to_string()),
         handles: Some(handles),
         indexing: IndexingPolicy::Auto,
+        selection: crate::config::ServerSelection::Explicit,
     }
 }
 
@@ -314,7 +315,7 @@ async fn prepare_rename_routes_with_rename() {
     let mut translator = Translator::new()
         .with_extensions(std::collections::HashMap::from([(
             "rs".to_string(),
-            "rust".to_string(),
+            crate::config::LanguageId::from_static("rust"),
         )]))
         .with_router(ToolRouter::from_configs(&configs).unwrap());
     translator

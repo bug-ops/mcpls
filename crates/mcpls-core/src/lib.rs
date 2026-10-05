@@ -365,6 +365,7 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
             };
@@ -533,6 +534,7 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
+                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
             };

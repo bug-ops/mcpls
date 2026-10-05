@@ -1403,7 +1403,7 @@ mod tests {
     async fn test_handle_diagnostics_pull_error_falls_back_to_nonempty_cache() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("rs".to_string(), "rust".to_string());
+        extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let mut translator =
             Translator::new()
@@ -1497,7 +1497,7 @@ mod tests {
     async fn test_handle_diagnostics_partial_response_degrades_to_empty_result() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("rs".to_string(), "rust".to_string());
+        extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let mut translator =
             Translator::new()
@@ -1567,7 +1567,7 @@ mod tests {
     async fn test_handle_diagnostics_pull_error_and_empty_cache_propagates_error() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("rs".to_string(), "rust".to_string());
+        extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let mut translator =
             Translator::new()

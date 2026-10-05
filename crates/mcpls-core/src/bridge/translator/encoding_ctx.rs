@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use super::dto::{Position, Position2D, PositionDegradation, Range};
+use super::dto::{Position, Position2D, PositionDegradation, PositionRange, Range};
 use crate::bridge::encoding::{
     ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
 };
@@ -391,15 +391,11 @@ impl EncodingCtx {
     pub(super) async fn denormalize_range(
         &self,
         uri: &lsp_types::Uri,
-        range: &Range,
+        range: PositionRange,
     ) -> lsp_types::Range {
         lsp_types::Range {
-            start: self
-                .to_lsp(uri, Position::from_server_output(&range.start))
-                .await,
-            end: self
-                .to_lsp(uri, Position::from_server_output(&range.end))
-                .await,
+            start: self.to_lsp(uri, range.start()).await,
+            end: self.to_lsp(uri, range.end()).await,
         }
     }
 }

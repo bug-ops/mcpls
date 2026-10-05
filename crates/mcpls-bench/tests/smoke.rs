@@ -76,6 +76,7 @@ fn run_smoke(work_dir: &std::path::Path, cwd: Option<&std::path::Path>) -> RunRe
 }
 
 fn assert_all_ok(report: &RunReport) {
+    assert_eq!(report.host.os, std::env::consts::OS);
     let samples: Vec<_> = report.runs.iter().flat_map(|run| &run.samples).collect();
     assert!(!samples.is_empty(), "the run produced no samples");
     let not_ok: Vec<_> = samples

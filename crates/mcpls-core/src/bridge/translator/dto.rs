@@ -865,6 +865,10 @@ pub struct InlayHintsResult {
 /// serves both. `data` is opaque to the caller and meaningful only to the
 /// server that produced the item.
 ///
+/// Lines and columns above [`MAX_POSITION_VALUE`] cannot be passed back, so
+/// an item from a `prepare_*` tool whose range crosses that column (for
+/// example on a minified line) is rejected by the walking tools.
+///
 /// # Examples
 ///
 /// ```
@@ -907,6 +911,89 @@ pub struct HierarchyItem {
     /// input.
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_workspace: bool,
+}
+
+/// Why a client-supplied [`HierarchyItem`] was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidHierarchyItem {
+    /// The item's `range` is invalid.
+    #[error("invalid hierarchy item range: {0}")]
+    Range(InvalidRange),
+    /// The item's `selectionRange` is invalid.
+    #[error("invalid hierarchy item selectionRange: {0}")]
+    SelectionRange(InvalidRange),
+}
+
+/// A [`HierarchyItem`] whose ranges passed client-input validation.
+///
+/// Taken by the walking handlers instead of the raw wire DTO, so a zero,
+/// oversized or reversed range cannot reach the LSP conversion. Built only by
+/// [`Self::from_client`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{CheckedHierarchyItem, HierarchyItem, InvalidHierarchyItem};
+///
+/// let wire = |line: u32| -> HierarchyItem {
+///     serde_json::from_value(serde_json::json!({
+///         "name": "Base", "kind": 5, "uri": "file:///a.cpp",
+///         "range": {"start": {"line": line, "character": 1}, "end": {"line": 2, "character": 1}},
+///         "selectionRange": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 11}},
+///     }))
+///     .unwrap()
+/// };
+/// assert!(CheckedHierarchyItem::from_client(wire(1)).is_ok());
+/// assert!(matches!(
+///     CheckedHierarchyItem::from_client(wire(0)),
+///     Err(InvalidHierarchyItem::Range(_))
+/// ));
+/// ```
+#[derive(Debug, Clone)]
+pub struct CheckedHierarchyItem {
+    pub(super) name: String,
+    pub(super) kind: u32,
+    pub(super) detail: Option<String>,
+    pub(super) uri: String,
+    pub(super) range: PositionRange,
+    pub(super) selection_range: PositionRange,
+    pub(super) data: Option<serde_json::Value>,
+}
+
+impl CheckedHierarchyItem {
+    /// Validates the ranges of a client-supplied item.
+    ///
+    /// # Errors
+    ///
+    /// Returns which range was zero-based, above [`MAX_POSITION_VALUE`] or
+    /// reversed. Containment of `selectionRange` in `range` is not checked.
+    pub fn from_client(item: HierarchyItem) -> Result<Self, InvalidHierarchyItem> {
+        let range = checked_range(&item.range).map_err(InvalidHierarchyItem::Range)?;
+        let selection_range =
+            checked_range(&item.selection_range).map_err(InvalidHierarchyItem::SelectionRange)?;
+        Ok(Self {
+            name: item.name,
+            kind: item.kind,
+            detail: item.detail,
+            uri: item.uri,
+            range,
+            selection_range,
+            data: item.data,
+        })
+    }
+
+    /// The item's document URI, as the client sent it.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+fn checked_range(range: &Range) -> Result<PositionRange, InvalidRange> {
+    PositionRange::from_client(
+        (range.start.line, range.start.character),
+        (range.end.line, range.end.character),
+    )
 }
 
 /// Result of a type hierarchy prepare, supertypes or subtypes request.
@@ -1485,6 +1572,56 @@ impl ServerText for DocumentHighlightsResult {
 
 #[cfg(test)]
 mod tests {
+    fn hierarchy_wire(range: [u32; 4], selection: [u32; 4]) -> HierarchyItem {
+        let at = |line, character| serde_json::json!({"line": line, "character": character});
+        serde_json::from_value(serde_json::json!({
+            "name": "x", "kind": 5, "uri": "file:///a.rs",
+            "range": {"start": at(range[0], range[1]), "end": at(range[2], range[3])},
+            "selectionRange": {"start": at(selection[0], selection[1]), "end": at(selection[2], selection[3])},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn checked_hierarchy_item_accepts_valid_ranges() {
+        let item = CheckedHierarchyItem::from_client(hierarchy_wire([1, 1, 2, 1], [1, 7, 1, 9]));
+        assert_eq!(item.unwrap().uri(), "file:///a.rs");
+    }
+
+    #[test]
+    fn checked_hierarchy_item_rejects_bad_range_and_names_it() {
+        for bad in [
+            [0, 1, 1, 1],
+            [1, 0, 1, 1],
+            [1, 1, 1, 1_000_001],
+            [1, 1, u32::MAX, 1],
+            [2, 1, 1, 1],
+        ] {
+            let err =
+                CheckedHierarchyItem::from_client(hierarchy_wire(bad, [1, 1, 1, 1])).unwrap_err();
+            assert!(matches!(err, InvalidHierarchyItem::Range(_)), "{bad:?}");
+            let err =
+                CheckedHierarchyItem::from_client(hierarchy_wire([1, 1, 9, 1], bad)).unwrap_err();
+            assert!(
+                matches!(err, InvalidHierarchyItem::SelectionRange(_)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_hierarchy_item_rejects_selection_column_above_max() {
+        let err = CheckedHierarchyItem::from_client(hierarchy_wire(
+            [1, 1, 2, 1],
+            [1, 1_000_001, 1, 1_000_001],
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            InvalidHierarchyItem::SelectionRange(InvalidRange::Start(InvalidPosition::TooLarge))
+        );
+    }
+
     use super::*;
 
     const SECRET: &str = "SuperSecretValue123";

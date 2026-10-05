@@ -20,10 +20,12 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::lock_std;
-use crate::config::ServerId;
-use crate::error::{Error, Result};
+use crate::config::{LanguageId, ServerId};
+use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
-use crate::util::{BoundedReadOutcome, bounded_read_cap, check_bounded_utf8};
+use crate::util::{
+    BoundedReadOutcome, OpenRegularFileError, RegularFile, bounded_read_cap, check_bounded_utf8,
+};
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
 /// [`mtime_settled`]. The stat itself is never debounced -- only this
@@ -203,32 +205,6 @@ fn mtime_settled(mtime: Option<SystemTime>, read_at: SystemTime) -> bool {
     })
 }
 
-/// Rejects `file` unless its Win32 file type is `FILE_TYPE_DISK`, the
-/// Windows equivalent of the Unix `fstat`-based regular-file check in
-/// [`DocumentTracker::open_checked`]. `std::fs::Metadata::is_file()` alone
-/// is not a reliable rejection for every special path on Windows (e.g.
-/// reserved device names like `CON`, `COM1`, `NUL`); those can still block
-/// indefinitely on read, so this bounds the read -- not the open itself,
-/// which Win32 has no non-blocking equivalent for (see #442).
-#[cfg(windows)]
-async fn check_disk_file_type(file: &fs::File, path: &Path) -> Result<()> {
-    // `winapi_util` only accepts `std::fs::File`; the duplicate handle reports the same type.
-    let std_file = file
-        .try_clone()
-        .await
-        .map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?
-        .into_std()
-        .await;
-
-    match winapi_util::file::typ(&std_file) {
-        Ok(file_type) if file_type.is_disk() => Ok(()),
-        _ => Err(Error::NotARegularFile(path.to_path_buf())),
-    }
-}
-
 /// A snapshot of a document's on-disk filesystem state, captured the last
 /// time its content was actually read and compared.
 ///
@@ -296,7 +272,7 @@ impl Eq for DiskSync {}
 #[derive(Debug, Clone)]
 pub(super) struct DocumentState {
     uri: Uri,
-    language_id: String,
+    language_id: LanguageId,
     version: i32,
     text: DocumentText,
     disk: Option<DiskSync>,
@@ -337,7 +313,7 @@ impl Eq for DocumentState {}
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
     /// provenance and no server yet recorded as synced.
-    fn new(uri: Uri, language_id: String, text: DocumentText) -> Self {
+    fn new(uri: Uri, language_id: LanguageId, text: DocumentText) -> Self {
         Self {
             uri,
             language_id,
@@ -365,7 +341,7 @@ impl DocumentState {
     /// Language identifier.
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn language_id(&self) -> &str {
+    pub(crate) const fn language_id(&self) -> &LanguageId {
         &self.language_id
     }
 
@@ -568,7 +544,7 @@ pub struct DocumentTracker {
     /// Resource limits for tracking.
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
-    extension_map: HashMap<String, String>,
+    extension_map: HashMap<String, LanguageId>,
     /// `didClose` notifications owed after `Self::open`'s LRU eviction (#495),
     /// per path and server. See [`PendingClose`].
     ///
@@ -581,7 +557,7 @@ pub struct DocumentTracker {
 impl DocumentTracker {
     /// Create a new document tracker with custom limits and extension mappings.
     #[must_use]
-    pub fn new(limits: ResourceLimits, extension_map: HashMap<String, String>) -> Self {
+    pub fn new(limits: ResourceLimits, extension_map: HashMap<String, LanguageId>) -> Self {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
@@ -1207,52 +1183,28 @@ impl DocumentTracker {
     /// replace (e.g. a concurrent `rename`) between the check and the open
     /// swap in something else entirely.
     ///
-    /// On Unix the open itself uses `O_NONBLOCK`, which has no effect on
-    /// regular files but makes opening a FIFO (or other peer-waiting special
-    /// file) return immediately instead of blocking indefinitely for a
-    /// writer -- the file-type check below then rejects it. Without this,
-    /// a FIFO substituted for an expected regular file could hang the
-    /// calling task (and pin a blocking-pool thread) forever (see #418).
-    ///
-    /// **Known gap on Windows**: `CreateFileW` (what `fs::File::open` and
-    /// `OpenOptions::open` call into) has no `O_NONBLOCK` equivalent, so the
-    /// open itself can still block indefinitely on a hostile path (e.g. an
-    /// oplock held by another process, or a dead network redirector) --
-    /// Win32 offers nothing to bound that. What Windows does get is a
-    /// content-read guarantee: the open handle is checked via `GetFileType`
-    /// (see [`check_disk_file_type`]) immediately after open and before
-    /// `metadata()` or any content read, rejecting anything that is not
-    /// `FILE_TYPE_DISK` (e.g. reserved device names like `CON`, `COM1`,
-    /// `NUL`, which `FileType::is_file()` alone does not reliably reject) --
-    /// see #442. Platforms that are neither Unix nor Windows get neither
-    /// protection: a plain blocking open with no file-type check beyond
-    /// `is_file()`.
+    /// The open runs on the blocking pool through [`RegularFile::open`], which
+    /// owns the non-blocking FIFO and Windows device-name protections (see
+    /// #418 and #442) shared with the config loader.
     async fn open_checked(&self, path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
-        #[cfg(unix)]
-        let opened = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .await;
-        #[cfg(not(unix))]
-        let opened = fs::File::open(path).await;
-
-        let file = opened.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        // Must precede metadata() below: GetFileInformationByHandle may fail for non-disk handles.
-        #[cfg(windows)]
-        check_disk_file_type(&file, path).await?;
-        let meta = file.metadata().await.map_err(|e| Error::FileIo {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        if !meta.is_file() {
-            return Err(Error::NotARegularFile(path.to_path_buf()));
-        }
+        let owned = path.to_path_buf();
+        let opened = tokio::task::spawn_blocking(move || RegularFile::open(&owned))
+            .await
+            .map_err(|source| Error::TaskFailed {
+                task: BackgroundTask::FileOpen,
+                source,
+            })?;
+        let (file, meta) = opened
+            .map_err(|e| match e {
+                OpenRegularFileError::Io(source) => Error::FileIo {
+                    path: path.to_path_buf(),
+                    source,
+                },
+                OpenRegularFileError::NotRegular => Error::NotARegularFile(path.to_path_buf()),
+            })?
+            .into_parts();
         self.check_file_size(meta.len())?;
-        Ok((file, meta))
+        Ok((fs::File::from_std(file), meta))
     }
 
     /// Reads `file`'s content as UTF-8, bounded to one byte past
@@ -1478,7 +1430,7 @@ impl DocumentTracker {
                             DidOpenTextDocumentParams {
                                 text_document: TextDocumentItem {
                                     uri: uri.clone(),
-                                    language_id: language_id.into(),
+                                    language_id: String::from(language_id).into(),
                                     version: target_version,
                                     text,
                                 },
@@ -1814,16 +1766,19 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 /// Detect the language ID from a file path.
 ///
 /// Consults the extension map to determine the language ID for a file.
-/// If the extension is not found in the map, returns "plaintext".
+/// If the extension is not found in the map, returns [`PLAINTEXT_LANGUAGE`].
 #[must_use]
-pub fn detect_language(path: &Path, extension_map: &HashMap<String, String>) -> String {
+pub fn detect_language(path: &Path, extension_map: &HashMap<String, LanguageId>) -> LanguageId {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     extension_map
         .get(extension)
         .cloned()
-        .unwrap_or_else(|| "plaintext".to_string())
+        .unwrap_or(PLAINTEXT_LANGUAGE)
 }
+
+/// Language id reported for a file whose extension is not in the extension map.
+pub const PLAINTEXT_LANGUAGE: LanguageId = LanguageId::from_static("plaintext");
 
 #[cfg(test)]
 mod tests {
@@ -1834,9 +1789,9 @@ mod tests {
     #[test]
     fn test_detect_language() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
-        map.insert("py".to_string(), "python".to_string());
-        map.insert("ts".to_string(), "typescript".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert("py".to_string(), LanguageId::from_static("python"));
+        map.insert("ts".to_string(), LanguageId::from_static("typescript"));
 
         assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
         assert_eq!(detect_language(Path::new("script.py"), &map), "python");
@@ -1847,7 +1802,7 @@ mod tests {
     #[tokio::test]
     async fn test_document_tracker() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/file.rs");
@@ -1997,7 +1952,7 @@ mod tests {
             max_file_size: 100,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2254,7 +2209,7 @@ mod tests {
             max_file_size: 10,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2293,7 +2248,7 @@ mod tests {
             max_file_size: 0,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2319,7 +2274,7 @@ mod tests {
     fn test_document_state_clone() {
         let state = DocumentState {
             uri: Uri::from("file:///test.rs"),
-            language_id: "rust".to_string(),
+            language_id: LanguageId::from_static("rust"),
             version: 5,
             text: DocumentText::new("fn main() {}".to_string()),
             disk: None,
@@ -2368,52 +2323,58 @@ mod tests {
     )]
     fn test_detect_language_all_extensions() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
-        map.insert("py".to_string(), "python".to_string());
-        map.insert("pyw".to_string(), "python".to_string());
-        map.insert("pyi".to_string(), "python".to_string());
-        map.insert("js".to_string(), "javascript".to_string());
-        map.insert("mjs".to_string(), "javascript".to_string());
-        map.insert("cjs".to_string(), "javascript".to_string());
-        map.insert("ts".to_string(), "typescript".to_string());
-        map.insert("mts".to_string(), "typescript".to_string());
-        map.insert("cts".to_string(), "typescript".to_string());
-        map.insert("tsx".to_string(), "typescriptreact".to_string());
-        map.insert("jsx".to_string(), "javascriptreact".to_string());
-        map.insert("go".to_string(), "go".to_string());
-        map.insert("c".to_string(), "c".to_string());
-        map.insert("h".to_string(), "c".to_string());
-        map.insert("cpp".to_string(), "cpp".to_string());
-        map.insert("cc".to_string(), "cpp".to_string());
-        map.insert("cxx".to_string(), "cpp".to_string());
-        map.insert("hpp".to_string(), "cpp".to_string());
-        map.insert("hh".to_string(), "cpp".to_string());
-        map.insert("hxx".to_string(), "cpp".to_string());
-        map.insert("java".to_string(), "java".to_string());
-        map.insert("rb".to_string(), "ruby".to_string());
-        map.insert("php".to_string(), "php".to_string());
-        map.insert("swift".to_string(), "swift".to_string());
-        map.insert("kt".to_string(), "kotlin".to_string());
-        map.insert("kts".to_string(), "kotlin".to_string());
-        map.insert("scala".to_string(), "scala".to_string());
-        map.insert("sc".to_string(), "scala".to_string());
-        map.insert("zig".to_string(), "zig".to_string());
-        map.insert("lua".to_string(), "lua".to_string());
-        map.insert("sh".to_string(), "shellscript".to_string());
-        map.insert("bash".to_string(), "shellscript".to_string());
-        map.insert("zsh".to_string(), "shellscript".to_string());
-        map.insert("json".to_string(), "json".to_string());
-        map.insert("toml".to_string(), "toml".to_string());
-        map.insert("yaml".to_string(), "yaml".to_string());
-        map.insert("yml".to_string(), "yaml".to_string());
-        map.insert("xml".to_string(), "xml".to_string());
-        map.insert("html".to_string(), "html".to_string());
-        map.insert("htm".to_string(), "html".to_string());
-        map.insert("css".to_string(), "css".to_string());
-        map.insert("scss".to_string(), "scss".to_string());
-        map.insert("less".to_string(), "less".to_string());
-        map.insert("md".to_string(), "markdown".to_string());
-        map.insert("markdown".to_string(), "markdown".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert("py".to_string(), LanguageId::from_static("python"));
+        map.insert("pyw".to_string(), LanguageId::from_static("python"));
+        map.insert("pyi".to_string(), LanguageId::from_static("python"));
+        map.insert("js".to_string(), LanguageId::from_static("javascript"));
+        map.insert("mjs".to_string(), LanguageId::from_static("javascript"));
+        map.insert("cjs".to_string(), LanguageId::from_static("javascript"));
+        map.insert("ts".to_string(), LanguageId::from_static("typescript"));
+        map.insert("mts".to_string(), LanguageId::from_static("typescript"));
+        map.insert("cts".to_string(), LanguageId::from_static("typescript"));
+        map.insert(
+            "tsx".to_string(),
+            LanguageId::from_static("typescriptreact"),
+        );
+        map.insert(
+            "jsx".to_string(),
+            LanguageId::from_static("javascriptreact"),
+        );
+        map.insert("go".to_string(), LanguageId::from_static("go"));
+        map.insert("c".to_string(), LanguageId::from_static("c"));
+        map.insert("h".to_string(), LanguageId::from_static("c"));
+        map.insert("cpp".to_string(), LanguageId::from_static("cpp"));
+        map.insert("cc".to_string(), LanguageId::from_static("cpp"));
+        map.insert("cxx".to_string(), LanguageId::from_static("cpp"));
+        map.insert("hpp".to_string(), LanguageId::from_static("cpp"));
+        map.insert("hh".to_string(), LanguageId::from_static("cpp"));
+        map.insert("hxx".to_string(), LanguageId::from_static("cpp"));
+        map.insert("java".to_string(), LanguageId::from_static("java"));
+        map.insert("rb".to_string(), LanguageId::from_static("ruby"));
+        map.insert("php".to_string(), LanguageId::from_static("php"));
+        map.insert("swift".to_string(), LanguageId::from_static("swift"));
+        map.insert("kt".to_string(), LanguageId::from_static("kotlin"));
+        map.insert("kts".to_string(), LanguageId::from_static("kotlin"));
+        map.insert("scala".to_string(), LanguageId::from_static("scala"));
+        map.insert("sc".to_string(), LanguageId::from_static("scala"));
+        map.insert("zig".to_string(), LanguageId::from_static("zig"));
+        map.insert("lua".to_string(), LanguageId::from_static("lua"));
+        map.insert("sh".to_string(), LanguageId::from_static("shellscript"));
+        map.insert("bash".to_string(), LanguageId::from_static("shellscript"));
+        map.insert("zsh".to_string(), LanguageId::from_static("shellscript"));
+        map.insert("json".to_string(), LanguageId::from_static("json"));
+        map.insert("toml".to_string(), LanguageId::from_static("toml"));
+        map.insert("yaml".to_string(), LanguageId::from_static("yaml"));
+        map.insert("yml".to_string(), LanguageId::from_static("yaml"));
+        map.insert("xml".to_string(), LanguageId::from_static("xml"));
+        map.insert("html".to_string(), LanguageId::from_static("html"));
+        map.insert("htm".to_string(), LanguageId::from_static("html"));
+        map.insert("css".to_string(), LanguageId::from_static("css"));
+        map.insert("scss".to_string(), LanguageId::from_static("scss"));
+        map.insert("less".to_string(), LanguageId::from_static("less"));
+        map.insert("md".to_string(), LanguageId::from_static("markdown"));
+        map.insert("markdown".to_string(), LanguageId::from_static("markdown"));
 
         assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
         assert_eq!(detect_language(Path::new("script.py"), &map), "python");
@@ -2621,7 +2582,7 @@ mod tests {
     #[tokio::test]
     async fn test_document_tracker_concurrent_operations() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path1 = PathBuf::from("/test/file1.rs");
@@ -2646,7 +2607,7 @@ mod tests {
     #[test]
     fn test_empty_content() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/empty.rs");
@@ -2659,7 +2620,7 @@ mod tests {
     #[test]
     fn test_unicode_content() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/unicode.rs");
@@ -2679,7 +2640,7 @@ mod tests {
             max_file_size: 1000,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2707,7 +2668,7 @@ mod tests {
             max_file_size: 100,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2724,7 +2685,7 @@ mod tests {
     #[test]
     fn test_detect_language_with_custom_extension() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), "nushell".to_string());
+        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
 
         assert_eq!(detect_language(Path::new("script.nu"), &map), "nushell");
 
@@ -2738,7 +2699,7 @@ mod tests {
     #[test]
     fn test_detect_language_custom_overrides_default() {
         let mut custom_map = HashMap::new();
-        custom_map.insert("rs".to_string(), "custom-rust".to_string());
+        custom_map.insert("rs".to_string(), LanguageId::from_static("custom-rust"));
 
         assert_eq!(
             detect_language(Path::new("main.rs"), &custom_map),
@@ -2746,7 +2707,7 @@ mod tests {
         );
 
         let mut default_map = HashMap::new();
-        default_map.insert("rs".to_string(), "rust".to_string());
+        default_map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         assert_eq!(detect_language(Path::new("main.rs"), &default_map), "rust");
     }
@@ -2754,7 +2715,7 @@ mod tests {
     #[test]
     fn test_detect_language_fallback_to_plaintext() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), "nushell".to_string());
+        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
 
         // .rs not in custom map, should return plaintext
         assert_eq!(detect_language(Path::new("main.rs"), &map), "plaintext");
@@ -2769,7 +2730,7 @@ mod tests {
     #[test]
     fn test_document_tracker_with_extensions() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), "nushell".to_string());
+        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
 
@@ -2785,7 +2746,7 @@ mod tests {
     #[test]
     fn test_document_tracker_uses_provided_map() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/main.rs");
@@ -2800,9 +2761,9 @@ mod tests {
     #[test]
     fn test_multiple_extensions_same_language() {
         let mut map = HashMap::new();
-        map.insert("cpp".to_string(), "c++".to_string());
-        map.insert("cc".to_string(), "c++".to_string());
-        map.insert("cxx".to_string(), "c++".to_string());
+        map.insert("cpp".to_string(), LanguageId::from_static("c++"));
+        map.insert("cc".to_string(), LanguageId::from_static("c++"));
+        map.insert("cxx".to_string(), LanguageId::from_static("c++"));
 
         assert_eq!(detect_language(Path::new("main.cpp"), &map), "c++");
         assert_eq!(detect_language(Path::new("main.cc"), &map), "c++");
@@ -2812,7 +2773,7 @@ mod tests {
     #[test]
     fn test_case_sensitive_extensions() {
         let mut map = HashMap::new();
-        map.insert("NU".to_string(), "nushell".to_string());
+        map.insert("NU".to_string(), LanguageId::from_static("nushell"));
 
         // Lowercase .nu should not match uppercase "NU" in map
         assert_eq!(detect_language(Path::new("script.nu"), &map), "plaintext");
@@ -2865,7 +2826,7 @@ mod tests {
     #[test]
     fn test_open_paths_populated_tracker() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.open(PathBuf::from("/b.rs"), String::new()).unwrap();
@@ -2877,7 +2838,7 @@ mod tests {
     #[test]
     fn test_open_paths_after_close() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), "rust".to_string());
+        map.insert("rs".to_string(), LanguageId::from_static("rust"));
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.close(Path::new("/a.rs"));
@@ -3596,11 +3557,7 @@ mod tests {
     async fn test_read_to_string_checked_rejects_fifo() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fifo");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mkfifo must succeed to set up this test");
+        crate::test_lsp::make_fifo(&path);
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         // A timeout here means the fix failed and open() is still blocking
@@ -3613,30 +3570,6 @@ mod tests {
         .unwrap();
 
         assert_matches!(result, Err(Error::NotARegularFile(_)));
-    }
-
-    /// Direct regression for #442: `check_disk_file_type` itself, isolated
-    /// from `open_checked`'s surrounding `is_file()` check. Unlike
-    /// `test_read_to_string_checked_rejects_nul_device` below, this fails if
-    /// `check_disk_file_type` were ever bypassed or deleted -- both checks
-    /// currently produce the identical `Error::NotARegularFile` variant, so
-    /// an end-to-end test alone can't tell them apart.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn test_check_disk_file_type_accepts_regular_rejects_nul() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("regular.txt");
-        std::fs::write(&path, "hello").unwrap();
-
-        let regular = fs::File::open(&path).await.unwrap();
-        assert!(check_disk_file_type(&regular, &path).await.is_ok());
-
-        let nul_path = PathBuf::from("NUL");
-        let nul = fs::File::open(&nul_path).await.unwrap();
-        assert_matches!(
-            check_disk_file_type(&nul, &nul_path).await,
-            Err(Error::NotARegularFile(_))
-        );
     }
 
     /// Regression for #442: `read_to_string_checked` must reject the `NUL`

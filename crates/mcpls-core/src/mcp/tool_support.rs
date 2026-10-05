@@ -10,7 +10,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Serialize, Serializer};
 
 use crate::bridge::{Capability, RouteSupport, ToolSupportSnapshot};
-use crate::config::{ToolKind, ToolPrefix};
+use crate::config::{LanguageId, ToolKind, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
 
 /// Where a tool's request is served.
@@ -336,7 +336,7 @@ impl ToolSupportReport {
     /// tool) from `snapshot`, naming tools as clients see them under `prefix`.
     pub(super) fn build(
         snapshot: &ToolSupportSnapshot,
-        languages: Vec<String>,
+        languages: &[LanguageId],
         prefix: Option<&ToolPrefix>,
     ) -> Self {
         let tools = McpTool::ALL
@@ -350,7 +350,7 @@ impl ToolSupportReport {
                             .iter()
                             .map(|language| {
                                 (
-                                    language.clone(),
+                                    language.to_string(),
                                     snapshot.document_support_gated(
                                         language,
                                         kind,
@@ -382,7 +382,10 @@ impl ToolSupportReport {
                 }
             })
             .collect();
-        Self { languages, tools }
+        Self {
+            languages: languages.iter().map(ToString::to_string).collect(),
+            tools,
+        }
     }
 }
 

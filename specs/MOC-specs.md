@@ -12,7 +12,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
 | 001 | [[config/001-config-discovery-and-heuristics/spec\|config-discovery-and-heuristics]] | enhancement | P1 | implemented (retroactive) | — |
-| 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | implemented | #615 |
+| 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | implemented | #615, #634 |
 
 ## lsp
 

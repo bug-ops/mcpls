@@ -82,7 +82,8 @@ async fn setup_rust_analyzer_with_lifecycle_cache()
 
 fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
     let workspace_path = rust_workspace_path();
-    let extension_map = std::collections::HashMap::from([("rs".to_string(), "rust".to_string())]);
+    let extension_map =
+        std::collections::HashMap::from([("rs".to_string(), LanguageId::from_static("rust"))]);
     let mut translator = Translator::new()
         .with_extensions(extension_map)
         .with_router(ToolRouter::catch_all([(
@@ -113,6 +114,7 @@ async fn spawn_rust_analyzer() -> LspServer {
         name: None,
         handles: None,
         indexing: mcpls_core::bridge::IndexingPolicy::Auto,
+        selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
     let server_init_config = ServerInitConfig {
@@ -1089,6 +1091,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         name: None,
         handles: None,
         indexing: mcpls_core::bridge::IndexingPolicy::Auto,
+        selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
     let server_init_config = ServerInitConfig {

@@ -4,7 +4,7 @@
 //! do their MCP-facing DTOs, so both families convert through one pair of
 //! functions instead of two copies.
 
-use super::dto::{HierarchyItem, lsp_kind_to_u32};
+use super::dto::{CheckedHierarchyItem, HierarchyItem, MAX_POSITION_VALUE, Range, lsp_kind_to_u32};
 use super::encoding_ctx::EncodingCtx;
 
 /// The fields common to an LSP call or type hierarchy item, in the routed
@@ -77,16 +77,28 @@ impl From<LspHierarchyItem> for lsp_types::TypeHierarchyItem {
     }
 }
 
+/// Clamps a normalized range to [`MAX_POSITION_VALUE`], so an item mcpls emits
+/// (an end-of-line sentinel or a minified line) can be passed back to the
+/// walking tools, which reject larger values.
+fn clamp_to_input_limit(mut range: Range) -> Range {
+    for position in [&mut range.start, &mut range.end] {
+        position.line = position.line.min(MAX_POSITION_VALUE);
+        position.character = position.character.min(MAX_POSITION_VALUE);
+    }
+    range
+}
+
 /// Convert an LSP hierarchy item into its MCP form, normalizing both ranges
-/// into 1-based coordinates through `ctx`.
+/// into 1-based coordinates through `ctx` and clamping them to the input limit.
 pub(super) async fn hierarchy_item_to_mcp<Lsp>(item: Lsp, ctx: &EncodingCtx) -> HierarchyItem
 where
     Lsp: Into<LspHierarchyItem>,
 {
     let item = item.into();
     let out_of_workspace = ctx.is_out_of_workspace(&item.uri);
-    let range = ctx.normalize_range(&item.uri, item.range).await;
-    let selection_range = ctx.normalize_range(&item.uri, item.selection_range).await;
+    let range = clamp_to_input_limit(ctx.normalize_range(&item.uri, item.range).await);
+    let selection_range =
+        clamp_to_input_limit(ctx.normalize_range(&item.uri, item.selection_range).await);
 
     HierarchyItem {
         name: item.name,
@@ -105,16 +117,15 @@ where
 ///
 /// `uri` is the already-parsed form of `item`'s own URI.
 pub(super) async fn hierarchy_item_to_lsp<Lsp>(
-    item: HierarchyItem,
+    item: CheckedHierarchyItem,
     uri: lsp_types::Uri,
     ctx: &EncodingCtx,
 ) -> Lsp
 where
     Lsp: From<LspHierarchyItem>,
 {
-    // TODO(#636): hierarchy item input ranges bypass Position validation (line 0 saturates to 1)
-    let range = ctx.denormalize_range(&uri, &item.range).await;
-    let selection_range = ctx.denormalize_range(&uri, &item.selection_range).await;
+    let range = ctx.denormalize_range(&uri, item.range).await;
+    let selection_range = ctx.denormalize_range(&uri, item.selection_range).await;
 
     Lsp::from(LspHierarchyItem {
         name: item.name,
@@ -158,36 +169,18 @@ mod tests {
         }
     }
 
-    /// Pins the #617 follow-up marker: an input range at line 0 is clamped
-    /// to line 1 (LSP line 0) instead of being rejected.
     #[tokio::test]
-    async fn input_range_at_line_zero_clamps_to_the_first_line() {
+    async fn end_of_line_sentinel_is_clamped_and_round_trips_without_rejection() {
         let ctx = test_ctx();
         let uri = lsp_types::Uri::from("file:///a.cpp");
-        let zero = crate::bridge::translator::dto::Range {
-            start: Position2D {
-                line: 0,
-                character: 0,
-            },
-            end: Position2D {
-                line: 0,
-                character: 0,
-            },
-        };
-        let item = HierarchyItem {
-            name: "x".into(),
-            kind: 5,
-            detail: None,
-            uri: uri.to_string(),
-            range: zero.clone(),
-            selection_range: zero,
-            data: None,
-            out_of_workspace: false,
-        };
+        let mut item = lsp_type_item(&uri);
+        item.range.end.character = 2_147_483_647;
+        item.selection_range.end.character = 2_147_483_647;
 
-        let lsp: lsp_types::TypeHierarchyItem = hierarchy_item_to_lsp(item, uri, &ctx).await;
-
-        assert_eq!(lsp.range.start.line, 0);
+        let dto: HierarchyItem = hierarchy_item_to_mcp(item, &ctx).await;
+        assert_eq!(dto.range.end.character, MAX_POSITION_VALUE);
+        assert_eq!(dto.selection_range.end.character, MAX_POSITION_VALUE);
+        assert!(CheckedHierarchyItem::from_client(dto).is_ok());
     }
 
     #[tokio::test]
@@ -206,7 +199,8 @@ mod tests {
             }
         );
 
-        let back: lsp_types::TypeHierarchyItem = hierarchy_item_to_lsp(dto, uri, &ctx).await;
+        let back: lsp_types::TypeHierarchyItem =
+            hierarchy_item_to_lsp(CheckedHierarchyItem::from_client(dto).unwrap(), uri, &ctx).await;
         assert_eq!(back, original);
     }
 
@@ -227,8 +221,12 @@ mod tests {
         };
 
         let dto: HierarchyItem = hierarchy_item_to_mcp(call.clone(), &ctx).await;
-        let back: lsp_types::CallHierarchyItem =
-            hierarchy_item_to_lsp(dto, call.uri.clone(), &ctx).await;
+        let back: lsp_types::CallHierarchyItem = hierarchy_item_to_lsp(
+            CheckedHierarchyItem::from_client(dto).unwrap(),
+            call.uri.clone(),
+            &ctx,
+        )
+        .await;
         assert_eq!(back, call);
     }
 }

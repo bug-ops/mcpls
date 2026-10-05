@@ -22,7 +22,7 @@ use super::Translator;
 use super::respawn::BackoffPolicy;
 use super::servers::{Backend, Phase};
 use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
-use crate::config::ServerId;
+use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
@@ -202,6 +202,7 @@ impl RestartFailure {
             | Error::ResourceUri(_)
             | Error::InvalidPositionInput(_)
             | Error::InvalidRangeInput(_)
+            | Error::InvalidHierarchyItemInput(_)
             | Error::ServerUnavailable { .. }
             | Error::InvalidToolParams(_)
             | Error::FileIo { .. }
@@ -667,8 +668,7 @@ impl Translator {
         let language_id = config.server_config.language_id.clone();
 
         if self.is_shutting_down() {
-            self.invalidate_stopped_server(id, language_id.as_str())
-                .await;
+            self.invalidate_stopped_server(id, &language_id).await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::ShuttingDown,
             };
@@ -685,8 +685,7 @@ impl Translator {
         self.note_restart_attempt(id);
         if let Err(error) = respawned {
             tracing::warn!(%id, %error, "LSP server restart failed");
-            self.invalidate_stopped_server(id, language_id.as_str())
-                .await;
+            self.invalidate_stopped_server(id, &language_id).await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::from_error(&error),
             };
@@ -713,7 +712,7 @@ impl Translator {
 
     /// The old process is gone and no replacement runs: drop what it cached
     /// and say so, so its diagnostics are never served as live.
-    async fn invalidate_stopped_server(&self, id: &ServerId, language_id: &str) {
+    async fn invalidate_stopped_server(&self, id: &ServerId, language_id: &LanguageId) {
         // Best effort: the old pump goes first, and an aborted task stops at its
         // next await, so it cannot re-cache what the dead server buffered
         // once the cache below is cleared.

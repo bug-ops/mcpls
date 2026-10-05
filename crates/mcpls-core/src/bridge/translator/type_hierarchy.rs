@@ -7,7 +7,7 @@ use lsp_types::{
 };
 
 use super::Translator;
-use super::dto::{HierarchyItem, Position, TypeHierarchyResult};
+use super::dto::{CheckedHierarchyItem, Position, TypeHierarchyResult};
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
@@ -93,7 +93,10 @@ impl Translator {
     /// request fails, the routed server does not advertise
     /// `typeHierarchyProvider` support, or the server is still indexing the
     /// workspace after `INDEXING_READY_TIMEOUT`.
-    pub async fn handle_supertypes(&self, item: HierarchyItem) -> Result<TypeHierarchyResult> {
+    pub async fn handle_supertypes(
+        &self,
+        item: CheckedHierarchyItem,
+    ) -> Result<TypeHierarchyResult> {
         self.walk_type_hierarchy(item, WalkDirection::Supertypes)
             .await
     }
@@ -103,17 +106,17 @@ impl Translator {
     /// # Errors
     ///
     /// See [`Self::handle_supertypes`].
-    pub async fn handle_subtypes(&self, item: HierarchyItem) -> Result<TypeHierarchyResult> {
+    pub async fn handle_subtypes(&self, item: CheckedHierarchyItem) -> Result<TypeHierarchyResult> {
         self.walk_type_hierarchy(item, WalkDirection::Subtypes)
             .await
     }
 
     async fn walk_type_hierarchy(
         &self,
-        item: HierarchyItem,
+        item: CheckedHierarchyItem,
         direction: WalkDirection,
     ) -> Result<TypeHierarchyResult> {
-        let uri = lsp_types::Uri::from(item.uri.as_str());
+        let uri = lsp_types::Uri::from(item.uri());
         let path = self.parse_file_uri(&uri).await?;
         let doc = self
             .prepare_gated_document_for_path(
@@ -169,7 +172,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{Position2D, Range};
+    use crate::bridge::translator::dto::{HierarchyItem, Position2D, Range};
     use crate::bridge::translator::navigation::MAX_NORMALIZED_LOCATIONS;
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
@@ -193,6 +196,10 @@ mod tests {
             "range": range, "selectionRange": range,
             "data": {"id": name}
         })
+    }
+
+    fn checked_item(uri: &str) -> CheckedHierarchyItem {
+        CheckedHierarchyItem::from_client(item_dto(uri)).unwrap()
     }
 
     fn item_dto(uri: &str) -> HierarchyItem {
@@ -326,7 +333,7 @@ mod tests {
         let path = dir.path().join("a.rs");
         fs::write(&path, "struct Derived;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();
-        let item = item_dto(&uri);
+        let item = checked_item(&uri);
 
         let translator = Arc::new(translator);
         let handle = {
@@ -388,7 +395,7 @@ mod tests {
         fs::write(&path, "struct Derived;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();
 
-        let result = translator.handle_supertypes(item_dto(&uri)).await;
+        let result = translator.handle_supertypes(checked_item(&uri)).await;
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
     }
 
@@ -411,7 +418,7 @@ mod tests {
         let translator = Arc::new(translator);
         let handle = {
             let translator = Arc::clone(&translator);
-            let item = item_dto(&raw_uri);
+            let item = checked_item(&raw_uri);
             tokio::spawn(async move { translator.handle_supertypes(item).await })
         };
         let mut wire = BufReader::new(&mut server.write_stdout);
@@ -434,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn walk_rejects_non_file_uri() {
         let result = Translator::new()
-            .handle_subtypes(item_dto("https://example.com/a.rs"))
+            .handle_subtypes(checked_item("https://example.com/a.rs"))
             .await;
         assert!(result.is_err());
     }
@@ -447,7 +454,7 @@ mod tests {
         let path = dir.path().join("a.rs");
         fs::write(&path, "struct Derived;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();
-        let item = item_dto(&uri);
+        let item = checked_item(&uri);
 
         let translator = Arc::new(translator);
         let handle = {
