@@ -406,7 +406,7 @@ Get compiler errors, warnings, and hints for a file, including diagnostics from 
 
 ### Returns
 
-An object with a `diagnostics` array plus `indexing_in_progress` and `push_notifications_degraded` flags:
+An object with a `diagnostics` array plus `availability`, `origin`, `indexing_in_progress` and `push_notifications_degraded`:
 
 ```json
 {
@@ -430,12 +430,18 @@ An object with a `diagnostics` array plus `indexing_in_progress` and `push_notif
       "code": "unused_variables"
     }
   ],
+  "availability": "published",
+  "origin": "pull",
   "indexing_in_progress": false,
   "push_notifications_degraded": false
 }
 ```
 
 Severity levels: `error`, `warning`, `information`, `hint`.
+
+`availability` says whether the cache has an answer for the file: `published` (the server reported on it; an empty list then means the file is clean), `pending` (nothing has been published yet since the server started) or `evicted` (a publish was dropped to bound the cache, so what the server said is unknown). An empty list next to `pending` or `evicted` is not a clean file. `get_cached_diagnostics` and the `lsp-diagnostics://` resource carry the same field.
+
+`origin` is `pull` when a `textDocument/diagnostic` request answered (merged with the push cache) and `push_cache` when the server answers no pull requests and the push cache alone answered. A server that advertises no `diagnosticProvider` is asked once: if it refuses (`-32601`) mcpls does not ask again until the server is restarted, and logs nothing at error level.
 
 `push_notifications_degraded` is `true` if the language server publishing this file's diagnostics crashed and was restarted during this mcpls session: diagnostics it delivers only by push (e.g. rust-analyzer's flycheck/clippy) are no longer received, so the result may be incomplete until mcpls restarts. Checked both before and after the underlying request, since the request itself can trigger a restart.
 
@@ -992,16 +998,17 @@ Get cached diagnostics: what the LSP server pushed via `textDocument/publishDiag
       "range": { "start": { "line": 10, "character": 5 }, "end": { "line": 10, "character": 10 } }
     }
   ],
+  "availability": "published",
   "push_notifications_degraded": false,
   "indexing_in_progress": false
 }
 ```
 
-`push_notifications_degraded` is `true` if the file's routed server crashed and was respawned since it last published, so push-only diagnostics are no longer received and the cached diagnostics above may be incomplete until mcpls restarts. `indexing_in_progress` is the same signal `get_diagnostics` returns (see that tool's `Returns` section) -- `true` means the routed server was still indexing as of this read, so the cached diagnostics above may reflect a partial index.
+`availability` is `published`, `pending` or `evicted`, as for `get_diagnostics`: an empty list next to `pending` or `evicted` is not a clean file. `push_notifications_degraded` is `true` if the file's routed server crashed and was respawned since it last published, so push-only diagnostics are no longer received and the cached diagnostics above may be incomplete until mcpls restarts. `indexing_in_progress` is the same signal `get_diagnostics` returns (see that tool's `Returns` section) -- `true` means the routed server was still indexing as of this read, so the cached diagnostics above may reflect a partial index.
 
 ### Notes
 
-- Returns the diagnostics pushed by the LSP server via `textDocument/publishDiagnostics` together with the last full `textDocument/diagnostic` report a `get_diagnostics` call stored for the file, without making a new pull request; a pushed diagnostic that duplicates a pulled one is dropped, so the result matches what `get_diagnostics` returned. The cache refreshes on the next pull: a stored pulled report is replaced only by a later pull or dropped by a push with a newer document version, so a file edited since the last pull can show older pulled diagnostics (a push without a version does not replace them). Like pushed ones, stored pulled diagnostics keep the server's `relatedInformation` locations (which can point outside the workspace) and redacted `data` in the `lsp-diagnostics://` resource read
+- Returns the diagnostics pushed by the LSP server via `textDocument/publishDiagnostics` together with the last full `textDocument/diagnostic` report a `get_diagnostics` call stored for the file, without making a new pull request; a pushed diagnostic that duplicates a pulled one is dropped, so the result matches what `get_diagnostics` returned. The cache refreshes on the next pull: a stored pulled report is replaced by a later pull, or dropped by a push that shows the file moved on (a newer document version; an equal or lower or missing version once the document is no longer at the pulled version or is not open), so a file edited since the last pull shows older pulled diagnostics only until the server's next publish. Like pushed ones, stored pulled diagnostics keep the server's `relatedInformation` locations (which can point outside the workspace) and redacted `data` in the `lsp-diagnostics://` resource read
 - Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
 - Returns an empty array if the file hasn't been analyzed yet or no push notifications have been received, but only once the file's server is running (or no server is configured for its language)
 - If the server for the file's language failed to start, returns that startup error (`... failed to start: ...`, including the server's stderr when it printed any) instead of an empty array; the `lsp-diagnostics://` resource read behaves the same. Startup failures are not retried: fix the server and restart mcpls
@@ -1009,6 +1016,7 @@ Get cached diagnostics: what the LSP server pushed via `textDocument/publishDiag
 - While the file's server is still starting, returns the retryable `ServerInitializing` error (code `-32051`) instead of an empty array; retry after a short wait
 - The diagnostics resource read, `resources/subscribe` and `subscriptions/listen` follow the same rules: subscribing while the server is still starting succeeds, and a subscriber is sent one `resources/updated` when startup fails, after which a re-read returns the error
 - A `get_diagnostics` call that changes a file's diagnostics also sends `resources/updated` to every session subscribed to its `lsp-diagnostics://` resource before the call returns; an identical pull sends nothing. A file edited on disk that no tool call pulls notifies nobody
+- A write that evicts another file's cache entry to stay within the cache bound (a push or a pull) sends that file's subscribers one `resources/updated`, so a re-read returns its new `availability`
 - Useful when you want fast, cached-only results without waiting for a fresh pull request
 
 ---
@@ -1133,12 +1141,13 @@ Report which tools are usable for which languages in the current session, so an 
 |-------|--------|
 | `coverage` | `all` (every listed language), `some`, `none`, `unknown` (a server is still initializing), `always` (needs no language server) |
 | `routes[].languages` | Languages sharing this route's outcome (absent for workspace-wide tools) |
-| `routes[].status` | `supported`, `capability_not_advertised`, `initializing`, `no_server` |
+| `routes[].status` | `supported`, `push_only`, `capability_not_advertised`, `initializing`, `no_server` |
 
 ### Notes
 
 - `languages` lists every configured language (or only the language of `file_path`); an empty list means no server is configured
-- `routes` is omitted for tools with `all` or `always` coverage; workspace-wide tools such as `workspace_symbol_search` have one route without `languages`
+- `push_only` is reported for `get_diagnostics` when the routed server advertises no `diagnosticProvider` and has not answered a pull request: `get_diagnostics` then answers from the push cache (`origin: "push_cache"`). It counts as supported for `coverage`, but its routes are always listed
+- `routes` is omitted for tools with `all` or `always` coverage, except `get_diagnostics` when a route is `push_only`; workspace-wide tools such as `workspace_symbol_search` have one route without `languages`
 - Languages with an identical outcome (same `status`, `server` and `capability`) share one route entry, listed in `languages` in first-seen order, so the response stays compact with many configured languages
 - `supported` means the call will be dispatched to a server that advertises the capability, not that it will succeed: indexing, push-only diagnostics, and respawn backoff can still fail it
 - Capabilities a server registers dynamically after `initialize` are not reflected, here or in per-call enforcement
@@ -1657,7 +1666,11 @@ One entry per targeted server, sorted by id:
   (`server_restarted`); retry them.
 - While the old process stops, the server's tools return the retryable `server_initializing` error.
 - Documents are re-opened on the new process on next access, and the tool is gated on the new
-  process's indexing readiness like any other.
+  process's indexing readiness like any other. A server that reported a readiness signal before
+  (rust-analyzer's `serverStatus`, or `$/progress`) reads `loading` from the moment it is replaced,
+  by restart or by automatic respawn, until its replacement reports one or the indexing-ready
+  timeout elapses, so a query right after the restart waits or returns `-32050`/`-32051` instead
+  of an empty result; a server that never reported a signal is not delayed.
 - On Unix the whole process group is killed, including shared daemons the server started (for
   example the Gradle daemon behind jdtls); descendants that call `setsid()` may survive.
 
