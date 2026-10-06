@@ -244,7 +244,7 @@ THEN they list the supported form, say how to cover several extensions, and agre
 - No brace expansion and no glob matching: several `**/*.ext` patterns cover several extensions.
 - Single-file patterns are rejected, not kept with a caveat: they over-match the whole extension.
 - Extensionless files (`Makefile`, `Dockerfile`) are mapped by a bare-name `file_patterns` entry (#675). `workspace.language_extensions` stays extension-only, and dotted names and dotfiles stay unsupported, so a name never has an extension and the two maps cannot both claim a file.
-- `get_tool_support` coverage ignoring the extension map is a separate issue.
+- `get_tool_support` lists the languages a file can be detected as, through the same effective map (#676).
 - Windows-style separators in a pattern (`**\\*.rs`) are out of scope: the directory part is ignored, and the final segment is taken after the last `/`, so a backslash pattern is rejected rather than mis-parsed.
 
 ## 10. See Also

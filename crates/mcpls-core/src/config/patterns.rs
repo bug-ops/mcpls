@@ -359,7 +359,7 @@ impl FilePattern {
             Some(extension) => FileExtension::new(extension)
                 .ok()
                 .map(PatternTarget::Extension),
-            None if matches!(directory, "" | "**") => {
+            None if directory == "**" || !pattern.contains('/') => {
                 FileName::new(basename).ok().map(PatternTarget::Name)
             }
             None => None,
@@ -434,6 +434,7 @@ pub(super) const UNSUPPORTED_FILE_PATTERNS: &[&str] = &[
     "**/*",
     "src/**",
     "docs/Makefile",
+    "/Makefile",
     "src/**/Dockerfile",
     "**/Makefile.am",
     "**/.eslintrc",
