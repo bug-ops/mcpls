@@ -179,7 +179,7 @@ impl Servers {
         let Some(slot) = self.0.get(id) else {
             return PullProbe::default();
         };
-        match (slot.pull_probe, self.client(id)) {
+        match (slot.pull_probe, self.client_ref(id)) {
             (Some((conn, probe)), Some(client)) if conn == client.connection_id() => probe,
             _ => PullProbe::default(),
         }
@@ -194,7 +194,7 @@ impl Servers {
         conn: ConnectionId,
         next: impl FnOnce(PullProbe) -> PullProbe,
     ) -> Option<PullProbe> {
-        if self.client(id)?.connection_id() != conn {
+        if self.client_ref(id)?.connection_id() != conn {
             return None;
         }
         let current = self.pull_probe(id);
@@ -210,9 +210,15 @@ impl Servers {
 
     /// The client of a running or stopped server.
     pub(super) fn client(&self, id: &ServerId) -> Option<LspClient> {
+        self.client_ref(id).cloned()
+    }
+
+    /// The client of a running or stopped server, borrowed, for readers that
+    /// only look at it under the guard.
+    pub(super) fn client_ref(&self, id: &ServerId) -> Option<&LspClient> {
         match &self.0.get(id)?.status {
-            ServerStatus::Running(backend) => Some(backend.client().clone()),
-            ServerStatus::Stopped(client) => Some(client.clone()),
+            ServerStatus::Running(backend) => Some(backend.client()),
+            ServerStatus::Stopped(client) => Some(client),
             ServerStatus::Expected { .. } | ServerStatus::Restarting | ServerStatus::Failed(_) => {
                 None
             }
