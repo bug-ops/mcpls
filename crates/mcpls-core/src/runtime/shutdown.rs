@@ -20,6 +20,9 @@ use crate::util::AbortOnDrop;
 /// registered anything for `shutdown_servers` to act on).
 const LSP_INIT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounds the second wait, after `abort()`, for the init task's locals to drop.
+const LSP_INIT_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
+
 /// Awaits the background LSP init task's `JoinHandle` with a bounded
 /// `timeout`, logging a panic at `error` level (previously dropped
 /// silently, see #196) or an unresponsive task at `warn` level instead of
@@ -51,21 +54,14 @@ pub(super) async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: D
         Err(_) => {
             warn!("Timed out waiting for background LSP initialization task to stop");
             handle.abort();
-            let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+            if tokio::time::timeout(LSP_INIT_TASK_ABORT_GRACE, handle)
+                .await
+                .is_err()
+            {
+                warn!("Background LSP initialization task did not stop after abort");
+            }
         }
     }
-}
-
-/// Whether a shutdown signal caught during [`shutdown`]'s cleanup window
-/// should force an immediate `std::process::exit`, given how many such
-/// signals (including this one) have been received so far.
-///
-/// Extracted as a pure function, rather than inlined into the loop that
-/// calls it, so the threshold is unit-testable without actually invoking
-/// `std::process::exit` — which would tear down the test process itself
-/// under `cargo nextest` before any assertion could run.
-const fn should_escalate(repeat_signals: u32) -> bool {
-    repeat_signals >= 1
 }
 
 /// Post-transport shutdown sequence, run once the transport future
@@ -107,13 +103,13 @@ const fn should_escalate(repeat_signals: u32) -> bool {
 /// escalation behavior below for how that's bounded.
 ///
 /// A signal caught here means "the operator wants out": the first one during
-/// cleanup ([`should_escalate`]) is logged and forces an immediate
-/// `std::process::exit(1)`, since the graceful default (waiting out
-/// `shutdown_servers`'s bounded timeouts) already had its chance before the
-/// operator intervened. This is deliberately not lenient — because a signal
-/// in the re-registration gap above is silently dropped rather than
-/// counted, requiring a second repeat before acting would let an unlucky
-/// operator's second press go unnoticed too. `exit(1)` skips unwinding, so
+/// cleanup is logged and forces an immediate `std::process::exit(1)`, since
+/// the graceful default (waiting out `shutdown_servers`'s bounded timeouts)
+/// already had its chance before the operator intervened. This is
+/// deliberately not lenient — because a signal in the re-registration gap
+/// above is silently dropped rather than counted, requiring a second repeat
+/// before acting would let an unlucky operator's second press go unnoticed
+/// too. `exit(1)` skips unwinding, so
 /// it forfeits `Drop` (`kill_on_drop`) and the graceful LSP `exit`, but any
 /// still-running LSP child is killed by the lifeline/job binding (see
 /// [`Translator::shutdown_servers`]'s "Limitations" section) — an explicit
@@ -128,15 +124,9 @@ pub async fn shutdown(
 
     let mut cleanup_signal = ShutdownSignal::new();
     let force_exit_on_signal = tokio::spawn(async move {
-        let mut repeat_signals = 0u32;
-        loop {
-            cleanup_signal.recv().await;
-            repeat_signals = repeat_signals.saturating_add(1);
-            if should_escalate(repeat_signals) {
-                error!("shutdown signal received during cleanup, forcing immediate exit");
-                std::process::exit(1);
-            }
-        }
+        cleanup_signal.recv().await;
+        error!("shutdown signal received during cleanup, forcing immediate exit");
+        std::process::exit(1);
     });
     // Aborts `force_exit_on_signal` on every exit from this scope, including
     // an unwind out of `shutdown_servers().await` below — otherwise that path
@@ -155,6 +145,7 @@ pub async fn shutdown(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crate::bridge::Translator;
 
@@ -270,6 +261,35 @@ mod tests {
             future_dropped.load(Ordering::SeqCst),
             "timed-out background init task's future must be dropped via abort(), \
              not left running detached until its own sleep completes"
+        );
+    }
+
+    /// An init task that ignores `abort()` (a blocking task cannot be
+    /// cancelled) must be reported, not forgotten after the second wait.
+    #[tokio::test]
+    async fn test_await_lsp_init_handle_logs_task_that_ignores_abort() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(super::LSP_INIT_TASK_ABORT_GRACE + Duration::from_millis(500));
+        });
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        super::await_lsp_init_handle(handle, Duration::from_millis(20)).await;
+
+        drop(guard);
+
+        assert!(
+            captured
+                .messages()
+                .iter()
+                .any(|m| m.contains("did not stop after abort")),
+            "expected a warn! log for the task that outlived the abort grace"
         );
     }
 
