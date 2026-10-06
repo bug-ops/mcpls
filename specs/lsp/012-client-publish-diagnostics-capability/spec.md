@@ -11,7 +11,7 @@ tags:
   - diagnostics
   - typescript
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]]"
@@ -23,6 +23,11 @@ related:
 ---
 
 # Feature: Advertise `textDocument.publishDiagnostics` so push-model servers deliver diagnostics
+
+> [!important] Decision (implemented, #665)
+> - **Declared:** `textDocument.publishDiagnostics` with `versionSupport: true` only; related information, tags, code description and data stay undeclared because the MCP `Diagnostic` shape drops them.
+> - **Pull:** `textDocument/diagnostic` is still not declared (FR-006).
+> - **Live check (2026-10-06):** typescript-language-server publishes with the capability present (its notification carries no `version`); pyright publishes versioned diagnostics (`version: 7` for a document opened at 7), so the cache keeps the version it already stores.
 
 > [!info] Metadata
 > **Type**: bug (handshake gap)
@@ -207,11 +212,11 @@ No new entities. One declared client capability.
 - Match on a server name to decide whether to declare the capability.
 - Change `get_diagnostics` pull or merge behavior as part of this fix.
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-- [NEEDS CLARIFICATION: which sub-capabilities to declare. The cache stores the document version, so declaring version support looks consistent. The MCP `Diagnostic` shape carries range, severity, message and code only, so related information, tags, code description and data would be declared and then dropped. Proposed default: declare version support only.]
-- [NEEDS CLARIFICATION: does declaring tag support change which hints typescript-language-server sends (unused or deprecated markers as separate hint diagnostics versus tagged diagnostics)? Verify live before deciding; the live proof with an empty capability object already carries the unused-variable hint.]
-- [NEEDS CLARIFICATION: do any other built-in servers (for example a server not covered by the four verified ones) also gate on this capability? Check the remaining built-in entries during the live no-regression pass.]
+- **Sub-capabilities:** `versionSupport` only, because the cache stores the document version and the MCP shape carries nothing else.
+- **Tag support:** not declared; the unused-variable hint already arrives as a separate hint diagnostic with an empty capability object.
+- **Other servers gating on the capability:** none found among pyright and typescript-language-server in the live pass; rust-analyzer, clangd and gopls publish regardless and are covered by the playbook no-regression case (FR-008).
 
 ## 10. See Also
 

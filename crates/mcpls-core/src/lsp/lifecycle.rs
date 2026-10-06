@@ -743,6 +743,12 @@ impl LspServer {
                     ..Default::default()
                 }),
                 folding_range: Some(Self::folding_range_capabilities()),
+                // typescript-language-server publishes nothing unless this object is present;
+                // only `versionSupport`, the one field the diagnostics cache retains.
+                publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                    version_support: Some(true),
+                    ..Default::default()
+                }),
                 selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
                     dynamic_registration: Some(false),
                 }),
@@ -1411,6 +1417,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(capabilities.dynamic_registration, Some(false));
+    }
+
+    #[test]
+    fn test_client_capabilities_advertises_publish_diagnostics_with_version_support_only() {
+        let capabilities = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.publish_diagnostics)
+            .unwrap();
+
+        assert_eq!(
+            capabilities,
+            lsp_types::PublishDiagnosticsClientCapabilities {
+                version_support: Some(true),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_client_capabilities_do_not_advertise_pull_diagnostics() {
+        let text_document = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .unwrap();
+
+        assert!(text_document.diagnostic.is_none());
     }
 
     #[test]
