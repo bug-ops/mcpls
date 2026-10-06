@@ -971,7 +971,10 @@ async fn test_run_http_unknown_tool_is_in_band_invalid_params_with_http_200() {
         r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
     )
     .await;
-    assert!(initialized.starts_with("HTTP/1.1 202"), "got: {initialized}");
+    assert!(
+        initialized.starts_with("HTTP/1.1 202"),
+        "got: {initialized}"
+    );
 
     let response = post_in_session(
         addr,

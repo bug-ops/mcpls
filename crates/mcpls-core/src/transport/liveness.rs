@@ -31,7 +31,7 @@ use tokio::time::Instant;
 
 use super::config::{ProbeDeadline, ProbeInterval};
 use super::saturating_deadline;
-use super::session_manager::{SessionFingerprint, StreamGuard};
+use super::session_manager::{SessionFingerprint, StreamGuard, spawn_bounded_close};
 use crate::util::lock_std;
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
@@ -296,29 +296,15 @@ impl StreamProbe {
     /// reconnected GET is promoted; detached and bounded so a wedged session
     /// worker cannot stall it.
     fn close_standalone_stream(self) {
-        tokio::spawn(async move {
-            let closed = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
-                let handle = self
-                    .manager
-                    .sessions
-                    .read()
-                    .await
-                    .get(&self.session)
-                    .cloned();
-                match handle {
-                    Some(handle) => handle.close_standalone_sse_stream(None).await.err(),
-                    None => None,
-                }
-            })
-            .await;
-            match closed {
-                Ok(None) => {}
-                Ok(Some(e)) => {
-                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream failed: {e}");
-                }
-                Err(_) => {
-                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream timed out");
-                }
+        let Self {
+            manager, session, ..
+        } = self;
+        let target = session.clone();
+        spawn_bounded_close("closing standalone stream", session, async move {
+            let handle = manager.sessions.read().await.get(&target).cloned();
+            match handle {
+                Some(handle) => handle.close_standalone_sse_stream(None).await,
+                None => Ok(()),
             }
         });
     }
