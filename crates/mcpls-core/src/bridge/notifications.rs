@@ -3,6 +3,7 @@
 //! Stores diagnostics, log messages, and server messages received from LSP servers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
@@ -10,9 +11,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::bridge::DiagnosticsAvailability;
 use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, IndexingTracker};
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
+use crate::bridge::{DiagnosticsAvailability, DocumentTracker, uri_to_path};
 use crate::config::ServerId;
 use crate::util::truncate_string;
 
@@ -246,6 +247,38 @@ impl ChangeOutcome {
             },
             _ => Self::Changed,
         }
+    }
+}
+
+/// What the document tracker says about the document a push is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentSync {
+    /// The server was last told this version of the document.
+    Synced(i32),
+    /// The document is not open for the server.
+    NotOpen,
+    /// No tracker is attached, so there is nothing to compare with.
+    Unattached,
+}
+
+/// Whether a push supersedes the pulled slot of its file.
+///
+/// A push carrying a newer document version than the pull answered does. A
+/// push with an equal or lower version does when the document is no longer at
+/// the pulled version (reopening a document restarts its version, and a closed
+/// document's pull is older than the file). A push without a version cannot be
+/// compared, so it supersedes the pull only when the document has moved on or
+/// is gone; while the document still is at the pulled version, a versionless
+/// flycheck push must not erase the pulled native diagnostics (bridge/004).
+///
+/// Without a tracker ([`DocumentSync::Unattached`]) only a newer version counts.
+const fn pull_is_superseded(pulled: i32, pushed: Option<i32>, sync: DocumentSync) -> bool {
+    match (pushed, sync) {
+        (Some(pushed), _) if pushed > pulled => true,
+        (_, DocumentSync::Unattached) => false,
+        (_, DocumentSync::NotOpen) => true,
+        (Some(_), DocumentSync::Synced(current)) => current < pulled,
+        (None, DocumentSync::Synced(current)) => current != pulled,
     }
 }
 
@@ -798,6 +831,9 @@ pub struct NotificationCache {
     /// [`Self::availability`]. Unlike `recent_evictions` it is written by
     /// capacity evictions only, never by a server clear.
     eviction_marks: EvictionMarks,
+    /// Tracker whose synced versions tell whether a push supersedes a pulled
+    /// slot; see [`Self::attach_documents`].
+    documents: Option<Arc<DocumentTracker>>,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -843,6 +879,7 @@ impl NotificationCache {
             empty_diagnostics_count: 0,
             recent_evictions: EvictionRecord::default(),
             eviction_marks: EvictionMarks::default(),
+            documents: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
@@ -1157,7 +1194,7 @@ impl NotificationCache {
             diagnostics: BoundedDiagnostics::new(published.source(), diagnostics).0,
         };
 
-        self.drop_superseded_pull(&canonical_key, version);
+        self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
@@ -1219,28 +1256,53 @@ impl NotificationCache {
         })
     }
 
-    /// Removes `file`'s pulled slot when a push carries a document version
-    /// newer than the one the pull answered, since the pulled content is then
-    /// older than what the server last said.
+    /// Removes `file`'s pulled slot when a push shows that its content is
+    /// older than the file, by [`pull_is_superseded`]'s rule.
     ///
-    /// A push without a version, or with an equal one, keeps the pulled slot:
-    /// servers that both push and pull report the same version twice, and a
-    /// versionless flycheck push must not erase the pulled native diagnostics.
-    // TODO(#670): a slot can outlive a versionless or lower-versioned push
-    // (an LRU reopen restarts the tracker at version 1) until the next pull.
-    fn drop_superseded_pull(&mut self, file: &DiagnosticsKey, pushed_version: Option<i32>) {
-        let Some(pushed) = pushed_version else {
-            return;
-        };
+    /// The document's synced version is read from the attached tracker for
+    /// the server that owns the pulled slot; a push that carries a document
+    /// version newer than the pulled one supersedes it without the tracker.
+    fn drop_superseded_pull(
+        &mut self,
+        file: &DiagnosticsKey,
+        canonical: &Uri,
+        pushed_version: Option<i32>,
+    ) {
         let slot = SlotKey::pulled(file.clone());
-        let superseded = self
+        let Some((pulled, owner)) = self
             .entries
             .get(&slot)
-            .and_then(|entry| entry.info.version)
-            .is_some_and(|pulled| pushed > pulled);
-        if superseded {
+            .and_then(|entry| Some((entry.info.version?, entry.owner.clone())))
+        else {
+            return;
+        };
+        let sync = self.document_sync(&owner, canonical);
+        if pull_is_superseded(pulled, pushed_version, sync) {
+            debug!(
+                "dropping the pulled diagnostics of {}: superseded by a push \
+                 (pulled v{pulled}, pushed {pushed_version:?}, {sync:?})",
+                canonical.as_ref()
+            );
             self.take_entry(&slot);
         }
+    }
+
+    /// Attaches the document tracker whose synced versions decide whether a
+    /// push supersedes a pulled slot. Without one, only a push carrying a
+    /// newer document version does.
+    pub(crate) fn attach_documents(&mut self, documents: Arc<DocumentTracker>) {
+        self.documents = Some(documents);
+    }
+
+    /// What the attached tracker says about the document `canonical` names,
+    /// for `owner`.
+    fn document_sync(&self, owner: &ServerId, canonical: &Uri) -> DocumentSync {
+        let Some(documents) = &self.documents else {
+            return DocumentSync::Unattached;
+        };
+        uri_to_path(canonical)
+            .and_then(|path| documents.synced_version(&path, owner))
+            .map_or(DocumentSync::NotOpen, DocumentSync::Synced)
     }
 
     /// Issues the claim a pull of `server`'s diagnostics for a document at

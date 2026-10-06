@@ -160,6 +160,10 @@ async fn init_lsp_servers(
     if configs.is_empty() {
         return;
     }
+    notification_cache
+        .lock()
+        .await
+        .attach_documents(Arc::clone(translator.document_tracker()));
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: subscription_registry,
