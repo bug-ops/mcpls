@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
+use super::kind_filter::{self, KindFilter};
+use crate::bridge::notifications::ReportedSeverity;
 use crate::redaction::{Redactions, ServerText};
 
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
@@ -458,6 +460,17 @@ pub enum DiagnosticSeverity {
     Information,
     /// Hint diagnostic.
     Hint,
+}
+
+impl From<ReportedSeverity> for DiagnosticSeverity {
+    fn from(severity: ReportedSeverity) -> Self {
+        match severity {
+            ReportedSeverity::Error => Self::Error,
+            ReportedSeverity::Warning => Self::Warning,
+            ReportedSeverity::Information => Self::Information,
+            ReportedSeverity::Hint => Self::Hint,
+        }
+    }
 }
 
 /// A single diagnostic.
@@ -1226,9 +1239,9 @@ pub enum FoldingKind {
 
 /// Which folding regions to return.
 ///
-/// `Unspecified` regions are returned only by [`Self::All`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// `Unspecified` regions are returned only by [`Self::All`]. Accepted in any
+/// case, like every other kind filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FoldingKindFilter {
     /// Every region.
     #[default]
@@ -1257,18 +1270,56 @@ impl JsonSchema for FoldingKind {
 
 impl JsonSchema for FoldingKindFilter {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        "FoldingKindFilter".into()
+        Self::SCHEMA_NAME.into()
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        Self::schema()
+    }
+}
+
+impl kind_filter::sealed::Sealed for FoldingKindFilter {}
+
+impl KindFilter for FoldingKindFilter {
+    const SCHEMA_NAME: &'static str = "FoldingKindFilter";
+
+    fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|filter| filter.as_str().eq_ignore_ascii_case(text))
+    }
+
+    fn canonical(self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(self.as_str())
+    }
+
+    fn valid_values() -> String {
+        format!("{:?}", Self::ALL.map(Self::as_str))
+    }
+
+    fn schema() -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "enum": ["all", "comment", "imports", "region"],
+            "enum": Self::ALL.map(Self::as_str),
         })
     }
 }
 
 impl FoldingKindFilter {
+    /// Every filter, in documentation order.
+    pub const ALL: [Self; 4] = [Self::All, Self::Comment, Self::Imports, Self::Region];
+
+    /// The lowercase spelling the schema documents.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Comment => "comment",
+            Self::Imports => "imports",
+            Self::Region => "region",
+        }
+    }
+
     /// Whether a region of `kind` passes this filter.
     ///
     /// # Examples
@@ -2304,24 +2355,22 @@ mod tests {
             | FoldingKindFilter::Imports
             | FoldingKindFilter::Region => f,
         };
-        let variants = [
-            FoldingKindFilter::All,
-            FoldingKindFilter::Comment,
-            FoldingKindFilter::Imports,
-            FoldingKindFilter::Region,
-        ]
-        .map(filters);
-        let mut generator = schemars::SchemaGenerator::default();
-        let schema = FoldingKindFilter::json_schema(&mut generator);
+        let variants = FoldingKindFilter::ALL.map(filters);
+        let schema = FoldingKindFilter::schema();
         let listed: Vec<FoldingKindFilter> = schema
             .get("enum")
             .unwrap()
             .as_array()
             .unwrap()
             .iter()
-            .map(|name| serde_json::from_value(name.clone()).unwrap())
+            .map(|name| FoldingKindFilter::parse(name.as_str().unwrap()).unwrap())
             .collect();
         assert_eq!(listed, variants);
+        assert_eq!(
+            FoldingKindFilter::parse("IMPORTS"),
+            Some(FoldingKindFilter::Imports)
+        );
+        assert_eq!(FoldingKindFilter::parse("unspecified"), None);
     }
 
     #[test]

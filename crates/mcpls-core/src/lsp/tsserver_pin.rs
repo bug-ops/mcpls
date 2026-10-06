@@ -25,7 +25,6 @@
 //! TypeScript 7 install outside every workspace root ([`select_typescript_server`]).
 
 use std::borrow::Cow;
-use std::ffi::OsStr;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -33,9 +32,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::{BuiltinServer, LaunchCommand, LspServerConfig, ServerCommand, ServerId};
-use crate::error::InitFailureHint;
+use crate::config::{
+    BuiltinServer, CommandStem, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
+};
+use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::{HostOs, resolve_named, resolve_named_on};
+use crate::lsp::launcher::NPM_SPECIFIER_PREFIX;
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
@@ -50,7 +52,6 @@ const NODE_NAME: &str = "node";
 const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
 const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
-const NPM_SPECIFIER_PREFIX: &str = "npm:";
 const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
 const PACKAGE_RUNNERS: [&str; 7] = ["npx", "bunx", "pnpx", "pnpm", "yarn", "npm", "deno"];
 const PNPM_GLOBAL_DIR: &str = "global";
@@ -169,13 +170,6 @@ fn mentions_server(arg: &str) -> bool {
         .any(|part| part.as_os_str().to_string_lossy().starts_with(SERVER_STEM))
 }
 
-fn command_stem_is(command: &str, names: &[&str]) -> bool {
-    Path::new(command)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|stem| names.iter().any(|name| stem.eq_ignore_ascii_case(name)))
-}
-
 /// How the configured command reaches typescript-language-server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Launch<'a> {
@@ -198,7 +192,8 @@ fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
     if !config.args.iter().any(|arg| mentions_server(arg)) {
         return None;
     }
-    let script = command_stem_is(config.command.as_str(), &SCRIPT_INTERPRETERS)
+    let script = CommandStem::of(config.command.as_str())
+        .is_any(&SCRIPT_INTERPRETERS)
         .then(|| {
             config
                 .args
@@ -210,7 +205,7 @@ fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
     if let Some(script) = script {
         return Some(Launch::Script(script));
     }
-    let runner = command_stem_is(config.command.as_str(), &PACKAGE_RUNNERS)
+    let runner = CommandStem::of(config.command.as_str()).is_any(&PACKAGE_RUNNERS)
         || config
             .args
             .iter()
@@ -959,7 +954,46 @@ pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> T
     }
 }
 
+/// What untrusted mode vets a TypeScript server against, remembered so a
+/// respawn repeats the startup checks and names the same command.
+#[derive(Debug, Clone)]
+pub struct UntrustedVetting {
+    boundary: WorkspaceRoots,
+    configured: ServerCommand,
+}
+
+impl UntrustedVetting {
+    /// Vetting against `boundary` for the server configured as `configured`.
+    pub const fn new(boundary: WorkspaceRoots, configured: ServerCommand) -> Self {
+        Self {
+            boundary,
+            configured,
+        }
+    }
+}
+
 impl TypescriptPlan {
+    /// The refusal untrusted mode owes this plan, if any: a pin inside the
+    /// boundary, or a launcher no tsserver can be pinned for. Startup and
+    /// respawn both vet through here.
+    ///
+    /// # Errors
+    ///
+    /// [`UntrustedRefusal::WorkspaceTsserver`] or
+    /// [`UntrustedRefusal::UnpinnedTypescriptLauncher`], the latter naming
+    /// the command as configured.
+    pub fn vet_untrusted(&self, vetting: &UntrustedVetting) -> Result<(), UntrustedRefusal> {
+        if let Some(tsserver) = self.pin_inside(&vetting.boundary) {
+            return Err(UntrustedRefusal::WorkspaceTsserver { tsserver });
+        }
+        if self.has_unpinnable_launcher() {
+            return Err(UntrustedRefusal::UnpinnedTypescriptLauncher {
+                command: vetting.configured.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// The canonical tsserver that would be pinned, when it lies inside
     /// `boundary`: the pin then names workspace code, which untrusted mode
     /// refuses.
@@ -1709,9 +1743,11 @@ mod tests {
     fn test_resolve_config_env_path_overrides_parent() {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
-        config
-            .env
-            .insert("PATH".into(), layout.bin.to_str().unwrap().into());
+        config.env.insert(
+            "PATH".into(),
+            layout.bin.to_str().unwrap().into(),
+            crate::lsp::HostOs::CURRENT,
+        );
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }

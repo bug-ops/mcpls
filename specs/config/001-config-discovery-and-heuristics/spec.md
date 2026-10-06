@@ -29,7 +29,7 @@ related:
 > This is a retroactive spec: `crates/mcpls-core/src/config/mod.rs` and
 > `crates/mcpls-core/src/config/server.rs` already implement everything described below.
 > Representative evidence: `ServerConfig::load`/`load_with_trust`/`load_from` (config/mod.rs),
-> `ServerHeuristics::is_applicable_recursive` (config/server.rs), and the default 6-server /
+> `MarkerScan::collect` (config/server.rs), and the default 6-server /
 > ~30-extension built-in config (`ServerConfig::default`, `default_language_extensions`). No
 > single PR authored this end-to-end; it is the accretion of the config subsystem's entire
 > history, most recently including the untrusted-project-config model (#345/#348) and the bounded
@@ -41,8 +41,8 @@ related:
 > still missing, stopping as soon as every marker is found, so a monorepo no longer pays one walk per
 > configured server. `plan_server_starts` runs on the blocking pool (`serve_with`), which keeps the
 > async workers free; `initialize` still waits for the plan, since the router the MCP server answers
-> from is built from it. `LspServerConfig::should_spawn` remains the single-server form with the same
-> result.
+> from is built from it. `MarkerScan` is the only marker-applicability implementation (#699): the
+> former `LspServerConfig::should_spawn` and `ServerHeuristics::is_applicable*` are removed.
 
 ## 1. Overview
 
@@ -138,7 +138,7 @@ subproject's server because the marker isn't at the workspace root
 **Acceptance criteria:**
 ```
 GIVEN a workspace root containing no Cargo.toml at the root but a nested packages/rust-lib/Cargo.toml
-WHEN LspServerConfig::should_spawn is evaluated for the rust-analyzer server config
+WHEN MarkerScan::applies_to is evaluated for the rust-analyzer server config
 THEN it returns true (recursive marker search finds the nested Cargo.toml, up to
      heuristics_max_depth)
 
@@ -157,11 +157,15 @@ THEN node_modules is excluded from the search and this nested package.json does 
 | FR-003 | WHEN a project-local `./mcpls.toml` is found and trust is `Untrusted` (the default) THE SYSTEM SHALL skip it entirely (not partially — including `[workspace]`), log a warning naming the resolved path and the opt-in mechanism, and set `project_config_ignored: true` on the returned config | must |
 | FR-004 | WHEN a project-local `./mcpls.toml` is found and trust is `Trusted` THE SYSTEM SHALL load it via the same path/validation logic as an explicitly-named config | must |
 | FR-005 | THE SYSTEM SHALL bound every config-file read to `MAX_CONFIG_FILE_BYTES` (8 MiB) via a `Read::take`-bounded read, not a `metadata().len()` pre-check alone, since the latter is bypassable by character devices/FIFOs reporting `len() == 0` regardless of actual readable data | must |
-| FR-006 | THE SYSTEM SHALL validate every loaded (or caller-constructed) `ServerConfig` via `ServerConfig::validate()` before it is used by `serve`/`serve_with`, rejecting the first violated rule with a diagnosable `Error::InvalidConfig` | must |
+| FR-006 | THE SYSTEM SHALL reject an `--allow-server` id that names no configured server when the workspace trust is applied (`load_explicit`/`load_discovered`), and `serve`/`serve_with` SHALL run `ServerConfig::validate()` once for a config built in code; `load_from` runs no validation and the duplicate-name warning is gone (`ToolRouter::from_configs` is authoritative) (#694) | must |
+| FR-006a | WHEN a config fails to load THE SYSTEM SHALL show each cause once in the error chain: the TOML and config wrapper errors forward their source instead of repeating its text (#706) | must |
+| FR-006b | THE SYSTEM SHALL load the config in the CLI before the async runtime exists, and resolve the workspace roots in the same blocking closure as `plan_server_starts` (#698) | must |
+| FR-006c | THE SYSTEM SHALL hold a server's `env` as `ServerEnv`, whose keys compare as the host compares names (ASCII-case-insensitively on Windows, in every trust mode), so executable resolution and the TypeScript pin read the same `PATH` the child sees; two keys naming one variable on Windows are rejected at load with `ConfigError::DuplicateEnvKey`, and hardening writes replace every alias (#691) | must |
+| FR-006d | THE SYSTEM SHALL match command stems (launcher rules, TypeScript pin, builtin matching) through one `CommandStem`, ASCII-case-insensitively on every host, and carry the spawn command in `ServerSpawnFailed`/`ServerNotFound`/`ServerExitedDuringInit` as a `ServerCommand` (#697) | must |
 | FR-007 | THE SYSTEM SHALL resolve relative `workspace.roots` entries against the config file's own directory for an explicitly-named config (`load_from`'s default), but against the process's current working directory for the auto-discovered global/user config tier (since that tier is not tied to any particular project) | must |
 | FR-008 | THE SYSTEM SHALL provide 6 built-in `LspServerConfig`s (rust-analyzer, pyright, typescript-language-server, gopls, clangd, zls), each gated by `ServerHeuristics::project_markers` naming the files/directories that indicate that language's project type | must |
 | FR-009 | THE SYSTEM SHALL provide ~30 built-in file-extension → language-ID mappings (`default_language_extensions`), user-overridable/-extensible via `workspace.language_extensions` | must |
-| FR-010 | WHEN `ServerHeuristics::is_applicable_recursive` searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10; `ServerConfig::validate` rejects values above `MAX_HEURISTICS_DEPTH` = 64), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`); at startup THE SYSTEM SHALL do so with one walk per workspace root for all servers together, on the blocking pool (`MarkerScan`) | must |
+| FR-010 | WHEN the project-marker walk (`MarkerScan::collect`) searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10; values above `MAX_HEURISTICS_DEPTH` = 64 are rejected when the config is loaded), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`); at startup THE SYSTEM SHALL do so with one walk per workspace root for all servers together, on the blocking pool (`MarkerScan`) | must |
 | FR-011 | WHEN `ServerHeuristics::project_markers` is empty THE SYSTEM SHALL treat the server as always applicable (no heuristic gating) | must |
 | FR-012 | THE SYSTEM SHALL reject (`Error::InvalidConfig`) an empty `workspace.position_encodings` list, an unrecognized encoding string, an empty `workspace.roots` entry, an empty/duplicate-claiming server config (`language_id`, `command`, `handles`), a `timeout_seconds`/`request_timeout_seconds` of `0` or above `MAX_TIMEOUT_SECONDS` (900s), and a `workspace.heuristics_max_depth` above `MAX_HEURISTICS_DEPTH` (64) | must |
 
@@ -190,7 +194,7 @@ THEN node_modules is excluded from the search and this nested package.json does 
 | Scenario | Expected Behavior |
 |----------|--------------------|
 | `$MCPLS_CONFIG` points at a nonexistent path | `Error::ConfigNotFound` |
-| Config file larger than `MAX_CONFIG_FILE_BYTES` (8 MiB) | Rejected via `Error::FileSizeLimitExceeded` before the whole file is buffered, including for special files (e.g. `/dev/zero`) that report `metadata().len() == 0` |
+| Config file larger than `MAX_CONFIG_FILE_BYTES` (8 MiB) | Rejected via `ConfigError::FileTooLarge`, which names the fixed limit (not `workspace.max_file_size`, which does not apply to the config file; #684), before the whole file is buffered, including for special files (e.g. `/dev/zero`) that report `metadata().len() == 0` |
 | Config file exactly at the 8 MiB boundary | Accepted — the boundary itself is not rejected |
 | Config file is not valid UTF-8 | `Error::InvalidConfig` naming the UTF-8 decode failure |
 | Project-local `./mcpls.toml` exists, trust untrusted | Skipped entirely, warning logged, `project_config_ignored: true`, falls through to the next tier |

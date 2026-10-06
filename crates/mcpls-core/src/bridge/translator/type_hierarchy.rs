@@ -1,9 +1,8 @@
 //! Type hierarchy prepare/supertypes/subtypes handlers.
 
 use lsp_types::{
-    PartialResultParams, TextDocumentIdentifier, TextDocumentPositionParams, TypeHierarchyItem,
-    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
-    WorkDoneProgressParams,
+    PartialResultParams, TypeHierarchyItem, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, WorkDoneProgressParams,
 };
 
 use super::Translator;
@@ -11,6 +10,7 @@ use super::dto::{CheckedHierarchyItem, Position, TypeHierarchyResult};
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
+use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
@@ -53,33 +53,20 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<Indexed<TypeHierarchyResult>> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result:
+                Indexed {
+                    result: response,
+                    indexing,
+                },
+            ctx,
+            doc: _doc,
+        } = self
+            .disclosed_position_request::<lsp_types::TypeHierarchyPrepareRequest>(
                 &file_path,
+                position,
                 Capability::TypeHierarchy,
-                IndexingGate::NotRequired,
-                &[position],
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = TypeHierarchyPrepareParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let (response, indexing) = self
-            .sampled_indexing(
-                server_id,
-                client.request_typed::<lsp_types::TypeHierarchyPrepareRequest>(
-                    params,
-                    client.request_timeout(),
-                ),
+                (),
             )
             .await?;
 

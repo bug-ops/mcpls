@@ -323,7 +323,7 @@ mod tests {
     use super::super::server::McplsServer;
 
     /// Total serialized `tools` array budget (compact bytes).
-    const TOOLS_LIST_TOTAL_BUDGET_BYTES: usize = 135_000;
+    const TOOLS_LIST_TOTAL_BUDGET_BYTES: usize = 135_500;
     /// Largest serialized single `Tool` (compact bytes).
     const TOOL_BUDGET_BYTES: usize = 9_000;
     /// Sum of all schema `description` bytes.
@@ -483,6 +483,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Appends the JSON path of every object schema under `value` that is not
+    /// closed (`additionalProperties: false`) when `want_closed`, or that is
+    /// closed when not.
+    fn object_schemas_with_openness(
+        value: &Value,
+        path: &str,
+        want_closed: bool,
+        found: &mut Vec<String>,
+    ) {
+        let Value::Object(map) = value else {
+            if let Value::Array(items) = value {
+                for (index, item) in items.iter().enumerate() {
+                    object_schemas_with_openness(
+                        item,
+                        &format!("{path}/{index}"),
+                        want_closed,
+                        found,
+                    );
+                }
+            }
+            return;
+        };
+        let is_object_schema =
+            map.contains_key("properties") || map.get("type").is_some_and(|t| t == "object");
+        let closed = map.get("additionalProperties") == Some(&Value::Bool(false));
+        if is_object_schema && closed != want_closed {
+            found.push(path.to_owned());
+        }
+        for (key, child) in map {
+            let child_path = format!("{path}/{key}");
+            match (key.as_str(), child) {
+                ("properties" | DEFINITIONS_KEY, Value::Object(schemas)) => {
+                    for (name, schema) in schemas {
+                        object_schemas_with_openness(
+                            schema,
+                            &format!("{child_path}/{name}"),
+                            want_closed,
+                            found,
+                        );
+                    }
+                }
+                _ => object_schemas_with_openness(child, &child_path, want_closed, found),
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_input_schema_object_is_closed_to_unknown_arguments() {
+        let mut violations = Vec::new();
+        for tool in shaped_tools() {
+            let mut found = Vec::new();
+            object_schemas_with_openness(
+                &Value::Object((*tool.input_schema).clone()),
+                "",
+                true,
+                &mut found,
+            );
+            violations.extend(
+                found
+                    .into_iter()
+                    .map(|path| format!("{}: {path}", tool.name)),
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "input schema objects without additionalProperties: false:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_no_output_schema_is_closed() {
+        let mut violations = Vec::new();
+        for tool in shaped_tools() {
+            let Some(output) = tool.output_schema.as_deref() else {
+                continue;
+            };
+            let mut found = Vec::new();
+            object_schemas_with_openness(&Value::Object(output.clone()), "", false, &mut found);
+            violations.extend(
+                found
+                    .into_iter()
+                    .map(|path| format!("{}: {path}", tool.name)),
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "output schema objects closed to additional properties:\n{}",
+            violations.join("\n")
+        );
     }
 
     /// The schema with every string `description` and `title` removed: what

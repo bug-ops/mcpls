@@ -168,7 +168,7 @@ Priorities: `must` / `should` / `may`. Byte counts are UTF-8 bytes of the compac
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 135,000 B (baseline 171,465 B; stretch target 110,000 B) (135,000 B is the enforced figure, raised from 130,000 B for the diagnostics `availability`/`origin` fields, the `indexing_in_progress` flag on four more tools, the `push_only` route status and the inlined kind-filter enums of batch 27; the stretch target is not tracked) | must |
+| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 135,500 B (baseline 171,465 B; stretch target 110,000 B) (135,500 B is the enforced figure, raised from 135,000 B for the `additionalProperties: false` keyword on 43 input schema objects of [[mcp/016-reject-unknown-tool-arguments/spec\|mcp/016]] (measured 135,143 B), and earlier from 130,000 B for the diagnostics `availability`/`origin` fields, the `indexing_in_progress` flag on four more tools, the `push_only` route status and the inlined kind-filter enums of batch 27; the stretch target is not tracked) | must |
 | FR-002 | EACH serialized `Tool` SHALL NOT exceed the per-tool budget: 9,000 B (baseline maximum 12,458 B, `get_references`) (9,000 B enforced for every tool; no per-tool override) | must |
 | FR-003 | THE sum of all `description` string bytes inside every `inputSchema` and `outputSchema` SHALL NOT exceed 35,000 B (baseline 73,444 B) | should |
 | FR-004 | THE system SHALL NOT emit, in any `inputSchema` or `outputSchema` `description`, a Markdown code fence (a line starting with three backticks), a Markdown heading line (a line starting with `#`), or a rustdoc section such as `# Examples`, `# Errors` or `# Panics` | must |
@@ -232,7 +232,7 @@ Baseline values are those measured at commit `517cb53`.
 
 | ID | Metric | Baseline | Target |
 |----|--------|----------|--------|
-| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 135,000 B (stretch 110,000 B) |
+| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 135,500 B (stretch 110,000 B) |
 | SC-002 | Largest single `Tool` | 12,458 B (`get_references`) | at most 9,000 B |
 | SC-003 | Sum of schema `description` bytes | 73,444 B | at most 35,000 B |
 | SC-004 | Schema descriptions containing a code fence or rustdoc section heading | 10 (about 5.9 KB) | 0 |

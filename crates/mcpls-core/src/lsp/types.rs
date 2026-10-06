@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
+/// JSON-RPC protocol version carried by every message.
+pub const JSONRPC_VERSION: &str = "2.0";
+
 /// JSON-RPC 2.0 request message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -63,6 +66,60 @@ pub struct JsonRpcError {
     /// Optional additional error data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+impl JsonRpcError {
+    /// An error object with `code` and `message` and no data.
+    #[must_use]
+    pub fn new(code: lsp_types::ErrorCodes, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+/// How an outbound JSON-RPC response ends: a result or an error, never both
+/// and never neither.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JsonRpcOutcome {
+    /// The request succeeded with this result (`null` included).
+    Result(Value),
+    /// The request failed.
+    Error(JsonRpcError),
+}
+
+impl From<Result<Value, JsonRpcError>> for JsonRpcOutcome {
+    fn from(outcome: Result<Value, JsonRpcError>) -> Self {
+        match outcome {
+            Ok(result) => Self::Result(result),
+            Err(error) => Self::Error(error),
+        }
+    }
+}
+
+/// A JSON-RPC 2.0 response mcpls sends to the server: the one place the
+/// outbound envelope is built.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRpcReply {
+    jsonrpc: &'static str,
+    id: RequestId,
+    #[serde(flatten)]
+    outcome: JsonRpcOutcome,
+}
+
+impl JsonRpcReply {
+    /// A reply to request `id`.
+    #[must_use]
+    pub const fn new(id: RequestId, outcome: JsonRpcOutcome) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            id,
+            outcome,
+        }
+    }
 }
 
 /// Request ID can be a number or string per JSON-RPC 2.0.
@@ -260,6 +317,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn test_reply_carries_exactly_one_of_result_and_error() {
+        let id = RequestId::Number(7);
+        let ok = JsonRpcReply::new(id.clone(), JsonRpcOutcome::Result(Value::Null));
+        let failed = JsonRpcReply::new(
+            id,
+            JsonRpcOutcome::Error(JsonRpcError::new(
+                lsp_types::ErrorCodes::MethodNotFound,
+                "x",
+            )),
+        );
+
+        assert_eq!(
+            serde_json::to_value(ok).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 7, "result": null})
+        );
+        assert_eq!(
+            serde_json::to_value(failed).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601, "message": "x"}})
+        );
+    }
 
     #[test]
     fn test_request_serialization() {

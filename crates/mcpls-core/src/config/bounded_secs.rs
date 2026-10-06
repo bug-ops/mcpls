@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::server::MAX_TIMEOUT_SECONDS;
+use super::limits::MAX_TIMEOUT_SECONDS;
 use crate::bridge::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_SETTLE,
 };
@@ -36,8 +36,8 @@ pub struct InvalidSecs {
 /// use std::time::Duration;
 /// use mcpls_core::config::TimeoutSecs;
 ///
-/// assert!(TimeoutSecs::new(0).is_none());
-/// assert!(TimeoutSecs::new(901).is_none());
+/// assert!(TimeoutSecs::new(0).is_err());
+/// assert!(TimeoutSecs::new(901).is_err());
 /// assert_eq!(TimeoutSecs::new(45).unwrap().as_duration(), Duration::from_secs(45));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,17 +45,24 @@ pub struct InvalidSecs {
 pub struct BoundedSecs<const MIN: u64, const MAX: u64>(NonZeroU64);
 
 impl<const MIN: u64, const MAX: u64> BoundedSecs<MIN, MAX> {
-    /// `None` when `secs` is outside `MIN..=MAX`.
-    #[must_use]
-    pub const fn new(secs: u64) -> Option<Self> {
+    /// Builds the value from `secs`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidSecs`] when `secs` is outside `MIN..=MAX`.
+    pub const fn new(secs: u64) -> Result<Self, InvalidSecs> {
         const { assert!(MIN >= 1 && MIN <= MAX, "MIN must satisfy 1 <= MIN <= MAX") };
-        if secs < MIN || secs > MAX {
-            return None;
+        if secs >= MIN
+            && secs <= MAX
+            && let Some(secs) = NonZeroU64::new(secs)
+        {
+            return Ok(Self(secs));
         }
-        match NonZeroU64::new(secs) {
-            Some(secs) => Some(Self(secs)),
-            None => None,
-        }
+        Err(InvalidSecs {
+            value: secs,
+            min: MIN,
+            max: MAX,
+        })
     }
 
     /// The wrapped number of seconds, within `MIN..=MAX`.
@@ -75,11 +82,7 @@ impl<const MIN: u64, const MAX: u64> TryFrom<u64> for BoundedSecs<MIN, MAX> {
     type Error = InvalidSecs;
 
     fn try_from(value: u64) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or(InvalidSecs {
-            value,
-            min: MIN,
-            max: MAX,
-        })
+        Self::new(value)
     }
 }
 
@@ -95,8 +98,8 @@ pub type TimeoutSecs = BoundedSecs<1, MAX_TIMEOUT_SECONDS>;
 impl TimeoutSecs {
     /// Thirty seconds.
     pub const DEFAULT: Self = match Self::new(30) {
-        Some(secs) => secs,
-        None => panic!("the default timeout must be in range"),
+        Ok(secs) => secs,
+        Err(_) => panic!("the default timeout must be in range"),
     };
 }
 
@@ -118,8 +121,8 @@ pub type IndexingReadyTimeoutSecs =
 impl IndexingReadyTimeoutSecs {
     /// The built-in default, `DEFAULT_INDEXING_READY_TIMEOUT_SECS`.
     pub const DEFAULT: Self = match Self::new(DEFAULT_INDEXING_READY_TIMEOUT_SECS) {
-        Some(secs) => secs,
-        None => panic!("the default indexing-ready timeout must be in range"),
+        Ok(secs) => secs,
+        Err(_) => panic!("the default indexing-ready timeout must be in range"),
     };
 }
 
@@ -135,23 +138,31 @@ mod tests {
 
     #[test]
     fn test_timeout_bounds() {
-        assert!(TimeoutSecs::new(0).is_none());
+        assert!(TimeoutSecs::new(0).is_err());
+        assert_eq!(
+            TimeoutSecs::new(901),
+            Err(InvalidSecs {
+                value: 901,
+                min: 1,
+                max: MAX_TIMEOUT_SECONDS
+            })
+        );
         assert_eq!(TimeoutSecs::new(1).unwrap().get(), 1);
         assert_eq!(
             TimeoutSecs::new(MAX_TIMEOUT_SECONDS).unwrap().get(),
             MAX_TIMEOUT_SECONDS
         );
-        assert!(TimeoutSecs::new(MAX_TIMEOUT_SECONDS + 1).is_none());
+        assert!(TimeoutSecs::new(MAX_TIMEOUT_SECONDS + 1).is_err());
     }
 
     #[test]
     fn test_indexing_ready_timeout_bounds_are_exclusive() {
         let settle = PROGRESS_SETTLE.as_secs();
         let stale = INDEXING_STALENESS_BOUND.as_secs();
-        assert!(IndexingReadyTimeoutSecs::new(settle).is_none());
-        assert!(IndexingReadyTimeoutSecs::new(settle + 1).is_some());
-        assert!(IndexingReadyTimeoutSecs::new(stale - 1).is_some());
-        assert!(IndexingReadyTimeoutSecs::new(stale).is_none());
+        assert!(IndexingReadyTimeoutSecs::new(settle).is_err());
+        assert!(IndexingReadyTimeoutSecs::new(settle + 1).is_ok());
+        assert!(IndexingReadyTimeoutSecs::new(stale - 1).is_ok());
+        assert!(IndexingReadyTimeoutSecs::new(stale).is_err());
     }
 
     #[test]

@@ -295,6 +295,8 @@ All questions of the draft are resolved:
 - Subscribing does not open the document.
 - Eviction of a subscribed entry is announced for pull-triggered and push-triggered evictions alike (#649); protecting subscribed entries from eviction was rejected because it breaks the fair-share and aggregate bounds.
 - `previous_result_id` stays `None`.
+- Cache representation (#693): a cached entry carries one `Origin`, either pushed (with its URI spelling) or pulled (with ticket, tracked opening and the document version it was requested at), so pull bookkeeping cannot outlive its slot and a pulled report is always versioned. Document versions and openings are the `DocumentVersion` and `Opening` types, never bare integers. Push and pull writes share one eviction routine (`make_room`): a write that finds nothing to evict is dropped and leaves the server's eviction overflow as it was.
+- Severity (#693): `ReportedSeverity` is the single severity order for the report and the size cap; a diagnostic without a (recognized) severity counts as information in both, so the cap no longer drops it before hints.
 
 ## 11. See Also
 

@@ -184,7 +184,7 @@ impl Translator {
             .prepare_gated_document(
                 file_path,
                 Capability::DocumentSymbols,
-                IndexingGate::NotRequired,
+                IndexingGate::FileLocal,
             )
             .await?;
         self.fetch_document_symbols(doc).await
@@ -415,7 +415,7 @@ struct RawWorkspaceSymbol {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
     use std::{assert_matches, fs};
@@ -601,7 +601,7 @@ mod tests {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     /// `document_symbols` is single-file analysis, valid even mid-index
-    /// (spec FR-008), so `IndexingGate::NotRequired` at its
+    /// (spec FR-008), so `IndexingGate::FileLocal` at its
     /// `prepare_gated_document` call site must mean it dispatches even
     /// while the routed server reports `IndexingState::Loading` -- unlike
     /// the whole-workspace tools, which would error in this state.

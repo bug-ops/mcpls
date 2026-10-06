@@ -41,9 +41,11 @@ Read the extra fields before you trust an empty list:
 | Field | Values and meaning |
 |-------|--------------------|
 | `availability` | `published`: the server reported on the file, so an empty list means clean. `pending`: nothing was published yet. `evicted`: a publish was dropped to bound the cache. An empty list next to `pending` or `evicted` is not a clean file |
-| `origin` | `pull` when a `textDocument/diagnostic` request answered, `push_cache` when the server has no pull support and the cache alone answered |
+| `origin` | `pull` when a `textDocument/diagnostic` request answered, `push_cache` when the server has no pull support and the cache alone answered, `cache_after_failed_pull` when the pull failed and the cache answered |
 | `indexing_in_progress` | `true` if the server was still indexing during the read, so early errors may be false and real ones may be missing |
 | `push_notifications_degraded` | `true` if the server crashed and restarted during this session, so push-only diagnostics may be missing until mcpls restarts |
+
+**After an edit.** Once mcpls has re-synced a changed file, a pushed diagnostic from an older version of the file is not listed when the server's pull for the current version no longer reports it, so an error you just fixed does not linger for the 250 to 350 ms a server such as pyright needs to publish again. Only items the same server's pull reported before are dropped: pushed diagnostics that no pull ever reports (clippy results from rust-analyzer, for example) stay. If the pull failed or the server answers only by push, nothing is dropped and the latest push is the answer. Limits: a pushed item without a `source` that no earlier pull covered, and items of a server whose pulls never reported that `source` yet (for example its first pull came back empty), stay until the server publishes again.
 
 Diagnostics from the two sources are deduplicated by severity, code and proximity (within 3 lines), without comparing messages. Two distinct errors with the same code that start within 3 lines appear once, with the pulled message.
 
@@ -89,7 +91,7 @@ Returns the ranges that enclose a position, innermost first (expression, stateme
 
 ## get_folding_ranges
 
-Returns the foldable regions of a file with 1-based lines, a `kind` and collapsed text, sorted by start line with the longest first. Argument `kind` is `all` (default), `comment`, `imports` or `region`.
+Returns the foldable regions of a file with 1-based lines, a `kind` and collapsed text, sorted by start line with the longest first. Argument `kind` is `all` (default), `comment`, `imports` or `region`, in any case.
 
 ```json
 { "file_path": "/work/app/src/lib.rs", "kind": "imports" }

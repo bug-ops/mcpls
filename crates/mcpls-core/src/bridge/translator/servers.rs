@@ -12,7 +12,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
-use super::pull_support::PullProbe;
+use super::pull_support::{PullProbe, PullSupport};
 use super::respawn::RespawnBackoff;
 use super::restart::RestartGeneration;
 use crate::config::ServerId;
@@ -234,6 +234,16 @@ impl Servers {
                 None
             }
         })
+    }
+
+    /// What is known about `id` answering `textDocument/diagnostic`: whether
+    /// its running process advertises a pull provider, with what its probe
+    /// showed.
+    pub(super) fn pull_support(&self, id: &ServerId) -> PullSupport {
+        let advertised = self
+            .server(id)
+            .is_some_and(|server| server.capabilities().diagnostic_provider.is_some());
+        PullSupport::of(advertised, self.pull_probe(id))
     }
 
     /// The server of a running slot that has one.

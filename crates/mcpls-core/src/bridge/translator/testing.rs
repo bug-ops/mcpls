@@ -114,7 +114,7 @@ pub(super) fn lsp_diag(
 pub(super) fn diag_info(diagnostics: Vec<lsp_types::Diagnostic>) -> DiagnosticInfo {
     DiagnosticInfo {
         uri: lsp_types::Uri::from("file:///test.rs"),
-        version: Some(1),
+        version: Some(crate::bridge::DocumentVersion::FIRST),
         diagnostics,
     }
 }
@@ -189,7 +189,6 @@ pub(super) fn translator_with_capabilities_and_encoding(
 /// Windows, so everything below is unix-only.
 #[cfg(unix)]
 mod sh_servers {
-    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -257,7 +256,7 @@ mod sh_servers {
                 language_id: LanguageId::new(id).unwrap(),
                 command: ServerCommand::from_static("sh").into(),
                 args: vec![script.to_string_lossy().to_string()],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,

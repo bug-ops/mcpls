@@ -76,8 +76,10 @@ pub fn fake_lsp_client_with_config(config: LspServerConfig) -> (LspClient, FakeS
 /// Both notification lanes of a client built by
 /// [`fake_lsp_client_with_lanes`].
 pub struct FakeLanes {
-    /// Diagnostics/log/showMessage lane.
+    /// Log/showMessage lane.
     pub notification_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    /// The diagnostics mailbox.
+    pub publishes: crate::lsp::PublishReader,
     /// Lifecycle lane (`$/progress` `begin`/`end`, unrecognized notifications).
     pub lifecycle_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
 }
@@ -94,11 +96,12 @@ pub fn fake_lsp_client_with_redactions(
 ) -> (LspClient, FakeServer, FakeLanes) {
     let (transport, fake_server) = fake_transport();
     let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(32);
+    let (notification_sink, publishes) = crate::lsp::NotificationSink::new(notification_tx);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
     let client = LspClient::from_transport_with_notifications(
         LspServerConfig::rust_analyzer(),
         transport,
-        notification_tx,
+        notification_sink,
         lifecycle_tx,
         std::sync::Arc::new(redactions),
     );
@@ -107,6 +110,7 @@ pub fn fake_lsp_client_with_redactions(
         fake_server,
         FakeLanes {
             notification_rx,
+            publishes,
             lifecycle_rx,
         },
     )
@@ -487,7 +491,7 @@ pub fn spawn_test_pump_over_lanes(
     CancellationToken,
 ) {
     spawn_pump(
-        lanes.notification_rx,
+        crate::lsp::NotificationInbox::new(lanes.notification_rx, lanes.publishes),
         lanes.lifecycle_rx,
         (),
         crate::mcp::SubscriptionRegistry::default(),
@@ -500,7 +504,7 @@ pub fn spawn_test_pump_over_lanes(
 }
 
 fn spawn_pump<K: Send + 'static>(
-    rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    rx: impl Into<crate::lsp::NotificationInbox> + Send + 'static,
     lifecycle_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
     keep_alive: K,
     subs: crate::mcp::SubscriptionRegistry,
@@ -513,6 +517,7 @@ fn spawn_pump<K: Send + 'static>(
 ) {
     let cancel = CancellationToken::new();
     let shared = crate::runtime::pump::PumpShared {
+        roles: crate::runtime::pump::DiagnosticsRoles::default(),
         notification_cache: std::sync::Arc::clone(&notification_cache),
         subs,
         workspace_roots,

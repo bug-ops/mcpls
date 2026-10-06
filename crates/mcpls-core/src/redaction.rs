@@ -50,10 +50,7 @@ fn name_segments(name: &str) -> impl Iterator<Item = &str> {
     name.split(['_', '-', '.']).flat_map(|piece| {
         let mut starts = vec![0];
         let chars: Vec<(usize, char)> = piece.char_indices().collect();
-        for (index, window) in chars.windows(2).enumerate() {
-            let [(_, before), (start, after)] = window else {
-                continue;
-            };
+        for (index, [(_, before), (start, after)]) in chars.array_windows().enumerate() {
             let next_is_lower = chars
                 .get(index.saturating_add(2))
                 .is_some_and(|(_, next)| next.is_lowercase());
@@ -66,11 +63,8 @@ fn name_segments(name: &str) -> impl Iterator<Item = &str> {
         }
         starts.push(piece.len());
         starts
-            .windows(2)
-            .filter_map(|bounds| match bounds {
-                [from, to] => piece.get(*from..*to),
-                _ => None,
-            })
+            .array_windows()
+            .filter_map(|[from, to]| piece.get(*from..*to))
             .collect::<Vec<_>>()
     })
 }
@@ -537,7 +531,6 @@ fn collect_secret_json(
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
-    use std::collections::HashMap;
 
     use super::*;
 
@@ -551,7 +544,7 @@ mod tests {
 
     fn server_config() -> LspServerConfig {
         let mut config = LspServerConfig::rust_analyzer();
-        config.env = HashMap::new();
+        config.env = crate::config::ServerEnv::default();
         config.args = Vec::new();
         config.initialization_options = None;
         config
@@ -560,9 +553,11 @@ mod tests {
     #[test]
     fn test_for_servers_covers_every_configured_server_over_one_environment() {
         let mut first = server_config();
-        first
-            .env
-            .insert("FIRST_TOKEN".into(), "first-secret-value".into());
+        first.env.insert(
+            "FIRST_TOKEN".into(),
+            "first-secret-value".into(),
+            crate::lsp::HostOs::CURRENT,
+        );
         let mut second = server_config();
         second.args = vec!["--api-key=second-secret-value".into()];
 
@@ -931,13 +926,17 @@ mod tests {
     #[test]
     fn test_for_server_takes_secret_named_env_only() {
         let mut config = server_config();
-        config.env = HashMap::from([
-            ("API_TOKEN".to_string(), "tok-1234567890".to_string()),
-            (
-                "RUSTUP_TOOLCHAIN".to_string(),
-                "nightly-2024-01-01".to_string(),
-            ),
-        ]);
+        config.env = crate::config::ServerEnv::from_entries(
+            [
+                ("API_TOKEN".to_string(), "tok-1234567890".to_string()),
+                (
+                    "RUSTUP_TOOLCHAIN".to_string(),
+                    "nightly-2024-01-01".to_string(),
+                ),
+            ],
+            crate::lsp::HostOs::CURRENT,
+        )
+        .unwrap();
 
         let set = Redactions::for_server(&config, []);
 

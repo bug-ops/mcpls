@@ -52,7 +52,7 @@ impl Translator {
             .prepare_positioned_document(
                 &file_path,
                 Capability::SelectionRange,
-                IndexingGate::NotRequired,
+                IndexingGate::FileLocal,
                 &[position],
             )
             .await?;

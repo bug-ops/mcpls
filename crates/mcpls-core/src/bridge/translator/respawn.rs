@@ -342,7 +342,7 @@ impl Translator {
             }
         };
         let receivers = NotificationReceivers {
-            notifications: new_server.take_notification_rx(),
+            notifications: new_server.take_notification_inbox(),
             lifecycle: new_server.take_lifecycle_rx(),
             pinned_tsserver,
         };
@@ -452,11 +452,18 @@ impl Translator {
         receivers: NotificationReceivers,
     ) -> tokio::task::AbortHandle {
         let NotificationReceivers {
-            mut notifications,
+            notifications,
             mut lifecycle,
             pinned_tsserver,
         } = receivers;
-        tokio::spawn(async move { while notifications.recv().await.is_some() {} });
+        // Dropping the mailbox reader makes the writer stop buffering; only the
+        // log/showMessage channel needs draining.
+        let crate::lsp::NotificationInbox {
+            mut messages,
+            publishes,
+        } = notifications;
+        drop(publishes);
+        tokio::spawn(async move { while messages.recv().await.is_some() {} });
         let cache = self.notification_cache.clone();
         let lifecycle_id = id.clone();
         let forwarder = tokio::spawn(async move {
@@ -1371,7 +1378,7 @@ sleep 1
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
                     args: vec![],
-                    env: HashMap::new(),
+                    env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,
                     settings: None,
@@ -1386,7 +1393,7 @@ sleep 1
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
                     args: vec![],
-                    env: HashMap::new(),
+                    env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,
                     settings: None,

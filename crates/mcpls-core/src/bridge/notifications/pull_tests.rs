@@ -66,7 +66,7 @@ fn pull_for(
     version: i32,
     items: Vec<LspDiagnostic>,
 ) -> PullWrite {
-    let stamp = cache.begin_pull(&server(), version);
+    let stamp = cache.begin_pull(&server(), DocumentVersion::new(version));
     cache.store_pulled_diagnostics(
         &server(),
         target,
@@ -105,7 +105,7 @@ fn outcome(cache: &NotificationCache, write: PullWrite) -> ChangeOutcome {
         PullWrite::Stored {
             slot: SlotChange::Replaced { before },
             ..
-        } => ChangeOutcome::of(before.merge().as_ref(), merged(cache).as_ref()),
+        } => ChangeOutcome::of(before.unwrap().merge().as_ref(), merged(cache).as_ref()),
         PullWrite::Discarded { reason, .. } => panic!("pull was discarded: {reason:?}"),
     }
 }
@@ -158,7 +158,10 @@ fn test_pulled_slot_is_visible_to_every_read_path() {
     assert!(cache.diagnostics(&file()).is_none());
     assert_eq!(cache.diagnostics_owner(&file()), Some(&server()));
     assert_eq!(messages(&cache), ["E0308"]);
-    assert_eq!(merged(&cache).unwrap().version, Some(1));
+    assert_eq!(
+        merged(&cache).unwrap().version.map(DocumentVersion::get),
+        Some(1)
+    );
 }
 
 #[test]
@@ -318,8 +321,8 @@ fn test_fixing_the_only_error_is_a_change() {
 #[test]
 fn test_older_ticket_is_discarded_and_the_slot_keeps_the_newer_report() {
     let mut cache = NotificationCache::new();
-    let older = cache.begin_pull(&server(), 1);
-    let newer = cache.begin_pull(&server(), 1);
+    let older = cache.begin_pull(&server(), DocumentVersion::new(1));
+    let newer = cache.begin_pull(&server(), DocumentVersion::new(1));
     let store = |cache: &mut NotificationCache, stamp, message: &str| {
         cache.store_pulled_diagnostics(
             &server(),
@@ -340,7 +343,7 @@ fn test_older_ticket_is_discarded_and_the_slot_keeps_the_newer_report() {
 #[test]
 fn test_a_clear_between_issue_and_store_discards_the_pull() {
     let mut cache = NotificationCache::new();
-    let stamp = cache.begin_pull(&server(), 1);
+    let stamp = cache.begin_pull(&server(), DocumentVersion::new(1));
 
     assert!(cache.clear_server_diagnostics(&server()).is_empty());
     let write = cache.store_pulled_diagnostics(
@@ -359,7 +362,7 @@ fn test_a_clear_between_issue_and_store_discards_the_pull() {
 #[test]
 fn test_a_clear_of_another_server_keeps_the_pull() {
     let mut cache = NotificationCache::new();
-    let stamp = cache.begin_pull(&server(), 1);
+    let stamp = cache.begin_pull(&server(), DocumentVersion::new(1));
     cache.clear_server_diagnostics(&ServerId::from_static("other"));
 
     let write = cache.store_pulled_diagnostics(
@@ -376,7 +379,7 @@ fn test_a_clear_of_another_server_keeps_the_pull() {
 #[test]
 fn test_a_moved_version_discards_the_pull() {
     let mut cache = NotificationCache::new();
-    let stamp = cache.begin_pull(&server(), 1);
+    let stamp = cache.begin_pull(&server(), DocumentVersion::new(1));
 
     let write = cache.store_pulled_diagnostics(
         &server(),
@@ -393,7 +396,7 @@ fn test_a_moved_version_discards_the_pull() {
 #[test]
 fn test_a_discarded_pull_hands_its_items_back() {
     let mut cache = NotificationCache::new();
-    let stamp = cache.begin_pull(&server(), 3);
+    let stamp = cache.begin_pull(&server(), DocumentVersion::new(3));
     let write = cache.store_pulled_diagnostics(
         &server(),
         &file(),
@@ -411,7 +414,7 @@ fn test_a_discarded_pull_hands_its_items_back() {
         .merge()
         .unwrap();
 
-    assert_eq!(overlay.version, Some(3));
+    assert_eq!(overlay.version.map(DocumentVersion::get), Some(3));
     assert_eq!(overlay.diagnostics.len(), 1);
 }
 
@@ -453,15 +456,27 @@ fn test_an_equal_or_unversioned_push_keeps_the_pulled_slot() {
 fn test_merged_version_prefers_the_pushed_canonical_then_the_pulled() {
     let mut cache = NotificationCache::new();
     drop(pull_for(&mut cache, &file(), 4, vec![]));
-    assert_eq!(merged(&cache).unwrap().version, Some(4));
+    assert_eq!(
+        merged(&cache).unwrap().version.map(DocumentVersion::get),
+        Some(4)
+    );
 
     cache.store_published_diagnostics(&server(), &pushed_via("alias.rs"), None, vec![]);
-    assert_eq!(merged(&cache).unwrap().version, Some(4));
+    assert_eq!(
+        merged(&cache).unwrap().version.map(DocumentVersion::get),
+        Some(4)
+    );
 
     push(&mut cache, Some(4), vec![]);
-    assert_eq!(merged(&cache).unwrap().version, Some(4));
+    assert_eq!(
+        merged(&cache).unwrap().version.map(DocumentVersion::get),
+        Some(4)
+    );
     push(&mut cache, None, vec![]);
-    assert_eq!(merged(&cache).unwrap().version, Some(4));
+    assert_eq!(
+        merged(&cache).unwrap().version.map(DocumentVersion::get),
+        Some(4)
+    );
 }
 
 #[test]
@@ -853,27 +868,33 @@ fn test_a_lone_pulled_slot_is_sorted_and_capped_by_merge() {
 fn cache_overlay(items: Vec<LspDiagnostic>) -> DiagnosticSources {
     NotificationCache::new()
         .diagnostic_sources(&file())
-        .with_pulled(&file(), Some(1), BoundedDiagnostics(items))
+        .with_pulled(
+            &file(),
+            Some(DocumentVersion::new(1)),
+            BoundedDiagnostics(items),
+        )
 }
 
 /// #670: when a push supersedes a pulled slot, by the document's synced
 /// version as the tracker reports it.
 #[test]
 fn test_pull_supersession_rule() {
-    use DocumentSync::{NotOpen, Synced, Unattached};
+    use DocumentSync::{NotOpen, Unattached};
+
+    let synced = |n| DocumentSync::Synced(DocumentVersion::new(n));
 
     let cases = [
-        (4, Some(5), Synced(4), true),
+        (4, Some(5), synced(4), true),
         (4, Some(5), Unattached, true),
-        (4, Some(4), Synced(5), true),
-        (4, Some(2), Synced(5), true),
-        (4, Some(4), Synced(4), false),
-        (4, Some(2), Synced(4), false),
-        (4, Some(2), Synced(1), true),
+        (4, Some(4), synced(5), true),
+        (4, Some(2), synced(5), true),
+        (4, Some(4), synced(4), false),
+        (4, Some(2), synced(4), false),
+        (4, Some(2), synced(1), true),
         (4, Some(4), NotOpen, true),
-        (4, None, Synced(4), false),
-        (4, None, Synced(5), true),
-        (4, None, Synced(1), true),
+        (4, None, synced(4), false),
+        (4, None, synced(5), true),
+        (4, None, synced(1), true),
         (4, None, NotOpen, true),
         (4, Some(4), Unattached, false),
         (4, Some(2), Unattached, false),
@@ -881,7 +902,11 @@ fn test_pull_supersession_rule() {
     ];
     for (pulled, pushed, sync, superseded) in cases {
         assert_eq!(
-            pull_is_superseded(pulled, pushed, sync),
+            pull_is_superseded(
+                DocumentVersion::new(pulled),
+                pushed.map(DocumentVersion::new),
+                sync
+            ),
             superseded,
             "pulled {pulled}, pushed {pushed:?}, {sync:?}"
         );
@@ -941,7 +966,7 @@ impl TrackedFile {
         drop(cache.write_published_diagnostics(
             &server(),
             &PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone()),
-            version,
+            version.map(DocumentVersion::new),
             vec![error(2, "pushed")],
         ));
     }
@@ -1045,4 +1070,222 @@ fn test_without_a_tracker_only_a_newer_version_supersedes_the_pull() {
     assert_eq!(file.shown(&cache), ["pulled", "pushed"]);
     file.push(&mut cache, Some(5));
     assert_eq!(file.shown(&cache), ["pushed"]);
+}
+
+fn with_source(mut diagnostic: LspDiagnostic, source: &str) -> LspDiagnostic {
+    diagnostic.source = Some(source.to_owned());
+    diagnostic
+}
+
+impl TrackedFile {
+    fn set_version_of(&self, owner: &ServerId, version: i32) {
+        self.tracker
+            .set_synced_version_for_test(&self.path, owner, version);
+    }
+
+    fn push_items(
+        &self,
+        cache: &mut NotificationCache,
+        owner: &ServerId,
+        version: i32,
+        items: Vec<LspDiagnostic>,
+    ) {
+        drop(cache.write_published_diagnostics(
+            owner,
+            &PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone()),
+            Some(DocumentVersion::new(version)),
+            items,
+        ));
+    }
+
+    fn pull_items(
+        &self,
+        cache: &mut NotificationCache,
+        version: i32,
+        items: Vec<LspDiagnostic>,
+    ) -> PullWrite {
+        pull_for(cache, &self.uri, version, items)
+    }
+
+    fn cache(&self) -> NotificationCache {
+        let mut cache = NotificationCache::new();
+        cache.attach_documents(Arc::clone(&self.tracker));
+        cache
+    }
+
+    fn outcome_of(&self, cache: &NotificationCache, write: PullWrite) -> ChangeOutcome {
+        match write {
+            PullWrite::Stored {
+                slot: SlotChange::Identical,
+                ..
+            } => ChangeOutcome::Unchanged,
+            PullWrite::Stored {
+                slot: SlotChange::Replaced { before },
+                ..
+            } => ChangeOutcome::of(
+                before.unwrap().merge().as_ref(),
+                cache.diagnostic_sources(&self.uri).merge().as_ref(),
+            ),
+            PullWrite::Discarded { reason, .. } => panic!("pull was discarded: {reason:?}"),
+        }
+    }
+}
+
+/// #703: push v1 = pull v1 error, then pull v2 answers empty. The error the
+/// pull reported as fixed is not listed, and the exclusion publishes once.
+#[test]
+fn test_pull_answer_for_the_new_version_hides_the_push_it_already_reported() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    let item = || with_source(error(1, "x: int = 's'"), "pyright");
+    file.push_items(&mut cache, &server(), 1, vec![item()]);
+    drop(file.pull_items(&mut cache, 1, vec![item()]));
+    assert_eq!(file.shown(&cache), ["x: int = 's'"]);
+
+    file.set_version(2);
+    let write = file.pull_items(&mut cache, 2, vec![]);
+
+    assert_eq!(file.outcome_of(&cache, write), ChangeOutcome::Changed);
+    assert!(file.shown(&cache).is_empty());
+    let version = cache.diagnostic_sources(&file.uri).merge().unwrap().version;
+    assert_eq!(version, Some(DocumentVersion::new(2)));
+    let write = file.pull_items(&mut cache, 2, vec![]);
+    assert_eq!(file.outcome_of(&cache, write), ChangeOutcome::Unchanged);
+    cache.assert_consistent();
+}
+
+/// A push item no pull ever reports (flycheck) stays visible next to the
+/// excluded one.
+#[test]
+fn test_push_item_that_no_pull_reports_stays_visible_after_the_edit() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    let native = || with_source(error(1, "native"), "rust-analyzer");
+    let flycheck = with_source(error(5, "flycheck"), "rustc");
+    file.push_items(&mut cache, &server(), 1, vec![native(), flycheck]);
+    drop(file.pull_items(&mut cache, 1, vec![native()]));
+
+    file.set_version(2);
+    drop(file.pull_items(&mut cache, 2, vec![]));
+
+    assert_eq!(file.shown(&cache), ["flycheck"]);
+}
+
+/// Another server's publish for the new version arrives before the pull
+/// answers: it drops the pulled slot of the first server, whose coverage must
+/// survive that.
+#[test]
+fn test_another_servers_publish_does_not_lose_the_coverage_of_a_dropped_pull() {
+    let file = TrackedFile::new();
+    let other = ServerId::from_static("ruff");
+    file.open_at(1);
+    file.set_version_of(&other, 1);
+    let mut cache = file.cache();
+    let item = || with_source(error(1, "fixed"), "pyright");
+    file.push_items(&mut cache, &server(), 1, vec![item()]);
+    drop(file.pull_items(&mut cache, 1, vec![item()]));
+
+    file.set_version(2);
+    file.set_version_of(&other, 2);
+    file.push_items(
+        &mut cache,
+        &other,
+        2,
+        vec![with_source(error(7, "from ruff"), "ruff")],
+    );
+    drop(file.pull_items(&mut cache, 2, vec![]));
+
+    assert_eq!(file.shown(&cache), ["from ruff"]);
+    cache.assert_consistent();
+}
+
+/// The server's publish for the old version lands after the edit and after the
+/// pull for the new one: its items are known to be pull-reported by source.
+#[test]
+fn test_late_publish_for_the_old_version_is_hidden_by_its_learned_source() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    let item = || with_source(error(1, "fixed"), "pyright");
+    drop(file.pull_items(&mut cache, 1, vec![item()]));
+    file.set_version(2);
+    drop(file.pull_items(&mut cache, 2, vec![]));
+
+    file.push_items(&mut cache, &server(), 1, vec![item()]);
+
+    assert!(file.shown(&cache).is_empty());
+}
+
+/// No pull answered this file before the edit, but another file's pull taught
+/// the server's source: the first pull after the edit hides the stale push.
+#[test]
+fn test_first_pull_after_the_edit_uses_sources_learned_from_other_files() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    let other_file = Uri::from("file:///ws/other.rs");
+    drop(pull_for(
+        &mut cache,
+        &other_file,
+        1,
+        vec![with_source(error(3, "elsewhere"), "pyright")],
+    ));
+    file.push_items(
+        &mut cache,
+        &server(),
+        1,
+        vec![with_source(error(1, "fixed"), "pyright")],
+    );
+
+    file.set_version(2);
+    drop(file.pull_items(&mut cache, 2, vec![]));
+
+    assert!(file.shown(&cache).is_empty());
+}
+
+/// A failed pull leaves no slot at the synced version, so the latest push stays.
+#[test]
+fn test_without_a_pull_at_the_synced_version_the_push_stays() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    let item = || with_source(error(1, "kept"), "pyright");
+    file.push_items(&mut cache, &server(), 1, vec![item()]);
+    drop(file.pull_items(&mut cache, 1, vec![item()]));
+
+    file.set_version(2);
+
+    assert_eq!(file.shown(&cache), ["kept"]);
+}
+
+/// A push without a source that no earlier pull covered is the documented
+/// limit: it stays until the server republishes.
+#[test]
+fn test_uncovered_sourceless_push_stays_visible_until_republished() {
+    let file = TrackedFile::new();
+    file.open_at(1);
+    let mut cache = file.cache();
+    file.push_items(&mut cache, &server(), 1, vec![error(1, "stale")]);
+    file.set_version(2);
+    drop(file.pull_items(&mut cache, 2, vec![]));
+
+    assert_eq!(file.shown(&cache), ["stale"]);
+    file.push_items(&mut cache, &server(), 2, vec![]);
+    assert!(file.shown(&cache).is_empty());
+}
+
+#[test]
+fn test_server_clear_forgets_learned_pull_sources() {
+    let mut cache = NotificationCache::new();
+    drop(pull(
+        &mut cache,
+        vec![with_source(error(1, "x"), "pyright")],
+    ));
+    assert!(cache.pull_sources.contains_key(&server()));
+
+    drop(cache.clear_server_diagnostics(&server()));
+
+    assert!(cache.pull_sources.is_empty());
 }

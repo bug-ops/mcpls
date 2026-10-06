@@ -10,7 +10,7 @@ tags:
   - schema
   - error-handling
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -136,16 +136,16 @@ Priorities: `must` / `should` / `may`. "Tool parameters" means the type deserial
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN a `tools/call` `arguments` object contains a name that is not a declared parameter of the tool THE SYSTEM SHALL reject the call before any filesystem access, document synchronization or language-server request | must |
-| FR-002 | THE rejection SHALL name every unknown field and list the accepted field names of the object in which the unknown name appeared | must |
+| FR-002 | THE rejection SHALL name the first unknown field and list the accepted field names of the object in which it appeared. Only the first unknown field is named: serde reports the first failure and NFR-002 forbids scanning a `Value` for the rest | must |
 | FR-003 | THE rejection SHALL use the same error shape as the existing parameter deserialization failures (a tool-result error, `isError: true`, per [[mcp/011-client-path-boundary-parsing/spec\|mcp/011]] FR-004), so a client has one failure path for malformed arguments; the classification SHALL NOT be an internal error | must |
-| FR-004 | EVERY tool parameter type, including nested client-supplied object types, SHALL reject unknown fields at deserialization (`#[serde(deny_unknown_fields)]` or an equivalent typed mechanism), so no tool can opt out by omission | must |
+| FR-004 | EVERY tool parameter type, including nested client-supplied object types, SHALL reject unknown fields at deserialization (`#[serde(deny_unknown_fields)]` or an equivalent typed mechanism), so no tool can opt out by omission. `#[serde(flatten)]` is incompatible with it, so the eight flattening parameter types are explicit wire structs; the client-supplied hierarchy item is an input-only `HierarchyItemInput` (with `RangeInput` and `Position2DInput`) sharing the schema names of the output types, so no `outputSchema` is closed; its `data` stays open | must |
 | FR-005 | EVERY tool `inputSchema` SHALL declare `"additionalProperties": false` on its top-level object schema and on each nested object schema reachable from it that is built from client input | must |
 | FR-006 | THE advertised `additionalProperties: false` SHALL be derived from the same type attribute that enforces FR-004 (one source of truth), not added by hand per tool or by post-processing serialized JSON text | must |
 | FR-007 | THE change SHALL NOT alter any property name, `required` list, property type, enum value, nullability or description in any `inputSchema`; the only new keyword is `additionalProperties: false` | must |
-| FR-008 | THE `tools/list` payload SHALL remain within the total and per-tool budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (FR-001, FR-002); the added keyword is about 27 B per object schema and SHALL be accounted for in the measured figures | must |
+| FR-008 | THE `tools/list` payload SHALL remain within the budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (FR-001, FR-002); the added keyword is about 27 B per object schema and is accounted for in the measured figures. The total budget is raised by the user's decision from 135,000 B to 135,500 B: the measured total after #688, #705 and #700 is 135,143 B (43 keywords, +1,247 B), rounded up to the next 500 B; the per-tool (9,000 B) and description (35,000 B) budgets are unchanged | must |
 | FR-009 | THE system SHALL NOT accept aliases, near-miss spellings or legacy names for any parameter; the only accepted names are those in the schema. WHEN the rejected name is within a small edit distance of exactly one accepted name THE SYSTEM MAY add a "did you mean" hint to the message | may |
 | FR-010 | WHEN a declared optional parameter is present with the JSON value `null` THE SYSTEM SHALL treat it as absent exactly as before; the strict check applies to names, not to null values | must |
-| FR-011 | WHEN a name is unknown in a nested object (for example inside `context`) THE rejection SHALL identify the nested location, not only the top-level tool | should |
+| FR-011 | WHEN a name is unknown in a nested object (for example a hierarchy item) THE rejection SHALL name that field and the accepted fields of the nested object; it carries no JSON path, because rmcp's `from_value` discards the path and the typed error text is all that survives | should |
 | FR-012 | WHEN `restart_server` receives `server_ids` or any other unknown name THE SYSTEM SHALL report the unknown field first, before the "give `servers` or `all: true`" selection error | must |
 | FR-013 | THE system SHALL provide a unit test that, for every tool in `build_tool_router(None).list_all()`, asserts FR-005 on the `inputSchema` tree (top-level and every nested object schema), reporting tool name and JSON path for each violation | must |
 | FR-014 | THE system SHALL provide a regression test per reproduction in the Problem Statement (`get_code_actions` `kinds`, `workspace_symbol_search` `kind`, `restart_server` `server_ids`, `get_hover` extra property) that asserts the rejection, the field name in the message and that no language-server request was issued | must |
@@ -180,20 +180,20 @@ No new persistent data. Entities touched:
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| MCP client-added metadata `_meta` | Per the MCP specification `_meta` lives in the request `params` next to `name` and `arguments` (including `progressToken` and the per-request protocol metadata in [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp/003]]), not inside `arguments`; it is handled by the protocol layer and is unaffected. A `_meta` key placed inside `arguments` is an unknown name and is rejected; the message SHALL list the accepted fields so the client can move it [NEEDS CLARIFICATION: confirm against the rmcp version in use that `params._meta` and `progressToken` are consumed before the parameter type is deserialized, so a strict type never sees them] |
+| MCP client-added metadata `_meta` | Per the MCP specification `_meta` lives in the request `params` next to `name` and `arguments` (including `progressToken` and the per-request protocol metadata in [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp/003]]), not inside `arguments`; it is handled by the protocol layer and is unaffected. A `_meta` key placed inside `arguments` is an unknown name and is rejected; the message lists the accepted fields so the client can move it. Confirmed against rmcp 3.5.1: `CallToolRequestParams` carries `_meta`, `input_responses` and `request_state` as separate fields and only `arguments` reaches the parameter type (`test_request_meta_is_not_an_unknown_argument`) |
 | `$schema` key inside `arguments` | Not a parameter; rejected like any unknown name. A `$schema` key in the advertised `inputSchema` document itself is unchanged by this feature |
 | Client that echoes extra fields from a previous result back into arguments (for example `uri`, `kind`, `data`) | Rejected with the unknown field named; this is the intended break. The typed item inputs for hierarchy tools already declare the fields they accept and remain unchanged |
 | Client that always sends a fixed superset of arguments to every tool | Breaks by design; the client must send only declared names. Recorded as a breaking change (FR-016); backward compatibility is not a constraint before v1.0.0 |
-| Several unknown names in one call | All are named in one message (FR-002), not only the first |
-| Unknown name together with a bad value for a known name | One rejection; the unknown name is reported (serde reports the first failure, so the message SHALL still name the accepted fields) [NEEDS CLARIFICATION: is reporting only the first failure acceptable, or must the message aggregate every problem in the object] |
-| Unknown name inside a nested object (`context`, item input) | Rejected, with the nested location named (FR-011) |
+| Several unknown names in one call | Only the first is named (FR-002); the accepted fields are listed, so the client can fix the rest |
+| Unknown name together with a bad value for a known name | One rejection for the first failure serde meets; first-failure reporting is accepted (decided with FR-002) |
+| Unknown name inside a nested object (item input) | Rejected, naming the field and the accepted fields of that object, without a path (FR-011) |
 | Name differing only by case (`Kind_Filter`) | Unknown; rejected. Names are case-sensitive and there are no aliases (FR-009) |
 | Renamed parameter in a future release | The old name is unknown and rejected after the rename; no alias window is provided before v1.0.0, and the rename is recorded in `CHANGELOG.md` as a breaking change. After v1.0.0 a deprecation alias would be a separate spec |
 | Optional parameter set to `null` | Accepted as absent (FR-010) |
 | `get_tool_support` with no `file_path` or other optional name | Unchanged; strictness concerns undeclared names, not omitted optional ones |
 | Tool-name prefix configured | Only the tool `name` changes; strictness and schema keyword are identical |
 | Client strict about `additionalProperties` in schemas | Now sees the closed object, so a schema-validating client rejects the call locally; this is the intended benefit (US-002) |
-| Payload growth pushes a tool over the per-tool budget | The budget test of mcp/014 fails with measured and permitted bytes; the author trims descriptions or raises the constant in a reviewed change |
+| Payload growth pushes a tool over the per-tool budget | The budget test of mcp/014 fails with measured and permitted bytes; the author trims descriptions or raises the constant in a reviewed change. This change raised the total constant to 135,500 B (FR-008) |
 | `outputSchema` objects | Not closed by this feature; result types may gain fields compatibly |
 
 ## 7. Success Criteria
@@ -218,7 +218,7 @@ No new persistent data. Entities touched:
 - Update `CHANGELOG.md` with the breaking-change entry and the testing documents under `.local/testing/`.
 
 ### Ask First
-- Raising any mcp/014 budget constant to absorb the added keyword.
+- Raising any mcp/014 budget constant to absorb the added keyword (done once, with the user's approval: FR-008).
 - Adding an alias, a near-miss correction or a legacy name for any parameter (FR-009).
 - Closing `outputSchema` objects or any non-tool-argument type.
 - Accepting a specific undeclared key (for example `_meta` inside `arguments`) as a deliberate exception.
@@ -233,11 +233,12 @@ No new persistent data. Entities touched:
 ## 9. Open Questions
 
 > [!question] Open
-> - [NEEDS CLARIFICATION: should the rejection be a JSON-RPC `-32602` protocol error or the existing tool-result error (`isError: true`) used for other parameter deserialization failures? This spec chooses the existing shape (FR-003) because rmcp reports parameter deserialization failures that way (see mcp/011 FR-004); confirm that consistency outweighs the protocol-level classification.]
-> - [NEEDS CLARIFICATION: confirm that `params._meta`, `progressToken` and the per-request protocol metadata never reach the parameter deserializer under the rmcp version in use (edge case "MCP client-added metadata").]
-> - [NEEDS CLARIFICATION: first-failure only versus aggregated reporting when an object has both an unknown name and a bad value.]
-> - [NEEDS CLARIFICATION: should a "did you mean" hint (FR-009, may) be included, given that it adds a small edit-distance routine for an LLM-facing message?]
-> - [NEEDS CLARIFICATION: are there parameter types shared between tool arguments and tool results (for example item types echoed back) where closing the type would also close the result; if so, input and output views need separate types or a schema-only difference.]
+> [!success] Resolved
+> - The rejection is the existing tool-result error (`isError: true`), as rmcp reports every parameter deserialization failure (FR-003).
+> - `params._meta` and the other request-level fields never reach the parameter deserializer under rmcp 3.5.1 (edge case "MCP client-added metadata").
+> - First-failure reporting only; no aggregation (FR-002, FR-011).
+> - No "did you mean" hint (FR-009 stays unimplemented).
+> - Item types shared between tool arguments and results (`HierarchyItem`, `Range`, `Position2D`) have input-only twins with the same schema names, so the output schemas stay open (FR-004).
 
 ## 10. See Also
 

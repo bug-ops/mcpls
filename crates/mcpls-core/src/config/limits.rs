@@ -7,7 +7,105 @@ use std::num::{NonZeroU64, NonZeroUsize};
 
 use serde::{Deserialize, Serialize};
 
-use super::server::{DEFAULT_HEURISTICS_MAX_DEPTH, MAX_HEURISTICS_DEPTH};
+/// Default max depth for recursive marker search.
+pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
+
+/// Maximum allowed value, in seconds, for both [`super::LspServerConfig::timeout_seconds`]
+/// and [`super::LspServerConfig::request_timeout_seconds`], enforced by [`super::TimeoutSecs`].
+///
+/// tokio's `timeout`/`sleep` fall back to `Instant::far_future()` for
+/// astronomically large durations instead of panicking, so an unbounded value
+/// on either field (misconfiguration or typo) would silently disable the
+/// timeout rather than fail with a diagnosable error.
+///
+/// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
+/// retries a request up to 4 times total on a `-32802` (`ServerCancelled`) or
+/// `-32801` (`ContentModified`) response (one shared budget across both
+/// codes), so the worst-case latency for a single call bounded by this value
+/// is `4 * 900 + 3.5s` ≈ 1 hour, not 4 hours — this constant bounds one
+/// attempt, so it is chosen such that the actually-experienced worst case
+/// (the retried total) stays within about an hour.
+///
+/// [`LspClient::request`]: crate::lsp::LspClient::request
+pub const MAX_TIMEOUT_SECONDS: u64 = 900;
+
+/// Upper bound on `workspace.heuristics_max_depth`.
+///
+/// A guard against typos and misconfiguration (e.g. `999999`), not a bound on
+/// walk cost: the recursive project-marker walk in
+/// `MarkerScan::collect` does not follow links, so
+/// its cost is bounded by the size of the tree regardless of this value.
+/// 64 is several times the default of 10 and well beyond any realistic
+/// project nesting.
+pub const MAX_HEURISTICS_DEPTH: usize = 64;
+
+/// Why a value is not a valid [`ServerStartConcurrency`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("max_concurrent_server_starts must be at least 1")]
+pub struct InvalidServerStartConcurrency;
+
+/// How many LSP servers may be starting at the same time.
+///
+/// A fixed default keeps a generated configuration machine-independent.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerStartConcurrency;
+///
+/// assert!(ServerStartConcurrency::new(0).is_err());
+/// assert_eq!(ServerStartConcurrency::new(2).unwrap().get(), 2);
+/// assert_eq!(ServerStartConcurrency::default(), ServerStartConcurrency::DEFAULT);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "usize", into = "usize")]
+pub struct ServerStartConcurrency(NonZeroUsize);
+
+impl ServerStartConcurrency {
+    /// Eight servers at a time.
+    pub const DEFAULT: Self = match Self::new(8) {
+        Ok(limit) => limit,
+        Err(_) => panic!("the default concurrency must be non-zero"),
+    };
+
+    /// Builds a limit.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidServerStartConcurrency`] for zero.
+    pub const fn new(limit: usize) -> Result<Self, InvalidServerStartConcurrency> {
+        match NonZeroUsize::new(limit) {
+            Some(limit) => Ok(Self(limit)),
+            None => Err(InvalidServerStartConcurrency),
+        }
+    }
+
+    /// The wrapped limit, at least 1.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for ServerStartConcurrency {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl TryFrom<usize> for ServerStartConcurrency {
+    type Error = InvalidServerStartConcurrency;
+
+    fn try_from(limit: usize) -> Result<Self, Self::Error> {
+        Self::new(limit)
+    }
+}
+
+impl From<ServerStartConcurrency> for usize {
+    fn from(limit: ServerStartConcurrency) -> Self {
+        limit.get()
+    }
+}
 
 /// Why a number is not a valid [`SearchDepth`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,9 +290,15 @@ impl SizeLimit {
     #[must_use]
     pub const fn read_cap(self) -> u64 {
         match self.0 {
-            Some(max) => max.get().saturating_add(1),
+            Some(max) => Self::read_cap_for(max),
             None => u64::MAX,
         }
+    }
+
+    /// [`Self::read_cap`] of a limit of `max` bytes.
+    #[must_use]
+    pub(crate) const fn read_cap_for(max: NonZeroU64) -> u64 {
+        max.get().saturating_add(1)
     }
 }
 
@@ -426,6 +530,21 @@ mod tests {
         assert!(limit.admits(4));
         assert!(!limit.admits(5));
         assert!(SizeLimit::UNLIMITED.admits(u64::MAX));
+    }
+
+    #[test]
+    fn test_read_cap_for_is_the_limit_plus_one_and_saturates() {
+        assert_eq!(SizeLimit::read_cap_for(NonZeroU64::new(100).unwrap()), 101);
+        assert_eq!(SizeLimit::read_cap_for(NonZeroU64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_server_start_concurrency_rejects_zero_with_a_typed_error() {
+        assert_eq!(
+            ServerStartConcurrency::new(0),
+            Err(InvalidServerStartConcurrency)
+        );
+        assert_eq!(ServerStartConcurrency::new(3).unwrap().get(), 3);
     }
 
     #[test]

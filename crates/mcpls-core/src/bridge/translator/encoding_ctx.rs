@@ -2,6 +2,7 @@
 //! UTF-16 columns and an LSP server's negotiated encoding.
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -35,6 +36,12 @@ const LINE_READ_BUDGET_FILE_MULTIPLE: u64 = 4;
 /// whatever `max_file_size` is configured to.
 const LINE_READ_BUDGET_CEILING: u64 = 256 * 1024 * 1024;
 
+/// [`SizeLimit::DEFAULT`] as a bound, checked at compile time to be finite.
+const DEFAULT_FILE_SIZE: NonZeroU64 = match SizeLimit::DEFAULT.get() {
+    Some(default) => default,
+    None => panic!("SizeLimit::DEFAULT must be bounded"),
+};
+
 /// Per-response disk-read budget derived from the tracker's configured
 /// limits (#489): [`LINE_READ_BUDGET_FILE_MULTIPLE`] times
 /// `max_file_size`, so a deployment that raises the single-file limit gets a
@@ -48,10 +55,7 @@ const LINE_READ_BUDGET_CEILING: u64 = 256 * 1024 * 1024;
 const fn line_read_budget(limits: ResourceLimits) -> u64 {
     let basis = match limits.max_file_size.get() {
         Some(max) => max.get(),
-        None => match SizeLimit::DEFAULT.get() {
-            Some(default) => default.get(),
-            None => 0,
-        },
+        None => DEFAULT_FILE_SIZE.get(),
     };
     let budget = basis.saturating_mul(LINE_READ_BUDGET_FILE_MULTIPLE);
     if budget > LINE_READ_BUDGET_CEILING {

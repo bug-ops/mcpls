@@ -1,6 +1,5 @@
 //! Driving mcpls over MCP stdio and recording timed samples (`mcpls-bench run`).
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,8 +32,8 @@ use crate::target::{ProbeCall, Target};
 
 const READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const LSP_TIMEOUT_SECS: TimeoutSecs = match TimeoutSecs::new(60) {
-    Some(secs) => secs,
-    None => panic!("the LSP timeout must be in range"),
+    Ok(secs) => secs,
+    Err(_) => panic!("the LSP timeout must be in range"),
 };
 
 /// Options of one `run` invocation.
@@ -95,7 +94,7 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Res
         language_id: scenario.server.language_id.clone(),
         command: ServerCommand::new(server_path.to_string_lossy().into_owned())?.into(),
         args: scenario.server.args.clone(),
-        env: HashMap::new(),
+        env: mcpls_core::config::ServerEnv::default(),
         file_patterns,
         initialization_options: None,
         settings: None,

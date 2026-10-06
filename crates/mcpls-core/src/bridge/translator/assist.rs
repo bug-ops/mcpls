@@ -1,9 +1,7 @@
 //! Completions, signature help, and inlay hints handlers.
 
 use lsp_types::{
-    CompletionParams, CompletionTriggerKind, InlayHintParams, PartialResultParams,
-    SignatureHelpParams as LspSignatureHelpParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams,
+    CompletionTriggerKind, InlayHintParams, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use super::Translator;
@@ -12,10 +10,10 @@ use super::dto::{
     SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
 use super::navigation::ItemBudget;
+use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
-use crate::bridge::{ClientPath, Indexed, IndexingSignal};
-use crate::config::ServerId;
+use crate::bridge::{ClientPath, Indexed};
 use crate::error::{Error, Result};
 
 /// Extract hover contents as markdown string.
@@ -130,31 +128,6 @@ fn validate_completions_params(trigger: Option<&str>) -> Result<()> {
 }
 
 impl Translator {
-    /// Runs `request`, sampling the indexing state of `server_id` before and
-    /// after so a read that overlapped indexing is flagged even when indexing
-    /// ends mid-request.
-    ///
-    /// Samples nothing (not indexing) for a translator without a notification
-    /// cache. Never waits: ungated tools disclose the state rather than gate on
-    /// it (#668).
-    pub(super) async fn sampled_indexing<T>(
-        &self,
-        server_id: &ServerId,
-        request: impl Future<Output = Result<T>>,
-    ) -> Result<(T, IndexingSignal)> {
-        let before = self.sample_indexing(server_id).await;
-        let response = request.await?;
-        let after = self.sample_indexing(server_id).await;
-        Ok((response, before.union(after)))
-    }
-
-    async fn sample_indexing(&self, server_id: &ServerId) -> IndexingSignal {
-        match &self.notification_cache {
-            Some(cache) => IndexingSignal::sample(&*cache.lock().await, Some(server_id)),
-            None => IndexingSignal::default(),
-        }
-    }
-
     /// Handle completions request.
     ///
     /// # Errors
@@ -171,35 +144,23 @@ impl Translator {
     ) -> Result<CompletionsResult> {
         validate_completions_params(trigger.as_deref())?;
 
-        let doc = self
-            .prepare_positioned_document(
-                &file_path,
-                Capability::Completions,
-                IndexingGate::Required,
-                &[position],
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
             trigger_character: Some(trigger_char),
         });
 
-        let params = CompletionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-            context,
-        };
-
-        let response = client
-            .request_typed::<lsp_types::CompletionRequest>(params, client.completion_timeout())
+        let Positioned {
+            result: response,
+            ctx,
+            doc: _doc,
+        } = self
+            .position_request::<lsp_types::CompletionRequest>(
+                &file_path,
+                position,
+                Capability::Completions,
+                IndexingGate::Required,
+                context,
+            )
             .await?;
 
         let items = match response {
@@ -241,34 +202,20 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<Indexed<SignatureHelpResult>> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result:
+                Indexed {
+                    result: response,
+                    indexing,
+                },
+            ctx,
+            doc: _doc,
+        } = self
+            .disclosed_position_request::<lsp_types::SignatureHelpRequest>(
                 &file_path,
+                position,
                 Capability::SignatureHelp,
-                IndexingGate::NotRequired,
-                &[position],
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = LspSignatureHelpParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            context: None,
-        };
-
-        let (response, indexing) = self
-            .sampled_indexing(
-                server_id,
-                client.request_typed::<lsp_types::SignatureHelpRequest>(
-                    params,
-                    client.request_timeout(),
-                ),
+                (),
             )
             .await?;
 
@@ -321,42 +268,30 @@ impl Translator {
     ) -> Result<Indexed<InlayHintsResult>> {
         let (start, end) = (range.start(), range.end());
         let doc = self
-            .prepare_positioned_document(
-                &file_path,
-                Capability::InlayHints,
-                IndexingGate::NotRequired,
-                &[start, end],
-            )
+            .prepare_disclosed_document(&file_path, Capability::InlayHints, &[start, end])
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let lsp_start = ctx.to_lsp(uri, start).await;
-        let lsp_end = ctx.to_lsp(uri, end).await;
+        let uri = doc.uri();
+        let ctx = self.encoding_ctx(doc.server_id());
 
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             range: lsp_types::Range {
-                start: lsp_start,
-                end: lsp_end,
+                start: ctx.to_lsp(uri, start).await,
+                end: ctx.to_lsp(uri, end).await,
             },
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let (response, indexing) = self
-            .sampled_indexing(
-                server_id,
-                client
-                    .request_typed::<lsp_types::InlayHintRequest>(params, client.request_timeout()),
-            )
-            .await?;
+        let Indexed {
+            result: response,
+            indexing,
+        } = doc.request::<lsp_types::InlayHintRequest>(params).await?;
 
         let mut budget = ItemBudget::new();
         let lsp_hints = budget.admit(response.unwrap_or_default());
         let mut hints = Vec::with_capacity(lsp_hints.len());
         for hint in lsp_hints {
-            let position = ctx.to_mcp(&response_uri, hint.position).await;
+            let position = ctx.to_mcp(uri, hint.position).await;
             let label = match hint.label {
                 lsp_types::Label::String(s) => s,
                 lsp_types::Label::InlayHintLabelPartList(parts) => parts
@@ -395,7 +330,9 @@ mod tests {
     use std::{assert_matches, fs};
 
     use super::*;
+    use crate::bridge::IndexingSignal;
     use crate::bridge::translator::testing::*;
+    use crate::config::ServerId;
     use crate::test_lsp::client_path;
 
     /// #309 M3: `trigger` has no cap of its own even though the LSP spec

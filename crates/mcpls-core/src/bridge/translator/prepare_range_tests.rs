@@ -505,7 +505,7 @@ async fn an_untracked_document_passes_the_line_check() {
         .prepare_gated_document(
             &client_path(path.to_string_lossy().into_owned()),
             Capability::PrepareRename,
-            IndexingGate::NotRequired,
+            IndexingGate::FileLocal,
         )
         .await
         .unwrap();
@@ -591,7 +591,7 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::new(name.to_string()).unwrap().into(),
         args: vec![],
-        env: std::collections::HashMap::new(),
+        env: crate::config::ServerEnv::default(),
         file_patterns: vec![],
         initialization_options: None,
         settings: None,

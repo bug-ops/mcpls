@@ -50,6 +50,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
+
+    // Loaded before the runtime exists: it reads and may create files, which
+    // must not run on an async worker.
+    let config = match load_config(&args, config_origin, &trust) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::error!(error = ?err, "mcpls exited with an error");
+            std::process::exit(Outcome::Failure.exit_code());
+        }
+    };
+
+    let transport = transport(&args);
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -64,7 +78,7 @@ fn main() {
     // Route fatal errors through the tracing subscriber (rather than the
     // default `Result` `Termination` printer) so they honor --log-json too.
     let outcome = block_on_guarded(runtime, async {
-        match run(args, trust, config_origin).await {
+        match run(config, transport).await {
             Ok(()) => Outcome::Success,
             Err(err) => {
                 tracing::error!(error = ?err, "mcpls exited with an error");
@@ -104,42 +118,49 @@ fn http_config(args: &Args, bind: std::net::SocketAddr) -> mcpls_core::HttpConfi
         .with_allowed_hosts(args.allowed_hosts())
 }
 
-async fn run(args: Args, trust: WorkspaceTrust, config_origin: ConfigOrigin) -> Result<()> {
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
+/// Loads the configuration. In untrusted mode the file that was actually loaded
+/// must lie outside the workspace, whichever way it was found.
+fn load_config(
+    args: &Args,
+    config_origin: ConfigOrigin,
+    trust: &WorkspaceTrust,
+) -> Result<mcpls_core::ServerConfig> {
+    args.config.as_ref().map_or_else(
+        || {
+            let project_trust = if args.trust_project_config {
+                ProjectConfigTrust::Trusted
+            } else {
+                ProjectConfigTrust::Untrusted
+            };
+            mcpls_core::ServerConfig::load_discovered(project_trust, trust)
+                .context("failed to load configuration")
+        },
+        |config_path| {
+            mcpls_core::ServerConfig::load_explicit(config_path, config_origin, trust)
+                .with_context(|| format!("failed to load config from {}", config_path.display()))
+        },
+    )
+}
 
-    // Load configuration. In untrusted mode the file that was actually loaded
-    // must lie outside the workspace, whichever way it was found.
-    let config = if let Some(config_path) = &args.config {
-        mcpls_core::ServerConfig::load_explicit(config_path, config_origin, &trust)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?
-    } else {
-        let project_trust = if args.trust_project_config {
-            ProjectConfigTrust::Trusted
-        } else {
-            ProjectConfigTrust::Untrusted
-        };
-        mcpls_core::ServerConfig::load_discovered(project_trust, &trust)
-            .context("failed to load configuration")?
-    };
+/// The transport selected by the command line.
+#[cfg(feature = "transport-http")]
+fn transport(args: &Args) -> mcpls_core::Transport {
+    args.listen.map_or(mcpls_core::Transport::Stdio, |bind| {
+        mcpls_core::Transport::Http(http_config(args, bind))
+    })
+}
 
+/// The transport selected by the command line.
+#[cfg(not(feature = "transport-http"))]
+const fn transport(_args: &Args) -> mcpls_core::Transport {
+    mcpls_core::Transport::Stdio
+}
+
+async fn run(config: mcpls_core::ServerConfig, transport: mcpls_core::Transport) -> Result<()> {
     tracing::debug!(
         lsp_servers = config.lsp_servers.len(),
         "configuration loaded"
     );
-
-    // Select transport based on CLI flags.
-    let transport = {
-        #[cfg(feature = "transport-http")]
-        {
-            args.listen.map_or(mcpls_core::Transport::Stdio, |bind| {
-                mcpls_core::Transport::Http(http_config(&args, bind))
-            })
-        }
-        #[cfg(not(feature = "transport-http"))]
-        {
-            mcpls_core::Transport::Stdio
-        }
-    };
 
     mcpls_core::serve_with(config, transport)
         .await

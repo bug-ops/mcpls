@@ -3,21 +3,53 @@
 //! A kind filter reaches the tool boundary as text. [`KindFilterInput`] turns
 //! it into a closed value there, case-insensitively, so everything past the
 //! boundary holds a typed kind and sends it in its canonical spelling.
-//! Deserialization never fails on the text itself: an unknown spelling becomes
-//! [`KindFilterInput::Rejected`], and [`KindFilterInput::into_known`] turns it
-//! into the invalid-params error, so a bad filter keeps the error class it
-//! always had instead of becoming a generic deserialization failure.
+//! Deserialization never fails on the text itself: an unknown or over-long
+//! spelling becomes [`KindFilterInput::Rejected`], and
+//! [`KindFilterInput::into_known`] turns it into the invalid-params error, so
+//! every kind filter input fails the same way, with the same casing rules and a
+//! bounded message, instead of as a generic deserialization failure.
 
 use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize, Serializer};
 
+use super::addressing::MAX_SYMBOL_NAME_BYTES;
 use crate::error::Error;
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
 
+pub(super) mod sealed {
+    /// Keeps [`super::KindFilter`] implementable only inside this crate.
+    pub trait Sealed {}
+}
+
+/// The tool input a kind filter arrives in, named in rejection messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindFilterField {
+    /// `kind_filter` of `workspace_symbol_search` and `get_code_actions`.
+    KindFilter,
+    /// `symbol_kind` of an addressed tool.
+    SymbolKind,
+    /// `kind` of `get_folding_ranges`.
+    Kind,
+}
+
+impl KindFilterField {
+    /// The input's name on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KindFilter => "kind_filter",
+            Self::SymbolKind => "symbol_kind",
+            Self::Kind => "kind",
+        }
+    }
+}
+
 /// A closed set of kinds a filter can name.
-pub trait KindFilter: Copy {
+///
+/// Sealed: only the filters of this crate implement it.
+pub trait KindFilter: sealed::Sealed + Copy {
     /// The schema name of the filter type.
     const SCHEMA_NAME: &'static str;
 
@@ -27,16 +59,15 @@ pub trait KindFilter: Copy {
     /// The spelling sent on to the server.
     fn canonical(self) -> Cow<'static, str>;
 
-    /// The message of the invalid-params error for a spelling that names no
-    /// kind.
-    fn rejection_message(rejected: &str) -> String;
+    /// The spellings a rejection message offers instead.
+    fn valid_values() -> String;
 
     /// The JSON schema of the accepted spellings.
     fn schema() -> Schema;
 }
 
 /// A `kind_filter` spelling that names no known kind, kept as written for the
-/// error message.
+/// error message; at most [`MAX_SYMBOL_NAME_BYTES`] long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectedKindFilter(String);
 
@@ -48,31 +79,58 @@ impl RejectedKindFilter {
     }
 }
 
-/// A `kind_filter` tool input: a known kind, or the spelling that named none.
+/// Why a kind filter spelling was not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rejection {
+    /// The spelling is longer than [`MAX_SYMBOL_NAME_BYTES`]; it is not kept.
+    TooLong {
+        /// The spelling's length in bytes.
+        len: usize,
+    },
+    /// The spelling names no kind.
+    Unknown(RejectedKindFilter),
+}
+
+/// A `kind_filter` tool input: a known kind, or the reason it named none.
 ///
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::bridge::{CodeActionKindFilter, KindFilterInput};
+/// use mcpls_core::bridge::{CodeActionKindFilter, KindFilterField, KindFilterInput};
 ///
 /// let input = KindFilterInput::<CodeActionKindFilter>::from("QuickFix".to_owned());
-/// assert_eq!(input.into_known().unwrap(), CodeActionKindFilter::QuickFix);
+/// assert_eq!(
+///     input.into_known(KindFilterField::KindFilter).unwrap(),
+///     CodeActionKindFilter::QuickFix
+/// );
 ///
 /// let bad = KindFilterInput::<CodeActionKindFilter>::from("nope".to_owned());
-/// assert!(bad.into_known().is_err());
+/// assert!(bad.into_known(KindFilterField::KindFilter).is_err());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(from = "String", bound(deserialize = "K: KindFilter"))]
 pub enum KindFilterInput<K> {
     /// The text named this kind.
     Known(K),
-    /// The text named no kind.
-    Rejected(RejectedKindFilter),
+    /// The text was refused.
+    Rejected(Rejection),
 }
 
 impl<K: KindFilter> From<String> for KindFilterInput<K> {
     fn from(text: String) -> Self {
-        K::parse(&text).map_or_else(|| Self::Rejected(RejectedKindFilter(text)), Self::Known)
+        if text.len() > MAX_SYMBOL_NAME_BYTES {
+            return Self::Rejected(Rejection::TooLong { len: text.len() });
+        }
+        K::parse(&text).map_or_else(
+            || Self::Rejected(Rejection::Unknown(RejectedKindFilter(text))),
+            Self::Known,
+        )
+    }
+}
+
+impl<K: Default> Default for KindFilterInput<K> {
+    fn default() -> Self {
+        Self::Known(K::default())
     }
 }
 
@@ -81,12 +139,19 @@ impl<K: KindFilter> KindFilterInput<K> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidToolParams`] naming the spelling and the valid kinds.
-    pub fn into_known(self) -> Result<K, Error> {
+    /// [`Error::InvalidToolParams`] naming `field`, the spelling (unless it is
+    /// over-long) and the valid kinds.
+    pub fn into_known(self, field: KindFilterField) -> Result<K, Error> {
+        let field = field.as_str();
         match self {
             Self::Known(kind) => Ok(kind),
-            Self::Rejected(rejected) => Err(Error::InvalidToolParams(K::rejection_message(
+            Self::Rejected(Rejection::TooLong { len }) => Err(Error::InvalidToolParams(format!(
+                "`{field}` is too long: {len} bytes, at most {MAX_SYMBOL_NAME_BYTES}"
+            ))),
+            Self::Rejected(Rejection::Unknown(rejected)) => Err(Error::InvalidToolParams(format!(
+                "Invalid {field}: '{}'. Valid values: {}",
                 rejected.as_str(),
+                K::valid_values()
             ))),
         }
     }
@@ -96,7 +161,10 @@ impl<K: KindFilter> Serialize for KindFilterInput<K> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Known(kind) => serializer.serialize_str(&kind.canonical()),
-            Self::Rejected(rejected) => serializer.serialize_str(rejected.as_str()),
+            Self::Rejected(Rejection::Unknown(rejected)) => {
+                serializer.serialize_str(rejected.as_str())
+            }
+            Self::Rejected(Rejection::TooLong { .. }) => serializer.serialize_str(""),
         }
     }
 }
@@ -173,6 +241,8 @@ impl CodeActionKindFilter {
     }
 }
 
+impl sealed::Sealed for CodeActionKindFilter {}
+
 impl KindFilter for CodeActionKindFilter {
     const SCHEMA_NAME: &'static str = "CodeActionKindFilter";
 
@@ -186,11 +256,8 @@ impl KindFilter for CodeActionKindFilter {
         Cow::Borrowed(self.as_str())
     }
 
-    fn rejection_message(rejected: &str) -> String {
-        format!(
-            "Invalid kind_filter: '{rejected}'. Valid values: {:?}",
-            Self::spellings()
-        )
+    fn valid_values() -> String {
+        format!("{:?}", Self::spellings())
     }
 
     fn schema() -> Schema {
@@ -224,6 +291,8 @@ impl SymbolKindFilter {
     }
 }
 
+impl sealed::Sealed for SymbolKindFilter {}
+
 impl KindFilter for SymbolKindFilter {
     const SCHEMA_NAME: &'static str = "SymbolKindFilter";
 
@@ -244,10 +313,9 @@ impl KindFilter for SymbolKindFilter {
         Cow::Owned(u32::from(self.0).to_string())
     }
 
-    fn rejection_message(rejected: &str) -> String {
+    fn valid_values() -> String {
         format!(
-            "Invalid kind_filter: '{rejected}'. Valid values: {:?}, or the numeric LSP \
-             SymbolKind value",
+            "{:?}, or the numeric LSP SymbolKind value",
             Self::spellings()
         )
     }
@@ -267,6 +335,8 @@ mod tests {
     type CodeAction = KindFilterInput<CodeActionKindFilter>;
     type Symbol = KindFilterInput<SymbolKindFilter>;
 
+    const FIELD: KindFilterField = KindFilterField::KindFilter;
+
     #[test]
     fn test_code_action_kinds_parse_in_any_case_and_send_canonically() {
         for (written, expected) in [
@@ -282,7 +352,9 @@ mod tests {
             ),
             ("refactor.EXTRACT", CodeActionKindFilter::RefactorExtract),
         ] {
-            let kind = CodeAction::from(written.to_owned()).into_known().unwrap();
+            let kind = CodeAction::from(written.to_owned())
+                .into_known(FIELD)
+                .unwrap();
             assert_eq!(kind, expected, "{written}");
         }
         assert_eq!(
@@ -294,7 +366,7 @@ mod tests {
     #[test]
     fn test_an_unknown_code_action_kind_is_invalid_params_naming_the_valid_ones() {
         let err = CodeAction::from("bogus".to_owned())
-            .into_known()
+            .into_known(FIELD)
             .unwrap_err();
         let Error::InvalidToolParams(message) = err else {
             panic!("expected InvalidToolParams, got {err:?}");
@@ -316,9 +388,47 @@ mod tests {
         let rejected: CodeAction = serde_json::from_str("\"nope\"").unwrap();
         assert_eq!(
             rejected,
-            KindFilterInput::Rejected(RejectedKindFilter("nope".to_owned()))
+            KindFilterInput::Rejected(Rejection::Unknown(RejectedKindFilter("nope".to_owned())))
         );
         assert!(serde_json::from_str::<CodeAction>("3").is_err());
+    }
+
+    #[test]
+    fn test_an_over_long_spelling_is_rejected_without_being_echoed() {
+        let long = "x".repeat(MAX_SYMBOL_NAME_BYTES + 1);
+        for field in [
+            KindFilterField::KindFilter,
+            KindFilterField::SymbolKind,
+            KindFilterField::Kind,
+        ] {
+            let err = Symbol::from(long.clone()).into_known(field).unwrap_err();
+            let Error::InvalidToolParams(message) = err else {
+                panic!("expected InvalidToolParams, got {err:?}");
+            };
+            assert!(message.contains(field.as_str()), "{message}");
+            assert!(message.contains("too long"), "{message}");
+            assert!(!message.contains(&long), "{message}");
+        }
+        let at_cap = "x".repeat(MAX_SYMBOL_NAME_BYTES);
+        let message = match Symbol::from(at_cap).into_known(FIELD).unwrap_err() {
+            Error::InvalidToolParams(message) => message,
+            other => panic!("expected InvalidToolParams, got {other:?}"),
+        };
+        assert!(message.starts_with("Invalid kind_filter: '"), "{message}");
+    }
+
+    #[test]
+    fn test_the_rejection_names_the_input_it_came_from() {
+        let err = Symbol::from("nope".to_owned())
+            .into_known(KindFilterField::SymbolKind)
+            .unwrap_err();
+        let Error::InvalidToolParams(message) = err else {
+            panic!("expected InvalidToolParams, got {err:?}");
+        };
+        assert!(
+            message.starts_with("Invalid symbol_kind: 'nope'"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -343,12 +453,14 @@ mod tests {
 
     #[test]
     fn test_symbol_kinds_accept_names_case_insensitively_and_numbers() {
-        let by_name = Symbol::from("enummember".to_owned()).into_known().unwrap();
+        let by_name = Symbol::from("enummember".to_owned())
+            .into_known(FIELD)
+            .unwrap();
         assert_eq!(by_name.kind(), lsp_types::SymbolKind::EnumMember);
         assert_eq!(by_name.canonical(), "22");
-        let by_number = Symbol::from("22".to_owned()).into_known().unwrap();
+        let by_number = Symbol::from("22".to_owned()).into_known(FIELD).unwrap();
         assert_eq!(by_number, by_name);
-        let custom = Symbol::from("4000".to_owned()).into_known().unwrap();
+        let custom = Symbol::from("4000".to_owned()).into_known(FIELD).unwrap();
         assert_eq!(custom.canonical(), "4000");
     }
 
@@ -357,17 +469,17 @@ mod tests {
     fn test_only_plain_digits_are_a_numeric_symbol_kind() {
         for rejected in ["+5", "-5", " 5", "5 ", "", "4294967296"] {
             assert!(
-                Symbol::from(rejected.to_owned()).into_known().is_err(),
+                Symbol::from(rejected.to_owned()).into_known(FIELD).is_err(),
                 "{rejected:?}"
             );
         }
-        assert!(Symbol::from("007".to_owned()).into_known().is_ok());
+        assert!(Symbol::from("007".to_owned()).into_known(FIELD).is_ok());
     }
 
     #[test]
     fn test_an_unknown_symbol_kind_is_invalid_params() {
         let err = Symbol::from("NotAKind".to_owned())
-            .into_known()
+            .into_known(FIELD)
             .unwrap_err();
         let Error::InvalidToolParams(message) = err else {
             panic!("expected InvalidToolParams, got {err:?}");
@@ -382,19 +494,13 @@ mod tests {
     fn test_rejection_messages_list_exactly_the_schema_spellings() {
         let code_actions = CodeActionKindFilter::schema();
         let listed = code_actions.as_value()["enum"].clone();
-        let message = CodeActionKindFilter::rejection_message("x");
-        assert!(
-            message.ends_with(&format!("Valid values: {}", debug_list(&listed))),
-            "{message}"
-        );
+        let message = CodeActionKindFilter::valid_values();
+        assert_eq!(message, debug_list(&listed));
 
         let symbols = SymbolKindFilter::schema();
         let listed = symbols.as_value()["anyOf"][0]["enum"].clone();
-        let message = SymbolKindFilter::rejection_message("x");
-        assert!(
-            message.contains(&format!("Valid values: {}", debug_list(&listed))),
-            "{message}"
-        );
+        let message = SymbolKindFilter::valid_values();
+        assert!(message.starts_with(&debug_list(&listed)), "{message}");
     }
 
     fn debug_list(values: &serde_json::Value) -> String {

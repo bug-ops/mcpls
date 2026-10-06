@@ -1,24 +1,26 @@
 //! Diagnostics pump: drains one LSP server's notification lanes into the
 //! shared cache and fans publications out to subscribed MCP sessions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{
     self, DiagnosticsRole, IndexingReset, NotificationCache, Publication, PublicationKind,
-    PublishedPathResolver, WorkspaceRoots,
+    PublishedPathResolver, PushWrite, WorkspaceRoots,
 };
 use crate::config::ServerId;
-use crate::lsp::LspNotification;
+use crate::lsp::{
+    LostPublishes, LspNotification, NotificationInbox, PublishDelivery, PublishReader,
+};
 use crate::mcp::SubscriptionRegistry;
-use crate::util::catch_panic;
+use crate::util::{catch_panic, lock_std};
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
@@ -35,19 +37,142 @@ pub struct PumpShared {
     /// misbehaving server could otherwise flush the FIFO-capped cache with
     /// fabricated URIs.
     pub(crate) workspace_roots: WorkspaceRoots,
+    /// The role of every server's pump, so a recomputed role reaches the pump
+    /// that is live, including one started for a respawned server.
+    pub(crate) roles: DiagnosticsRoles,
+}
+
+/// The role of every server's pump, one `watch` sender per server.
+///
+/// The sender outlives any one pump: a pump started for a respawned or
+/// restarted server subscribes to the same sender, so a role recomputed while
+/// servers settle reaches whichever pump is live.
+#[derive(Clone, Default)]
+pub struct DiagnosticsRoles(Arc<StdMutex<HashMap<ServerId, watch::Sender<DiagnosticsRole>>>>);
+
+impl DiagnosticsRoles {
+    /// A receiver of `id`'s role. The sender keeps the role it has: a pump that
+    /// starts later follows the role the startup recomputation maintains, and
+    /// `role` only seeds a server that has none yet.
+    pub(crate) fn subscribe(
+        &self,
+        id: &ServerId,
+        role: DiagnosticsRole,
+    ) -> watch::Receiver<DiagnosticsRole> {
+        let mut senders = lock_std(&self.0);
+        let sender = senders
+            .entry(id.clone())
+            .or_insert_with(|| watch::channel(role).0);
+        let receiver = sender.subscribe();
+        drop(senders);
+        receiver
+    }
+
+    /// The current role of `id`, if a pump was ever started for it.
+    #[cfg(test)]
+    pub(crate) fn get(&self, id: &ServerId) -> Option<DiagnosticsRole> {
+        lock_std(&self.0).get(id).map(|sender| *sender.borrow())
+    }
+
+    /// Sets `id`'s role if a pump was ever started for it.
+    pub(crate) fn set(&self, id: &ServerId, role: DiagnosticsRole) {
+        if let Some(sender) = lock_std(&self.0).get(id) {
+            sender.send_if_modified(|current| {
+                let changed = *current != role;
+                *current = role;
+                changed
+            });
+        }
+    }
+}
+
+impl std::fmt::Debug for DiagnosticsRoles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiagnosticsRoles").finish_non_exhaustive()
+    }
+}
+
+/// What a pump still reads; a source is `None` once it has closed.
+struct PumpInputs {
+    messages: Option<mpsc::Receiver<LspNotification>>,
+    publishes: Option<PublishReader>,
+    lifecycle: Option<mpsc::Receiver<LspNotification>>,
+}
+
+impl PumpInputs {
+    const fn all_closed(&self) -> bool {
+        self.messages.is_none() && self.publishes.is_none() && self.lifecycle.is_none()
+    }
+}
+
+/// Next frame of `source`; `None` when it just closed (and is dropped), and
+/// pending forever once it was.
+async fn recv_open(
+    source: &mut Option<mpsc::Receiver<LspNotification>>,
+) -> Option<LspNotification> {
+    let Some(receiver) = source else {
+        return std::future::pending().await;
+    };
+    let frame = receiver.recv().await;
+    if frame.is_none() {
+        *source = None;
+    }
+    frame
+}
+
+/// Next delivery of the mailbox in `source`, with [`recv_open`]'s closing rule.
+async fn recv_publish(source: &mut Option<PublishReader>) -> Option<PublishDelivery> {
+    let Some(reader) = source else {
+        return std::future::pending().await;
+    };
+    let delivery = reader.recv().await;
+    if delivery.is_none() {
+        *source = None;
+    }
+    delivery
+}
+
+/// Whether a pump keeps going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
+}
+
+/// A drained notification and whether its path is resolved first.
+enum BatchItem {
+    /// An admitted publication: its path is resolved before it is applied.
+    Resolve(LspNotification),
+    /// Anything else: applied as it is.
+    Skip(LspNotification),
+}
+
+/// Everything one server's pump needs besides what it reads.
+struct Pump {
+    server_id: ServerId,
+    cancel: CancellationToken,
+    role_rx: watch::Receiver<DiagnosticsRole>,
+    pinned_tsserver: Option<PathBuf>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    subs: SubscriptionRegistry,
+    workspace_roots: WorkspaceRoots,
+    resolver: PublishedPathResolver,
 }
 
 /// Background task that drains LSP notifications, writes them to the cache,
 /// and queues `resources/updated` for each MCP session subscribed to the URI.
 ///
-/// Selects over two independent lanes (P3) rather than one: `rx` carries
-/// diagnostics/log/showMessage, `lifecycle_rx` carries `$/progress`
-/// `begin`/`end` frames and `Other` (which carries e.g. rust-analyzer's
-/// `experimental/serverStatus`). Splitting them means a high-volume
-/// diagnostics publisher (rust-analyzer republishing whole-workspace
-/// diagnostics on every save) can never starve out a low-volume readiness
-/// signal, or vice versa -- see `lsp::client::LspClient::message_loop_inner`
-/// for where each notification is classified onto its lane.
+/// Reads three independent sources (P3) rather than one: the inbox's
+/// `messages` channel carries log/showMessage frames, its mailbox carries
+/// `publishDiagnostics` (coalesced per file; a publish the mailbox could not
+/// hold arrives as a list of lost files that the cache then marks), and
+/// `lifecycle_rx` carries `$/progress` `begin`/`end` frames and `Other` (which
+/// carries e.g. rust-analyzer's `experimental/serverStatus`). Splitting them
+/// means a high-volume diagnostics publisher (rust-analyzer republishing
+/// whole-workspace diagnostics on every save) can never starve out a
+/// low-volume readiness signal, or vice versa -- see
+/// `lsp::client::LspClient::message_loop_inner` for where each notification is
+/// classified.
 ///
 /// Delivery is per session and never awaits a peer: the pump only calls
 /// `SessionState::publish_if_subscribed` on each registered session, whose own
@@ -56,10 +181,9 @@ pub struct PumpShared {
 /// only cached.
 ///
 /// The task exits when:
-/// - **Both** lanes have closed (`rx.recv()` and `lifecycle_rx.recv()` both
-///   returned `None`) -- in practice both senders live inside the same
-///   `LspClient` and close together, but each lane is tracked independently
-///   so one closing early can never stop the other from still being drained.
+/// - **All** sources have closed -- in practice they close together with the
+///   `LspClient`, but each is tracked independently so one closing early can
+///   never stop the others from still being drained.
 /// - The cancellation token is cancelled.
 ///
 /// # Lock independence
@@ -69,23 +193,20 @@ pub struct PumpShared {
 /// Neither an in-flight LSP round-trip (e.g. `textDocument/diagnostic`) nor
 /// any other translator-side work holds the notification-cache lock, so this
 /// pump is never blocked by tool-call activity: a `publishDiagnostics`
-/// notification arriving mid-request is cached immediately instead of being
-/// silently dropped. This matters because the LSP transport forwards
-/// notifications via `mpsc::Sender::try_send`, which drops on a full channel
-/// rather than blocking — a pump stalled behind someone else's lock would
-/// previously lose notifications under sustained push traffic.
+/// notification arriving mid-request waits in the mailbox and is cached as
+/// soon as the pump runs, instead of being lost.
 pub async fn diagnostics_pump(
     server_id: ServerId,
-    rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
+    inbox: impl Into<NotificationInbox>,
+    lifecycle_rx: mpsc::Receiver<LspNotification>,
     cancel: CancellationToken,
-    role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
+    role_rx: watch::Receiver<DiagnosticsRole>,
     pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
 ) {
     diagnostics_pump_with_resolver(
         server_id,
-        rx,
+        inbox,
         lifecycle_rx,
         cancel,
         role_rx,
@@ -104,123 +225,267 @@ pub async fn diagnostics_pump(
 )]
 async fn diagnostics_pump_with_resolver(
     server_id: ServerId,
-    mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    mut lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
+    inbox: impl Into<NotificationInbox>,
+    lifecycle_rx: mpsc::Receiver<LspNotification>,
     cancel: CancellationToken,
-    role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
+    role_rx: watch::Receiver<DiagnosticsRole>,
     pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
-    mut resolver: PublishedPathResolver,
+    resolver: PublishedPathResolver,
 ) {
+    let NotificationInbox {
+        messages,
+        publishes,
+    } = inbox.into();
     let PumpShared {
         notification_cache,
         subs,
         workspace_roots,
+        roles: _,
     } = shared;
-    let mut notification_closed = false;
-    let mut lifecycle_closed = false;
-    'pump: loop {
-        if notification_closed && lifecycle_closed {
-            break;
+    let mut pump = Pump {
+        server_id,
+        cancel,
+        role_rx,
+        pinned_tsserver,
+        notification_cache,
+        subs,
+        workspace_roots,
+        resolver,
+    };
+    pump.run(PumpInputs {
+        messages: Some(messages),
+        publishes: Some(publishes),
+        lifecycle: Some(lifecycle_rx),
+    })
+    .await;
+}
+
+impl Pump {
+    async fn run(&mut self, mut inputs: PumpInputs) {
+        while !inputs.all_closed() {
+            let flow = tokio::select! {
+                () = self.cancel.cancelled() => Flow::Stop,
+                frame = recv_open(&mut inputs.messages) => match frame {
+                    Some(first) => {
+                        let mut batch = vec![first];
+                        drain_messages(&mut inputs.messages, &mut batch);
+                        self.apply_batch(batch, &mut inputs.lifecycle).await
+                    }
+                    None => Flow::Continue,
+                },
+                delivery = recv_publish(&mut inputs.publishes) => match delivery {
+                    Some(delivery) => self.apply_delivery(delivery, &mut inputs).await,
+                    None => Flow::Continue,
+                },
+                frame = recv_open(&mut inputs.lifecycle) => {
+                    if let Some(notif) = frame {
+                        self.on_lifecycle(notif).await;
+                    }
+                    Flow::Continue
+                }
+            };
+            if flow == Flow::Stop {
+                return;
+            }
         }
-        tokio::select! {
-            () = cancel.cancelled() => break,
-            msg = rx.recv(), if !notification_closed => {
-                let Some(first) = msg else {
-                    notification_closed = true;
-                    continue;
-                };
-                let mut batch = vec![first];
-                while batch.len() < PUMP_BATCH {
-                    match rx.try_recv() {
-                        Ok(notif) => batch.push(notif),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            notification_closed = true;
-                            break;
+    }
+
+    async fn on_lifecycle(&self, notif: LspNotification) {
+        bridge::on_lifecycle(
+            Some(&self.notification_cache),
+            &self.server_id,
+            self.pinned_tsserver.as_deref(),
+            notif,
+        )
+        .await;
+    }
+
+    /// Applies one mailbox delivery: a publish is batched with the publishes
+    /// that follow it, files the mailbox lost are marked in the cache.
+    async fn apply_delivery(&mut self, delivery: PublishDelivery, inputs: &mut PumpInputs) -> Flow {
+        match delivery {
+            PublishDelivery::Publish(first) => {
+                let mut batch = vec![LspNotification::PublishDiagnostics(first)];
+                let mut lost = None;
+                if let Some(reader) = &mut inputs.publishes {
+                    while batch.len() < PUMP_BATCH {
+                        match reader.try_recv() {
+                            Some(PublishDelivery::Publish(next)) => {
+                                batch.push(LspNotification::PublishDiagnostics(next));
+                            }
+                            Some(PublishDelivery::Lost(files)) => {
+                                lost = Some(files);
+                                break;
+                            }
+                            None => break,
                         }
                     }
                 }
-
-                // A cold burst resolves its paths in parallel but is applied
-                // strictly in arrival order, so a clear is never reordered.
-                let admission_role = *role_rx.borrow();
-                let admitted: Vec<bool> = batch
-                    .iter()
-                    .map(|n| publication_admitted(n, admission_role, &workspace_roots))
-                    .collect();
-                let uris: Vec<Publication<'_>> = batch
-                    .iter()
-                    .zip(&admitted)
-                    .filter_map(|(n, admitted)| match n {
-                        LspNotification::PublishDiagnostics(p) if *admitted => Some(Publication {
-                            uri: &p.uri,
-                            kind: if p.diagnostics.is_empty() {
-                                PublicationKind::Clear
-                            } else {
-                                PublicationKind::Diagnostics
-                            },
-                        }),
-                        _ => None,
-                    })
-                    .collect();
-                // The lifecycle lane keeps being serviced while paths resolve;
-                // the diagnostics lane waits, which keeps its order.
-                let publications = {
-                    let mut resolving =
-                        std::pin::pin!(resolver.resolve_batch(&uris, &workspace_roots));
-                    loop {
-                        tokio::select! {
-                            () = cancel.cancelled() => break 'pump,
-                            done = &mut resolving => break done,
-                            msg = lifecycle_rx.recv(), if !lifecycle_closed => match msg {
-                                Some(notif) => {
-                                    bridge::on_lifecycle(
-                                        Some(&notification_cache),
-                                        &server_id,
-                                        pinned_tsserver.as_deref(),
-                                        notif,
-                                    )
-                                    .await;
-                                }
-                                None => lifecycle_closed = true,
-                            },
-                        }
-                    }
-                };
-                drop(uris);
-                let mut publications = publications.into_iter();
-
-                for (notif, admitted) in batch.into_iter().zip(admitted) {
-                    let published = if admitted {
-                        publications.next().flatten()
-                    } else {
-                        None
-                    };
-                    // Re-read after the (possibly slow) resolve: a demotion in
-                    // the meantime must stop caching and fan-out (#174 s8).
-                    let role = *role_rx.borrow();
-                    apply_notification(&server_id, notif, published, role, &notification_cache, &subs).await;
+                if self.apply_batch(batch, &mut inputs.lifecycle).await == Flow::Stop {
+                    return Flow::Stop;
+                }
+                match lost {
+                    Some(files) => self.apply_lost(files, &mut inputs.lifecycle).await,
+                    None => Flow::Continue,
                 }
             }
-            msg = lifecycle_rx.recv(), if !lifecycle_closed => {
-                let Some(notif) = msg else {
-                    lifecycle_closed = true;
-                    continue;
-                };
-                bridge::on_lifecycle(
-                    Some(&notification_cache),
-                    &server_id,
-                    pinned_tsserver.as_deref(),
-                    notif,
-                )
-                .await;
+            PublishDelivery::Lost(files) => self.apply_lost(files, &mut inputs.lifecycle).await,
+        }
+    }
+
+    /// Resolves `publications` while the lifecycle lane keeps being serviced;
+    /// `None` when the pump was cancelled meanwhile.
+    async fn resolve(
+        &mut self,
+        publications: &[Publication<'_>],
+        lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
+    ) -> Option<Vec<Option<PublishedDiagnosticsUri>>> {
+        let mut resolving = std::pin::pin!(
+            self.resolver
+                .resolve_batch(publications, &self.workspace_roots)
+        );
+        loop {
+            tokio::select! {
+                () = self.cancel.cancelled() => return None,
+                done = &mut resolving => return Some(done),
+                frame = recv_open(lifecycle) => {
+                    if let Some(notif) = frame {
+                        bridge::on_lifecycle(
+                            Some(&self.notification_cache),
+                            &self.server_id,
+                            self.pinned_tsserver.as_deref(),
+                            notif,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A cold burst resolves its paths in parallel but is applied strictly in
+    /// arrival order, so a clear is never reordered.
+    async fn apply_batch(
+        &mut self,
+        batch: Vec<LspNotification>,
+        lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
+    ) -> Flow {
+        let admission_role = *self.role_rx.borrow();
+        let items: Vec<BatchItem> = batch
+            .into_iter()
+            .map(|notif| {
+                if publication_admitted(&notif, admission_role, &self.workspace_roots) {
+                    BatchItem::Resolve(notif)
+                } else {
+                    BatchItem::Skip(notif)
+                }
+            })
+            .collect();
+        let publications: Vec<Publication<'_>> = items
+            .iter()
+            .filter_map(|item| match item {
+                BatchItem::Resolve(LspNotification::PublishDiagnostics(p)) => Some(Publication {
+                    uri: &p.uri,
+                    kind: if p.diagnostics.is_empty() {
+                        PublicationKind::Clear
+                    } else {
+                        PublicationKind::Diagnostics
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        let Some(resolved) = self.resolve(&publications, lifecycle).await else {
+            return Flow::Stop;
+        };
+        drop(publications);
+        let mut resolved = resolved.into_iter();
+
+        for item in items {
+            let (notif, published) = match item {
+                BatchItem::Resolve(notif) => (notif, resolved.next().flatten()),
+                BatchItem::Skip(notif) => (notif, None),
+            };
+            // Re-read after the (possibly slow) resolve: a demotion in the
+            // meantime must stop caching and fan-out (#174 s8).
+            let role = *self.role_rx.borrow();
+            apply_notification(
+                &self.server_id,
+                notif,
+                published,
+                role,
+                &self.notification_cache,
+                &self.subs,
+            )
+            .await;
+        }
+        Flow::Continue
+    }
+
+    /// Marks the files whose publishes the mailbox could not hold, so they
+    /// read as lost instead of `pending`, and tells their subscribers.
+    async fn apply_lost(
+        &mut self,
+        lost: LostPublishes,
+        lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
+    ) -> Flow {
+        if *self.role_rx.borrow() == DiagnosticsRole::Secondary {
+            return Flow::Continue;
+        }
+        let uris: Vec<&lsp_types::Uri> = lost
+            .uris
+            .iter()
+            .filter(|uri| self.workspace_roots.admits_uri(uri))
+            .collect();
+        let publications: Vec<Publication<'_>> = uris
+            .iter()
+            .map(|uri| Publication {
+                uri,
+                kind: PublicationKind::Diagnostics,
+            })
+            .collect();
+        let Some(resolved) = self.resolve(&publications, lifecycle).await else {
+            return Flow::Stop;
+        };
+        drop(publications);
+        let files: Vec<bridge::DiagnosticsKey> = resolved
+            .into_iter()
+            .flatten()
+            .map(|published| bridge::DiagnosticsKey::of(published.canonical()))
+            .collect();
+        let changed = self.notification_cache.lock().await.record_lost_publishes(
+            &self.server_id,
+            &files,
+            lost.overflowed,
+        );
+        publish_invalidated(&self.subs, &changed).await;
+        Flow::Continue
+    }
+}
+
+/// Moves the frames already waiting in `source` into `batch`, up to
+/// [`PUMP_BATCH`] in all.
+fn drain_messages(
+    source: &mut Option<mpsc::Receiver<LspNotification>>,
+    batch: &mut Vec<LspNotification>,
+) {
+    let Some(receiver) = source else {
+        return;
+    };
+    while batch.len() < PUMP_BATCH {
+        match receiver.try_recv() {
+            Ok(notif) => batch.push(notif),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                *source = None;
+                return;
             }
         }
     }
 }
 
-/// Notifications drained from the diagnostics lane per resolve round.
+/// Notifications drained per resolve round.
 const PUMP_BATCH: usize = 64;
 
 /// Whether `notif` is a publication this pump should canonicalize and cache.
@@ -266,13 +531,15 @@ async fn apply_notification(
             let write = notification_cache.lock().await.write_published_diagnostics(
                 server_id,
                 &published,
-                p.version,
+                p.version.map(crate::bridge::DocumentVersion::new),
                 p.diagnostics,
             );
 
-            publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
-                .await;
-            publish_invalidated(subs, &write.evicted).await;
+            if matches!(write, PushWrite::Stored { .. }) {
+                publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
+                    .await;
+            }
+            publish_invalidated(subs, write.evicted()).await;
         }
         LspNotification::LogMessage(m) => {
             notification_cache
@@ -401,7 +668,7 @@ impl bridge::NotificationWiring for PumpWiring {
         receivers: bridge::NotificationReceivers,
         role: DiagnosticsRole,
     ) -> tokio::task::AbortHandle {
-        let (_role_tx, role_rx) = tokio::sync::watch::channel(role);
+        let role_rx = self.shared.roles.subscribe(&id, role);
         tokio::spawn(supervised_pump(
             id,
             receivers,
@@ -534,6 +801,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: c,
                 subs: subs.clone(),
                 workspace_roots: test_workspace_roots(),
@@ -607,6 +875,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs: subs.clone(),
                 workspace_roots,
@@ -677,6 +946,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: cache,
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -709,6 +979,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: cache,
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -739,6 +1010,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: cache,
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -787,6 +1059,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -848,6 +1121,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -906,6 +1180,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -973,6 +1248,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -1124,6 +1400,7 @@ mod pump_tests {
         let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: cache,
                 subs,
                 workspace_roots: roots,
@@ -1245,6 +1522,7 @@ mod pump_tests {
         let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: make_cache(),
                 subs,
                 workspace_roots: test_workspace_roots(),
@@ -1265,6 +1543,7 @@ mod pump_tests {
         let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: make_cache(),
                 subs: make_subs(),
                 workspace_roots: test_workspace_roots(),
@@ -1285,6 +1564,7 @@ mod pump_tests {
         let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: make_cache(),
                 subs: subs.clone(),
                 workspace_roots: test_workspace_roots(),
@@ -1392,6 +1672,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
                 workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
@@ -1443,6 +1724,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
                 workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
@@ -1508,6 +1790,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             Some(PathBuf::from("/pin/tsserver.js")),
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: make_cache(),
                 subs: make_subs(),
                 workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
@@ -1601,6 +1884,7 @@ mod pump_tests {
             role_rx,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
                 workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
@@ -1665,6 +1949,7 @@ mod pump_tests {
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
+                roles: DiagnosticsRoles::default(),
                 notification_cache: make_cache(),
                 subs: make_subs(),
                 workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
@@ -1863,6 +2148,75 @@ mod pump_tests {
             .merge()
             .unwrap();
         assert!(info.diagnostics.is_empty(), "the alias's clear must apply");
+    }
+
+    /// #692: a publish the cache refuses (the file's URI spellings are at their
+    /// cap) is not announced; the next accepted publish is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pump_does_not_notify_for_a_dropped_publish() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let links: Vec<PathBuf> = (0..9)
+            .map(|n| {
+                let link = root.join(format!("link{n}.rs"));
+                std::os::unix::fs::symlink(&file, &link).unwrap();
+                link
+            })
+            .collect();
+
+        let cache = make_cache();
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_session, mut rx_session) = mpsc::channel(32);
+        let canonical = bridge::resources::make_uri(&file).unwrap();
+        session
+            .subscribe_for_test(
+                &DiagnosticsResourceUri::for_test(&canonical),
+                Target::Channel(tx_session),
+            )
+            .await
+            .unwrap();
+        let (tx, _cancel_tx) = spawn_test_pump_with_cache(
+            subs,
+            WorkspaceRoots::from_paths(&[root]).unwrap(),
+            Arc::clone(&cache),
+        );
+        let publish = |path: PathBuf| {
+            let tx = tx.clone();
+            async move {
+                tx.send(LspNotification::PublishDiagnostics(
+                    PublishDiagnosticsParams {
+                        uri: bridge::path_to_uri(&path).unwrap(),
+                        diagnostics: vec![lsp_types::Diagnostic {
+                            message: "boom".to_owned().into(),
+                            ..Default::default()
+                        }],
+                        version: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            }
+        };
+
+        for link in links.iter().take(8) {
+            publish(link.clone()).await;
+            assert_eq!(recv_within(&mut rx_session).await, canonical);
+        }
+        publish(links[8].clone()).await;
+        publish(file.clone()).await;
+
+        assert_eq!(recv_within(&mut rx_session).await, canonical);
+        tokio::task::yield_now().await;
+        assert!(
+            rx_session.try_recv().is_err(),
+            "the dropped publish must not have been announced"
+        );
     }
 
     /// #468: a session whose peer stopped reading neither blocks the pump
@@ -2108,7 +2462,7 @@ mod pump_tests {
                     language_id: LanguageId::from_static("rust"),
                     command: crate::config::ServerCommand::from_static("rust-analyzer"),
                     reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
-                        command: "rust-analyzer".to_string(),
+                        command: crate::config::ServerCommand::from_static("rust-analyzer"),
                         source: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
@@ -2201,5 +2555,171 @@ mod pump_tests {
         publish_startup_failures(&harness.translator, &harness.subs).await;
 
         assert_eq!(harness.updates_within(UPDATE_WINDOW).await, 1);
+    }
+}
+
+#[cfg(test)]
+mod burst_tests {
+    use std::time::Duration;
+
+    use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
+
+    use super::*;
+    use crate::bridge::DiagnosticsAvailability;
+    use crate::lsp::{MailboxLimits, NotificationSink};
+    use crate::test_lsp::CapturedLogs;
+
+    fn make_cache() -> Arc<Mutex<NotificationCache>> {
+        Arc::new(Mutex::new(NotificationCache::new()))
+    }
+
+    #[cfg(windows)]
+    fn roots_and_uri_prefix() -> (WorkspaceRoots, &'static str) {
+        (
+            WorkspaceRoots::for_test(vec![PathBuf::from(r"C:\test")], vec![]),
+            "file:///C:/test/",
+        )
+    }
+    #[cfg(not(windows))]
+    fn roots_and_uri_prefix() -> (WorkspaceRoots, &'static str) {
+        (
+            WorkspaceRoots::for_test(vec![PathBuf::from("/test")], vec![]),
+            "file:///test/",
+        )
+    }
+
+    fn shared_over(
+        cache: &Arc<Mutex<NotificationCache>>,
+        workspace_roots: WorkspaceRoots,
+    ) -> PumpShared {
+        PumpShared {
+            roles: DiagnosticsRoles::default(),
+            notification_cache: Arc::clone(cache),
+            subs: SubscriptionRegistry::new(),
+            workspace_roots,
+        }
+    }
+
+    /// #704: a burst bigger than the mailbox holds, with the pump not running
+    /// while it arrives, leaves every file cached or marked lost -- none reads
+    /// `pending` -- and the overflow writes at most one warning.
+    #[tokio::test]
+    async fn test_burst_over_the_mailbox_cap_caches_or_marks_every_file() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const FILES: usize = 50;
+        const CAP: usize = 10;
+        let captured = CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let (roots, prefix) = roots_and_uri_prefix();
+        let uri = |n: usize| Uri::from(format!("{prefix}f{n}.rs"));
+        let (messages_tx, messages_rx) = mpsc::channel(4);
+        let (sink, publish_rx) = NotificationSink::with_limits(
+            messages_tx,
+            MailboxLimits {
+                max_pending: CAP,
+                max_bytes: usize::MAX,
+            },
+        );
+        for n in 0..FILES {
+            sink.publishes().publish(PublishDiagnosticsParams {
+                uri: uri(n),
+                diagnostics: vec![Diagnostic {
+                    message: format!("error {n}").into(),
+                    ..Diagnostic::default()
+                }],
+                version: None,
+            });
+        }
+        drop(sink);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(4);
+        drop(lifecycle_tx);
+        let cache = make_cache();
+
+        let pump = tokio::spawn(diagnostics_pump(
+            ServerId::from_static("rust"),
+            NotificationInbox::new(messages_rx, publish_rx),
+            lifecycle_rx,
+            CancellationToken::new(),
+            watch::channel(DiagnosticsRole::Authoritative).1,
+            None,
+            shared_over(&cache, roots),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the pump must end once the mailbox is drained and closed")
+            .unwrap();
+
+        let cache = cache.lock().await;
+        let states: Vec<DiagnosticsAvailability> = (0..FILES)
+            .map(|n| cache.availability(&uri(n), Some(&ServerId::from_static("rust"))))
+            .collect();
+        assert!(
+            !states.contains(&DiagnosticsAvailability::Pending),
+            "{states:?}"
+        );
+        let published = states
+            .iter()
+            .filter(|state| **state == DiagnosticsAvailability::Published)
+            .count();
+        assert_eq!(published, CAP);
+        assert_eq!(states.len() - published, FILES - CAP);
+        assert!(
+            states
+                .iter()
+                .skip(CAP)
+                .all(|state| *state == DiagnosticsAvailability::Evicted)
+        );
+        let warnings = captured
+            .entries()
+            .iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::WARN && message.contains("mailbox is full")
+            })
+            .count();
+        assert_eq!(warnings, 1);
+    }
+
+    /// #696: a pump started for a respawned server shares the role sender, so
+    /// a role recomputed afterwards reaches it.
+    #[test]
+    fn test_replacement_pump_receives_later_role_changes() {
+        let roles = DiagnosticsRoles::default();
+        let id = ServerId::from_static("rust");
+        let original = roles.subscribe(&id, DiagnosticsRole::Secondary);
+        let replacement = roles.subscribe(&id, DiagnosticsRole::Secondary);
+
+        roles.set(&id, DiagnosticsRole::Authoritative);
+
+        assert_eq!(*original.borrow(), DiagnosticsRole::Authoritative);
+        assert_eq!(*replacement.borrow(), DiagnosticsRole::Authoritative);
+    }
+
+    /// The pump ends when the mailbox and both channels are closed.
+    #[tokio::test]
+    async fn test_pump_ends_once_every_source_closed() {
+        let (messages_tx, messages_rx) = mpsc::channel(1);
+        let (sink, publish_rx) = NotificationSink::new(messages_tx);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        let (roots, _) = roots_and_uri_prefix();
+        let cache = make_cache();
+        let pump = tokio::spawn(diagnostics_pump(
+            ServerId::from_static("rust"),
+            NotificationInbox::new(messages_rx, publish_rx),
+            lifecycle_rx,
+            CancellationToken::new(),
+            watch::channel(DiagnosticsRole::Authoritative).1,
+            None,
+            shared_over(&cache, roots),
+        ));
+
+        drop(sink);
+        drop(lifecycle_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the pump must end")
+            .unwrap();
     }
 }

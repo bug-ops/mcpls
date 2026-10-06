@@ -24,7 +24,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::{WorkspaceRoots, try_path_to_uri};
-use crate::config::{LspServerConfig, LspSettings, PositionEncodings};
+use crate::config::{LspServerConfig, LspSettings, PositionEncodings, ServerCommand};
 use crate::error::{
     BackgroundTask, Error, InitFailureHint, InitPhase, Result, ServerSpawnFailure, StartupFailure,
     StdioStream, UntrustedRefusal,
@@ -37,7 +37,8 @@ use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::lsp::{
-    CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, ParentEnv, process_env, tsserver_pin,
+    CONTENT_MODIFIED_RETRY_METHODS, HostOs, ManagedEnvVar, NotificationInbox, NotificationSink,
+    ParentEnv, PublishReader, process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -237,8 +238,8 @@ pub enum ChildWorkingDir {
 #[derive(Debug, Clone)]
 struct AutoPin {
     tsserver: PathBuf,
-    /// The untrusted-mode boundary the pin was vetted against, if any.
-    untrusted_boundary: Option<WorkspaceRoots>,
+    /// What untrusted mode vetted the pin against, if it is on.
+    vetting: Option<tsserver_pin::UntrustedVetting>,
 }
 
 /// Configuration for LSP server initialization.
@@ -308,17 +309,14 @@ impl ServerInitConfig {
     }
 
     /// This config with `tsserver` recorded as the pin mcpls chose, vetted
-    /// against `untrusted_boundary` in untrusted-workspace mode.
+    /// as `vetting` says in untrusted-workspace mode.
     #[must_use]
     pub(crate) fn with_auto_pin(
         mut self,
         tsserver: PathBuf,
-        untrusted_boundary: Option<WorkspaceRoots>,
+        vetting: Option<tsserver_pin::UntrustedVetting>,
     ) -> Self {
-        self.auto_pin = Some(AutoPin {
-            tsserver,
-            untrusted_boundary,
-        });
+        self.auto_pin = Some(AutoPin { tsserver, vetting });
         self
     }
 
@@ -433,20 +431,14 @@ impl ServerInitConfig {
         let mut unpinned = self.server_config.clone();
         unpinned.initialization_options = None;
         let plan = tsserver_pin::plan_typescript(unpinned, process_env);
-        if let Some(boundary) = &pin.untrusted_boundary {
-            if let Some(tsserver) = plan.pin_inside(boundary) {
-                return Err(self.refusal(UntrustedRefusal::WorkspaceTsserver { tsserver }));
-            }
-            if plan.has_unpinnable_launcher() {
-                return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                    command: self.server_config.command.server_command().clone(),
-                }));
-            }
+        if let Some(vetting) = &pin.vetting {
+            plan.vet_untrusted(vetting)
+                .map_err(|refusal| self.refusal(refusal))?;
         }
         let (server_config, tsserver) = plan.apply(&self.workspace_roots);
         let auto_pin = tsserver.map(|tsserver| AutoPin {
             tsserver,
-            untrusted_boundary: pin.untrusted_boundary.clone(),
+            vetting: pin.vetting.clone(),
         });
         Ok(Self {
             server_config,
@@ -488,6 +480,11 @@ pub struct LspServer {
     /// Extract this before registering the server to receive real-time
     /// notifications (e.g., `textDocument/publishDiagnostics`).
     pub notification_rx: mpsc::Receiver<LspNotification>,
+    /// Receiver of the diagnostics mailbox: `textDocument/publishDiagnostics`
+    /// is coalesced per file and a publish it cannot hold is reported as lost
+    /// instead of being dropped (see [`PublishReader`]). Extract it with
+    /// [`Self::take_publish_rx`].
+    pub publish_rx: PublishReader,
     /// Receiver for the lifecycle lane (P3): `$/progress` `begin`/`end`
     /// frames and unrecognized notifications (which carry e.g.
     /// rust-analyzer's `experimental/serverStatus`), kept separate from
@@ -520,6 +517,7 @@ impl std::fmt::Debug for LspServer {
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
             .field("notification_rx", &"<channel>")
+            .field("publish_rx", &"<mailbox>")
             .field("lifecycle_rx", &"<channel>")
             .field("child", &"<process>")
             .field("id", &self.init_config.server_config.id())
@@ -535,11 +533,12 @@ impl std::fmt::Debug for LspServer {
 pub fn child_env_var(
     config: &LspServerConfig,
     key: &str,
+    host: HostOs,
     parent_env: impl ParentEnv,
 ) -> Option<std::ffi::OsString> {
     config
         .env
-        .get(key)
+        .get(key, host)
         .map(std::ffi::OsString::from)
         .or_else(|| parent_env(key))
 }
@@ -565,6 +564,19 @@ impl LspServer {
     pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.notification_rx, dummy)
+    }
+
+    /// Take everything the notification lane delivers: the log/showMessage
+    /// receiver and the diagnostics mailbox, ready for a pump.
+    pub fn take_notification_inbox(&mut self) -> NotificationInbox {
+        NotificationInbox::new(self.take_notification_rx(), self.take_publish_rx())
+    }
+
+    /// Take the diagnostics mailbox out of this server, replacing it with a
+    /// closed one. Extract it with [`Self::take_notification_rx`] before
+    /// registering the server for a pump.
+    pub fn take_publish_rx(&mut self) -> PublishReader {
+        std::mem::replace(&mut self.publish_rx, PublishReader::closed())
     }
 
     /// Take the lifecycle receiver out of this server, replacing it with a
@@ -632,7 +644,7 @@ impl LspServer {
         );
 
         let mut child = ServerProcess::spawn(command)
-            .map_err(|e| spawn_error(config.server_config.command.to_string(), e))?;
+            .map_err(|e| spawn_error(config.server_config.command.server_command().clone(), e))?;
 
         let stdin = child
             .take_stdin()
@@ -648,11 +660,12 @@ impl LspServer {
 
         let transport = LspTransport::with_redactions(stdin, stdout, Arc::clone(&redactions));
         let (notification_tx, notification_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let (notification_sink, publish_rx) = NotificationSink::new(notification_tx);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_CHANNEL_CAPACITY);
         let client = LspClient::from_transport_with_notifications(
             config.server_config.clone(),
             transport,
-            notification_tx,
+            notification_sink,
             lifecycle_tx,
             Arc::clone(&redactions),
         );
@@ -678,7 +691,7 @@ impl LspServer {
                     // so wait the (bounded) end-of-file grace whether or not it
                     // has exited yet.
                     let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
-                    let hint = Self::init_failure_hint(&config);
+                    let hint = Self::init_failure_hint(&config).await;
                     return Err(Error::LspInitFailed {
                         phase,
                         cause: Box::new(redactions.sanitize_error(*cause)),
@@ -696,6 +709,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
+            publish_rx,
             lifecycle_rx,
             child: Some(child),
             init_config: config,
@@ -718,10 +732,10 @@ impl LspServer {
             EofWait::Skip
         };
         let stderr = stderr_capture.finish(eof_wait, redactions).await;
-        let hint = Self::init_failure_hint(config);
+        let hint = Self::init_failure_hint(config).await;
         match exit_status {
             Some(status) => Error::ServerExitedDuringInit {
-                command: config.server_config.command.to_string(),
+                command: config.server_config.command.server_command().clone(),
                 exit_code: status.code(),
                 hint,
                 stderr,
@@ -737,13 +751,23 @@ impl LspServer {
 
     /// The guidance for a failed `initialize` of `config`, if its cause is known.
     ///
-    /// Runs on the failure path only and reads nothing but package manifests.
-    fn init_failure_hint(config: &ServerInitConfig) -> Option<InitFailureHint> {
-        tsserver_pin::init_failure_hint(
-            config.server_config(),
-            config.workspace_roots(),
-            process_env,
-        )
+    /// Runs on the failure path only. It walks `PATH` and reads package
+    /// manifests, so it runs on the blocking pool; the hint is dropped when the
+    /// pool is shutting down.
+    async fn init_failure_hint(config: &ServerInitConfig) -> Option<InitFailureHint> {
+        let config = config.clone();
+        let hint = crate::on_blocking_pool(move || {
+            tsserver_pin::init_failure_hint(
+                config.server_config(),
+                config.workspace_roots(),
+                process_env,
+            )
+        })
+        .await;
+        hint.unwrap_or_else(|error| {
+            debug!("Dropped the init failure hint: {error}");
+            None
+        })
     }
 
     /// Logs the command and argument count at `info`, and the argument values
@@ -785,19 +809,19 @@ impl LspServer {
         }
 
         for key in ENV_PASSTHROUGH {
-            if let Some(value) = child_env_var(config, key, &parent_env) {
+            if let Some(value) = child_env_var(config, key, HostOs::CURRENT, &parent_env) {
                 command.env(key, value);
             }
         }
         #[cfg(windows)]
         for key in ENV_PASSTHROUGH_WINDOWS {
-            if let Some(value) = child_env_var(config, key, &parent_env) {
+            if let Some(value) = child_env_var(config, key, HostOs::CURRENT, &parent_env) {
                 command.env(key, value);
             }
         }
 
         command
-            .envs(&config.env)
+            .envs(config.env.iter())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1370,7 +1394,7 @@ async fn early_exit_status(child: &mut ServerProcess) -> Option<std::process::Ex
 
 /// Classify a spawn failure: a missing executable gets its own variant so the
 /// message can carry PATH and install guidance.
-fn spawn_error(command: String, source: std::io::Error) -> Error {
+fn spawn_error(command: ServerCommand, source: std::io::Error) -> Error {
     if source.kind() == std::io::ErrorKind::NotFound {
         Error::ServerNotFound { command, source }
     } else {
@@ -1432,6 +1456,7 @@ pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer 
         capabilities: lsp_types::ServerCapabilities::default(),
         position_encoding: PositionEncodingKind::UTF8,
         notification_rx: mock_notification_rx,
+        publish_rx: PublishReader::closed(),
         lifecycle_rx: mock_lifecycle_rx,
         child: None,
         init_config: crate::test_lsp::init_config_for(server_config),
@@ -1487,6 +1512,7 @@ impl LspServer {
             capabilities,
             position_encoding,
             notification_rx,
+            publish_rx: PublishReader::closed(),
             lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
@@ -1501,7 +1527,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::PositionEncoding;
-    use crate::config::{FilePattern, LanguageId, ServerCommand, TimeoutSecs, ToolSet};
+    use crate::config::{FilePattern, LanguageId, TimeoutSecs, ToolSet};
 
     #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
@@ -1734,8 +1760,6 @@ mod tests {
 
     #[test]
     fn test_server_init_config_with_options() {
-        use std::collections::HashMap;
-
         let init_opts = serde_json::json!({
             "settings": {
                 "python": {
@@ -1746,8 +1770,12 @@ mod tests {
             }
         });
 
-        let mut env = HashMap::new();
-        env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
+        let mut env = crate::config::ServerEnv::default();
+        env.insert(
+            "PYTHONPATH".to_string(),
+            "/usr/lib".to_string(),
+            HostOs::CURRENT,
+        );
 
         let config = ServerInitConfig::new(
             LspServerConfig {
@@ -1837,6 +1865,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
+            publish_rx: PublishReader::closed(),
             lifecycle_rx: mock_lifecycle_rx,
             child: Some(ServerProcess::from_unbound(mock_child)),
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
@@ -1888,6 +1917,7 @@ mod tests {
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx,
+            publish_rx: PublishReader::closed(),
             lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
@@ -1922,6 +1952,7 @@ mod tests {
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
             notification_rx: mock_notification_rx,
+            publish_rx: PublishReader::closed(),
             lifecycle_rx: mock_lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
@@ -1939,9 +1970,15 @@ mod tests {
     fn test_spawn_error_classifies_not_found() {
         use std::io::{Error as IoError, ErrorKind};
 
-        let missing = spawn_error("x".to_string(), IoError::from(ErrorKind::NotFound));
+        let missing = spawn_error(
+            ServerCommand::from_static("x"),
+            IoError::from(ErrorKind::NotFound),
+        );
         assert_matches!(missing, Error::ServerNotFound { .. });
-        let denied = spawn_error("x".to_string(), IoError::from(ErrorKind::PermissionDenied));
+        let denied = spawn_error(
+            ServerCommand::from_static("x"),
+            IoError::from(ErrorKind::PermissionDenied),
+        );
         assert_matches!(denied, Error::ServerSpawnFailed { .. });
     }
 
@@ -2169,14 +2206,16 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
         );
-        config
-            .server_config
-            .env
-            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            "OTHER_VALUE".to_string(),
+            "bravo-secret-222".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
+        config.server_config.env.insert(
+            "API_TOKEN".to_string(),
+            "s3cr3t-value".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
             "bravo-secret-222".to_owned(),
@@ -2201,11 +2240,13 @@ echo 'fatal: bad toolchain' >&2
         config.server_config.env.insert(
             "RUSTUP_TOOLCHAIN".to_string(),
             "nightly-2024-01-01".to_string(),
+            crate::lsp::HostOs::CURRENT,
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            "API_TOKEN".to_string(),
+            "s3cr3t-value".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2287,10 +2328,11 @@ sleep 5
             .server_config
             .args
             .push("--api-key=SuperSecretArg456".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            "API_TOKEN".to_string(),
+            "SuperSecretValue123".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
 
         let mut server = LspServer::spawn(config).await.unwrap();
         let mut rx = server.take_notification_rx();
@@ -2324,10 +2366,11 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            "API_TOKEN".to_string(),
+            "SuperSecretValue123".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2348,10 +2391,11 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            "API_TOKEN".to_string(),
+            "SuperSecretValue123".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2723,6 +2767,23 @@ sleep 5
         }
     }
 
+    /// #691: an override spelled `Path` is the `PATH` the child sees on Windows,
+    /// so resolution must read it too; elsewhere it is another variable.
+    #[test]
+    fn child_env_var_compares_names_as_the_host_does() {
+        let config = bare_server_config(HashMap::from([("Path".to_string(), "/over".to_string())]));
+        let parent = |_: &str| Some(std::ffi::OsString::from("/parent"));
+
+        assert_eq!(
+            child_env_var(&config, "PATH", HostOs::Windows, parent),
+            Some(std::ffi::OsString::from("/over"))
+        );
+        assert_eq!(
+            child_env_var(&config, "PATH", HostOs::Other, parent),
+            Some(std::ffi::OsString::from("/parent"))
+        );
+    }
+
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only
     /// `command`/`args`/`env` matter.
     fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
@@ -2730,7 +2791,7 @@ sleep 5
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
             args: vec![],
-            env,
+            env: crate::config::ServerEnv::from_entries(env, HostOs::CURRENT).unwrap(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
@@ -2942,7 +3003,7 @@ sleep 5
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pyright-langserver").into(),
                 args: vec![],
-                env: std::collections::HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
@@ -2957,7 +3018,7 @@ sleep 5
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pylsp").into(),
                 args: vec![],
-                env: std::collections::HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,

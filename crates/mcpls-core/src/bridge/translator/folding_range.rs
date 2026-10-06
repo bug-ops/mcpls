@@ -105,7 +105,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 Capability::FoldingRange,
-                IndexingGate::NotRequired,
+                IndexingGate::FileLocal,
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());

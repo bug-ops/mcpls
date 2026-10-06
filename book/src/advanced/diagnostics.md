@@ -42,7 +42,7 @@ Every diagnostics answer carries `availability`, because an empty list is ambigu
 |-------|---------|
 | `published` | The server reported on the file; an empty list means clean |
 | `pending` | Nothing has been published since the server started; unknown |
-| `evicted` | A publish was dropped to bound the cache; unknown |
+| `evicted` | A publish was dropped to bound the cache or the delivery buffer (a burst of more than 1000 files, or 64 MiB, from one server); what the server said is unknown |
 
 A server restart returns every file to `pending`.
 

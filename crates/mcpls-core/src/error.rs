@@ -15,13 +15,13 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, FileKey, FilePattern, LanguageId, ServerCommand, ServerId, ToolKind,
-    UnsupportedFilePattern,
+    BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
+    LanguageId, ServerCommand, ServerId, ToolKind, UnsupportedFilePattern,
 };
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
-use crate::util::{escape_control, truncate_str};
+use crate::util::{SizeExceeded, escape_control, truncate_str};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -284,6 +284,15 @@ pub enum UntrustedRefusal {
         /// The configured `command`.
         command: ServerCommand,
     },
+    /// The auto-selected TypeScript command resolved to an executable that is
+    /// not typescript-language-server (a `PATH` entry symlinked to another
+    /// program), so it cannot be hardened without dropping the tsserver pin.
+    AutoSelectionTarget {
+        /// The resolved executable the command would have been replaced with.
+        executable: ServerCommand,
+        /// Why the selection cannot follow the resolved executable.
+        cause: InvalidAutoSelection,
+    },
     /// The login home directory is unknown and the inherited `HOME` lies
     /// inside the workspace, where rustup, cargo and npm would read their
     /// configuration from.
@@ -358,6 +367,11 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its executable '{command}' was not found on a PATH outside the workspace, \
                  which untrusted mode requires"
+            ),
+            Self::AutoSelectionTarget { executable, cause } => write!(
+                f,
+                "its executable resolved to '{executable}' ({cause}), so untrusted mode \
+                 cannot pin it; give the absolute path of the server as `command`"
             ),
             Self::UnknownHome => f.write_str(
                 "HOME is not set and the login home directory is unknown, so untrusted mode \
@@ -468,6 +482,7 @@ impl fmt::Display for FailedToStart<'_> {
                     }
                     UntrustedRefusal::WorkspaceExecutable { .. }
                     | UntrustedRefusal::UnresolvedExecutable { .. }
+                    | UntrustedRefusal::AutoSelectionTarget { .. }
                     | UntrustedRefusal::WorkspaceHome { .. }
                     | UntrustedRefusal::EmptyHome { .. }
                     | UntrustedRefusal::UnknownHome
@@ -1000,8 +1015,22 @@ pub enum ConfigError {
     },
 
     /// The config file's bytes are not UTF-8.
-    #[error("config file is not valid UTF-8: {0}")]
+    #[error("config file is not valid UTF-8")]
     NotUtf8(#[source] std::string::FromUtf8Error),
+
+    /// The config file is over its fixed size limit, which is not configurable.
+    #[error("config file is {} bytes, over the fixed {} byte limit", .0.size, .0.max)]
+    FileTooLarge(SizeExceeded),
+
+    /// A server's `env` table sets one variable twice, which the host treats as
+    /// one name.
+    #[error("lsp_servers entry '{server}': {error}")]
+    DuplicateEnvKey {
+        /// The id of the entry that holds the table.
+        server: ServerId,
+        /// The colliding keys.
+        error: DuplicateEnvKey,
+    },
 
     /// A config path has no directory to resolve relative entries against.
     #[error("configuration path has no parent directory: {}", .path.display())]
@@ -1040,10 +1069,10 @@ pub enum ConfigError {
     DuplicateServerId {
         /// The shared id.
         id: ServerId,
-        /// Description of the first entry.
-        first: String,
-        /// Description of the second entry.
-        second: String,
+        /// The first entry.
+        first: Box<EntrySummary>,
+        /// The second entry.
+        second: Box<EntrySummary>,
     },
 
     /// A language has two servers that both omit `handles`.
@@ -1194,7 +1223,7 @@ pub enum Error {
         file: FileKey,
         /// The `file_patterns` configured across all servers, so the error can
         /// show what was available to map the extension.
-        patterns: Vec<FilePattern>,
+        patterns: Arc<[FilePattern]>,
     },
 
     /// A server is configured for the language, but no server claims this
@@ -1296,7 +1325,7 @@ pub enum Error {
     },
 
     /// Invalid configuration.
-    #[error("invalid configuration: {0}")]
+    #[error(transparent)]
     Config(#[from] ConfigError),
 
     /// I/O error.
@@ -1308,11 +1337,11 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 
     /// TOML deserialization error.
-    #[error("TOML parsing error: {0}")]
+    #[error(transparent)]
     TomlDe(#[from] toml::de::Error),
 
     /// TOML serialization error.
-    #[error("TOML serialization error: {0}")]
+    #[error(transparent)]
     TomlSer(#[from] toml::ser::Error),
 
     /// Request timeout, carrying the elapsed limit.
@@ -1323,7 +1352,7 @@ pub enum Error {
     #[error("failed to spawn LSP server '{command}': {source}")]
     ServerSpawnFailed {
         /// Command that failed to spawn.
-        command: String,
+        command: ServerCommand,
         /// Underlying IO error.
         #[source]
         source: std::io::Error,
@@ -1333,10 +1362,10 @@ pub enum Error {
     ///
     /// Distinct from [`Error::ServerSpawnFailed`] so the message can carry
     /// PATH and install guidance.
-    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command, Platform::CURRENT))]
+    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command.as_str(), Platform::CURRENT))]
     ServerNotFound {
         /// Command that could not be found.
-        command: String,
+        command: ServerCommand,
         /// Underlying IO error.
         #[source]
         source: std::io::Error,
@@ -1396,10 +1425,10 @@ pub enum Error {
 
     /// LSP server process exited before completing the `initialize`
     /// handshake.
-    #[error("LSP server '{command}' exited during initialization{}{}{}", EarlyExitDetail(.command, *.exit_code), HintSuffix(.hint), StderrSuffix(.stderr))]
+    #[error("LSP server '{command}' exited during initialization{}{}{}", EarlyExitDetail(.command.as_str(), *.exit_code), HintSuffix(.hint), StderrSuffix(.stderr))]
     ServerExitedDuringInit {
         /// Command that was spawned.
-        command: String,
+        command: ServerCommand,
         /// Exit code, or `None` if the process was terminated by a signal.
         exit_code: Option<i32>,
         /// The likely cause and remedy, when one is known.
@@ -1482,7 +1511,7 @@ pub enum Error {
         /// Current number of documents.
         current: usize,
         /// Maximum allowed documents.
-        max: usize,
+        max: std::num::NonZeroUsize,
     },
 
     /// Resource-subscription limit exceeded for the session.
@@ -1519,14 +1548,11 @@ pub enum Error {
 
     /// File size limit exceeded.
     #[error(
-        "file size limit exceeded: {size} bytes, max {max} bytes (raise workspace.max_file_size in config to increase this)"
+        "file size limit exceeded: {} bytes, max {} bytes (raise workspace.max_file_size in config to increase this)",
+        .0.size,
+        .0.max
     )]
-    FileSizeLimitExceeded {
-        /// Actual file size.
-        size: u64,
-        /// Maximum allowed size.
-        max: std::num::NonZeroU64,
-    },
+    FileSizeLimitExceeded(SizeExceeded),
 
     /// Path exists but does not refer to a regular file (e.g. a FIFO or a
     /// character/block device).
@@ -2253,7 +2279,7 @@ mod tests {
             "LSP server initialization failed: Initialize request failed: I/O error: boom; stderr: fatal: bad config"
         );
         let exited = Error::ServerExitedDuringInit {
-            command: "gopls".to_string(),
+            command: crate::config::ServerCommand::from_static("gopls"),
             exit_code: Some(2),
             hint: None,
             stderr,
@@ -2369,7 +2395,7 @@ mod tests {
     fn test_error_display_document_limit() {
         let err = Error::DocumentLimitExceeded {
             current: 150,
-            max: 100,
+            max: std::num::NonZeroUsize::new(100).unwrap(),
         };
         assert_eq!(
             err.to_string(),
@@ -2379,10 +2405,10 @@ mod tests {
 
     #[test]
     fn test_error_display_file_size_limit() {
-        let err = Error::FileSizeLimitExceeded {
+        let err = Error::FileSizeLimitExceeded(SizeExceeded {
             size: 20_000_000,
             max: std::num::NonZeroU64::new(10_000_000).unwrap(),
-        };
+        });
         assert_eq!(
             err.to_string(),
             "file size limit exceeded: 20000000 bytes, max 10000000 bytes (raise workspace.max_file_size in config to increase this)"
@@ -2410,6 +2436,34 @@ mod tests {
         assert_matches!(err, Error::Json(_));
     }
 
+    /// #706: no entry of a config error's cause chain repeats the text of the
+    /// entry behind it.
+    #[test]
+    fn test_config_error_chain_does_not_repeat_source_text() {
+        let toml_err = toml::from_str::<toml::Value>("[invalid toml").unwrap_err();
+        let non_utf8 = String::from_utf8(vec![0xff]).unwrap_err();
+        let errors = [
+            Error::from(toml_err),
+            Error::from(ConfigError::NotUtf8(non_utf8)),
+        ];
+        for err in errors {
+            let mut chain = vec![err.to_string()];
+            let mut source = std::error::Error::source(&err);
+            while let Some(cause) = source {
+                chain.push(cause.to_string());
+                source = cause.source();
+            }
+            for pair in chain.windows(2) {
+                assert!(
+                    !pair[0].contains(&pair[1]),
+                    "'{}' repeats its source '{}'",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_error_from_toml_de() {
         let toml_str = "[invalid toml";
@@ -2435,7 +2489,7 @@ mod tests {
 
     fn not_found(command: &str) -> Error {
         Error::ServerNotFound {
-            command: command.to_string(),
+            command: crate::config::ServerCommand::new(command).unwrap(),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         }
     }
@@ -2494,7 +2548,7 @@ mod tests {
     fn test_error_source_chain() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err = Error::ServerSpawnFailed {
-            command: "rust-analyzer".to_string(),
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
             source: io_err,
         };
 
@@ -2574,7 +2628,7 @@ mod tests {
                 failures: vec![failure],
             },
             Error::ServerExitedDuringInit {
-                command: "x".to_string(),
+                command: crate::config::ServerCommand::from_static("x"),
                 exit_code: Some(1),
                 hint: None,
                 stderr: None,
@@ -2600,7 +2654,7 @@ mod tests {
         }
         .to_string();
         let exited = Error::ServerExitedDuringInit {
-            command: "typescript-language-server".to_string(),
+            command: crate::config::ServerCommand::from_static("typescript-language-server"),
             exit_code: Some(1),
             hint,
             stderr,
@@ -2619,7 +2673,7 @@ mod tests {
     #[test]
     fn test_server_exited_during_init_display_hints_only_for_rust_analyzer() {
         let hinted = Error::ServerExitedDuringInit {
-            command: "rust-analyzer".to_string(),
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
             exit_code: Some(1),
             hint: None,
             stderr: None,
@@ -2632,7 +2686,7 @@ mod tests {
         );
 
         let plain = Error::ServerExitedDuringInit {
-            command: "gopls".to_string(),
+            command: crate::config::ServerCommand::from_static("gopls"),
             exit_code: None,
             hint: None,
             stderr: None,
@@ -2709,7 +2763,7 @@ mod tests {
         Error::NoServerForLanguage {
             language: LanguageId::from_static(language),
             file: FileKey::Unmappable,
-            patterns: vec![],
+            patterns: Arc::default(),
         }
     }
 
@@ -2718,10 +2772,10 @@ mod tests {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
             file: FileKey::Extension(FileExtension::from_static("cpp")),
-            patterns: vec![
+            patterns: Arc::from([
                 FilePattern::from_static("**/*.rs"),
                 FilePattern::from_static("**/*.h"),
-            ],
+            ]),
         };
         let message = err.to_string();
         assert!(message.starts_with("no LSP server configured for language: plaintext ("));
@@ -2740,7 +2794,7 @@ mod tests {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
             file: FileKey::Unmappable,
-            patterns: vec![],
+            patterns: Arc::default(),
         };
         let message = err.to_string();
         assert!(
@@ -2758,7 +2812,7 @@ mod tests {
         let err = Error::NoServerForLanguage {
             language: LanguageId::from_static("nushell"),
             file: FileKey::Extension(FileExtension::from_static("nu")),
-            patterns: vec![FilePattern::from_static("**/*.rs")],
+            patterns: Arc::from([FilePattern::from_static("**/*.rs")]),
         };
         assert_eq!(
             err.to_string(),
@@ -2771,7 +2825,7 @@ mod tests {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
             file: FileKey::Name(FileName::from_static("Makefile")),
-            patterns: vec![FilePattern::from_static("**/*.rs")],
+            patterns: Arc::from([FilePattern::from_static("**/*.rs")]),
         };
         let message = err.to_string();
         assert!(
@@ -2820,10 +2874,10 @@ mod tests {
             Error::NoResolvableListenUris,
             Error::ResourceUri(ResourceUriError::InvalidScheme("x".to_string())),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
-            Error::FileSizeLimitExceeded {
+            Error::FileSizeLimitExceeded(SizeExceeded {
                 size: 100,
                 max: std::num::NonZeroU64::new(10).unwrap(),
-            },
+            }),
             Error::ListenFilterTooLarge { max: 1000 },
             Error::InvalidClientPath(InvalidClientPath::ContainsNul),
         ];
@@ -2995,7 +3049,7 @@ mod tests {
             Error::NoWorkspaceRoots(PathBuf::from("/tmp")),
             Error::DocumentLimitExceeded {
                 current: 150,
-                max: 100,
+                max: std::num::NonZeroUsize::new(100).unwrap(),
             },
             Error::SubscriptionLimitReached { max: 1000 },
         ];
