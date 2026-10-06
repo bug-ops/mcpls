@@ -13,7 +13,7 @@ compatibility: >-
   requires building with the non-default `transport-http` feature.
 metadata:
   repository: "https://github.com/bug-ops/mcpls"
-  docs: "https://github.com/bug-ops/mcpls/tree/main/docs/user-guide"
+  docs: "https://bug-ops.github.io/mcpls/"
 ---
 
 # mcpls
@@ -35,7 +35,7 @@ identifiers and command arguments are returned unmodified.
 This skill covers operating the **binary**: installing it, choosing CLI flags and
 environment variables, registering it with an MCP client, and writing `mcpls.toml`.
 It does not enumerate the 31 MCP tools themselves or their parameters — for that, see
-[Tools Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/tools-reference.md).
+[Tools Reference](https://bug-ops.github.io/mcpls/tools/overview.html).
 If the bridge is configured with `mcp.tool_prefix`, every tool name listed there gains
 that prefix (`{tool_prefix}_{tool}`).
 
@@ -48,7 +48,7 @@ concurrently, and one failing to start does not affect the others (graceful
 degradation) — but a language with no server configured, or whose server isn't on
 `PATH`, simply has no code intelligence available for it.
 
-See [Language Server Setup](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#language-server-setup)
+See [Language Server Setup](https://bug-ops.github.io/mcpls/guide/language-servers.html)
 for per-language install commands.
 
 ## Installation
@@ -62,7 +62,7 @@ cargo install mcpls
 **Pre-built binaries:** download the archive for your platform from
 [GitHub Releases](https://github.com/bug-ops/mcpls/releases), extract it, and move
 the `mcpls` binary onto your `PATH`. See
-[Pre-Built Binaries](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#method-2-pre-built-binaries-from-github-releases)
+[Pre-Built Binaries](https://bug-ops.github.io/mcpls/getting-started/installation.html)
 for per-platform archive names. Each archive ships with a `.sha256` sidecar; verify
 before extracting:
 
@@ -213,7 +213,7 @@ malicious-by-default — it just needs an explicit trust decision.
 
 The rest of `instructions` is not guaranteed to be mcpls's built-in capability
 blurb: a configured `[mcp].instructions` (see [Configuration
-Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#mcp-section))
+Reference](https://bug-ops.github.io/mcpls/reference/config.html#mcp))
 **replaces** that text entirely. Read whatever `instructions` actually contains at
 connection time rather than assuming the built-in wording — the ignored-config NOTE
 above is still appended after it regardless.
@@ -221,7 +221,7 @@ above is still appended after it regardless.
 ### Starter config
 
 A minimal `mcpls.toml` — expand per-language via
-[Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md):
+[Configuration Reference](https://bug-ops.github.io/mcpls/reference/config.html):
 
 A `[workspace]` table is deliberately omitted here: `roots` defaults to `[]`, which
 already auto-resolves to the current directory, and adding `[workspace]` for that
@@ -257,23 +257,23 @@ allowlist, heuristics), see
 
 | Goal | How |
 |---|---|
-| Add support for a new language | Add a `[[lsp_servers]]` entry with `language_id`, `command`, `file_patterns`. See [Multi-Language Configuration](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/installation.md#multi-language-configuration). |
+| Add support for a new language | Add a `[[lsp_servers]]` entry with `language_id`, `command`, `file_patterns`. See [Multi-Language Configuration](https://bug-ops.github.io/mcpls/guide/language-servers.html#monorepos). |
 | Route specific tools to a specialized server | Set `handles` on each `[[lsp_servers]]` entry to claim only the tools that server should serve; see `handles` in [references/configuration.md](references/configuration.md). |
 | Fix a slow/timing-out LSP request | Raise that server's `request_timeout_seconds` (per-request) and/or `timeout_seconds` (handshake) in `mcpls.toml`. |
 | Handle a "still initializing" error on a large project | This is `Error::ServerInitializing` — the server is up but hasn't finished its `initialize` handshake (common with rust-analyzer on a large repo). It returns immediately, it does not time out, so raising `request_timeout_seconds` does nothing here. Wait and retry the call instead. |
-| Debug why mcpls won't start | Run with `--log-level debug` (or `trace`) and inspect stderr; see [Troubleshooting](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#advanced-debugging). |
+| Debug why mcpls won't start | Run with `--log-level debug` (or `trace`) and inspect stderr; see [Troubleshooting](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#read-the-logs-first). |
 | Use a trusted project's own `mcpls.toml` | Pass `--trust-project-config` — see [Config trust model](#config-trust-model). |
 
 ## Troubleshooting
 
 For symptom-driven debugging, see
-[Troubleshooting Guide](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md):
+[Troubleshooting Guide](https://bug-ops.github.io/mcpls/guide/troubleshooting.html):
 
-- ["command not found: mcpls"](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#command-not-found-mcpls) — `PATH` doesn't include Cargo's bin directory.
-- [mcpls not showing up in an MCP client](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#claude-code-integration) — verify the client config points at an absolute binary path.
-- ["LSP server not available for file type"](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#lsp-server-issues) — no `[[lsp_servers]]` entry matches the file's extension.
-- ["Configuration file not found" / unexpected config used](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#configuration-issues) — check the [search order and paths](#search-order-and-paths) above first.
-- [High memory or CPU usage](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/troubleshooting.md#performance-issues) — usually an over-broad `workspace.roots` or too many configured servers.
+- ["command not found: mcpls"](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#command-not-found-mcpls) — `PATH` doesn't include Cargo's bin directory.
+- [mcpls not showing up in an MCP client](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#mcpls-does-not-appear-in-the-client) — verify the client config points at an absolute binary path.
+- ["LSP server not available for file type"](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#lsp-server-not-available-for-file-type) — no `[[lsp_servers]]` entry matches the file's extension.
+- ["Configuration file not found" / unexpected config used](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#configuration-file-not-found-or-the-wrong-one-is-used) — check the [search order and paths](#search-order-and-paths) above first.
+- [High memory or CPU usage](https://bug-ops.github.io/mcpls/guide/troubleshooting.html#queries-are-slow-or-time-out) — usually an over-broad `workspace.roots` or too many configured servers.
 
 ## Further reference
 

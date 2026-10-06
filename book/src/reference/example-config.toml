@@ -2,7 +2,7 @@
 # Copy to ~/.config/mcpls/mcpls.toml or specify with --config flag.
 # If placed as ./mcpls.toml in a project directory instead, mcpls ignores it
 # unless you pass --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) —
-# see docs/user-guide/configuration.md#trusting-a-project-local-config.
+# see https://bug-ops.github.io/mcpls/advanced/security.html.
 
 # MCP serverInfo/initialize presentation overrides (all optional; omit any
 # field to keep mcpls's built-in text). `instructions` REPLACES the built-in
@@ -32,12 +32,12 @@ position_encodings = ["utf-8", "utf-16"]
 # - Include only languages you need
 
 # Example: Add Nushell support
-# [[language_extensions]]
+# [[workspace.language_extensions]]
 # extensions = ["nu"]
 # language_id = "nushell"
 
 # Example: Override Rust detection to use custom language ID
-# [[language_extensions]]
+# [[workspace.language_extensions]]
 # extensions = ["rs"]
 # language_id = "custom-rust"
 
@@ -124,7 +124,7 @@ timeout_seconds = 30
 # identity (defaults to language_id, but two servers for one language must
 # not share it); `handles` restricts a server to exactly those tools --
 # omit `handles` for a catch-all that serves everything not claimed
-# elsewhere. See docs/user-guide/configuration.md for the full semantics.
+# elsewhere. See https://bug-ops.github.io/mcpls/reference/config.html for the full semantics.
 # [[lsp_servers]]
 # name = "pyright"
 # language_id = "python"

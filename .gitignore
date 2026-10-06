@@ -28,7 +28,7 @@ tarpaulin-report.html
 criterion/
 
 # Documentation build
-/docs/book/
+/book/book/
 
 # Environment
 .env

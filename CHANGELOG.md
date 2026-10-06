@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- User documentation is now an mdBook in `book/`, published to GitHub Pages by a new workflow; `docs/` is removed and the READMEs link to the book.
 - **Breaking:** `--workspace-trust untrusted` and repeatable `--allow-server <id>` start only the named servers, refuse a config file or server executable inside the workspace, and spawn the resolved executable with a workspace-free `PATH` and the login home as `HOME`/`USERPROFILE`; new public `ServerConfig::workspace_trust` field (struct literals must set it), `ServerConfig::ensure_outside_workspace` and `load_discovered`, `ConfigOrigin`, `WorkspaceTrust`, `ServerAllowlist`, `Error::ConfigInsideWorkspace` and `StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal)`; untrusted conflicts with `--trust-project-config`. (#647)
 - `get_folding_ranges` tool (`textDocument/foldingRange`) with a `kind` filter and the `folding_range` `handles` value; collapsed text is redacted and cut to 256 bytes. (#644)
 - `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#644)

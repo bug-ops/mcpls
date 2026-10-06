@@ -2,8 +2,8 @@
 
 Compact field tables for `mcpls.toml`. This is a schema reference, not a tutorial —
 for worked examples per language, see
-[Configuration Reference](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md)
-and [Complete Examples](https://github.com/bug-ops/mcpls/blob/main/docs/user-guide/configuration.md#complete-examples).
+[Configuration Reference](https://bug-ops.github.io/mcpls/reference/config.html)
+and [Complete Examples](https://bug-ops.github.io/mcpls/reference/config.html#complete-examples).
 
 ## `[mcp]` fields
 

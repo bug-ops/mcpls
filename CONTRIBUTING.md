@@ -108,9 +108,8 @@ mcpls/
 │   │   │   └── config/ # Configuration types
 │   │   └── tests/
 │   └── mcpls-cli/      # CLI application
-├── docs/
-│   └── adr/            # Architecture Decision Records
-├── examples/
+├── book/               # User documentation (mdBook)
+├── specs/              # Specifications
 └── tests/fixtures/
 ```
 
