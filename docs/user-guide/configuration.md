@@ -1010,7 +1010,7 @@ TypeScript 7 is the native port of the compiler. Its npm package ships no `lib/t
    `typescript-language-server` is kept (also when `tsc` needs `node` and `node` is not on `PATH`), and the choice and its reason are logged at info level.
    When the native server is chosen, mcpls replaces the entry's `command` and `args`; remove
    `selection` to keep your own. A TypeScript 6 install next to `typescript-language-server` wins over a
-   TypeScript 7 one. Windows is unchanged: `tsc` there is a `.cmd` shim, so use option 3.
+   TypeScript 7 one. On Windows the npm or pnpm `tsc.cmd` shim is mapped to its `typescript` package and the server is started as `node <package>\bin\tsc --lsp --stdio` with the absolute `node` found on `PATH` (a missing `node` keeps `typescript-language-server`); this launch has not been verified on a live Windows install, so option 3 remains the safe choice there.
 3. Run the TypeScript 7 native server explicitly. Edit the existing `typescript` entry
    of your config file (or remove it first) so that its `command` and `args` are as below, and
    remove its `selection` key (`selection = "auto"` is rejected on any other command):

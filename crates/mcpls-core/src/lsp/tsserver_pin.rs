@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::WorkspaceRoots;
 use crate::config::{BuiltinServer, LaunchCommand, LspServerConfig, ServerCommand, ServerId};
 use crate::error::InitFailureHint;
-use crate::lsp::command_path::{is_executable_file, resolve_named};
+use crate::lsp::command_path::{HostOs, resolve_named, resolve_named_on};
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
@@ -45,6 +45,9 @@ const TYPESCRIPT_RELATIVE: &str = "node_modules/typescript";
 const TSSERVER_IN_PACKAGE: &str = "lib/tsserver.js";
 const TSSERVER_RELATIVE: &str = "node_modules/typescript/lib/tsserver.js";
 const NATIVE_TSC_NAME: &str = "tsc";
+const NATIVE_TSC_WINDOWS_SHIM: &str = "tsc.cmd";
+const NODE_NAME: &str = "node";
+const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
 const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
 const NPM_SPECIFIER_PREFIX: &str = "npm:";
@@ -305,12 +308,28 @@ fn nearest_native_typescript(start: &Path) -> Option<PathBuf> {
         .and_then(|(state, package)| (state == TypescriptState::Native).then_some(package))
 }
 
-/// The canonical server package directory containing (or equal to) `path`.
-fn package_dir_of(path: &Path) -> Option<PathBuf> {
+/// An npm package whose install layout [`InstallLayout`] can follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NpmPackage {
+    TypescriptLanguageServer,
+    Typescript,
+}
+
+impl NpmPackage {
+    const fn stem(self) -> &'static str {
+        match self {
+            Self::TypescriptLanguageServer => SERVER_STEM,
+            Self::Typescript => TYPESCRIPT_STEM,
+        }
+    }
+}
+
+/// The canonical directory of `package` containing (or equal to) `path`.
+fn package_dir_of(path: &Path, package: NpmPackage) -> Option<PathBuf> {
     let real = dunce::canonicalize(path).ok()?;
     real.ancestors()
         .find(|dir| {
-            dir.file_name().is_some_and(|name| name == SERVER_STEM)
+            dir.file_name().is_some_and(|name| name == package.stem())
                 && dir.join("package.json").is_file()
         })
         .map(Path::to_path_buf)
@@ -330,23 +349,27 @@ enum InstallLayout {
 impl InstallLayout {
     const ALL: [Self; 3] = [Self::Symlink, Self::NpmShim, Self::PnpmGlobal];
 
-    fn locate(self, executable: &Path) -> Option<PathBuf> {
+    fn locate(self, executable: &Path, package: NpmPackage) -> Option<PathBuf> {
         match self {
-            Self::Symlink => package_dir_of(executable),
-            Self::NpmShim => package_dir_of(&server_in_modules(executable.parent()?)),
-            Self::PnpmGlobal => pnpm_global_package(&executable.parent()?.join(PNPM_GLOBAL_DIR)),
+            Self::Symlink => package_dir_of(executable, package),
+            Self::NpmShim => {
+                package_dir_of(&package_in_modules(executable.parent()?, package), package)
+            }
+            Self::PnpmGlobal => {
+                pnpm_global_package(&executable.parent()?.join(PNPM_GLOBAL_DIR), package)
+            }
         }
     }
 }
 
-fn server_in_modules(dir: &Path) -> PathBuf {
-    dir.join(NODE_MODULES).join(SERVER_STEM)
+fn package_in_modules(dir: &Path, package: NpmPackage) -> PathBuf {
+    dir.join(NODE_MODULES).join(package.stem())
 }
 
-/// The one server package under a pnpm `global` directory; more than
+/// The one `package` under a pnpm `global` directory; more than
 /// [`MAX_PNPM_GLOBAL_ENTRIES`] entries, or more than one distinct match, is
 /// ambiguous and yields `None`.
-fn pnpm_global_package(global: &Path) -> Option<PathBuf> {
+fn pnpm_global_package(global: &Path, package: NpmPackage) -> Option<PathBuf> {
     let entries = std::fs::read_dir(global)
         .ok()?
         .take(MAX_PNPM_GLOBAL_ENTRIES + 1)
@@ -357,15 +380,15 @@ fn pnpm_global_package(global: &Path) -> Option<PathBuf> {
     }
     let mut packages = entries
         .iter()
-        .filter_map(|entry| package_dir_of(&server_in_modules(&entry.path())));
+        .filter_map(|entry| package_dir_of(&package_in_modules(&entry.path(), package), package));
     let package = packages.next()?;
     packages.all(|other| other == package).then_some(package)
 }
 
-fn locate_package(executable: &Path) -> Option<PathBuf> {
+fn locate_package(executable: &Path, package: NpmPackage) -> Option<PathBuf> {
     InstallLayout::ALL
         .into_iter()
-        .find_map(|layout| layout.locate(executable))
+        .find_map(|layout| layout.locate(executable, package))
 }
 
 /// Node's lookup of the `typescript` dependency: `node_modules` of every
@@ -407,11 +430,14 @@ fn server_package_dir(
     match launch {
         Launch::PackageRunner => Err(UnresolvedReason::PackageRunner),
         Launch::UnknownWrapper => Err(unsupported),
-        Launch::Script(script) => package_dir_of(script).ok_or(unsupported),
+        Launch::Script(script) => {
+            package_dir_of(script, NpmPackage::TypescriptLanguageServer).ok_or(unsupported)
+        }
         Launch::Server(command) => {
             let executable = resolve_named(command, config, parent_env)
                 .ok_or(UnresolvedReason::ServerNotOnPath)?;
-            locate_package(&executable.spawn).ok_or(unsupported)
+            locate_package(&executable.spawn, NpmPackage::TypescriptLanguageServer)
+                .ok_or(unsupported)
         }
     }
 }
@@ -461,7 +487,19 @@ pub fn resolve(config: &LspServerConfig, parent_env: impl ParentEnv) -> Option<T
 /// auto-selection candidate passes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTsc {
-    command: ServerCommand,
+    tsc: ServerCommand,
+    launch: NativeLaunch,
+}
+
+/// How a [`NativeTsc`] is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeLaunch {
+    /// The `tsc` file is executed itself (a native binary, or a `node`
+    /// shebang script on Unix).
+    Direct,
+    /// The `tsc` script is passed to this `node`, as a shebang cannot be
+    /// executed on Windows.
+    ThroughNode(ServerCommand),
 }
 
 /// Why a `tsc` candidate was not accepted as a [`NativeTsc`].
@@ -517,7 +555,11 @@ impl NativeTsc {
     ///
     /// The rejection that decided: canonicalization failure and a shape or
     /// version mismatch are [`CandidateRejected::NotNativeTsc`].
-    fn from_candidate(path: &Path, roots: &WorkspaceRoots) -> Result<Self, CandidateRejected> {
+    fn from_candidate(
+        path: &Path,
+        roots: &WorkspaceRoots,
+        host: HostOs,
+    ) -> Result<Self, CandidateRejected> {
         let canonical = dunce::canonicalize(path).map_err(|_| CandidateRejected::NotNativeTsc)?;
         if native_package_of(&canonical).is_none() {
             return Err(CandidateRejected::NotNativeTsc);
@@ -529,22 +571,35 @@ impl NativeTsc {
         if roots.contains_canonical(&canonical) || parent_inside {
             return Err(CandidateRejected::InsideWorkspace);
         }
-        if !is_executable_file(&canonical) {
+        if !host.is_executable_file(&canonical) {
             return Err(CandidateRejected::NotExecutable);
         }
-        let command = canonical.to_str().ok_or(CandidateRejected::NonUtf8Path)?;
-        let command = ServerCommand::new(command).map_err(|_| CandidateRejected::NotExecutable)?;
-        Ok(Self { command })
+        let tsc = canonical.to_str().ok_or(CandidateRejected::NonUtf8Path)?;
+        let tsc = ServerCommand::new(tsc).map_err(|_| CandidateRejected::NotExecutable)?;
+        Ok(Self {
+            tsc,
+            launch: NativeLaunch::Direct,
+        })
     }
 
     /// The canonical path of the native `tsc`.
     #[must_use]
     pub fn path(&self) -> &Path {
-        Path::new(&self.command)
+        Path::new(&self.tsc)
     }
 
-    fn command(&self) -> ServerCommand {
-        self.command.clone()
+    /// The `command` and `args` that start the native server.
+    fn launch_parts(&self) -> (ServerCommand, Vec<String>) {
+        let lsp_args = NATIVE_TSC_ARGS.iter().map(ToString::to_string);
+        match &self.launch {
+            NativeLaunch::Direct => (self.tsc.clone(), lsp_args.collect()),
+            NativeLaunch::ThroughNode(node) => (
+                node.clone(),
+                std::iter::once(self.tsc.to_string())
+                    .chain(lsp_args)
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -572,9 +627,6 @@ pub enum TsserverKept {
     /// The server is started through an unsupported shim, wrapper or package
     /// runner.
     UnsupportedLauncher,
-    /// Native selection is only implemented on Unix, where `bin/tsc` is
-    /// directly executable.
-    UnsupportedPlatform,
 }
 
 impl fmt::Display for TsserverKept {
@@ -596,9 +648,6 @@ impl fmt::Display for TsserverKept {
             Self::UnsupportedLauncher => {
                 "typescript-language-server is started through an unsupported launcher or shim"
             }
-            Self::UnsupportedPlatform => {
-                "native server selection is not supported on this platform"
-            }
         })
     }
 }
@@ -614,11 +663,50 @@ pub enum TypescriptServerChoice {
 
 /// `binary` as the child would find it on its effective `PATH`.
 fn find_on_child_path(
+    host: HostOs,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
     binary: &str,
 ) -> Option<PathBuf> {
-    resolve_named(Path::new(binary), config, parent_env).map(|resolved| resolved.spawn)
+    resolve_named_on(host, Path::new(binary), config, parent_env).map(|resolved| resolved.spawn)
+}
+
+/// The `bin/tsc` of the native `typescript` package a `tsc` on the child's
+/// `PATH` belongs to. On Windows the npm shim is `tsc.cmd`, found explicitly
+/// because a bare `tsc` only matches `tsc.exe`, and mapped to its package
+/// through the install layout.
+fn native_tsc_on_path(
+    host: HostOs,
+    config: &LspServerConfig,
+    parent_env: impl ParentEnv,
+) -> Option<PathBuf> {
+    match host {
+        HostOs::Windows => {
+            let shim = find_on_child_path(host, config, parent_env, NATIVE_TSC_WINDOWS_SHIM)?;
+            locate_package(&shim, NpmPackage::Typescript).map(|package| native_tsc_in(&package))
+        }
+        HostOs::Other => find_on_child_path(host, config, parent_env, NATIVE_TSC_NAME),
+    }
+}
+
+/// How `tsc` is started on `host`, or why it cannot be.
+fn native_launch(
+    host: HostOs,
+    tsc: &Path,
+    config: &LspServerConfig,
+    parent_env: impl ParentEnv,
+) -> Result<NativeLaunch, TsserverKept> {
+    let node = || find_on_child_path(host, config, &parent_env, NODE_NAME);
+    match host {
+        HostOs::Windows => {
+            let node = node().ok_or(TsserverKept::NodeNotOnPath)?;
+            let node = node.to_str().ok_or(TsserverKept::NonUtf8Path)?;
+            let node = ServerCommand::new(node).map_err(|_| TsserverKept::NodeNotOnPath)?;
+            Ok(NativeLaunch::ThroughNode(node))
+        }
+        HostOs::Other if needs_node(tsc) && node().is_none() => Err(TsserverKept::NodeNotOnPath),
+        HostOs::Other => Ok(NativeLaunch::Direct),
+    }
 }
 
 /// Chooses the server flavor for `config`, or `None` when the entry is
@@ -634,16 +722,23 @@ pub fn select_typescript_server(
     roots: &WorkspaceRoots,
     parent_env: impl ParentEnv,
 ) -> Option<TypescriptServerChoice> {
+    select_typescript_server_on(config, roots, parent_env, HostOs::CURRENT)
+}
+
+/// [`select_typescript_server`] with the executable rules of `host`, so the
+/// Windows path is exercised on every OS.
+fn select_typescript_server_on(
+    config: &LspServerConfig,
+    roots: &WorkspaceRoots,
+    parent_env: impl ParentEnv,
+    host: HostOs,
+) -> Option<TypescriptServerChoice> {
     if config.command.is_explicit() {
         return None;
     }
     let kept = |reason| Some(TypescriptServerChoice::Tsserver(reason));
     if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
         return kept(TsserverKept::UserTsserverPath);
-    }
-    // TODO(#646): auto-select native tsc on Windows (.cmd shims)
-    if !cfg!(unix) {
-        return kept(TsserverKept::UnsupportedPlatform);
     }
     let resolved = inspect(config, &parent_env)?;
     let candidate = match resolved.resolution {
@@ -656,19 +751,19 @@ pub fn select_typescript_server(
             .map(|package| native_tsc_in(&package)),
         TsserverResolution::Unresolved(
             UnresolvedReason::NoTypescriptNextToServer | UnresolvedReason::ServerNotOnPath,
-        ) => find_on_child_path(config, &parent_env, NATIVE_TSC_NAME),
+        ) => native_tsc_on_path(host, config, &parent_env),
     };
     let Some(candidate) = candidate else {
         return kept(TsserverKept::NoNativeOutsideWorkspace);
     };
-    Some(match NativeTsc::from_candidate(&candidate, roots) {
-        Ok(tsc)
-            if needs_node(tsc.path())
-                && find_on_child_path(config, &parent_env, "node").is_none() =>
-        {
-            TypescriptServerChoice::Tsserver(TsserverKept::NodeNotOnPath)
-        }
-        Ok(tsc) => TypescriptServerChoice::Native(tsc),
+    Some(match NativeTsc::from_candidate(&candidate, roots, host) {
+        Ok(mut tsc) => match native_launch(host, tsc.path(), config, &parent_env) {
+            Ok(launch) => {
+                tsc.launch = launch;
+                TypescriptServerChoice::Native(tsc)
+            }
+            Err(kept) => TypescriptServerChoice::Tsserver(kept),
+        },
         Err(rejected) => TypescriptServerChoice::Tsserver(rejected.into()),
     })
 }
@@ -709,8 +804,9 @@ pub fn with_selected_typescript_server<'a>(
                 "starting the native TypeScript server (`tsc --lsp --stdio`): TypeScript 7 found outside the workspace"
             );
             let mut native = config.clone();
-            native.command = LaunchCommand::explicit(tsc.command());
-            native.args = NATIVE_TSC_ARGS.iter().map(ToString::to_string).collect();
+            let (command, args) = tsc.launch_parts();
+            native.command = LaunchCommand::explicit(command);
+            native.args = args;
             Cow::Owned(native)
         }
         Some(TypescriptServerChoice::Tsserver(reason)) => {
@@ -1006,7 +1102,7 @@ mod major_tests {
 
 #[cfg(test)]
 mod launch_tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use super::*;
 
@@ -1084,6 +1180,100 @@ mod launch_tests {
         let home = install.base.join("pnpm");
         write_executable(&home.join(SERVER_STEM), "");
         home
+    }
+
+    fn windows_select(
+        env_dir: &Path,
+        roots: &WorkspaceRoots,
+        host: HostOs,
+    ) -> Option<TypescriptServerChoice> {
+        select_typescript_server_on(
+            &config(SERVER_STEM, &[]),
+            roots,
+            env_with_path(env_dir),
+            host,
+        )
+    }
+
+    /// An npm global prefix on Windows: the `tsc.cmd` shim, `node.exe` and the
+    /// TypeScript 7 package under `node_modules`.
+    fn windows_npm_prefix(with_node: bool) -> (Install, PathBuf, PathBuf) {
+        let install = install();
+        let prefix = install.base.join("npm");
+        write(&prefix.join(NATIVE_TSC_WINDOWS_SHIM), "");
+        typescript(&prefix, "7.0.2", false);
+        let tsc = native_tsc_in(&prefix.join(TYPESCRIPT_RELATIVE));
+        write(&tsc, "#!/usr/bin/env node\n");
+        if with_node {
+            write(&prefix.join("node.exe"), "");
+        }
+        (install, prefix, tsc)
+    }
+
+    #[test]
+    fn test_windows_selects_the_tsc_cmd_shim_package_and_launches_through_node() {
+        let (_install, prefix, tsc) = windows_npm_prefix(true);
+
+        let choice = windows_select(&prefix, &WorkspaceRoots::default(), HostOs::Windows);
+
+        let Some(TypescriptServerChoice::Native(native)) = choice else {
+            panic!("expected the native server, got {choice:?}");
+        };
+        let (command, args) = native.launch_parts();
+        assert_eq!(command, prefix.join("node.exe").to_str().unwrap());
+        assert_eq!(args, [tsc.to_str().unwrap(), "--lsp", "--stdio"]);
+    }
+
+    #[test]
+    fn test_windows_keeps_the_server_without_node_on_path() {
+        let (_install, prefix, _tsc) = windows_npm_prefix(false);
+
+        assert_eq!(
+            windows_select(&prefix, &WorkspaceRoots::default(), HostOs::Windows),
+            Some(TypescriptServerChoice::Tsserver(
+                TsserverKept::NodeNotOnPath
+            ))
+        );
+    }
+
+    #[test]
+    fn test_windows_maps_a_pnpm_home_shim_through_global() {
+        let install = install();
+        let home = install.base.join("pnpm");
+        write(&home.join(NATIVE_TSC_WINDOWS_SHIM), "");
+        write(&home.join("node.exe"), "");
+        let store = home.join("global/5");
+        typescript(&store, "7.0.2", false);
+        write(&native_tsc_in(&store.join(TYPESCRIPT_RELATIVE)), "");
+
+        let choice = windows_select(&home, &WorkspaceRoots::default(), HostOs::Windows);
+
+        assert_matches!(choice, Some(TypescriptServerChoice::Native(_)));
+    }
+
+    #[test]
+    fn test_windows_never_selects_a_shim_inside_the_workspace() {
+        let (install, prefix, _tsc) = windows_npm_prefix(true);
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&install.base)).unwrap();
+
+        assert_eq!(
+            windows_select(&prefix, &roots, HostOs::Windows),
+            Some(TypescriptServerChoice::Tsserver(
+                TsserverKept::NativeInsideWorkspace
+            ))
+        );
+    }
+
+    #[test]
+    fn test_other_hosts_do_not_look_for_the_tsc_cmd_shim() {
+        let (_install, prefix, _tsc) = windows_npm_prefix(true);
+
+        assert_eq!(
+            windows_select(&prefix, &WorkspaceRoots::default(), HostOs::Other),
+            Some(TypescriptServerChoice::Tsserver(
+                TsserverKept::NoNativeOutsideWorkspace
+            ))
+        );
     }
 
     const fn unsupported() -> TsserverResolution {
@@ -2020,7 +2210,8 @@ mod tests {
 
     fn native_tsc(path: &Path) -> NativeTsc {
         NativeTsc {
-            command: ServerCommand::new(path.to_str().unwrap()).unwrap(),
+            tsc: ServerCommand::new(path.to_str().unwrap()).unwrap(),
+            launch: NativeLaunch::Direct,
         }
     }
 

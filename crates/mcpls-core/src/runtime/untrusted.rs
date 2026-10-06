@@ -21,6 +21,7 @@ use crate::config::{
 use crate::error::{
     HomeVariable, ResolvedItem, ServerSpawnFailure, StartupFailure, UntrustedRefusal,
 };
+use crate::lsp::command_path::HostOs;
 use crate::lsp::{
     self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
     tsserver_pin,
@@ -77,25 +78,10 @@ enum EnvKeyCase {
     Insensitive,
 }
 
-/// The host operating system, as far as untrusted-mode hardening differs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostOs {
-    Windows,
-    Other,
-}
-
-impl HostOs {
-    const CURRENT: Self = if cfg!(windows) {
-        Self::Windows
-    } else {
-        Self::Other
-    };
-
-    const fn env_key_case(self) -> EnvKeyCase {
-        match self {
-            Self::Windows => EnvKeyCase::Insensitive,
-            Self::Other => EnvKeyCase::Sensitive,
-        }
+const fn env_key_case(host: HostOs) -> EnvKeyCase {
+    match host {
+        HostOs::Windows => EnvKeyCase::Insensitive,
+        HostOs::Other => EnvKeyCase::Sensitive,
     }
 }
 
@@ -144,7 +130,7 @@ fn harden_for_untrusted(
     parent_env: &dyn ParentEnv,
 ) -> Result<LspServerConfig, UntrustedRefusal> {
     let mut effective = effective.into_owned();
-    normalize_env_keys(&mut effective.env, host.env_key_case());
+    normalize_env_keys(&mut effective.env, env_key_case(host));
     let unresolved = || UntrustedRefusal::UnresolvedExecutable {
         command: effective.command.server_command().clone(),
     };
