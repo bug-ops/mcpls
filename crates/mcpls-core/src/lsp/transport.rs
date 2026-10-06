@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -19,6 +20,7 @@ use tracing::{Level, debug, trace, warn};
 use crate::error::{Error, RedactedText, Result};
 use crate::lsp::types::{InboundMessage, RequestId};
 use crate::redaction::Redactions;
+use crate::util::WarnLimiter;
 
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -93,7 +95,11 @@ impl fmt::Debug for LspTransport {
 pub struct LspTransportReader {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     redactions: Arc<Redactions>,
+    malformed_header_warn: WarnLimiter,
 }
+
+/// Shortest time between two `warn` lines about malformed headers.
+const MALFORMED_HEADER_WARN_EVERY: Duration = Duration::from_mins(1);
 
 impl fmt::Debug for LspTransportReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,6 +140,7 @@ impl LspTransport {
             LspTransportReader {
                 stdout: BufReader::new(Box::new(stdout)),
                 redactions,
+                malformed_header_warn: WarnLimiter::default(),
             },
         )
     }
@@ -292,10 +299,16 @@ impl LspTransportReader {
             if let Some((key, value)) = line.trim_end().split_once(':') {
                 headers.insert(key.trim().to_lowercase(), value.trim().to_string());
             } else {
-                warn!(
-                    "Malformed header: {}",
-                    crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES)
-                );
+                let shown =
+                    crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES);
+                if self
+                    .malformed_header_warn
+                    .due(Instant::now(), MALFORMED_HEADER_WARN_EVERY)
+                {
+                    warn!("Malformed header: {shown}");
+                } else {
+                    debug!("Malformed header: {shown}");
+                }
             }
         }
 
@@ -974,6 +987,36 @@ mod tests {
 
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
         assert!(header.contains(&expected_len.to_string()));
+    }
+
+    /// A server that sends many malformed header lines is warned about once.
+    #[tokio::test]
+    async fn test_malformed_header_warnings_are_rate_limited() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let inbound = format!(
+            "no colon one\r\nno colon two\r\nno colon three\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (_, mut reader) = LspTransport::new(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+        );
+
+        assert_matches!(reader.receive().await, Ok(InboundMessage::Response(_)));
+
+        let warnings = captured
+            .entries()
+            .into_iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::WARN && message.contains("Malformed header")
+            })
+            .count();
+        assert_eq!(warnings, 1);
     }
 
     #[test]
