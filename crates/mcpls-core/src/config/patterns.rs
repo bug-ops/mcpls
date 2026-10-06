@@ -105,46 +105,52 @@ pub enum InvalidFileExtension {
     /// The extension started with a dot, which `Path::extension` never reports.
     #[error("file extension must be written without the leading dot")]
     LeadingDot,
-    /// The extension contained a character other than a letter, a digit, `_`,
-    /// `-` or `+`.
-    #[error("file extension may contain only letters, digits, '_', '-' and '+', found {0:?}")]
+    /// The extension contained a character other than an ASCII letter, an
+    /// ASCII digit, `_`, `-` or `+`.
+    #[error("file extension may contain only ASCII letters, digits, '_', '-' and '+', found {0:?}")]
     InvalidChar(char),
 }
 
-impl InvalidFileExtension {
-    fn check(extension: &str) -> Option<Self> {
-        if extension.is_empty() {
-            return Some(Self::Empty);
-        }
-        if extension.starts_with('.') {
-            return Some(Self::LeadingDot);
-        }
-        extension
-            .chars()
-            .find(|c| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '+')))
-            .map(Self::InvalidChar)
-    }
-
-    const fn check_ascii(extension: &str) -> Option<Self> {
-        let mut rest = extension.as_bytes();
-        if rest.is_empty() {
-            return Some(Self::Empty);
-        }
-        if let [b'.', ..] = rest {
-            return Some(Self::LeadingDot);
-        }
-        while let [byte, tail @ ..] = rest {
-            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')) {
-                return Some(Self::InvalidChar(*byte as char));
-            }
-            rest = tail;
-        }
-        None
-    }
+/// Whether `byte` may appear in a file extension: an ASCII letter or digit,
+/// `_`, `-` or `+`.
+pub const fn is_pattern_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')
 }
 
-/// A file extension as `Path::extension` reports it: no leading dot, and none
-/// of the glob or path characters that make a pattern ambiguous.
+/// The first rule an extension breaks, without the offending character.
+#[derive(Clone, Copy)]
+enum ExtensionFault {
+    Empty,
+    LeadingDot,
+    InvalidByteAt(usize),
+}
+
+/// The one extension rule, shared by [`FileExtension::new`] and
+/// [`FileExtension::from_static`]. A non-ASCII byte is always offending, so
+/// the index it reports is the start of a character.
+const fn first_extension_fault(extension: &str) -> Option<ExtensionFault> {
+    let bytes = extension.as_bytes();
+    let mut rest = bytes;
+    if let [b'.', ..] = rest {
+        return Some(ExtensionFault::LeadingDot);
+    }
+    if rest.is_empty() {
+        return Some(ExtensionFault::Empty);
+    }
+    while let [byte, tail @ ..] = rest {
+        if !is_pattern_name_byte(*byte) {
+            return Some(ExtensionFault::InvalidByteAt(
+                bytes.len().saturating_sub(rest.len()),
+            ));
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// A file extension as `Path::extension` reports it: no leading dot, and only
+/// ASCII letters, digits, `_`, `-` and `+`, so no glob or path characters
+/// that make a pattern ambiguous.
 ///
 /// `extensions = [".rs"]` would load but never match, so a leading dot is
 /// rejected at load time. Case is significant, as in the extension map.
@@ -168,11 +174,11 @@ impl FileExtension {
     ///
     /// # Panics
     ///
-    /// Panics if `extension` is not a valid ASCII extension.
+    /// Panics if `extension` is not a valid extension.
     #[must_use]
     pub const fn from_static(extension: &'static str) -> Self {
         assert!(
-            InvalidFileExtension::check_ascii(extension).is_none(),
+            first_extension_fault(extension).is_none(),
             "invalid file extension"
         );
         Self(Cow::Borrowed(extension))
@@ -186,10 +192,18 @@ impl FileExtension {
     /// breaks.
     pub fn new(extension: impl Into<String>) -> Result<Self, InvalidFileExtension> {
         let extension = extension.into();
-        if let Some(reason) = InvalidFileExtension::check(&extension) {
-            return Err(reason);
+        match first_extension_fault(&extension) {
+            None => Ok(Self(Cow::Owned(extension))),
+            Some(ExtensionFault::Empty) => Err(InvalidFileExtension::Empty),
+            Some(ExtensionFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
+            Some(ExtensionFault::InvalidByteAt(index)) => {
+                let offender = extension
+                    .get(index..)
+                    .and_then(|rest| rest.chars().next())
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                Err(InvalidFileExtension::InvalidChar(offender))
+            }
         }
-        Ok(Self(Cow::Owned(extension)))
     }
 }
 
@@ -357,6 +371,24 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn test_file_extension_rejects_non_ascii_with_the_offending_char() {
+        assert_eq!(
+            FileExtension::new("r\u{e9}s"),
+            Err(InvalidFileExtension::InvalidChar('\u{e9}'))
+        );
+        assert_eq!(
+            FileExtension::new("\u{4e2d}"),
+            Err(InvalidFileExtension::InvalidChar('\u{4e2d}'))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid file extension")]
+    fn test_file_extension_from_static_panics_on_non_ascii() {
+        let _ = FileExtension::from_static("r\u{e9}s");
     }
 
     #[test]

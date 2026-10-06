@@ -407,7 +407,7 @@ mod settler_tests {
         ServerStartOutcome::Failed(ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.to_string(),
+            command: config.command.clone(),
             reason: StartupFailure::InitTaskPanicked,
         })
     }
@@ -579,7 +579,7 @@ mod settler_tests {
             .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
                 server_id: explicit.id(),
                 language_id: LanguageId::from_static("rust"),
-                command: explicit.command.to_string(),
+                command: explicit.command.clone(),
                 reason: StartupFailure::InitTaskPanicked,
             }))
             .await;
@@ -989,7 +989,7 @@ mod init_supervision_tests {
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: id.clone(),
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(Error::ServerTerminated)),
         }]);
 

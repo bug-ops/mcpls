@@ -1363,7 +1363,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: id.clone(),
             language_id: LanguageId::new(language).unwrap(),
-            command: command.to_string(),
+            command: ServerCommand::new(command).unwrap(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                 command: command.to_string(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),

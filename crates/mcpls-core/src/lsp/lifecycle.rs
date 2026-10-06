@@ -109,40 +109,47 @@ const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 /// produce.
 const LIFECYCLE_CHANNEL_CAPACITY: usize = 128;
 
-/// Every symbol kind defined by LSP 3.17 and understood by mcpls.
+/// Every symbol kind defined by LSP 3.17 and understood by mcpls, with the
+/// lowercase name a `workspace/symbol` `kind_filter` accepts for it.
 ///
-/// Single source of truth for both the `initialize` request's
-/// `value_set` and the `workspace/symbol` `kind_filter` validation in
-/// [`crate::bridge::translator::symbols`] — the latter derives its accepted
-/// string names from this array via `format!("{:?}", kind)`.
-pub const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
-    SymbolKind::File,
-    SymbolKind::Module,
-    SymbolKind::Namespace,
-    SymbolKind::Package,
-    SymbolKind::Class,
-    SymbolKind::Method,
-    SymbolKind::Property,
-    SymbolKind::Field,
-    SymbolKind::Constructor,
-    SymbolKind::Enum,
-    SymbolKind::Interface,
-    SymbolKind::Function,
-    SymbolKind::Variable,
-    SymbolKind::Constant,
-    SymbolKind::String,
-    SymbolKind::Number,
-    SymbolKind::Boolean,
-    SymbolKind::Array,
-    SymbolKind::Object,
-    SymbolKind::Key,
-    SymbolKind::Null,
-    SymbolKind::EnumMember,
-    SymbolKind::Struct,
-    SymbolKind::Event,
-    SymbolKind::Operator,
-    SymbolKind::TypeParameter,
+/// Single source of truth for both the `initialize` request's `value_set`
+/// and the `kind_filter` validation in [`crate::bridge::translator::symbols`].
+pub const SUPPORTED_SYMBOL_KINDS: [(SymbolKind, &str); 26] = [
+    (SymbolKind::File, "file"),
+    (SymbolKind::Module, "module"),
+    (SymbolKind::Namespace, "namespace"),
+    (SymbolKind::Package, "package"),
+    (SymbolKind::Class, "class"),
+    (SymbolKind::Method, "method"),
+    (SymbolKind::Property, "property"),
+    (SymbolKind::Field, "field"),
+    (SymbolKind::Constructor, "constructor"),
+    (SymbolKind::Enum, "enum"),
+    (SymbolKind::Interface, "interface"),
+    (SymbolKind::Function, "function"),
+    (SymbolKind::Variable, "variable"),
+    (SymbolKind::Constant, "constant"),
+    (SymbolKind::String, "string"),
+    (SymbolKind::Number, "number"),
+    (SymbolKind::Boolean, "boolean"),
+    (SymbolKind::Array, "array"),
+    (SymbolKind::Object, "object"),
+    (SymbolKind::Key, "key"),
+    (SymbolKind::Null, "null"),
+    (SymbolKind::EnumMember, "enummember"),
+    (SymbolKind::Struct, "struct"),
+    (SymbolKind::Event, "event"),
+    (SymbolKind::Operator, "operator"),
+    (SymbolKind::TypeParameter, "typeparameter"),
 ];
+
+/// The kinds of [`SUPPORTED_SYMBOL_KINDS`] as the `initialize` request lists them.
+fn advertised_symbol_kinds() -> Vec<SymbolKind> {
+    SUPPORTED_SYMBOL_KINDS
+        .iter()
+        .map(|&(kind, _)| kind)
+        .collect()
+}
 
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
@@ -416,7 +423,7 @@ impl ServerInitConfig {
             }
             if plan.has_unpinnable_launcher() {
                 return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                    command: self.server_config.command.to_string(),
+                    command: self.server_config.command.clone(),
                 }));
             }
         }
@@ -436,7 +443,7 @@ impl ServerInitConfig {
         Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: self.server_config.id(),
             language_id: self.server_config.language_id.clone(),
-            command: self.server_config.command.to_string(),
+            command: self.server_config.command.clone(),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         }))
     }
@@ -844,7 +851,7 @@ impl LspServer {
                 document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
                     dynamic_registration: Some(false),
                     symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
-                        value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
+                        value_set: Some(advertised_symbol_kinds()),
                     }),
                     hierarchical_document_symbol_support: Some(true),
                     ..Default::default()
@@ -1290,7 +1297,7 @@ async fn contain(
     ServerStartOutcome::Failed(ServerSpawnFailure {
         server_id,
         language_id,
-        command: command.to_string(),
+        command,
         reason,
     })
 }
@@ -2645,7 +2652,7 @@ sleep 5
             );
             assert_eq!(
                 document_symbol.symbol_kind.unwrap().value_set,
-                Some(SUPPORTED_SYMBOL_KINDS.to_vec())
+                Some(advertised_symbol_kinds())
             );
 
             write_success_response(
@@ -2940,7 +2947,7 @@ sleep 5
         translator.settle_failed(&ServerSpawnFailure {
             server_id: ServerId::from_static("pyright-diag"),
             language_id: LanguageId::from_static("python"),
-            command: "pyright-langserver".to_string(),
+            command: ServerCommand::from_static("pyright-langserver"),
             reason: StartupFailure::InitTaskPanicked,
         });
         translator.settle_started(fake_lsp_server_with_config(configs[1].clone()));

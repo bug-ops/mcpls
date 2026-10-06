@@ -687,7 +687,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: ServerId::new(id).unwrap(),
             language_id: crate::config::LanguageId::from_static("rust"),
-            command: "x".to_string(),
+            command: crate::config::ServerCommand::from_static("x"),
             reason: StartupFailure::InitTaskPanicked,
         }
     }

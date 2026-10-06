@@ -2088,7 +2088,7 @@ mod pump_tests {
                 .record_startup_failures(&[crate::error::ServerSpawnFailure {
                     server_id: ServerId::from_static("rust"),
                     language_id: LanguageId::from_static("rust"),
-                    command: "rust-analyzer".to_string(),
+                    command: crate::config::ServerCommand::from_static("rust-analyzer"),
                     reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                         command: "rust-analyzer".to_string(),
                         source: std::io::Error::from(std::io::ErrorKind::NotFound),

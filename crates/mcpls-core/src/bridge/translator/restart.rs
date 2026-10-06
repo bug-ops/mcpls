@@ -1122,7 +1122,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             translator.rebind_router(&HashSet::new());
@@ -1148,7 +1148,7 @@ mod tests {
             translator.record_refusals(&[ServerSpawnFailure {
                 server_id: config.id(),
                 language_id: config.language_id.clone(),
-                command: config.command.to_string(),
+                command: config.command.clone(),
                 reason: StartupFailure::RefusedUntrustedWorkspace(
                     crate::error::UntrustedRefusal::NotAllowed { builtin: None },
                 ),
@@ -1214,7 +1214,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
                 language_id: crate::config::LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             assert_matches!(
@@ -1267,7 +1267,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             let _startup = translator.begin_startup();
@@ -1680,7 +1680,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             let failed = translator

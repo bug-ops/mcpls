@@ -210,10 +210,10 @@ pub struct SymbolKindFilter(lsp_types::SymbolKind);
 impl SymbolKindFilter {
     /// The names the schema documents and the rejection message lists: the
     /// supported kinds in lowercase, which parsing accepts like any case.
-    fn spellings() -> Vec<String> {
+    fn spellings() -> Vec<&'static str> {
         SUPPORTED_SYMBOL_KINDS
             .iter()
-            .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+            .map(|&(_, name)| name)
             .collect()
     }
 
@@ -236,8 +236,8 @@ impl KindFilter for SymbolKindFilter {
         }
         SUPPORTED_SYMBOL_KINDS
             .into_iter()
-            .find(|kind| format!("{kind:?}").eq_ignore_ascii_case(text))
-            .map(Self)
+            .find(|&(_, name)| name.eq_ignore_ascii_case(text))
+            .map(|(kind, _)| Self(kind))
     }
 
     fn canonical(self) -> Cow<'static, str> {
@@ -328,6 +328,17 @@ mod tests {
             serde_json::to_string(&known).unwrap(),
             "\"source.organizeImports\""
         );
+    }
+
+    /// The names are part of the published `tools/list` schema, so they must
+    /// stay what they were when they were derived from `Debug`.
+    #[test]
+    fn test_symbol_kind_names_are_the_lowercase_variant_names() {
+        for (kind, name) in SUPPORTED_SYMBOL_KINDS {
+            assert_eq!(name, format!("{kind:?}").to_ascii_lowercase());
+        }
+        assert!(SymbolKindFilter::spellings().contains(&"enummember"));
+        assert!(SymbolKindFilter::spellings().contains(&"typeparameter"));
     }
 
     #[test]

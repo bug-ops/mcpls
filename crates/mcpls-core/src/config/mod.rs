@@ -2115,7 +2115,7 @@ mod tests {
         let result = ServerConfig::load_from(&config_path);
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES.get()
+            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
         );
     }
 

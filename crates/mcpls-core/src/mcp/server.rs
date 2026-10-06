@@ -2006,9 +2006,9 @@ mod tests {
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::bridge::{Capability, IndexingSignal, LogLevel, ResultContext, RouteSignals};
-    #[cfg(unix)]
-    use crate::config::ServerCommand;
-    use crate::config::{FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle};
+    use crate::config::{
+        FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle, ServerCommand,
+    };
     #[cfg(unix)]
     use crate::config::{PositionEncodings, TimeoutSecs};
     use crate::mcp::tool_support::ToolBackend;
@@ -2208,7 +2208,10 @@ mod tests {
             crate::error::Error::NotARegularFile(PathBuf::from("/dev/null")),
             crate::error::Error::NoResolvableListenUris,
             crate::error::Error::DocumentNotFound(PathBuf::from("/missing.rs")),
-            crate::error::Error::FileSizeLimitExceeded { size: 100, max: 10 },
+            crate::error::Error::FileSizeLimitExceeded {
+                size: 100,
+                max: std::num::NonZeroU64::new(10).unwrap(),
+            },
             crate::error::Error::InvalidClientPath(crate::bridge::InvalidClientPath::Empty),
         ];
 
@@ -2346,7 +2349,7 @@ mod tests {
             crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
                 server_id: crate::config::ServerId::from_static("b"),
                 language_id: crate::config::LanguageId::from_static("python"),
-                command: "pyright".to_owned(),
+                command: ServerCommand::from_static("pyright"),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::LspInitFailed {
                         phase: crate::error::InitPhase::Initialize,
@@ -2747,7 +2750,7 @@ mod tests {
             crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
                 server_id: crate::config::ServerId::from_static("rust"),
                 language_id: LanguageId::from_static("rust"),
-                command: "rust-analyzer".to_string(),
+                command: ServerCommand::from_static("rust-analyzer"),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::ServerNotFound {
                         command: "rust-analyzer".to_string(),
@@ -4611,7 +4614,7 @@ sleep 0.3
         translator.record_startup_failures(&[ServerSpawnFailure {
             server_id: id,
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                 command: "rust-analyzer".to_string(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -5872,7 +5875,7 @@ sleep 0.3
                 translator.record_startup_failures(&[ServerSpawnFailure {
                     server_id: id,
                     language_id: LanguageId::from_static("rust"),
-                    command: "rust-analyzer".to_string(),
+                    command: ServerCommand::from_static("rust-analyzer"),
                     reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                         command: "rust-analyzer".to_string(),
                         source: std::io::Error::from(std::io::ErrorKind::NotFound),

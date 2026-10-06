@@ -148,7 +148,7 @@ THEN they list the supported form, say how to cover several extensions, and agre
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place (`FilePattern::parse`): a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of letters, digits, `_`, `-` and `+` (a valid `FileExtension`), optionally preceded by any directory part such as `**/`; the directory part is ignored for routing | must |
+| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place (`FilePattern::parse`): a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of ASCII letters, digits, `_`, `-` and `+` (a valid `FileExtension`; non-ASCII characters are rejected), optionally preceded by any directory part such as `**/`; the directory part is ignored for routing | must |
 | FR-002 | WHEN a configured `file_patterns` entry is not a supported form THE SYSTEM SHALL NOT drop it silently | must |
 | FR-003 | WHEN a configured entry is not a supported form THE SYSTEM SHALL reject the config at load with `ConfigError::UnsupportedFilePattern` naming the server entry (its id), the pattern and the supported forms; loading a TOML file surfaces it inside `Error::TomlDe` (the entry is deserialized through `serde(try_from)`, and the message carries the line), while a value built in code reports it as `Error::Config` | must |
 | FR-004 | ~~Warning instead of rejection~~ superseded: the decision is rejection (section 9) | n/a |

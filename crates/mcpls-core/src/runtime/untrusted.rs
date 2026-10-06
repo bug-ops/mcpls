@@ -117,7 +117,7 @@ fn allowlist_refusal(
 fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
     launcher::launches_from_workspace(configured.command.as_str(), &configured.args).then(|| {
         UntrustedRefusal::ProjectLauncher {
-            command: configured.command.to_string(),
+            command: configured.command.clone(),
         }
     })
 }
@@ -146,7 +146,7 @@ fn harden_for_untrusted(
     let mut effective = effective.into_owned();
     normalize_env_keys(&mut effective.env, host.env_key_case());
     let unresolved = || UntrustedRefusal::UnresolvedExecutable {
-        command: effective.command.to_string(),
+        command: effective.command.clone(),
     };
     let resolved =
         lsp::command_path::resolve_command(&effective, parent_env).ok_or_else(unresolved)?;
@@ -353,7 +353,7 @@ pub fn plan_server_starts(
         );
         match admitted {
             Ok(init) => plan.admitted.push(init),
-            Err((command, refusal)) => plan.refused.push(refused(lsp_config, &command, refusal)),
+            Err((command, refusal)) => plan.refused.push(refused(lsp_config, command, refusal)),
         }
     }
     plan
@@ -369,8 +369,8 @@ fn admit(
     boundary: Option<&WorkspaceRoots>,
     login_home: Option<&Path>,
     redactions: &Arc<Redactions>,
-) -> Result<ServerInitConfig, (String, UntrustedRefusal)> {
-    let configured = |refusal| (lsp_config.command.to_string(), refusal);
+) -> Result<ServerInitConfig, (ServerCommand, UntrustedRefusal)> {
+    let configured = |refusal| (lsp_config.command.clone(), refusal);
     if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
         return Err(configured(refusal));
     }
@@ -396,7 +396,7 @@ fn admit(
             (hardened, working_dir)
         }
     };
-    let command = effective.command.to_string();
+    let command = effective.command.clone();
     let plan = tsserver_pin::plan_typescript(effective, process_env);
     if let Some(boundary) = boundary {
         if let Some(tsserver) = plan.pin_inside(boundary) {
@@ -404,7 +404,7 @@ fn admit(
         }
         if plan.has_unpinnable_launcher() {
             let refusal = UntrustedRefusal::UnpinnedTypescriptLauncher {
-                command: lsp_config.command.to_string(),
+                command: lsp_config.command.clone(),
             };
             return Err((command, refusal));
         }
@@ -428,7 +428,7 @@ fn admit(
 /// routing config stays the one as configured.
 fn refused(
     configured: &LspServerConfig,
-    command: &str,
+    command: ServerCommand,
     refusal: UntrustedRefusal,
 ) -> RefusedServer {
     RefusedServer {
@@ -436,7 +436,7 @@ fn refused(
         failure: ServerSpawnFailure {
             server_id: configured.id(),
             language_id: configured.language_id.clone(),
-            command: command.to_owned(),
+            command,
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         },
     }
@@ -1478,7 +1478,7 @@ mod plan_tests {
                 assert_eq!(
                     refusal_of(&plan),
                     Some(&UntrustedRefusal::ProjectLauncher {
-                        command: command.to_owned()
+                        command: ServerCommand::new(command).unwrap()
                     }),
                     "{command} {args:?}"
                 );
@@ -1534,7 +1534,7 @@ mod plan_tests {
             with_user_pin.initialization_options =
                 Some(serde_json::json!({"tsserver": {"path": "/opt/ts/tsserver.js"}}));
             for config in [typescript_shim(&fx, ".volta/bin"), with_user_pin] {
-                let command = config.command.to_string();
+                let command = config.command.clone();
 
                 let plan = plan(
                     &config_with(vec![config], untrusted_allowing_typescript()),

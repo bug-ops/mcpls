@@ -524,7 +524,7 @@ mod tests {
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: ServerId::from_static("pyright"),
             language_id: LanguageId::from_static("python"),
-            command: "pyright-langserver".to_string(),
+            command: ServerCommand::from_static("pyright-langserver"),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
 
@@ -556,7 +556,7 @@ mod tests {
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: failing_id.clone(),
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
         translator.rebind_router(&HashSet::from([ServerId::from_static("live")]));
@@ -579,7 +579,7 @@ mod tests {
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: ServerId::from_static("other"),
             language_id: LanguageId::from_static("go"),
-            command: "gopls".to_string(),
+            command: ServerCommand::from_static("gopls"),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
 

@@ -3,7 +3,6 @@
 //! Tracks open documents and their versions for LSP synchronization.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -845,10 +844,7 @@ impl DocumentTracker {
         if let Some(max) = self.limits.max_file_size.get()
             && size > max.get()
         {
-            return Err(Error::FileSizeLimitExceeded {
-                size,
-                max: max.get(),
-            });
+            return Err(Error::FileSizeLimitExceeded { size, max });
         }
         Ok(())
     }
@@ -1290,10 +1286,7 @@ impl DocumentTracker {
             .await
             .map_err(io_err)?;
         check_bounded_utf8(buf, max).map_err(|e| match e {
-            BoundedUtf8Error::TooLarge { size } => Error::FileSizeLimitExceeded {
-                size,
-                max: max.get().map_or(0, NonZeroU64::get),
-            },
+            BoundedUtf8Error::TooLarge { size, max } => Error::FileSizeLimitExceeded { size, max },
             BoundedUtf8Error::InvalidUtf8(e) => {
                 io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
@@ -3904,7 +3897,7 @@ mod tests {
         let result = tracker.read_to_string_checked(&path).await;
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { size: 11, max: 10 })
+            Err(Error::FileSizeLimitExceeded { size: 11, max }) if max.get() == 10
         );
     }
 

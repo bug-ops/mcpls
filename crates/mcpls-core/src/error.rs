@@ -15,7 +15,7 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, FileExtension, FilePattern, LanguageId, ServerId, ToolKind,
+    BuiltinServer, FileExtension, FilePattern, LanguageId, ServerCommand, ServerId, ToolKind,
     UnsupportedFilePattern,
 };
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
@@ -277,7 +277,7 @@ pub enum UntrustedRefusal {
     /// so untrusted mode cannot tell what would run.
     UnresolvedExecutable {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// The login home directory is unknown and the inherited `HOME` lies
     /// inside the workspace, where rustup, cargo and npm would read their
@@ -309,13 +309,13 @@ pub enum UntrustedRefusal {
     /// wrapper), so what would run is under the workspace's control.
     ProjectLauncher {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// The configured command starts the TypeScript server through a launcher
     /// that untrusted mode cannot pin to a binary outside the workspace.
     UnpinnedTypescriptLauncher {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// A resolved path is not valid UTF-8, so untrusted mode cannot pass it
     /// on unchanged.
@@ -420,7 +420,7 @@ pub struct ServerSpawnFailure {
     /// Language ID of the failed server.
     pub language_id: LanguageId,
     /// Command that was attempted.
-    pub command: String,
+    pub command: ServerCommand,
     /// Why the server never registered.
     pub reason: StartupFailure,
 }
@@ -1520,7 +1520,7 @@ pub enum Error {
         /// Actual file size.
         size: u64,
         /// Maximum allowed size.
-        max: u64,
+        max: std::num::NonZeroU64,
     },
 
     /// Path exists but does not refer to a regular file (e.g. a FIFO or a
@@ -1983,13 +1983,13 @@ mod tests {
             ServerSpawnFailure {
                 server_id: ServerId::from_static("rust"),
                 language_id: LanguageId::from_static("rust"),
-                command: "rust-analyzer".to_string(),
+                command: ServerCommand::from_static("rust-analyzer"),
                 reason: StartupFailure::InitTaskPanicked,
             },
             ServerSpawnFailure {
                 server_id: ServerId::from_static("python"),
                 language_id: LanguageId::from_static("python"),
-                command: "pyright".to_string(),
+                command: ServerCommand::from_static("pyright"),
                 reason: StartupFailure::InitTaskPanicked,
             },
         ];
@@ -2013,7 +2013,7 @@ mod tests {
         let failure = ServerSpawnFailure {
             server_id: ServerId::from_static("typescript"),
             language_id: LanguageId::from_static("typescript"),
-            command: "tsserver".to_string(),
+            command: ServerCommand::from_static("tsserver"),
             reason: StartupFailure::InitTaskPanicked,
         };
 
@@ -2375,7 +2375,7 @@ mod tests {
     fn test_error_display_file_size_limit() {
         let err = Error::FileSizeLimitExceeded {
             size: 20_000_000,
-            max: 10_000_000,
+            max: std::num::NonZeroU64::new(10_000_000).unwrap(),
         };
         assert_eq!(
             err.to_string(),
@@ -2498,7 +2498,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: ServerId::new(id).unwrap(),
             language_id: LanguageId::new(id).unwrap(),
-            command: command.to_string(),
+            command: ServerCommand::new(command).unwrap(),
             reason: StartupFailure::Spawn(Arc::new(error)),
         }
     }
@@ -2551,7 +2551,7 @@ mod tests {
         let err = Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: ServerId::from_static("rust"),
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::InitTaskPanicked,
         }));
         assert!(err.to_string().contains("initialization task panicked"));
@@ -2675,11 +2675,11 @@ mod tests {
     #[test]
     fn test_untrusted_refusal_new_variants_name_their_cause() {
         let launcher = UntrustedRefusal::ProjectLauncher {
-            command: "npx".to_owned(),
+            command: ServerCommand::from_static("npx"),
         };
         assert!(launcher.to_string().contains("'npx'"), "{launcher}");
         let unpinned = UntrustedRefusal::UnpinnedTypescriptLauncher {
-            command: "pnpm".to_owned(),
+            command: ServerCommand::from_static("pnpm"),
         };
         assert!(unpinned.to_string().contains("'pnpm'"), "{unpinned}");
         let non_utf8 = UntrustedRefusal::NonUtf8Path {
@@ -2793,7 +2793,10 @@ mod tests {
             Error::NoResolvableListenUris,
             Error::ResourceUri(ResourceUriError::InvalidScheme("x".to_string())),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
-            Error::FileSizeLimitExceeded { size: 100, max: 10 },
+            Error::FileSizeLimitExceeded {
+                size: 100,
+                max: std::num::NonZeroU64::new(10).unwrap(),
+            },
             Error::ListenFilterTooLarge { max: 1000 },
             Error::InvalidClientPath(InvalidClientPath::ContainsNul),
         ];
@@ -3119,7 +3122,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: ServerId::from_static("rust"),
             language_id: LanguageId::new("rust").unwrap(),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         }
     }

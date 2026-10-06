@@ -343,7 +343,7 @@ impl Translator {
                 ServerSpawnFailure {
                     server_id: server_config.id(),
                     language_id: server_config.language_id.clone(),
-                    command: server_config.command.to_string(),
+                    command: server_config.command.clone(),
                     reason: StartupFailure::InitTaskPanicked,
                 }
             }));
@@ -783,7 +783,9 @@ mod tests {
 
     use super::*;
     use crate::bridge::state::detect_language;
-    use crate::config::{DocumentLimit, ServerId, SizeLimit, ToolKind, ToolRouter, ToolSet};
+    use crate::config::{
+        DocumentLimit, ServerCommand, ServerId, SizeLimit, ToolKind, ToolRouter, ToolSet,
+    };
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
 
@@ -873,7 +875,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.to_string(),
+            command: config.command.clone(),
             reason: StartupFailure::InitTaskPanicked,
         }
     }
@@ -1230,7 +1232,7 @@ mod tests {
         let failure = |id: &str| ServerSpawnFailure {
             server_id: ServerId::new(id).unwrap(),
             language_id: LanguageId::new(id).unwrap(),
-            command: id.to_string(),
+            command: ServerCommand::new(id).unwrap(),
             reason: StartupFailure::InitTaskPanicked,
         };
         translator.record_startup_failures(&[failure("zls"), failure("clangd"), failure("gopls")]);
