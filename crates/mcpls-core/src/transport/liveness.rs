@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use super::config::{ProbeDeadline, ProbeInterval};
 use super::saturating_deadline;
 use super::session_manager::{SessionFingerprint, StreamGuard, spawn_bounded_close};
-use crate::util::lock_std;
+use crate::util::{catch_panic, lock_std};
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;
@@ -220,7 +220,14 @@ impl StreamProbe {
     {
         let token = self.liveness.claim_standalone();
         let (tx, mut rx) = mpsc::channel(OUTBOUND_CAPACITY);
-        tokio::spawn(self.run(token, inner, tx, guard));
+        tokio::spawn(async move {
+            if let Err(panicked) = catch_panic(self.run(token, inner, tx, guard)).await {
+                tracing::error!(
+                    "the SSE liveness forwarding task panicked: {}",
+                    panicked.message()
+                );
+            }
+        });
         futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
     }
 
@@ -355,6 +362,40 @@ mod tests {
 
     fn client_message(json: serde_json::Value) -> ClientJsonRpcMessage {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// #662: a panic in the forwarding task is logged, and the stream ends
+    /// instead of hanging open.
+    #[tokio::test]
+    async fn test_forwarding_task_panic_is_logged_and_ends_the_stream() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (probe, _liveness) = probe(Duration::from_secs(60), Duration::from_secs(60));
+        let panicking =
+            futures::stream::poll_fn(|_| -> std::task::Poll<Option<ServerSseMessage>> {
+                panic!("inner stream failure")
+            });
+        let mut outbound = Box::pin(probe.forward(panicking, None));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), outbound.next())
+            .await
+            .expect("a panicked forwarder must end the stream");
+        assert!(ended.is_none());
+        let entries = captured.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::ERROR
+                    && message.contains("liveness forwarding task panicked")
+                    && message.contains("inner stream failure")),
+            "{entries:?}"
+        );
     }
 
     #[test]
