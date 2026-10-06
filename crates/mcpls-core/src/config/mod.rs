@@ -2576,19 +2576,7 @@ mod tests {
 
     #[test]
     fn test_load_rejects_every_unsupported_file_pattern_form_naming_the_server() {
-        for pattern in [
-            "**/*.{cpp,h}",
-            "**/*.[ch]",
-            "**/*.ts?",
-            "**/*",
-            "src/**",
-            "Makefile",
-            ".eslintrc",
-            "**/*.",
-            "src/main.rs",
-            "Cargo.toml",
-            "**/*.tar.gz",
-        ] {
+        for &pattern in patterns::UNSUPPORTED_FILE_PATTERNS {
             let toml = format!(
                 "[[lsp_servers]]\nlanguage_id = \"cpp\"\ncommand = \"clangd\"\n\
                  file_patterns = [{pattern:?}]\n"

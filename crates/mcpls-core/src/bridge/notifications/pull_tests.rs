@@ -1,6 +1,8 @@
 //! Pulled slots of the diagnostics cache: provenance, dedupe, change
 //! detection, races and budgets.
 
+use std::assert_matches;
+
 use lsp_types::{Code, DiagnosticSeverity, Position, Range};
 
 use super::bounds::*;
@@ -368,7 +370,7 @@ fn test_a_clear_of_another_server_keeps_the_pull() {
         bounded(vec![]),
     );
 
-    assert!(matches!(write, PullWrite::Stored { .. }));
+    assert_matches!(write, PullWrite::Stored { .. });
 }
 
 #[test]
@@ -420,7 +422,7 @@ fn test_a_stale_pushed_version_does_not_block_the_pull() {
 
     let write = pull(&mut cache, vec![error(2, "fresh")]);
 
-    assert!(matches!(write, PullWrite::Stored { .. }));
+    assert_matches!(write, PullWrite::Stored { .. });
     assert_eq!(messages(&cache), ["left over", "fresh"]);
 }
 
@@ -630,13 +632,13 @@ fn test_keys_differing_in_drive_letter_case_name_one_slot() {
 
     let write = pull_for(&mut cache, &lower, 1, vec![error(1, "e")]);
 
-    assert!(matches!(
+    assert_matches!(
         write,
         PullWrite::Stored {
             slot: SlotChange::Identical,
             ..
         }
-    ));
+    );
     assert_eq!(cache.diagnostics_count(), 1);
 }
 

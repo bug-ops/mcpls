@@ -47,17 +47,24 @@ const LSP_INIT_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
 /// bounded, to drive that drop here instead of leaving it to chance.
 /// Otherwise a `SIGTERM` arriving mid-startup could orphan those LSP
 /// child processes, the exact failure mode #270 was filed to prevent.
-pub(super) async fn await_lsp_init_handle(mut handle: JoinHandle<()>, timeout: Duration) {
+pub(super) async fn await_lsp_init_handle(handle: JoinHandle<()>, timeout: Duration) {
+    await_lsp_init_handle_within(handle, timeout, LSP_INIT_TASK_ABORT_GRACE).await;
+}
+
+/// [`await_lsp_init_handle`] with the post-abort grace given, so a test can
+/// shorten it.
+async fn await_lsp_init_handle_within(
+    mut handle: JoinHandle<()>,
+    timeout: Duration,
+    abort_grace: Duration,
+) {
     match tokio::time::timeout(timeout, &mut handle).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
         Err(_) => {
             warn!("Timed out waiting for background LSP initialization task to stop");
             handle.abort();
-            if tokio::time::timeout(LSP_INIT_TASK_ABORT_GRACE, handle)
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(abort_grace, handle).await.is_err() {
                 warn!("Background LSP initialization task did not stop after abort");
             }
         }
@@ -272,17 +279,20 @@ mod tests {
 
         use crate::test_lsp::CapturedLogs;
 
-        let handle = tokio::task::spawn_blocking(|| {
-            std::thread::sleep(super::LSP_INIT_TASK_ABORT_GRACE + Duration::from_millis(500));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _ = released.recv();
         });
 
         let captured = CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let guard = tracing::subscriber::set_default(subscriber);
 
-        super::await_lsp_init_handle(handle, Duration::from_millis(20)).await;
+        let grace = Duration::from_millis(20);
+        super::await_lsp_init_handle_within(handle, grace, grace).await;
 
         drop(guard);
+        drop(release);
 
         assert!(
             captured

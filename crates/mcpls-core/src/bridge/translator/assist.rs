@@ -753,15 +753,9 @@ mod tests {
         let file = || client_path(path.to_string_lossy().into_owned());
 
         let completions = translator.handle_completions(file(), pos(5, 3), None).await;
-        assert!(matches!(
-            completions,
-            Err(Error::PositionBeyondDocument { .. })
-        ));
+        assert_matches!(completions, Err(Error::PositionBeyondDocument { .. }));
         let signature = translator.handle_signature_help(file(), pos(5, 3)).await;
-        assert!(matches!(
-            signature,
-            Err(Error::PositionBeyondDocument { .. })
-        ));
+        assert_matches!(signature, Err(Error::PositionBeyondDocument { .. }));
     }
 
     #[tokio::test]

@@ -416,6 +416,16 @@ async fn every_positioned_tool_rejects_a_line_beyond_the_document() {
         "inlay_hints",
         t.handle_inlay_hints(file(), span(pos(1, 1), beyond))
     );
+    // The start of a range is checked too, not only its end.
+    let past = pos(100, 1);
+    reject!(
+        "code_actions_start",
+        t.handle_code_actions(file(), bounded(beyond, past), None)
+    );
+    reject!(
+        "inlay_hints_start",
+        t.handle_inlay_hints(file(), span(beyond, past))
+    );
 }
 
 #[tokio::test]

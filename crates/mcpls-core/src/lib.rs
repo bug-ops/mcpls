@@ -119,11 +119,15 @@ async fn plan_off_runtime(
     redactions: &Arc<redaction::Redactions>,
 ) -> StartPlan {
     let (config, roots, redactions) = (config.clone(), roots.clone(), Arc::clone(redactions));
-    match tokio::task::spawn_blocking(move || plan_server_starts(&config, &roots, &redactions))
-        .await
-    {
-        Ok(plan) => plan,
-        // The pool does not cancel a running blocking task, so a failed join is a panic in the plan.
+    on_blocking_pool(move || plan_server_starts(&config, &roots, &redactions)).await
+}
+
+/// Runs `work` on the blocking pool and returns its result, re-raising a panic
+/// in it on the caller.
+async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        // The pool does not cancel a running blocking task, so a failed join is a panic in `work`.
         Err(error) => std::panic::resume_unwind(error.into_panic()),
     }
 }
@@ -347,6 +351,19 @@ mod tests {
         IndexingReadyTimeoutSecs, LanguageId, PositionEncodings, ServerStartConcurrency,
         TimeoutSecs,
     };
+
+    /// #659: a panic in the planning work reaches the caller instead of
+    /// being swallowed by the blocking pool.
+    #[tokio::test]
+    async fn test_on_blocking_pool_returns_the_value_and_propagates_a_panic() {
+        assert_eq!(on_blocking_pool(|| 7).await, 7);
+
+        let panicked =
+            crate::util::catch_panic(on_blocking_pool(|| -> u8 { panic!("planning exploded") }))
+                .await
+                .unwrap_err();
+        assert_eq!(panicked.message(), "planning exploded");
+    }
 
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {

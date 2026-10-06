@@ -313,6 +313,24 @@ impl PartialEq<&str> for FilePattern {
     }
 }
 
+/// Every form the file pattern tests must see rejected, shared with the
+/// config loading tests.
+#[cfg(test)]
+pub(super) const UNSUPPORTED_FILE_PATTERNS: &[&str] = &[
+    "**/*.{cpp,h}",
+    "**/*.[ch]",
+    "**/*.ts?",
+    "**/*",
+    "src/**",
+    "Makefile",
+    ".eslintrc",
+    "**/*.",
+    "**/*.tar.gz",
+    "src/main.rs",
+    "Cargo.toml",
+    "",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,20 +402,7 @@ mod tests {
 
     #[test]
     fn test_file_pattern_rejects_every_unsupported_form() {
-        for raw in [
-            "**/*.{cpp,h}",
-            "**/*.[ch]",
-            "**/*.ts?",
-            "**/*",
-            "src/**",
-            "Makefile",
-            ".eslintrc",
-            "**/*.",
-            "**/*.tar.gz",
-            "src/main.rs",
-            "Cargo.toml",
-            "",
-        ] {
+        for &raw in UNSUPPORTED_FILE_PATTERNS {
             let err = FilePattern::parse(raw).unwrap_err();
             assert_eq!(err.pattern(), raw);
             assert!(err.to_string().contains(&format!("'{raw}'")), "{raw}");
