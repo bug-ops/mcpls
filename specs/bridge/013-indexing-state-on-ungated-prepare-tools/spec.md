@@ -68,7 +68,8 @@ the project already accepts a flag as a valid way to disclose the state without 
 |-------|-------|-------------|---------------------------|
 | File-local analysis | `get_document_symbols`, selection ranges, folding ranges, format document, format range | The answer is valid mid-index | no |
 | Prepare steps | `prepare_call_hierarchy`, `prepare_type_hierarchy` | #423 scope decision | yes |
-| Resolution-assisted | `get_signature_help`, `get_document_highlights`, `get_inlay_hints` | No recorded decision | likely, `[NEEDS CLARIFICATION: audit]` |
+| Resolution-assisted | `get_signature_help`, `get_inlay_hints` | No recorded decision | yes (see section 11) |
+| Largely file-local | `get_document_highlights` | No recorded decision | no (see section 11) |
 
 `workspace_symbol_search` and `get_diagnostics` bypass the gate chokepoint by design; the latter
 already has the flag.
@@ -191,7 +192,7 @@ THEN every ungated tool has a recorded reason (file-local, or discloses indexing
 | Server never reports a signal (state `Unknown`) | Flag false; the caller cannot be told more than the server told mcpls (FR-006) |
 | Server restarted a moment ago | Covered by [[bridge/012-indexing-gate-after-restart/spec\|bridge/012]]; once that lands, the state is `Loading` and the flag follows |
 | File-local tool during indexing | No flag; the answer is valid |
-| `get_signature_help` or `get_inlay_hints` mid-index returns empty | `[NEEDS CLARIFICATION: classify in the audit]` |
+| `get_signature_help` or `get_inlay_hints` mid-index returns empty | Empty result with flag true: "may be incomplete, retry" |
 | Multi-server routing where the prepare tool resolves one server | The flag reflects the routed server only |
 
 ## 7. Success Criteria
@@ -225,11 +226,7 @@ THEN every ungated tool has a recorded reason (file-local, or discloses indexing
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: option choice. (a) Flag: add `indexing_in_progress` to the ungated name-resolution tools; no latency, caller must handle the flag; consistent with the diagnostics tools. (b) Gate: switch the prepare tools to `Required`; the caller needs no new logic, but a prepare call on a cold start can wait up to 30 s, and the #423 decision explicitly avoided that. (c) Hybrid: flag now, gate later if agents ignore the flag. Recommended default: (a), since the diagnostics tools set the precedent and the failure is disclosure, not wrongness.]
-- [NEEDS CLARIFICATION: why did #423 leave the prepare step ungated? The recorded reason is scope, not correctness. Confirm there is no hidden reason (for example prepare being used as a cheap readiness probe by clients) before reversing any part of it.]
-- [NEEDS CLARIFICATION: audit the resolution-assisted tools (`get_signature_help`, `get_document_highlights`, `get_inlay_hints`) and decide for each: flag, gate, or exempt. Inlay hints depend on type inference and may be partial mid-index; highlights are largely file-local.]
-- [NEEDS CLARIFICATION: where does the flag live in each response (a top-level field next to `items`, or inside a shared signals object as on the diagnostics responses)? Recommended default: the same flattened signals shape the diagnostics responses use.]
-- [NEEDS CLARIFICATION: should `get_tool_support` list which tools can report the field?]
+None; resolved in section 11.
 
 ## 10. See Also
 
@@ -240,3 +237,41 @@ THEN every ungated tool has a recorded reason (file-local, or discloses indexing
 - [[bridge/011-push-only-server-diagnostics/spec|bridge/011]] — another response-state disclosure on the diagnostics tools
 - [[mcp/005-tool-capability-discoverability/spec|mcp/005]] — `get_tool_support`
 - Code: `crates/mcpls-core/src/bridge/translator/routing.rs` (`IndexingGate` and its doc), `crates/mcpls-core/src/bridge/translator/call_hierarchy.rs`, `crates/mcpls-core/src/bridge/translator/type_hierarchy.rs`, `crates/mcpls-core/src/mcp/server.rs` (`DiagnosticsRouteSignals`)
+
+## 11. Resolution
+
+**Option chosen: (a) flag.** The ungated name-resolving tools report `indexing_in_progress`
+flattened beside their result, sampled by the shared `IndexingSignal` sampler that the diagnostics
+tools use. Nothing is gated, no timeout is added, and the #423 decision stands.
+
+**Trade-off against #423.** #423 left the prepare step ungated so that a cold start never stalls
+for the bounded wait. The cost it accepted was a false-empty result mid-index. The flag removes the
+ambiguity of that result and keeps the latency win; the cost moves to the caller, who must read the
+flag. A caller that ignores it still sees the old behavior. Gating stays available as a later
+change (option c) if agents are found to ignore the flag.
+
+**Sampling.** The state of the routed server is read from the notification cache before the LSP
+request and again after it, and the two samples are combined with `IndexingSignal::union`, so a
+read that overlapped indexing is flagged even when indexing ends mid-request. Only a tracked
+`Loading` state sets the flag; `Unknown` never does (FR-006).
+
+**Audit of every `IndexingGate::NotRequired` site (FR-001).**
+
+| Tool | Class | Decision |
+|------|-------|----------|
+| `prepare_call_hierarchy` | name-resolving | flag |
+| `prepare_type_hierarchy` | name-resolving | flag |
+| `get_signature_help` | name-resolving | flag |
+| `get_inlay_hints` | name-resolving (type inference, partial mid-index) | flag |
+| `get_document_highlights` | file-local (same-document occurrences) | exempt |
+| `get_document_symbols`, name addressing, `enclosing_symbol` | file-local | exempt |
+| `get_folding_ranges`, `get_selection_ranges` | file-local | exempt |
+| `format_document`, `format_range` | file-local | exempt |
+
+The classification is repeated on the `IndexingGate::NotRequired` doc comment so a new ungated
+site has to pick a class. The incoming and outgoing call tools stay `Required` (FR-009).
+
+**Shape.** The field is the flattened `IndexingSignal` (`indexing_in_progress`), not the full
+`RouteSignals` object: `push_notifications_degraded` concerns push-delivered diagnostics and has no
+meaning on these tools. The field is always present, `false` when not loading. `get_tool_support`
+does not list which tools report it; the tool descriptions and output schemas say so (FR-007).

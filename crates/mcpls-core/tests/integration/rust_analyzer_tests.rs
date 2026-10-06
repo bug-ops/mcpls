@@ -16,8 +16,8 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    ClientPath, IndexingState, NotificationCache, Position, TabSize, Translator, WorkspaceRoots,
-    apply_lifecycle_notification,
+    ClientPath, IndexingState, KindFilterInput, NotificationCache, Position, SymbolKindFilter,
+    TabSize, Translator, WorkspaceRoots, apply_lifecycle_notification,
 };
 use mcpls_core::config::{
     FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
@@ -31,6 +31,12 @@ use crate::common::test_utils::rust_workspace_path;
 use crate::skip_if_no_rust_analyzer;
 
 static INIT_TRACING: Once = Once::new();
+
+fn symbol_kind_filter(name: &str) -> SymbolKindFilter {
+    KindFilterInput::<SymbolKindFilter>::from(name.to_owned())
+        .into_known()
+        .unwrap()
+}
 
 fn client_path(path: impl AsRef<Path>) -> ClientPath {
     ClientPath::try_from(path.as_ref().to_path_buf()).unwrap()
@@ -963,7 +969,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
             String::new(), // Empty query to get all symbols
-            Some("Struct".to_string()),
+            Some(symbol_kind_filter("Struct")),
             100,
         ),
     )
@@ -1031,7 +1037,7 @@ async fn test_workspace_symbol_search_function() {
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
             "create".to_string(),
-            Some("Function".to_string()),
+            Some(symbol_kind_filter("Function")),
             100,
         ),
     )

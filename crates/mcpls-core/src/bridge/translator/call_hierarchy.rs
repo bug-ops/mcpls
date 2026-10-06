@@ -15,7 +15,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::ClientPath;
+use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
 /// Convert LSP call hierarchy item to MCP call hierarchy item.
@@ -63,7 +63,7 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
-    ) -> Result<CallHierarchyPrepareResult> {
+    ) -> Result<Indexed<CallHierarchyPrepareResult>> {
         let doc = self
             .prepare_positioned_document(
                 &file_path,
@@ -84,10 +84,13 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response = client
-            .request_typed::<lsp_types::CallHierarchyPrepareRequest>(
-                params,
-                client.request_timeout(),
+        let (response, indexing) = self
+            .sampled_indexing(
+                server_id,
+                client.request_typed::<lsp_types::CallHierarchyPrepareRequest>(
+                    params,
+                    client.request_timeout(),
+                ),
             )
             .await?;
 
@@ -102,11 +105,14 @@ impl Translator {
             items.push(convert_call_hierarchy_item(item, &ctx).await);
         }
 
-        Ok(CallHierarchyPrepareResult {
-            items,
-            truncated: budget.truncated(),
-            positions_degraded: ctx.positions_degraded(),
-        })
+        Ok(Indexed::new(
+            CallHierarchyPrepareResult {
+                items,
+                truncated: budget.truncated(),
+                positions_degraded: ctx.positions_degraded(),
+            },
+            indexing,
+        ))
     }
 
     /// Handle incoming calls request.
@@ -1147,7 +1153,8 @@ mod tests {
             .await
             .expect("prepare should not hang")
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(prepare_result.items.len(), 1);
         let item = prepare_result.items[0].clone();
         assert!(item.uri.contains("%20"));
@@ -1431,7 +1438,8 @@ mod tests {
                 .await
                 .expect("handler call should not hang")
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .result;
             assert_eq!(result.items.len(), MAX_NORMALIZED_LOCATIONS);
             assert_eq!(result.truncated, truncated);
             let wire = serde_json::to_value(&result).unwrap();

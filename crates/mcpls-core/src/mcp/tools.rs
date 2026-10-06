@@ -6,10 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, InvalidPosition, KindFilterInput,
-    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position,
-    RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
-    SymbolTarget, TabSize, parse_symbol_kind,
+    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, InvalidPosition, KindFilter,
+    KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES,
+    Position, RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
+    SymbolTarget, TabSize,
 };
 use crate::config::ServerId;
 
@@ -83,7 +83,7 @@ struct SymbolTargetWire {
         description = "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value."
     )]
     #[serde(default)]
-    symbol_kind: Option<String>,
+    symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
     /// Narrow `symbol_name` to symbols inside this container.
     #[schemars(
         description = "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name."
@@ -157,12 +157,15 @@ impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
             (None, None, Some(name)) => {
                 let kind = wire
                     .symbol_kind
-                    .as_deref()
-                    .map(|kind| {
-                        if kind.len() > MAX_SYMBOL_NAME_BYTES {
-                            return Err("`symbol_kind` is too long".to_string());
+                    .map(|kind| match kind {
+                        KindFilterInput::Known(kind) => Ok(kind.kind()),
+                        KindFilterInput::Rejected(rejected) => {
+                            Err(if rejected.as_str().len() > MAX_SYMBOL_NAME_BYTES {
+                                "`symbol_kind` is too long".to_string()
+                            } else {
+                                SymbolKindFilter::rejection_message(rejected.as_str())
+                            })
                         }
-                        parse_symbol_kind(kind)
                     })
                     .transpose()?;
                 SymbolTargetInput::Name(SymbolQuery {
@@ -736,6 +739,7 @@ mod tests {
         };
         assert_eq!(kind("Method"), Some(lsp_types::SymbolKind::Method));
         assert_eq!(kind("6"), Some(lsp_types::SymbolKind::Method));
+        assert_eq!(kind("METHOD"), Some(lsp_types::SymbolKind::Method));
     }
 
     #[test]

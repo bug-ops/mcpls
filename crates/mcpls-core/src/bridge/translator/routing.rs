@@ -89,16 +89,23 @@ pub(super) enum IndexingGate {
     /// definition, references, rename, completions, code actions, call
     /// hierarchy incoming/outgoing calls).
     Required,
-    /// This tool's answer is valid even mid-index (single-file analysis),
-    /// e.g. `document_symbols`. `handle_call_hierarchy_prepare` also uses
-    /// this variant, but not for the same reason: unlike `document_symbols`,
-    /// `prepareCallHierarchy` does perform position-based name resolution
-    /// (the same class of query as `textDocument/definition`, which *is*
-    /// [`Self::Required`]) -- leaving it ungated is a deliberate scope
-    /// decision for #423 (mid-index it degrades to an empty `prepare`
-    /// result rather than an explicit error), not a claim that it is
-    /// single-file analysis like `document_symbols`. The incoming/outgoing
-    /// calls that follow `prepare` use [`Self::Required`].
+    /// This tool does not wait for the workspace index. Every ungated tool is
+    /// one of:
+    /// - file-local, so its answer is valid mid-index and carries no signal:
+    ///   document symbols (also used by name addressing and `enclosing_symbol`),
+    ///   folding ranges, selection ranges, document highlights, format
+    ///   document and format range;
+    /// - name-resolving but ungated by the #423 scope decision, which keeps
+    ///   `prepare_call_hierarchy` and `prepare_type_hierarchy` from stalling a
+    ///   cold start for up to the bounded wait (the follow-up incoming and
+    ///   outgoing calls are [`Self::Required`]); `get_signature_help` and
+    ///   `get_inlay_hints` are in the same class. Instead of gating, each
+    ///   reports `indexing_in_progress` (#668): mid-index it still degrades to
+    ///   an empty result, but the caller can tell that from a genuinely empty
+    ///   one and retry. The trade-off is that the caller must read the flag,
+    ///   in exchange for no added latency.
+    ///
+    /// A new `NotRequired` site must say which of the two it is.
     NotRequired,
 }
 

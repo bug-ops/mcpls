@@ -56,7 +56,7 @@ pub use translator::{
     RestartServerResult, RestartTarget, ResultContext, RouteSupport, SelectionRangesResult,
     ServerIds, ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity, SymbolKindFilter,
     SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize, TextEdit, Translator,
-    TypeHierarchyResult, UnavailableReason, parse_symbol_kind,
+    TypeHierarchyResult, UnavailableReason,
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,

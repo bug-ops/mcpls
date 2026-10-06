@@ -1044,12 +1044,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -2273,12 +2312,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -3196,12 +3274,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5108,12 +5225,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5532,12 +5688,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5936,12 +6131,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -6522,12 +6756,51 @@
           "type": "string"
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,

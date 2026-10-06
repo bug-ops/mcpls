@@ -44,8 +44,8 @@ use crate::bridge::{
     ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
     DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
     DocumentHighlightsResult, DocumentSymbolsResult, FoldingRangesResult, FormatDocumentResult,
-    HierarchyItem, HoverResult, IncomingCallsResult, Indexed, IndexingSignal, InlayHintsResult,
-    KindFilter, KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
+    HierarchyItem, HoverResult, IncomingCallsResult, Indexed, InlayHintsResult, KindFilter,
+    KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
     PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
     RestartServerResult, RouteSignals, SelectionRangesResult, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult,
@@ -264,19 +264,13 @@ fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
     Position::from_client(line, character).map_err(|e| map_bridge_error(e.into()))
 }
 
-/// Resolves a `kind_filter` input to the spelling the translator takes, so an
-/// unknown kind is `-32602`.
-// TODO(#654): the translator takes the typed kind and drops its own validation.
+/// Resolves a `kind_filter` input to its typed kind, so an unknown kind is
+/// `-32602`.
 fn parse_kind_filter<K: KindFilter>(
     input: Option<KindFilterInput<K>>,
-) -> Result<Option<String>, McpError> {
+) -> Result<Option<K>, McpError> {
     input
-        .map(|input| {
-            input
-                .into_known()
-                .map(|kind| kind.canonical().into_owned())
-                .map_err(map_bridge_error)
-        })
+        .map(|input| input.into_known().map_err(map_bridge_error))
         .transpose()
 }
 
@@ -393,10 +387,20 @@ fn paginate_resource_paths<'a>(
     Ok((page, next_cursor))
 }
 
-/// Pairs `result` with an indexing signal that has not been sampled.
-// TODO(#668): sample the routed server's indexing state around the call, as `get_diagnostics` does.
-fn unsampled<T>(result: T) -> Indexed<T> {
-    Indexed::new(result, IndexingSignal::default())
+/// Moves the indexing signal a handler sampled outside the `resolved_symbol`
+/// that name addressing wraps around it.
+fn hoist_indexing<T>(addressed: Addressed<Indexed<T>>) -> Indexed<Addressed<T>> {
+    let Addressed {
+        result,
+        resolved_symbol,
+    } = addressed;
+    Indexed::new(
+        Addressed {
+            result: result.result,
+            resolved_symbol,
+        },
+        result.indexing,
+    )
 }
 
 /// `get_diagnostics`'s response shape.
@@ -979,7 +983,7 @@ impl McplsServer {
                     },
                 )
                 .await
-                .map(unsampled),
+                .map(hoist_indexing),
         )
     }
 
@@ -1035,8 +1039,7 @@ impl McplsServer {
             self.context
                 .translator
                 .handle_type_hierarchy_prepare(file_path, parse_position(line, character)?)
-                .await
-                .map(unsampled),
+                .await,
         )
     }
 
@@ -1298,8 +1301,7 @@ impl McplsServer {
             self.context
                 .translator
                 .handle_signature_help(file_path, parse_position(line, character)?)
-                .await
-                .map(unsampled),
+                .await,
         )
     }
 
@@ -1440,8 +1442,7 @@ impl McplsServer {
             self.context
                 .translator
                 .handle_inlay_hints(file_path, parse_range(&range)?)
-                .await
-                .map(unsampled),
+                .await,
         )
     }
 }

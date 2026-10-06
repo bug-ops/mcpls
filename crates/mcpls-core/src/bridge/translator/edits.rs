@@ -17,6 +17,7 @@ use super::dto::{
     TabSize, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
@@ -25,31 +26,6 @@ use crate::error::{Error, McpErrorKind, Result};
 use crate::escape_control;
 use crate::lsp::{LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
-
-/// Validate the `kind_filter` of `handle_code_actions`.
-fn validate_kind_filter(kind_filter: Option<&str>) -> Result<()> {
-    const VALID_ACTION_KINDS: &[&str] = &[
-        "quickfix",
-        "refactor",
-        "refactor.extract",
-        "refactor.inline",
-        "refactor.rewrite",
-        "source",
-        "source.organizeImports",
-    ];
-
-    if let Some(kind) = kind_filter
-        && !VALID_ACTION_KINDS
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case(kind))
-    {
-        return Err(Error::InvalidToolParams(format!(
-            "Invalid kind_filter: '{kind}'. Valid values: {VALID_ACTION_KINDS:?}"
-        )));
-    }
-
-    Ok(())
-}
 
 /// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
 ///
@@ -811,9 +787,8 @@ impl Translator {
         &self,
         file_path: ClientPath,
         range: BoundedRange,
-        kind_filter: Option<String>,
+        kind_filter: Option<CodeActionKindFilter>,
     ) -> Result<CodeActionsResult> {
-        validate_kind_filter(kind_filter.as_deref())?;
         let (start, end) = (range.range().start(), range.range().end());
 
         let doc = self
@@ -834,7 +809,8 @@ impl Translator {
         };
 
         // Build context with optional kind filter
-        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
+        let only =
+            kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k.as_str().to_owned())]);
 
         // Pass empty diagnostics context — rust-analyzer generates code actions
         // based on cursor position and its internal analysis state, not on the
@@ -1157,19 +1133,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_code_actions_invalid_kind() {
-        let translator = Translator::new();
-        let result = translator
-            .handle_code_actions(
-                client_path("/tmp/test.rs"),
-                bounded(Position::at(1, 1), Position::at(1, 10)),
-                Some("invalid_kind".to_string()),
-            )
-            .await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[tokio::test]
     async fn test_handle_code_actions_valid_kind_quickfix() {
         use tempfile::TempDir;
 
@@ -1185,7 +1148,7 @@ mod tests {
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
                 bounded(Position::at(1, 1), Position::at(1, 10)),
-                Some("quickfix".to_string()),
+                Some(CodeActionKindFilter::QuickFix),
             )
             .await;
         // Will fail due to no LSP server, but validates kind is accepted
@@ -1209,7 +1172,7 @@ mod tests {
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
                 bounded(Position::at(1, 1), Position::at(1, 10)),
-                Some("refactor".to_string()),
+                Some(CodeActionKindFilter::Refactor),
             )
             .await;
         assert!(result.is_err());
@@ -1232,7 +1195,7 @@ mod tests {
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
                 bounded(Position::at(1, 1), Position::at(1, 10)),
-                Some("refactor.extract".to_string()),
+                Some(CodeActionKindFilter::RefactorExtract),
             )
             .await;
         assert!(result.is_err());
@@ -1255,7 +1218,7 @@ mod tests {
             .handle_code_actions(
                 client_path(test_file.to_str().unwrap()),
                 bounded(Position::at(1, 1), Position::at(1, 10)),
-                Some("source.organizeImports".to_string()),
+                Some(CodeActionKindFilter::SourceOrganizeImports),
             )
             .await;
         assert!(result.is_err());
@@ -2465,7 +2428,7 @@ mod tests {
                     .handle_code_actions(
                         client_path(path),
                         bounded(Position::at(1, 1), Position::at(1, 10)),
-                        None,
+                        Some(CodeActionKindFilter::SourceOrganizeImports),
                     )
                     .await
             })
@@ -2476,6 +2439,10 @@ mod tests {
         assert_eq!(opened["method"], "textDocument/didOpen");
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], "textDocument/codeAction");
+        assert_eq!(
+            request["params"]["context"]["only"],
+            serde_json::json!(["source.organizeImports"])
+        );
 
         write_response(
             &mut server.read_half_stdin,

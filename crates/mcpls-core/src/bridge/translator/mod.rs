@@ -81,7 +81,6 @@ pub use restart::{
 };
 pub use routing::Capability;
 pub use support::{RouteSupport, ToolSupportSnapshot};
-pub use symbols::parse_symbol_kind;
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
