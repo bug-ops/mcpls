@@ -57,7 +57,8 @@ impl ServerId {
     /// Builds an id from a literal, checked at compile time when evaluated in
     /// a `const` context.
     ///
-    /// Accepts exactly the literals [`Self::new`] accepts: ASCII and not blank.
+    /// Accepts only ASCII, non-blank literals, a subset of what [`Self::new`]
+    /// accepts.
     ///
     /// # Panics
     ///
@@ -75,7 +76,7 @@ impl ServerId {
     pub const fn from_static(id: &'static str) -> Self {
         assert!(
             id.is_ascii() && !id.trim_ascii().is_empty(),
-            "server id cannot be blank"
+            "server id must be ASCII and not blank"
         );
         Self(Cow::Borrowed(id))
     }
@@ -732,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "server id cannot be blank")]
+    #[should_panic(expected = "server id must be ASCII and not blank")]
     fn test_server_id_from_static_panics_on_blank() {
         let _ = ServerId::from_static(" ");
     }

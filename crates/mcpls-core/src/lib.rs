@@ -219,7 +219,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     config.validate()?;
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
-    let extension_map = config.build_effective_language_map();
+    let language_map = config.build_effective_language_map();
 
     let startup_redactions = Arc::new(redaction::Redactions::for_servers(
         &config.lsp_servers,
@@ -256,7 +256,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let mut translator = Translator::new()
         .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
-        .with_extensions(extension_map)
+        .with_extensions(language_map)
         .with_file_patterns(
             config
                 .lsp_servers

@@ -38,8 +38,8 @@ impl LanguageId {
     ///
     /// # Panics
     ///
-    /// Panics if `id` is blank or not ASCII, so a literal passes exactly when
-    /// it passes [`Self::new`].
+    /// Panics if `id` is blank or not ASCII. A literal that passes is also
+    /// accepted by [`Self::new`], which additionally allows non-ASCII text.
     ///
     /// # Examples
     ///
@@ -53,7 +53,7 @@ impl LanguageId {
     pub const fn from_static(id: &'static str) -> Self {
         assert!(
             id.is_ascii() && !id.trim_ascii().is_empty(),
-            "language_id cannot be blank"
+            "language_id must be ASCII and not blank"
         );
         Self(Cow::Borrowed(id))
     }
@@ -160,13 +160,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "language_id cannot be blank")]
+    #[should_panic(expected = "language_id must be ASCII and not blank")]
     fn test_from_static_panics_on_empty() {
         let _ = LanguageId::from_static("");
     }
 
     #[test]
-    #[should_panic(expected = "language_id cannot be blank")]
+    #[should_panic(expected = "language_id must be ASCII and not blank")]
     fn test_from_static_panics_on_non_ascii_blank() {
         let _ = LanguageId::from_static("\u{a0}");
     }

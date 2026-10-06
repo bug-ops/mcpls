@@ -18,11 +18,14 @@ use crate::lsp::{ManagedEnvVar, ParentEnv, child_env_var};
 /// Passed explicitly so the Windows rules run, and are tested, on every OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostOs {
+    /// Windows: any regular file is executable, and `.cmd` shims exist.
     Windows,
+    /// Every other host: a file is executable by its execute bit.
     Other,
 }
 
 impl HostOs {
+    /// The host this build runs on.
     pub const CURRENT: Self = if cfg!(windows) {
         Self::Windows
     } else {
