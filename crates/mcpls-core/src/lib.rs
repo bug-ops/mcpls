@@ -354,7 +354,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
-    use std::path::PathBuf;
 
     use super::*;
     use crate::config::{
@@ -396,7 +395,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -407,7 +406,8 @@ mod tests {
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345"),
+                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345")
+                        .into(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -419,7 +419,6 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
                 workspace_trust: crate::config::WorkspaceTrust::default(),
@@ -455,7 +454,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -514,7 +513,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![workspace_root],
+                    roots: vec![crate::config::ConfiguredRoot::new(workspace_root).unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -568,7 +567,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::new()],
+                    roots: vec![],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -579,7 +578,7 @@ mod tests {
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("rust-analyzer"),
+                    command: ServerCommand::from_static("rust-analyzer").into(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -591,10 +590,11 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
-                workspace_trust: crate::config::WorkspaceTrust::default(),
+                workspace_trust: crate::config::WorkspaceTrust::untrusted([
+                    crate::config::ServerId::from_static("not-configured"),
+                ]),
             };
 
             // `validate()` runs before any spawn/transport work and should
@@ -613,8 +613,8 @@ mod tests {
                 Ok(result) => assert_matches!(
                     result,
                     Err(Error::Config(_)),
-                    "serve() must reject a caller-supplied config with an empty workspace root via \
-                     Error::Config, matching the load_from path; got: {result:?}"
+                    "serve() must reject a caller-supplied config that allows an unconfigured server \
+                     via Error::Config, matching the load_from path; got: {result:?}"
                 ),
             }
         }

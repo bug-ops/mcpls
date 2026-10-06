@@ -371,7 +371,7 @@ mod tests {
     }
 
     fn roots_of(root: &Path) -> WorkspaceRoots {
-        WorkspaceRoots::from_configured(&[root.to_path_buf()]).unwrap()
+        WorkspaceRoots::from_paths(&[root.to_path_buf()]).unwrap()
     }
 
     fn uri(path: &Path) -> Uri {

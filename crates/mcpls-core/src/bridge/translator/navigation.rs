@@ -101,7 +101,8 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
 /// caller-supplied `limit`, which otherwise has no upper bound of its own.
 pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 
-/// Per-response allowance of [`MAX_NORMALIZED_LOCATIONS`] items.
+/// Per-response allowance of items, [`MAX_NORMALIZED_LOCATIONS`] unless built
+/// with [`ItemBudget::with_cap`].
 ///
 /// Every item a handler normalizes must first pass through [`Self::admit`],
 /// so nested loops (e.g. call hierarchy `fromRanges`, workspace-edit
@@ -110,14 +111,21 @@ pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 #[derive(Debug)]
 pub(super) struct ItemBudget {
     remaining: usize,
+    cap: usize,
     truncated: bool,
 }
 
 impl ItemBudget {
     /// A fresh budget holding the full [`MAX_NORMALIZED_LOCATIONS`].
     pub(super) const fn new() -> Self {
+        Self::with_cap(MAX_NORMALIZED_LOCATIONS)
+    }
+
+    /// A fresh budget holding `cap` items.
+    pub(super) const fn with_cap(cap: usize) -> Self {
         Self {
-            remaining: MAX_NORMALIZED_LOCATIONS,
+            remaining: cap,
+            cap,
             truncated: false,
         }
     }
@@ -132,6 +140,19 @@ impl ItemBudget {
         }
         self.remaining = self.remaining.saturating_sub(items.len());
         items
+    }
+
+    /// Like [`Self::admit`] for a lazy sequence: pulls at most the remaining
+    /// allowance plus one item, so the cost stays bounded by the cap however
+    /// long the sequence is.
+    pub(super) fn admit_iter<T>(&mut self, items: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut items = items.into_iter();
+        let kept: Vec<T> = items.by_ref().take(self.remaining).collect();
+        if items.next().is_some() {
+            self.record_drop(kept.len().saturating_add(1));
+        }
+        self.remaining = self.remaining.saturating_sub(kept.len());
+        kept
     }
 
     /// Admits `items` only if all of them fit the remaining allowance;
@@ -157,8 +178,8 @@ impl ItemBudget {
         if !self.truncated {
             tracing::warn!(
                 reported,
-                cap = MAX_NORMALIZED_LOCATIONS,
-                "LSP response item count exceeds MAX_NORMALIZED_LOCATIONS; truncating"
+                cap = self.cap,
+                "LSP response item count exceeds the item cap; truncating"
             );
         }
         self.truncated = true;
@@ -2224,6 +2245,18 @@ mod tests {
         assert!(budget.admit_whole(vec![0u8; 3]).is_none());
         assert!(budget.truncated());
         assert!(budget.admit_whole(vec![0u8; 2]).is_some());
+    }
+
+    #[test]
+    fn test_item_budget_with_cap_admits_a_lazy_sequence_up_to_the_cap() {
+        let mut budget = ItemBudget::with_cap(3);
+        assert_eq!(budget.admit_iter(0..3), [0, 1, 2]);
+        assert!(!budget.truncated());
+
+        let mut budget = ItemBudget::with_cap(3);
+        assert_eq!(budget.admit_iter(0..), [0, 1, 2]);
+        assert!(budget.truncated());
+        assert!(budget.admit_iter(0..2).is_empty());
     }
 
     #[test]

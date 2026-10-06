@@ -1005,10 +1005,6 @@ pub enum ConfigError {
         path: PathBuf,
     },
 
-    /// `workspace.roots` holds an empty path.
-    #[error("workspace.roots entries cannot be empty")]
-    EmptyWorkspaceRoot,
-
     /// `selection = "auto"` on an entry that is not typescript-language-server.
     #[error(
         "selection = \"auto\" is only valid for typescript-language-server entries (language \
@@ -2415,7 +2411,9 @@ mod tests {
     #[test]
     fn test_result_type_alias() {
         fn _returns_error() -> Result<i32> {
-            Err(Error::Config(ConfigError::EmptyWorkspaceRoot))
+            Err(Error::Config(ConfigError::NoParentDirectory {
+                path: PathBuf::new(),
+            }))
         }
 
         let result: Result<i32> = Ok(42);

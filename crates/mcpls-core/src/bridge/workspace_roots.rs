@@ -15,6 +15,7 @@ use thiserror::Error as ThisError;
 use tracing::{debug, info, warn};
 
 use super::{ClientPath, uri_to_path};
+use crate::config::ConfiguredRoot;
 use crate::error::{BackgroundTask, ConfigError, Error};
 
 /// How path components are compared during containment checks.
@@ -426,9 +427,10 @@ fn verified_system_aliases(links_dir: &Path, roots: &[PathBuf]) -> Vec<PathBuf> 
 ///
 /// ```
 /// use mcpls_core::bridge::{ClientPath, WorkspaceRoots};
+/// use mcpls_core::config::ConfiguredRoot;
 ///
 /// let dir = std::env::temp_dir();
-/// let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&dir))?;
+/// let roots = WorkspaceRoots::from_configured(&[ConfiguredRoot::new(dir.clone())?])?;
 /// let path = roots.validate_blocking(&ClientPath::try_from(dir.clone())?)?;
 /// assert!(path.as_path().is_absolute());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -498,7 +500,11 @@ impl WorkspaceRoots {
     /// The directories untrusted mode treats as the workspace: these roots
     /// when `configured` names some, or, when it is empty and the roots are
     /// only the working directory, [`Self::checkout_scoped`] of them.
-    pub(crate) fn untrusted_boundary(&self, configured: &[PathBuf], home: Option<&Path>) -> Self {
+    pub(crate) fn untrusted_boundary(
+        &self,
+        configured: &[ConfiguredRoot],
+        home: Option<&Path>,
+    ) -> Self {
         if configured.is_empty() {
             self.checkout_scoped(home)
         } else {
@@ -557,20 +563,40 @@ impl WorkspaceRoots {
     ///
     /// ```
     /// use mcpls_core::bridge::WorkspaceRoots;
+    /// use mcpls_core::config::ConfiguredRoot;
     ///
-    /// let roots = WorkspaceRoots::from_configured(&[std::env::temp_dir()])?;
+    /// let roots = WorkspaceRoots::from_configured(&[ConfiguredRoot::new(std::env::temp_dir())?])?;
     /// assert!(!roots.is_empty());
-    /// # Ok::<(), mcpls_core::Error>(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn from_configured(roots: &[PathBuf]) -> Result<Self, Error> {
+    pub fn from_configured(roots: &[ConfiguredRoot]) -> Result<Self, Error> {
         Self::from_configured_with(roots, ProcessCwd::current)
     }
 
-    pub(crate) fn from_configured_with(
-        roots: &[PathBuf],
+    /// Test-only [`Self::from_configured`] over plain paths.
+    #[cfg(test)]
+    pub(crate) fn from_paths<P: AsRef<Path>>(roots: &[P]) -> Result<Self, Error> {
+        Self::from_paths_with(roots, ProcessCwd::current)
+    }
+
+    /// Test-only [`Self::from_configured_with`] over plain paths.
+    #[cfg(test)]
+    pub(crate) fn from_paths_with<P: AsRef<Path>>(
+        roots: &[P],
         cwd: impl FnOnce() -> Result<ProcessCwd, Error>,
     ) -> Result<Self, Error> {
-        let needs_cwd = roots.is_empty() || roots.iter().any(|root| root.is_relative());
+        let roots: Vec<ConfiguredRoot> = roots
+            .iter()
+            .map(|root| ConfiguredRoot::new(root.as_ref()).expect("test root"))
+            .collect();
+        Self::from_configured_with(&roots, cwd)
+    }
+
+    pub(crate) fn from_configured_with(
+        roots: &[ConfiguredRoot],
+        cwd: impl FnOnce() -> Result<ProcessCwd, Error>,
+    ) -> Result<Self, Error> {
+        let needs_cwd = roots.is_empty() || roots.iter().any(|root| root.as_path().is_relative());
         let cwd = needs_cwd.then(cwd).transpose()?;
 
         let resolved = match &cwd {
@@ -578,8 +604,10 @@ impl WorkspaceRoots {
             _ => roots
                 .iter()
                 .map(|root| match &cwd {
-                    Some(cwd) if root.is_relative() => ResolvedRoot::from_relative(root, cwd),
-                    _ => Ok(ResolvedRoot::from_absolute(root)),
+                    Some(cwd) if root.as_path().is_relative() => {
+                        ResolvedRoot::from_relative(root.as_path(), cwd)
+                    }
+                    _ => Ok(ResolvedRoot::from_absolute(root.as_path())),
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
         };
@@ -800,9 +828,7 @@ mod tests {
     }
 
     fn resolve_in(roots: &[PathBuf], base: &Path) -> Result<WorkspaceRoots, Error> {
-        WorkspaceRoots::from_configured_with(roots, || {
-            Ok(ProcessCwd::new(base.to_path_buf(), None))
-        })
+        WorkspaceRoots::from_paths_with(roots, || Ok(ProcessCwd::new(base.to_path_buf(), None)))
     }
 
     #[cfg(unix)]
@@ -811,7 +837,7 @@ mod tests {
         base: &Path,
         pwd: &Path,
     ) -> Result<WorkspaceRoots, Error> {
-        WorkspaceRoots::from_configured_with(roots, || {
+        WorkspaceRoots::from_paths_with(roots, || {
             Ok(ProcessCwd::new(
                 base.to_path_buf(),
                 Some(pwd.as_os_str().to_owned()),
@@ -978,10 +1004,10 @@ mod tests {
             Err(Error::Io(_))
         );
         assert_matches!(
-            WorkspaceRoots::from_configured_with(&[PathBuf::from("rel")], broken),
+            WorkspaceRoots::from_paths_with(&[PathBuf::from("rel")], broken),
             Err(Error::Io(_))
         );
-        assert!(WorkspaceRoots::from_configured_with(&[base], broken).is_ok());
+        assert!(WorkspaceRoots::from_paths_with(&[base], broken).is_ok());
     }
 
     /// #234 round-3 regression: a symlinked workspace root must canonicalize
@@ -1061,7 +1087,7 @@ mod tests {
         let root = base.join("root");
         std::fs::create_dir(&root).unwrap();
 
-        let roots = WorkspaceRoots::from_configured_with(std::slice::from_ref(&root), || {
+        let roots = WorkspaceRoots::from_paths_with(std::slice::from_ref(&root), || {
             panic!("cwd must not be read")
         })
         .unwrap();
@@ -1223,7 +1249,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raw = dir.path().to_path_buf();
 
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&raw)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&raw)).unwrap();
 
         assert!(roots.admits_lexically(&raw.join("a.rs")));
     }
@@ -1339,7 +1365,7 @@ mod tests {
         }
         let sealed = base.join("sealed");
         std::fs::create_dir(&sealed).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
         let uri = Uri::from(format!("file://{}", sealed.join("new.rs").display()).as_str());
         assert!(roots.admits_edit_uri(&uri).await);
 
@@ -1358,7 +1384,7 @@ mod tests {
         let target = dunce::canonicalize(outside.path()).unwrap().join("x");
         std::os::unix::fs::symlink(&target, base.join("evil.rs")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("nodir"), base.join("evil_dir")).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
 
         for name in ["evil.rs", "evil_dir/file.rs"] {
             let uri = Uri::from(format!("file://{}", base.join(name).display()).as_str());

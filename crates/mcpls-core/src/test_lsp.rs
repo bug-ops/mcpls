@@ -349,7 +349,7 @@ pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> Server
     let script = dir.join("server.sh");
     std::fs::write(&script, script_body).unwrap();
     let mut server_config = LspServerConfig::rust_analyzer();
-    server_config.command = ServerCommand::from_static("sh");
+    server_config.command = ServerCommand::from_static("sh").into();
     server_config.args = vec![script.to_string_lossy().to_string()];
     init_config_for(server_config)
 }

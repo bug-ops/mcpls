@@ -1139,7 +1139,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1163,7 +1163,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1186,7 +1186,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1232,7 +1232,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1450,7 +1450,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1483,8 +1483,8 @@ mod tests {
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let roots = vec![
-            WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap(),
-            WorkspaceRoots::from_configured_with(&[std::path::PathBuf::from(".")], || {
+            WorkspaceRoots::from_paths(std::slice::from_ref(&link)).unwrap(),
+            WorkspaceRoots::from_paths_with(&[std::path::PathBuf::from(".")], || {
                 Ok(ProcessCwd::new(
                     real.clone(),
                     Some(link.clone().into_os_string()),
@@ -1591,7 +1591,7 @@ mod tests {
             assert_eq!(convert_one_edit(roots, &link.join("a.rs")).await, (1, 0));
         }
 
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&link)).unwrap();
         fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert_eq!(
@@ -1651,7 +1651,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1753,7 +1753,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1832,7 +1832,7 @@ mod tests {
             data: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let result = convert_code_action(
             lsp_action,
             &test_ctx(),
@@ -1914,7 +1914,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -1974,7 +1974,7 @@ mod tests {
         };
 
         let dir = tempfile::TempDir::new().unwrap();
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             all_dropped_edit,
             &test_ctx(),
@@ -2070,7 +2070,7 @@ mod tests {
         };
 
         let dir = tempfile::TempDir::new().unwrap();
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -2177,7 +2177,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -2248,7 +2248,7 @@ mod tests {
             change_annotations: None,
         };
 
-        let workspace_roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let workspace_roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let (changes, dropped) = convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -3069,7 +3069,7 @@ mod tests {
         edit: serde_json::Value,
     ) -> (Vec<DocumentChanges>, DroppedEdits) {
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(edit).unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         convert_workspace_edit(
             edit,
             &test_ctx(),
@@ -3265,7 +3265,7 @@ mod tests {
             }))
             .unwrap()
         };
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let mut budget = ItemBudget::new();
 
         let first =

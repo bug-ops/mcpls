@@ -2132,7 +2132,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         (server, temp_dir, test_file)
     }
@@ -3048,9 +3048,8 @@ mod tests {
                 FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3069,7 +3068,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3124,9 +3123,8 @@ mod tests {
                 FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3140,7 +3138,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3198,9 +3196,8 @@ mod tests {
                 FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3219,7 +3216,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3288,9 +3285,8 @@ mod tests {
                 FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let translator = Arc::new(translator);
         let (client, fake) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3302,7 +3298,7 @@ mod tests {
         let server = Arc::new(McplsServer::new(
             translator,
             Arc::clone(&cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3602,9 +3598,8 @@ mod tests {
                 FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let translator = Arc::new(translator);
         let (client, mut fake_server) = fake_lsp_client();
         translator.register_client(server_id.clone(), client);
@@ -3625,7 +3620,7 @@ mod tests {
         let mcp_server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -3818,7 +3813,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -3855,7 +3850,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let canonical_path = test_file.canonicalize().unwrap();
@@ -3971,7 +3966,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let owner = crate::config::ServerId::from_static("rust");
         server.context.translator.register_server(
@@ -4089,7 +4084,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let uri = Url::from_file_path(test_file.canonicalize().unwrap())
             .unwrap()
@@ -4175,7 +4170,7 @@ mod tests {
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         // Deliberately not registered with `translator.register_server`.
         let owner = crate::config::ServerId::from_static("rust");
@@ -4266,7 +4261,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -4328,7 +4323,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -4387,7 +4382,7 @@ mod tests {
         let server = McplsServer::new(
             translator,
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -4461,7 +4456,7 @@ sleep 0.3
         let config = ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: ServerCommand::from_static("sh"),
+                command: ServerCommand::from_static("sh").into(),
                 args: vec![script_path.to_string_lossy().to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -4473,7 +4468,6 @@ sleep 0.3
                 name: Some(ServerId::from_static("rust")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             WorkspaceRoots::default(),
             PositionEncodings::DEFAULT,
@@ -4500,7 +4494,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -4553,7 +4547,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
 
         let params = Parameters(CachedDiagnosticsParams {
@@ -4573,7 +4567,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
         );
         let params = Parameters(CachedDiagnosticsParams {
             file_path: PathBuf::from(
@@ -4626,7 +4620,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::from_configured(&[root]).unwrap(),
+            WorkspaceRoots::from_paths(&[root]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -5337,7 +5331,7 @@ sleep 0.3
         let noncanonical = link_dir.join("test.rs");
         assert_ne!(noncanonical, test_file);
 
-        let validated = WorkspaceRoots::from_configured(&[base])
+        let validated = WorkspaceRoots::from_paths(&[base])
             .unwrap()
             .validate_blocking(&client_path(&noncanonical))
             .map(crate::bridge::WorkspacePath::into_path_buf)
@@ -5360,9 +5354,8 @@ sleep 0.3
 
         let dir = tempfile::TempDir::new().unwrap();
         let mut translator = Translator::new();
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let result = translator
             .validate_path(&client_path(dir.path().join("this/path/does/not/exist.rs")))
             .await;
@@ -5380,7 +5373,7 @@ sleep 0.3
     #[test]
     fn test_read_resource_nonexistent_path_maps_to_invalid_params() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
         let missing = temp_dir.path().join("does-not-exist.rs");
 
         let result = roots
@@ -5399,7 +5392,7 @@ sleep 0.3
         let temp_dir = tempfile::TempDir::new().unwrap();
         let file = temp_dir.path().join("main.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
 
         let err = roots
             .validate_blocking(&client_path(file.join("x")))
@@ -5487,7 +5480,7 @@ sleep 0.3
             format!("{}\u{0}x", file.display()),
             through_file.display().to_string(),
         ] {
-            let roots = WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap();
+            let roots = WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
             let mut translator = Translator::new();
             translator.set_workspace_roots(roots.clone());
             let server = McplsServer::new(
@@ -5545,7 +5538,7 @@ sleep 0.3
         symlink(&real_dir, &link_dir).unwrap();
         let noncanonical = link_dir.join("test.rs");
 
-        let roots = &WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let roots = &WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
         let validated = roots
             .validate_blocking(&client_path(&noncanonical))
             .map(crate::bridge::WorkspacePath::into_path_buf)
@@ -5587,7 +5580,7 @@ sleep 0.3
     fn test_unsubscribe_resolution_failures_split_malformed_from_unresolvable() {
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path().canonicalize().unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
 
         let malformed = DiagnosticsResourceUri::resolve("file:///a.rs", &roots).unwrap_err();
         assert!(!malformed.is_unresolvable_resource(), "{malformed:?}");
@@ -5700,7 +5693,7 @@ sleep 0.3
         let server = create_test_server_with_workspace_roots(
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
-            WorkspaceRoots::from_configured(&[root]).unwrap(),
+            WorkspaceRoots::from_paths(&[root]).unwrap(),
         );
         (server, dir, uri)
     }
@@ -5866,9 +5859,8 @@ sleep 0.3
                 id.clone(),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
         match state {
             RustServerState::Starting => translator.set_expected_servers(HashSet::from([id])),
             RustServerState::FailedToStart => {
@@ -5887,7 +5879,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
@@ -5896,7 +5888,7 @@ sleep 0.3
             server,
             rust_file,
             python_file,
-            roots: WorkspaceRoots::from_configured(&[root]).unwrap(),
+            roots: WorkspaceRoots::from_paths(&[root]).unwrap(),
             _dir: dir,
         }
     }
@@ -6244,9 +6236,8 @@ sleep 0.3
                     LanguageId::from_static("python"),
                 ),
             ]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let mut fake_servers = Vec::new();
         for (id, _, caps) in servers {
             let (client, fake) = fake_lsp_client();
@@ -6257,7 +6248,7 @@ sleep 0.3
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             SubscriptionRegistry::new(),
             ProjectConfigStatus::NotIgnored,
             mcp,

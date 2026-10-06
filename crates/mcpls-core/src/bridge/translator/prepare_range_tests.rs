@@ -589,7 +589,7 @@ async fn prepare_rename_requires_prepare_provider_not_just_rename() {
 fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
     LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: ServerCommand::new(name.to_string()).unwrap(),
+        command: ServerCommand::new(name.to_string()).unwrap().into(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec![],
@@ -601,7 +601,6 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         name: Some(ServerId::new(name).unwrap()),
         handles: Some(ToolSet::new(handles).unwrap()),
         indexing: IndexingPolicy::Auto,
-        selection: crate::config::ServerSelection::Explicit,
     }
 }
 
@@ -622,7 +621,7 @@ async fn prepare_rename_routes_with_rename() {
         )]))
         .with_router(ToolRouter::from_configs(&configs).unwrap());
     translator
-        .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
+        .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
     let (renamer_client, mut renamer) = fake_lsp_client();
     let (hoverer_client, _hoverer) = fake_lsp_client();

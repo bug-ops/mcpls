@@ -155,7 +155,7 @@ mod tests {
         let (workspace, outside) = (base.join("ws"), base.join("outside"));
         std::fs::create_dir_all(workspace.join("bin")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+        let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let path = std::env::join_paths([
             workspace.join("bin"),
             workspace.join("not-created-yet/bin"),
@@ -185,7 +185,7 @@ mod tests {
 
         fn config(command: &str) -> LspServerConfig {
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = ServerCommand::new(command.to_string()).unwrap();
+            config.command = ServerCommand::new(command.to_string()).unwrap().into();
             config
         }
 

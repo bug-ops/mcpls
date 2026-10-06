@@ -407,7 +407,7 @@ mod settler_tests {
         ServerStartOutcome::Failed(ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.clone(),
+            command: config.command.server_command().clone(),
             reason: StartupFailure::InitTaskPanicked,
         })
     }
@@ -579,7 +579,7 @@ mod settler_tests {
             .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
                 server_id: explicit.id(),
                 language_id: LanguageId::from_static("rust"),
-                command: explicit.command.clone(),
+                command: explicit.command.server_command().clone(),
                 reason: StartupFailure::InitTaskPanicked,
             }))
             .await;
@@ -719,7 +719,7 @@ mod startup_tests {
         let gate = dir.path().join("gate");
         let mut broken = named_sh_init_config(dir.path(), "broken", "rust", "exit 1\n");
         broken.server_config_mut().command =
-            ServerCommand::from_static("mcpls-no-such-language-server");
+            ServerCommand::from_static("mcpls-no-such-language-server").into();
         let slow = named_sh_init_config(
             dir.path(),
             "slow",
@@ -765,7 +765,7 @@ mod startup_tests {
             .map(|language| {
                 let mut config = named_sh_init_config(dir.path(), language, language, "exit 1\n");
                 config.server_config_mut().command =
-                    ServerCommand::from_static("mcpls-no-such-language-server");
+                    ServerCommand::from_static("mcpls-no-such-language-server").into();
                 config
             })
             .to_vec();

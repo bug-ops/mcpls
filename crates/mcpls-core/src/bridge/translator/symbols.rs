@@ -599,7 +599,7 @@ mod tests {
     async fn test_handle_workspace_symbol_no_claimant_names_tool() {
         let configs = vec![crate::config::LspServerConfig {
             language_id: LanguageId::from_static("python"),
-            command: ServerCommand::from_static("pyright-langserver"),
+            command: ServerCommand::from_static("pyright-langserver").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -611,7 +611,6 @@ mod tests {
             name: Some(ServerId::from_static("pyright")),
             handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);

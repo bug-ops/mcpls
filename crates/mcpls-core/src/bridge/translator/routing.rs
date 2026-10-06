@@ -1378,7 +1378,7 @@ mod tests {
     ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::new(language).unwrap(),
-            command: ServerCommand::from_static("sh"),
+            command: ServerCommand::from_static("sh").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -1390,7 +1390,6 @@ mod tests {
             name: Some(ServerId::new(name).unwrap()),
             handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -1548,7 +1547,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
-        translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_root]).unwrap());
+        translator.set_workspace_roots(WorkspaceRoots::from_paths(&[workspace_root]).unwrap());
 
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1565,7 +1564,7 @@ mod tests {
 
         // Set workspace root to temp_dir1
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir1.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir1.path().to_path_buf()]).unwrap(),
         );
 
         // Create file in temp_dir2 (outside workspace)
@@ -1582,7 +1581,7 @@ mod tests {
     fn test_validate_path_nonexistent_outside_path_is_outside_workspace() {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(outside.path().join("missing.rs")))
@@ -1594,7 +1593,7 @@ mod tests {
     #[test]
     fn test_validate_path_dotdot_escape_is_outside_workspace() {
         let root = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("../escape.rs")))
@@ -1608,7 +1607,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         fs::create_dir(root.path().join("a")).unwrap();
         fs::write(root.path().join("b.rs"), "").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("./a/../b.rs")))
@@ -1710,7 +1709,7 @@ mod tests {
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("link/secret.rs")))
@@ -1770,7 +1769,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1791,7 +1790,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1923,7 +1922,7 @@ mod tests {
 
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
-            command: ServerCommand::from_static("typescript-language-server"),
+            command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec![FilePattern::from_static("**/*.tsx")],
@@ -1935,7 +1934,6 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
 
         let translator = Translator::new()
@@ -2166,9 +2164,8 @@ mod tests {
                 id.clone(),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -2205,7 +2202,7 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&alias)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&alias)).unwrap();
         AliasFixture {
             dir,
             real,
@@ -2228,7 +2225,7 @@ mod tests {
 
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
-            command: ServerCommand::from_static("typescript-language-server"),
+            command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec![
@@ -2243,7 +2240,6 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
         let translator = Translator::new()
             .with_extensions(extension_map)
@@ -2280,7 +2276,7 @@ mod tests {
         let config = crate::config::ServerConfig {
             mcp: crate::config::McpConfig::default(),
             workspace: WorkspaceConfig {
-                roots: vec![PathBuf::from("/tmp/test-workspace")],
+                roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                 position_encodings: PositionEncodings::DEFAULT,
                 language_extensions: language_extensions.clone(),
                 heuristics_max_depth: SearchDepth::DEFAULT,
@@ -2348,9 +2344,8 @@ mod tests {
                         LanguageId::from_static("lang_b"),
                     ),
                 ]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
@@ -2441,9 +2436,8 @@ mod tests {
                     ServerId::from_static("lang_a"),
                     LanguageId::from_static("lang_a"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("lang_a"), client);
@@ -2511,9 +2505,8 @@ mod tests {
                 max_documents: DocumentLimit::new(1),
                 max_file_size: SizeLimit::UNLIMITED,
             });
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("lang_a"), client);
@@ -2734,9 +2727,8 @@ mod tests {
                     ServerId::from_static("lang_b"),
                     LanguageId::from_static("lang_b"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, _server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("lang_b"), client.clone());
@@ -2797,9 +2789,8 @@ mod tests {
                 max_documents: DocumentLimit::new(1),
                 max_file_size: SizeLimit::UNLIMITED,
             });
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_a, mut server_a) = fake_lsp_client();
         translator.register_client(ServerId::from_static("lang_a"), client_a);
@@ -2868,7 +2859,7 @@ mod tests {
         let pylsp_id = ServerId::from_static("pylsp");
         let pyright = LspServerConfig {
             language_id: LanguageId::from_static("python"),
-            command: ServerCommand::from_static("pyright-langserver"),
+            command: ServerCommand::from_static("pyright-langserver").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -2880,10 +2871,9 @@ mod tests {
             name: Some(ServerId::from_static("pyright")),
             handles: Some(ToolSet::single(ToolKind::Hover)),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
         let pylsp = LspServerConfig {
-            command: ServerCommand::from_static("pylsp"),
+            command: ServerCommand::from_static("pylsp").into(),
             name: Some(ServerId::from_static("pylsp")),
             handles: Some(ToolSet::single(ToolKind::Diagnostics)),
             ..pyright.clone()
@@ -2894,9 +2884,8 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(router);
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_pyright, mut server_pyright) = fake_lsp_client();
         let (client_pylsp, mut server_pylsp) = fake_lsp_client();

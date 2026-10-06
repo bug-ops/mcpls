@@ -967,7 +967,7 @@ mod tests {
                 .with_notification_cache(Arc::clone(&cache))
                 .with_clock(clock.clone());
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+                WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
 
             let mut server = crate::lsp::LspServer::spawn(stub_server_config("rust", script))
@@ -1148,7 +1148,7 @@ mod tests {
             translator.record_refusals(&[ServerSpawnFailure {
                 server_id: config.id(),
                 language_id: config.language_id.clone(),
-                command: config.command.clone(),
+                command: config.command.server_command().clone(),
                 reason: StartupFailure::RefusedUntrustedWorkspace(
                     crate::error::UntrustedRefusal::NotAllowed { builtin: None },
                 ),
@@ -1513,7 +1513,7 @@ mod tests {
             let fx = fixture(dir, &script, true).await;
             let mut broken = stub_server_config("rust", &script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("mcpls-test-missing-server");
+                ServerCommand::from_static("mcpls-test-missing-server").into();
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1569,7 +1569,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let mut translator = Translator::new().with_notification_cache(Arc::clone(&cache));
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+                WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
             let (_cancel, cancel_rx) = watch::channel(false);
             let wiring = PumpWiring::new(
@@ -1754,7 +1754,7 @@ mod tests {
             .expect("the seed server's diagnostics reach the cache");
             let mut broken = stub_server_config("rust", &script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("mcpls-test-missing-server");
+                ServerCommand::from_static("mcpls-test-missing-server").into();
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()

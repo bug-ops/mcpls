@@ -626,7 +626,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -734,7 +734,7 @@ mod tests {
         );
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -854,7 +854,7 @@ mod tests {
         cache.store_diagnostics(&ServerId::from_static("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -915,7 +915,7 @@ mod tests {
         );
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -936,7 +936,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent/path/file.rs");
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             &client_path(&missing),
         )
         .await;
@@ -1108,7 +1108,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&workspace_roots).unwrap(),
+            &WorkspaceRoots::from_paths(&workspace_roots).unwrap(),
             &client_path(&test_file),
         )
         .await;
@@ -1126,9 +1126,8 @@ mod tests {
                 ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let redactions = crate::redaction::Redactions::new([(
             "API_TOKEN".to_owned(),
             "SuperSecretValue123".to_owned(),
@@ -1228,9 +1227,8 @@ mod tests {
                     ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("rust"), client);
@@ -1325,9 +1323,8 @@ mod tests {
                     ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("rust"), client);
@@ -1398,9 +1395,8 @@ mod tests {
                     ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
         translator.register_client(ServerId::from_static("rust"), client);

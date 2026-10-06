@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::{BuiltinServer, LspServerConfig, ServerCommand, ServerId};
+use crate::config::{BuiltinServer, LaunchCommand, LspServerConfig, ServerCommand, ServerId};
 use crate::error::InitFailureHint;
 use crate::lsp::command_path::{is_executable_file, resolve_named};
 use crate::lsp::{LspNotification, ParentEnv};
@@ -634,7 +634,7 @@ pub fn select_typescript_server(
     roots: &WorkspaceRoots,
     parent_env: impl ParentEnv,
 ) -> Option<TypescriptServerChoice> {
-    if config.selection.is_explicit() {
+    if config.command.is_explicit() {
         return None;
     }
     let kept = |reason| Some(TypescriptServerChoice::Tsserver(reason));
@@ -709,7 +709,7 @@ pub fn with_selected_typescript_server<'a>(
                 "starting the native TypeScript server (`tsc --lsp --stdio`): TypeScript 7 found outside the workspace"
             );
             let mut native = config.clone();
-            native.command = tsc.command();
+            native.command = LaunchCommand::explicit(tsc.command());
             native.args = NATIVE_TSC_ARGS.iter().map(ToString::to_string).collect();
             Cow::Owned(native)
         }
@@ -976,6 +976,17 @@ fn pinned_initialization_options(
         .initialization_options
 }
 
+/// The default TypeScript entry started through `command`, auto-selected only
+/// when `command` is typescript-language-server.
+#[cfg(test)]
+fn typescript_entry(command: &str) -> LspServerConfig {
+    let mut config = LspServerConfig::typescript();
+    let command = ServerCommand::new(command).unwrap();
+    config.command =
+        LaunchCommand::auto(command.clone()).unwrap_or_else(|_| LaunchCommand::explicit(command));
+    config
+}
+
 #[cfg(test)]
 mod major_tests {
     use super::TypescriptMajor;
@@ -998,7 +1009,6 @@ mod launch_tests {
     use std::fs;
 
     use super::*;
-    use crate::config::ServerCommand;
 
     struct Install {
         _dir: tempfile::TempDir,
@@ -1051,8 +1061,7 @@ mod launch_tests {
     }
 
     fn config(command: &str, args: &[&str]) -> LspServerConfig {
-        let mut config = LspServerConfig::typescript();
-        config.command = ServerCommand::new(command.to_string()).unwrap();
+        let mut config = super::typescript_entry(command);
         config.args = args.iter().map(ToString::to_string).collect();
         config
     }
@@ -1345,8 +1354,7 @@ mod launch_tests {
         write(&tsc, "#!/bin/sh\n");
         fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut auto = config(SERVER_STEM, &[]);
-        auto.selection = crate::config::ServerSelection::Auto;
+        let auto = config(SERVER_STEM, &[]);
         let choice =
             select_typescript_server(&auto, &WorkspaceRoots::default(), env_with_path(&home));
         assert_matches!(choice, Some(TypescriptServerChoice::Native(_)));
@@ -1423,9 +1431,7 @@ mod tests {
     }
 
     fn config(command: &str) -> LspServerConfig {
-        let mut config = LspServerConfig::typescript();
-        config.command = ServerCommand::new(command.to_string()).unwrap();
-        config
+        super::typescript_entry(command)
     }
 
     fn env_with_path(path: &Path) -> impl ParentEnv {
@@ -1626,7 +1632,7 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
         let options = pinned_initialization_options(
             &config(SERVER_STEM),
-            &WorkspaceRoots::from_configured(std::slice::from_ref(&ws)).unwrap(),
+            &WorkspaceRoots::from_paths(std::slice::from_ref(&ws)).unwrap(),
             env_with_path(&layout.bin),
         );
         drop(guard);
@@ -1652,7 +1658,7 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
         let options = pinned_initialization_options(
             &config(SERVER_STEM),
-            &WorkspaceRoots::from_configured(std::slice::from_ref(&layout.base)).unwrap(),
+            &WorkspaceRoots::from_paths(std::slice::from_ref(&layout.base)).unwrap(),
             env_with_path(&layout.bin),
         );
         drop(guard);
@@ -2020,7 +2026,7 @@ mod tests {
 
     fn roots(paths: &[&Path]) -> WorkspaceRoots {
         let paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
-        WorkspaceRoots::from_configured(&paths).unwrap()
+        WorkspaceRoots::from_paths(&paths).unwrap()
     }
 
     fn select(
@@ -2055,7 +2061,7 @@ mod tests {
         assert_eq!(effective.command, tsc.to_str().unwrap());
         assert_eq!(effective.args, ["--lsp", "--stdio"]);
         assert_eq!(effective.language_id, base.language_id);
-        assert_eq!(effective.selection, base.selection);
+        assert!(effective.command.is_explicit());
     }
 
     #[test]
@@ -2081,7 +2087,8 @@ mod tests {
         let layout = global_install(false);
         native_install_next_to_server(&layout);
         let mut base = config(SERVER_STEM);
-        base.selection = crate::config::ServerSelection::Explicit;
+        base.command =
+            crate::config::LaunchCommand::explicit(base.command.server_command().clone());
         assert_eq!(select(&layout, &base, &WorkspaceRoots::default()), None);
         let effective = with_selected_typescript_server(
             &base,
@@ -2288,8 +2295,8 @@ mod tests {
 
     #[test]
     fn test_selection_ignores_non_typescript_servers() {
-        let mut rust = LspServerConfig::rust_analyzer();
-        rust.selection = crate::config::ServerSelection::Auto;
+        let rust = LspServerConfig::rust_analyzer();
+        assert!(crate::config::LaunchCommand::auto(rust.command.server_command().clone()).is_err());
         assert_eq!(
             select_typescript_server(&rust, &WorkspaceRoots::default(), |_| None),
             None
@@ -2316,7 +2323,6 @@ mod tests {
     fn test_invalid_tsserver_path_blocks_native_selection_and_pinning() {
         let layout = global_install(true);
         let mut auto = config(SERVER_STEM);
-        auto.selection = crate::config::ServerSelection::Auto;
         auto.initialization_options = Some(serde_json::json!({"tsserver": {"path": 42}}));
 
         let choice = select_typescript_server(
@@ -2344,7 +2350,7 @@ mod tests {
         let layout = global_install(true);
         let roots = WorkspaceRoots::default();
         let plan = plan_typescript(config(SERVER_STEM), env_with_path(&layout.bin));
-        let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&layout.base)).unwrap();
+        let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&layout.base)).unwrap();
 
         assert_eq!(plan.pin_inside(&boundary), Some(layout.tsserver.clone()));
         let (applied, pinned) = plan.apply(&roots);

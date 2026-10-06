@@ -345,29 +345,183 @@ impl AsRef<Path> for ServerCommand {
     }
 }
 
+/// `selection = "auto"` on a command that is not typescript-language-server.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("selection = \"auto\" is only valid for typescript-language-server entries")]
+pub struct InvalidAutoSelection;
+
+/// The command of a server entry together with the consent to replace it.
+///
+/// Binds [`ServerCommand`] to [`ServerSelection`] so that [`ServerSelection::Auto`]
+/// can only accompany a typescript-language-server command; the combination
+/// `rust-analyzer` plus `auto` cannot be built. The fields are private, so a
+/// command cannot be swapped without re-checking the selection: use
+/// [`Self::retarget`].
+///
+/// Reads like the [`ServerCommand`] it wraps (`as_str`, `Display`, `AsRef`,
+/// comparison with `&str`).
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::{LaunchCommand, ServerCommand, ServerSelection};
+///
+/// let tsls = ServerCommand::new("typescript-language-server").unwrap();
+/// let auto = LaunchCommand::auto(tsls).unwrap();
+/// assert_eq!(auto.selection(), ServerSelection::Auto);
+///
+/// let rust = ServerCommand::new("rust-analyzer").unwrap();
+/// assert!(LaunchCommand::auto(rust.clone()).is_err());
+/// assert!(LaunchCommand::explicit(rust).is_explicit());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchCommand {
+    command: ServerCommand,
+    selection: ServerSelection,
+}
+
+impl LaunchCommand {
+    /// `command` started exactly as written.
+    #[must_use]
+    pub const fn explicit(command: ServerCommand) -> Self {
+        Self {
+            command,
+            selection: ServerSelection::Explicit,
+        }
+    }
+
+    /// `command` that mcpls may replace with the native TypeScript server.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidAutoSelection`] unless `command` is typescript-language-server.
+    pub fn auto(command: ServerCommand) -> Result<Self, InvalidAutoSelection> {
+        Self::new(command, ServerSelection::Auto)
+    }
+
+    /// `command` with `selection`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidAutoSelection`] for [`ServerSelection::Auto`] on a command that
+    /// is not typescript-language-server.
+    pub fn new(
+        command: ServerCommand,
+        selection: ServerSelection,
+    ) -> Result<Self, InvalidAutoSelection> {
+        if selection == ServerSelection::Auto
+            && !BuiltinServer::TypescriptLanguageServer.matches_command(command.as_str())
+        {
+            return Err(InvalidAutoSelection);
+        }
+        Ok(Self { command, selection })
+    }
+
+    /// The default entry's command: typescript-language-server, auto-selected.
+    const fn typescript() -> Self {
+        Self {
+            command: ServerCommand::from_static(BuiltinServer::TypescriptLanguageServer.command()),
+            selection: ServerSelection::Auto,
+        }
+    }
+
+    /// This launch with `command` in place of the current one, keeping the
+    /// selection.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidAutoSelection`] when the selection is auto and `command` is not
+    /// typescript-language-server.
+    pub fn retarget(self, command: ServerCommand) -> Result<Self, InvalidAutoSelection> {
+        Self::new(command, self.selection)
+    }
+
+    /// The command as configured.
+    #[must_use]
+    pub const fn server_command(&self) -> &ServerCommand {
+        &self.command
+    }
+
+    /// Whether mcpls may replace the command.
+    #[must_use]
+    pub const fn selection(&self) -> ServerSelection {
+        self.selection
+    }
+
+    /// Whether the command is started exactly as written.
+    #[must_use]
+    pub const fn is_explicit(&self) -> bool {
+        self.selection.is_explicit()
+    }
+
+    /// The command text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.command.as_str()
+    }
+
+    fn into_parts(self) -> (ServerCommand, ServerSelection) {
+        (self.command, self.selection)
+    }
+}
+
+impl From<ServerCommand> for LaunchCommand {
+    fn from(command: ServerCommand) -> Self {
+        Self::explicit(command)
+    }
+}
+
+impl std::fmt::Display for LaunchCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.command, f)
+    }
+}
+
+impl AsRef<OsStr> for LaunchCommand {
+    fn as_ref(&self) -> &OsStr {
+        self.command.as_ref()
+    }
+}
+
+impl AsRef<Path> for LaunchCommand {
+    fn as_ref(&self) -> &Path {
+        self.command.as_ref()
+    }
+}
+
+impl PartialEq<str> for LaunchCommand {
+    fn eq(&self, other: &str) -> bool {
+        self.command == *other
+    }
+}
+
+impl PartialEq<&str> for LaunchCommand {
+    fn eq(&self, other: &&str) -> bool {
+        self.command == *other
+    }
+}
+
 /// Configuration for a single LSP server.
 ///
-/// Deserialization goes through a raw mirror of this struct so that an invalid
-/// `file_patterns` entry is reported with the id of the server that holds it.
+/// Serialization goes through a raw mirror of this struct, which reports an
+/// invalid `file_patterns` entry with the id of the server that holds it and
+/// builds the [`LaunchCommand`] from the `command` and `selection` keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(try_from = "RawLspServerConfig")]
+#[serde(try_from = "RawLspServerConfig", into = "RawLspServerConfig")]
 pub struct LspServerConfig {
     /// Language identifier (e.g., "rust", "python", "typescript").
     pub language_id: LanguageId,
 
-    /// Command to start the LSP server.
-    pub command: ServerCommand,
+    /// Command to start the LSP server, with whether mcpls may replace it.
+    pub command: LaunchCommand,
 
     /// Arguments to pass to the LSP server command.
-    #[serde(default)]
     pub args: Vec<String>,
 
     /// Environment variables for the LSP server process.
-    #[serde(default)]
     pub env: HashMap<String, String>,
 
     /// File patterns this server handles (glob patterns).
-    #[serde(default)]
     pub file_patterns: Vec<FilePattern>,
 
     /// LSP initialization options (server-specific).
@@ -381,14 +535,12 @@ pub struct LspServerConfig {
     /// only that installed the server fails to initialize, and the error says
     /// so. A native `tsc --lsp --stdio` command gets no pin and no generated
     /// options. See `SECURITY.md` for the trust model.
-    #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
 
     /// Per-server settings pushed after `initialized` via
     /// `workspace/didChangeConfiguration` and served on
     /// `workspace/configuration`. Top-level dotted keys are expanded into
     /// nested objects; keys inside values are left untouched.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<LspSettings>,
 
     /// Handshake timeout in seconds: bounds the `initialize` request during
@@ -396,7 +548,6 @@ pub struct LspServerConfig {
     /// after initialization; see [`Self::request_timeout_seconds`] for that.
     /// The LSP server's `shutdown` request during teardown uses a separate,
     /// fixed 5-second timeout that is not configurable by this field.
-    #[serde(default)]
     pub timeout_seconds: TimeoutSecs,
 
     /// Per-request timeout in seconds, applied to each LSP request issued
@@ -410,12 +561,10 @@ pub struct LspServerConfig {
     /// seconds. Completion requests are further capped at 10 seconds
     /// regardless of this value; see
     /// [`crate::lsp::LspClient::completion_timeout`].
-    #[serde(default)]
     pub request_timeout_seconds: TimeoutSecs,
 
     /// Heuristics for determining if this server should be spawned.
     /// If not specified, the server will always attempt to spawn.
-    #[serde(default)]
     pub heuristics: Option<ServerHeuristics>,
 
     /// Human-readable server identity used as the routing key.
@@ -425,7 +574,6 @@ pub struct LspServerConfig {
     /// language: this is what lets two servers share one `language_id`
     /// (e.g. pyright and pylsp both for `python`) without one silently
     /// overwriting the other in the maps keyed by [`ServerId`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<ServerId>,
 
     /// Tools this server handles.
@@ -433,7 +581,6 @@ pub struct LspServerConfig {
     /// `None` means this server is a catch-all: it serves every tool not
     /// explicitly claimed by another server for the same language.
     /// `Some(list)` restricts the server to exactly those tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handles: Option<ToolSet>,
 
     /// Workspace-indexing readiness policy for this server (P4 escape
@@ -442,15 +589,7 @@ pub struct LspServerConfig {
     /// `experimental/serverStatus`, or a generic `$/progress` sequence).
     /// Set to `"disabled"` for a server whose signal shape doesn't fit this
     /// tracker's assumptions -- see [`IndexingPolicy::Disabled`].
-    #[serde(default, skip_serializing_if = "IndexingPolicy::is_auto")]
     pub indexing: IndexingPolicy,
-
-    /// Whether mcpls may swap `command` and `args` for the native TypeScript
-    /// server at startup. Only the generated default TypeScript entry is
-    /// `auto`; a file without the key is `explicit`, and `command` and `args`
-    /// are used as written.
-    #[serde(default, skip_serializing_if = "ServerSelection::is_explicit")]
-    pub selection: ServerSelection,
 }
 
 /// The deserialized form of [`LspServerConfig`], before the entry-level checks.
@@ -458,7 +597,7 @@ pub struct LspServerConfig {
 /// Mirrors the public struct field for field; the `TryFrom` impl below
 /// destructures and builds both exhaustively, so a field added to one side
 /// only fails to compile.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLspServerConfig {
     language_id: LanguageId,
@@ -471,7 +610,7 @@ struct RawLspServerConfig {
     file_patterns: Vec<String>,
     #[serde(default)]
     initialization_options: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     settings: Option<LspSettings>,
     #[serde(default)]
     timeout_seconds: TimeoutSecs,
@@ -479,14 +618,51 @@ struct RawLspServerConfig {
     request_timeout_seconds: TimeoutSecs,
     #[serde(default)]
     heuristics: Option<ServerHeuristics>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<ServerId>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     handles: Option<ToolSet>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IndexingPolicy::is_auto")]
     indexing: IndexingPolicy,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ServerSelection::is_explicit")]
     selection: ServerSelection,
+}
+
+impl From<LspServerConfig> for RawLspServerConfig {
+    fn from(config: LspServerConfig) -> Self {
+        let LspServerConfig {
+            language_id,
+            command,
+            args,
+            env,
+            file_patterns,
+            initialization_options,
+            settings,
+            timeout_seconds,
+            request_timeout_seconds,
+            heuristics,
+            name,
+            handles,
+            indexing,
+        } = config;
+        let (command, selection) = command.into_parts();
+        Self {
+            language_id,
+            command,
+            args,
+            env,
+            file_patterns: file_patterns.into_iter().map(String::from).collect(),
+            initialization_options,
+            settings,
+            timeout_seconds,
+            request_timeout_seconds,
+            heuristics,
+            name,
+            handles,
+            indexing,
+            selection,
+        }
+    }
 }
 
 impl TryFrom<RawLspServerConfig> for LspServerConfig {
@@ -509,6 +685,11 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
             indexing,
             selection,
         } = raw;
+        let command = LaunchCommand::new(command, selection).map_err(|InvalidAutoSelection| {
+            ConfigError::SelectionAutoOnNonTypescript {
+                language: language_id.clone(),
+            }
+        })?;
         let file_patterns = file_patterns
             .iter()
             .map(|pattern| {
@@ -534,7 +715,6 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
             name,
             handles,
             indexing,
-            selection,
         })
     }
 }
@@ -758,7 +938,7 @@ impl LspServerConfig {
     ) -> Self {
         Self {
             language_id,
-            command: ServerCommand::from_static(server.command()),
+            command: ServerCommand::from_static(server.command()).into(),
             args: args.iter().map(ToString::to_string).collect(),
             env: HashMap::new(),
             file_patterns: file_patterns
@@ -775,7 +955,6 @@ impl LspServerConfig {
             name: None,
             handles: None,
             indexing: IndexingPolicy::Auto,
-            selection: ServerSelection::Explicit,
         }
     }
 
@@ -818,7 +997,7 @@ impl LspServerConfig {
     #[must_use]
     pub fn typescript() -> Self {
         Self {
-            selection: ServerSelection::Auto,
+            command: LaunchCommand::typescript(),
             ..Self::builtin(
                 const { LanguageId::from_static("typescript") },
                 BuiltinServer::TypescriptLanguageServer,
@@ -922,13 +1101,42 @@ mod tests {
         );
         assert!(serde_json::from_str::<ServerSelection>("\"native\"").is_err());
         assert_eq!(
-            LspServerConfig::typescript().selection,
+            LspServerConfig::typescript().command.selection(),
             ServerSelection::Auto
         );
         assert_eq!(
-            LspServerConfig::rust_analyzer().selection,
+            LspServerConfig::rust_analyzer().command.selection(),
             ServerSelection::Explicit
         );
+    }
+
+    #[test]
+    fn test_default_typescript_command_is_a_valid_auto_selection() {
+        let command = LspServerConfig::typescript().command;
+        assert_eq!(
+            LaunchCommand::auto(command.server_command().clone()),
+            Ok(command)
+        );
+    }
+
+    #[test]
+    fn test_retarget_keeps_the_selection_and_rechecks_auto() {
+        let tsls = |text: &str| ServerCommand::new(text).unwrap();
+        let auto = LaunchCommand::auto(tsls("typescript-language-server")).unwrap();
+
+        let moved = auto
+            .clone()
+            .retarget(tsls("/opt/bin/typescript-language-server"))
+            .unwrap();
+        assert_eq!(moved.selection(), ServerSelection::Auto);
+        assert_eq!(moved, "/opt/bin/typescript-language-server");
+        assert_eq!(
+            auto.retarget(tsls("rust-analyzer")),
+            Err(InvalidAutoSelection)
+        );
+
+        let explicit = LaunchCommand::explicit(tsls("rust-analyzer"));
+        assert!(explicit.retarget(tsls("anything")).is_ok());
     }
 
     #[test]
@@ -996,7 +1204,7 @@ mod tests {
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
-            command: ServerCommand::from_static("custom-lsp"),
+            command: ServerCommand::from_static("custom-lsp").into(),
             args: vec!["--flag".to_string()],
             env: env.clone(),
             file_patterns: vec![FilePattern::from_static("**/*.custom")],
@@ -1008,7 +1216,6 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
 
         assert_eq!(config.language_id, "custom");
@@ -1179,7 +1386,7 @@ mod tests {
     fn test_should_spawn_without_heuristics() {
         let config = LspServerConfig {
             language_id: LanguageId::from_static("test"),
-            command: ServerCommand::from_static("test-lsp"),
+            command: ServerCommand::from_static("test-lsp").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -1191,7 +1398,6 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
 
         let tmp = TempDir::new().unwrap();

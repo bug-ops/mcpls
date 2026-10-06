@@ -777,7 +777,7 @@ mod tests {
     ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::new(language_id).unwrap(),
-            command: ServerCommand::from_static("cmd"),
+            command: ServerCommand::from_static("cmd").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -789,7 +789,6 @@ mod tests {
             name: name.map(|id| ServerId::new(id).unwrap()),
             handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -870,7 +869,7 @@ mod tests {
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: ServerCommand::from_static("rust-analyzer"),
+                command: ServerCommand::from_static("rust-analyzer").into(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -882,11 +881,10 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: ServerCommand::from_static("rust-analyzer"),
+                command: ServerCommand::from_static("rust-analyzer").into(),
                 args: vec!["--dummy-second-instance".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -898,7 +896,6 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();

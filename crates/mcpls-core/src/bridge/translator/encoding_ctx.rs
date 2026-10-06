@@ -426,7 +426,7 @@ mod tests {
 
         let ctx = test_ctx_with_roots(
             PositionEncoding::Utf16,
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
         );
         assert!(!ctx.is_out_of_workspace(&uri));
     }
@@ -441,7 +441,7 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&link)).unwrap();
         let ctx = test_ctx_with_roots(PositionEncoding::Utf16, roots);
 
         assert!(!ctx.is_out_of_workspace(&path_to_uri(&link.join("main.rs")).unwrap()));
@@ -457,7 +457,7 @@ mod tests {
         let dir = TempDir::new_in("/tmp").unwrap();
         let canonical = dunce::canonicalize(dir.path()).unwrap();
         assert!(canonical.starts_with("/private/tmp"));
-        let roots = WorkspaceRoots::from_configured(&[canonical]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[canonical]).unwrap();
         let ctx = test_ctx_with_roots(PositionEncoding::Utf16, roots);
 
         let alias_spelling = dir.path().join("a.rs");
@@ -475,7 +475,7 @@ mod tests {
         let other_dir = TempDir::new().unwrap();
         let ctx = test_ctx_with_roots(
             PositionEncoding::Utf16,
-            WorkspaceRoots::from_configured(&[other_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[other_dir.path().to_path_buf()]).unwrap(),
         );
         assert!(ctx.is_out_of_workspace(&uri));
     }

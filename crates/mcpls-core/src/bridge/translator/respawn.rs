@@ -814,7 +814,7 @@ sleep 5
 
             let mut broken = stub_server_config("rust", &script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz").into();
             set_respawn_config(&translator, &id, broken);
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -911,7 +911,7 @@ fi
 
             let mut broken = stub_server_config("rust", &seed_script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz").into();
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -951,7 +951,7 @@ fi
 
             let mut broken = stub_server_config("rust", &seed_script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz").into();
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -1369,7 +1369,7 @@ sleep 1
             let configs = [
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("sh"),
+                    command: ServerCommand::from_static("sh").into(),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
@@ -1381,11 +1381,10 @@ sleep 1
                     name: Some(ServerId::from_static("hover-only")),
                     handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 },
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("sh"),
+                    command: ServerCommand::from_static("sh").into(),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
@@ -1397,7 +1396,6 @@ sleep 1
                     name: Some(ServerId::from_static("diag-catchall")),
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 },
             ];
             let router = ToolRouter::from_configs(configs.iter()).unwrap();
@@ -1474,7 +1472,7 @@ sleep 1
                     LanguageId::from_static("rust"),
                 )]));
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(&[workspace.to_path_buf()]).unwrap(),
+                WorkspaceRoots::from_paths(&[workspace.to_path_buf()]).unwrap(),
             );
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);

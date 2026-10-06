@@ -420,11 +420,11 @@ mod tests {
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
+            WorkspaceRoots::from_paths(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
         );
         #[cfg(not(windows))]
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[std::path::PathBuf::from("/")]).unwrap(),
+            WorkspaceRoots::from_paths(&[std::path::PathBuf::from("/")]).unwrap(),
         );
         // `Url::to_file_path` on Windows requires a drive-letter first path
         // segment; a Unix-style path with none fails to convert at all
@@ -472,11 +472,11 @@ mod tests {
         // `canonicalize()` instead of failing closed on `NoWorkspaceRoots`.
         #[cfg(windows)]
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
+            WorkspaceRoots::from_paths(&[std::path::PathBuf::from(r"C:\")]).unwrap(),
         );
         #[cfg(not(windows))]
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[std::path::PathBuf::from("/")]).unwrap(),
+            WorkspaceRoots::from_paths(&[std::path::PathBuf::from("/")]).unwrap(),
         );
         #[cfg(windows)]
         let uri = "file:///C:/this/path/does/not/exist/anywhere.rs";

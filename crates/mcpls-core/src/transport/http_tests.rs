@@ -1100,7 +1100,7 @@ async fn spawn_subscribe_test_server() -> SubscribeTestServer {
     let uri = crate::bridge::resources::make_uri(&file_path).unwrap();
 
     let server = test_server_with_roots(
-        WorkspaceRoots::from_configured(&[workspace.path().to_path_buf()]).unwrap(),
+        WorkspaceRoots::from_paths(&[workspace.path().to_path_buf()]).unwrap(),
     );
     let registry = server.subscription_registry();
 
@@ -1455,9 +1455,8 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
     let uri_x = crate::bridge::resources::make_uri(&file_x).unwrap();
     let uri_y = crate::bridge::resources::make_uri(&file_y).unwrap();
 
-    let server = test_server_with_roots(
-        WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
-    );
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
     let registry = server.subscription_registry();
     let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
 
@@ -1467,10 +1466,8 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
     subscribe_in_session(addr, &session_a, &uri_y).await;
     subscribe_in_session(addr, &session_b, &uri_y).await;
 
-    let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
-        registry,
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
-    );
+    let (tx, _cancel_tx) =
+        crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::from_paths(&[root]).unwrap());
     let publish = |file: &std::path::Path| {
         let notification =
             crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
@@ -1571,9 +1568,8 @@ async fn test_abandoned_subscribed_session_expires_despite_notifications() {
     std::fs::write(&file, "fn main() {}").unwrap();
     let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-    let server = test_server_with_roots(
-        WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
-    );
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
     let registry = server.subscription_registry();
     let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
@@ -1581,10 +1577,8 @@ async fn test_abandoned_subscribed_session_expires_despite_notifications() {
     subscribe_in_session(addr, &session, &uri).await;
     drop(stream);
 
-    let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
-        registry,
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
-    );
+    let (tx, _cancel_tx) =
+        crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::from_paths(&[root]).unwrap());
     let accept_headers =
         "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
     let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
@@ -1619,18 +1613,15 @@ async fn test_healthy_get_only_listener_is_not_reaped() {
     std::fs::write(&file, "fn main() {}").unwrap();
     let uri = crate::bridge::resources::make_uri(&file).unwrap();
 
-    let server = test_server_with_roots(
-        WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
-    );
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
     let registry = server.subscription_registry();
     let (addr, server_task) = spawn_idle_test_server(1, server).await;
 
     let (session, mut stream) = establish_session(addr).await;
     subscribe_in_session(addr, &session, &uri).await;
-    let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
-        registry,
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
-    );
+    let (tx, _cancel_tx) =
+        crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::from_paths(&[root]).unwrap());
 
     let started = tokio::time::Instant::now();
     while started.elapsed() < TEST_IDLE * 3 {
@@ -1673,9 +1664,8 @@ async fn spawn_listen_fixture() -> ListenFixture {
     let file = root.join("main.rs");
     std::fs::write(&file, "fn main() {}").unwrap();
     let uri = crate::bridge::resources::make_uri(&file).unwrap();
-    let server = test_server_with_roots(
-        WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
-    );
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
     let registry = server.subscription_registry();
     let (addr, server_task) = spawn_idle_test_server(1, server).await;
     ListenFixture {
@@ -1749,7 +1739,7 @@ async fn test_http_listen_delivers_one_update_per_raw_uri() {
     }
     let (tx, _cancel_tx) = crate::test_lsp::spawn_test_pump(
         fx.registry.clone(),
-        WorkspaceRoots::from_configured(std::slice::from_ref(&fx.root)).unwrap(),
+        WorkspaceRoots::from_paths(std::slice::from_ref(&fx.root)).unwrap(),
     );
     tx.send(publish_notification(&fx.file)).await.unwrap();
 
@@ -1824,7 +1814,7 @@ async fn test_http_listen_replays_cached_diagnostics() {
     let server = crate::mcp::McplsServer::new(
         std::sync::Arc::new(crate::bridge::Translator::new()),
         cache,
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
+        WorkspaceRoots::from_paths(&[root]).unwrap(),
         crate::mcp::SubscriptionRegistry::new(),
         crate::ProjectConfigStatus::NotIgnored,
         crate::config::McpConfig::default(),
@@ -1907,7 +1897,7 @@ async fn test_http_listen_lease_ends_stream_abruptly_and_frees_slot() {
     let root = dunce::canonicalize(workspace.path()).unwrap();
     std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
     let uri = crate::bridge::resources::make_uri(&root.join("main.rs")).unwrap();
-    let server = test_server_with_roots(WorkspaceRoots::from_configured(&[root]).unwrap());
+    let server = test_server_with_roots(WorkspaceRoots::from_paths(&[root]).unwrap());
     let registry = server.subscription_registry();
     let (addr, server_task) =
         spawn_http_server(server, |cfg| cfg.with_listen_lease(short_lease(300))).await;
@@ -1946,7 +1936,7 @@ async fn test_http_listen_without_lease_is_not_ended() {
     let root = dunce::canonicalize(workspace.path()).unwrap();
     std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
     let uri = crate::bridge::resources::make_uri(&root.join("main.rs")).unwrap();
-    let server = test_server_with_roots(WorkspaceRoots::from_configured(&[root]).unwrap());
+    let server = test_server_with_roots(WorkspaceRoots::from_paths(&[root]).unwrap());
     let (addr, server_task) = spawn_http_server(server, |cfg| {
         cfg.with_stream_liveness(StreamLiveness::Disabled)
     })
@@ -2019,7 +2009,7 @@ async fn test_http_listen_lease_with_real_client_replays_cache_and_evictions() {
     let server = crate::mcp::McplsServer::new(
         std::sync::Arc::new(crate::bridge::Translator::new()),
         std::sync::Arc::new(tokio::sync::Mutex::new(cache)),
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
+        WorkspaceRoots::from_paths(&[root]).unwrap(),
         crate::mcp::SubscriptionRegistry::new(),
         crate::ProjectConfigStatus::NotIgnored,
         crate::config::McpConfig::default(),
@@ -2208,7 +2198,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     let uri_main = crate::bridge::resources::make_uri(&file_main).unwrap();
     let uri_util = crate::bridge::resources::make_uri(&file_util).unwrap();
     let uri_sentinel = crate::bridge::resources::make_uri(&file_sentinel).unwrap();
-    let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap();
+    let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap();
 
     let server = test_server_with_roots(roots.clone());
     let registry = server.subscription_registry();
@@ -2323,7 +2313,7 @@ async fn test_pull_only_file_is_replayed_once_on_subscribe_and_listen() {
     let server = crate::mcp::McplsServer::new(
         std::sync::Arc::new(crate::bridge::Translator::new()),
         cache,
-        WorkspaceRoots::from_configured(&[root]).unwrap(),
+        WorkspaceRoots::from_paths(&[root]).unwrap(),
         crate::mcp::SubscriptionRegistry::new(),
         crate::ProjectConfigStatus::NotIgnored,
         crate::config::McpConfig::default(),

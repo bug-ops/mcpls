@@ -343,7 +343,7 @@ impl Translator {
                 ServerSpawnFailure {
                     server_id: server_config.id(),
                     language_id: server_config.language_id.clone(),
-                    command: server_config.command.clone(),
+                    command: server_config.command.server_command().clone(),
                     reason: StartupFailure::InitTaskPanicked,
                 }
             }));
@@ -875,7 +875,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.clone(),
+            command: config.command.server_command().clone(),
             reason: StartupFailure::InitTaskPanicked,
         }
     }

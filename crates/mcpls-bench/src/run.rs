@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mcpls_core::ServerConfig;
 use mcpls_core::bridge::IndexingPolicy;
-use mcpls_core::config::{FilePattern, LspServerConfig, ServerCommand, TimeoutSecs};
+use mcpls_core::config::{
+    ConfiguredRoot, FilePattern, LspServerConfig, ServerCommand, TimeoutSecs,
+};
 use rmcp::model::{ContentBlock, ErrorCode};
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::{RoleClient, ServiceExt};
@@ -87,10 +89,11 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Res
         .map(|pattern| FilePattern::parse(pattern))
         .collect::<Result<Vec<_>, _>>()?;
     let mut config = ServerConfig::default();
-    config.workspace.roots = vec![repo.to_path_buf()];
+    config.workspace.roots =
+        vec![ConfiguredRoot::new(repo).context("the repository path must not be empty")?];
     config.lsp_servers = vec![LspServerConfig {
         language_id: scenario.server.language_id.clone(),
-        command: ServerCommand::new(server_path.to_string_lossy().into_owned())?,
+        command: ServerCommand::new(server_path.to_string_lossy().into_owned())?.into(),
         args: scenario.server.args.clone(),
         env: HashMap::new(),
         file_patterns,
@@ -102,7 +105,6 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Res
         name: None,
         handles: None,
         indexing: IndexingPolicy::Auto,
-        selection: mcpls_core::config::ServerSelection::Explicit,
     }];
     Ok(config)
 }
@@ -712,7 +714,10 @@ mod tests {
         let parsed: ServerConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.lsp_servers.len(), 1);
         assert_eq!(parsed.lsp_servers[0].command, "/bin/rust-analyzer");
-        assert_eq!(parsed.workspace.roots, [PathBuf::from("/repo")]);
+        assert_eq!(
+            parsed.workspace.roots,
+            [ConfiguredRoot::new("/repo").unwrap()]
+        );
     }
 
     #[test]

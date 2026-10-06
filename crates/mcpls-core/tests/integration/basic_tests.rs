@@ -60,7 +60,8 @@ fn test_workspace_roots_configuration() {
     let mut translator = Translator::new();
     let first = tempfile::tempdir().expect("tempdir");
     let second = tempfile::tempdir().expect("tempdir");
-    let roots = [first.path().to_path_buf(), second.path().to_path_buf()];
+    let roots = [first.path(), second.path()]
+        .map(|path| mcpls_core::config::ConfiguredRoot::new(path).expect("non-empty root"));
 
     translator.set_workspace_roots(WorkspaceRoots::from_configured(&roots).expect("roots resolve"));
 }

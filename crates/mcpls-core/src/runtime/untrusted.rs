@@ -117,7 +117,7 @@ fn allowlist_refusal(
 fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
     launcher::launches_from_workspace(configured.command.as_str(), &configured.args).then(|| {
         UntrustedRefusal::ProjectLauncher {
-            command: configured.command.clone(),
+            command: configured.command.server_command().clone(),
         }
     })
 }
@@ -146,7 +146,7 @@ fn harden_for_untrusted(
     let mut effective = effective.into_owned();
     normalize_env_keys(&mut effective.env, host.env_key_case());
     let unresolved = || UntrustedRefusal::UnresolvedExecutable {
-        command: effective.command.clone(),
+        command: effective.command.server_command().clone(),
     };
     let resolved =
         lsp::command_path::resolve_command(&effective, parent_env).ok_or_else(unresolved)?;
@@ -179,7 +179,12 @@ fn harden_for_untrusted(
             path: PathBuf::from(path),
         })?;
     let home_env = home_overrides(&effective, boundary, login_home, parent_env)?;
-    effective.command = ServerCommand::new(command).map_err(|_| unresolved())?;
+    let hardened_command = ServerCommand::new(command).map_err(|_| unresolved())?;
+    effective.command = effective
+        .command
+        .clone()
+        .retarget(hardened_command)
+        .map_err(|_| unresolved())?;
     effective
         .env
         .insert(ManagedEnvVar::Path.name().to_owned(), path);
@@ -370,7 +375,7 @@ fn admit(
     login_home: Option<&Path>,
     redactions: &Arc<Redactions>,
 ) -> Result<ServerInitConfig, (ServerCommand, UntrustedRefusal)> {
-    let configured = |refusal| (lsp_config.command.clone(), refusal);
+    let configured = |refusal| (lsp_config.command.server_command().clone(), refusal);
     if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
         return Err(configured(refusal));
     }
@@ -396,7 +401,7 @@ fn admit(
             (hardened, working_dir)
         }
     };
-    let command = effective.command.clone();
+    let command = effective.command.server_command().clone();
     let plan = tsserver_pin::plan_typescript(effective, process_env);
     if let Some(boundary) = boundary {
         if let Some(tsserver) = plan.pin_inside(boundary) {
@@ -404,7 +409,7 @@ fn admit(
         }
         if plan.has_unpinnable_launcher() {
             let refusal = UntrustedRefusal::UnpinnedTypescriptLauncher {
-                command: lsp_config.command.clone(),
+                command: lsp_config.command.server_command().clone(),
             };
             return Err((command, refusal));
         }
@@ -452,7 +457,7 @@ mod plan_tests {
     fn rust_workspace() -> (tempfile::TempDir, WorkspaceRoots) {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         (dir, roots)
     }
 
@@ -528,7 +533,7 @@ mod plan_tests {
     #[test]
     fn plan_skips_server_without_project_markers() {
         let dir = tempfile::TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
 
         let plan = plan(&config_with_rust_analyzer(), &roots);
 
@@ -584,7 +589,9 @@ mod plan_tests {
             std::fs::set_permissions(&gopls, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut go = LspServerConfig::gopls();
-        go.command = ServerCommand::new(gopls.to_string_lossy().into_owned()).unwrap();
+        go.command = ServerCommand::new(gopls.to_string_lossy().into_owned())
+            .unwrap()
+            .into();
         let config = config_with(
             vec![LspServerConfig::rust_analyzer(), go],
             WorkspaceTrust::untrusted([ServerId::from_static("go")]),
@@ -600,7 +607,7 @@ mod plan_tests {
     fn plan_untrusted_marks_a_custom_server_as_not_builtin() {
         let (_dir, roots) = rust_workspace();
         let mut custom = LspServerConfig::rust_analyzer();
-        custom.command = ServerCommand::from_static("my-rust-server");
+        custom.command = ServerCommand::from_static("my-rust-server").into();
         let config = config_with(vec![custom], WorkspaceTrust::untrusted([]));
 
         let plan = plan(&config, &roots);
@@ -616,7 +623,7 @@ mod plan_tests {
     #[test]
     fn plan_untrusted_does_not_refuse_a_server_heuristics_skip() {
         let dir = tempfile::TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let config = config_with(
             vec![LspServerConfig::rust_analyzer()],
             WorkspaceTrust::untrusted([]),
@@ -637,7 +644,8 @@ mod plan_tests {
                 .to_string_lossy()
                 .into_owned(),
         )
-        .unwrap();
+        .unwrap()
+        .into();
 
         let plan = plan(&config_with(vec![config], WorkspaceTrust::Trusted), &roots);
 
@@ -667,7 +675,7 @@ mod plan_tests {
             std::fs::create_dir_all(workspace.join("bin")).unwrap();
             std::fs::create_dir_all(&outside).unwrap();
             std::fs::write(workspace.join("Cargo.toml"), "").unwrap();
-            let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+            let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
             Fixture {
                 _dir: dir,
                 workspace,
@@ -693,7 +701,7 @@ mod plan_tests {
 
         fn rust_with(command: &str) -> LspServerConfig {
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = ServerCommand::new(command.to_string()).unwrap();
+            config.command = ServerCommand::new(command.to_string()).unwrap().into();
             config
         }
 
@@ -929,12 +937,13 @@ mod plan_tests {
             let fx = fixture();
             let elsewhere = fx.outside.clone();
 
-            let configured_roots = std::slice::from_ref(&fx.workspace);
+            let configured_roots =
+                [crate::config::ConfiguredRoot::new(fx.workspace.clone()).unwrap()];
             let kept = fx.roots.untrusted_boundary(&[], Some(&elsewhere));
             let dropped = fx.roots.untrusted_boundary(&[], Some(&fx.workspace));
             let configured = fx
                 .roots
-                .untrusted_boundary(configured_roots, Some(&fx.workspace));
+                .untrusted_boundary(&configured_roots, Some(&fx.workspace));
 
             assert_eq!(kept.canonical(), fx.roots.canonical());
             assert!(dropped.canonical().is_empty());
@@ -957,8 +966,7 @@ mod plan_tests {
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value.clone())
             };
-            let boundary =
-                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             harden_for_untrusted(
                 Cow::Owned(rust_with(exe.to_str().unwrap())),
                 &boundary,
@@ -1272,8 +1280,7 @@ mod plan_tests {
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value.clone())
             };
-            let boundary =
-                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             harden_for_untrusted(
                 Cow::Owned(rust_with(exe.to_str().unwrap())),
                 &boundary,
@@ -1300,8 +1307,7 @@ mod plan_tests {
             let fx = fixture();
             let exe = fx.outside.join("rust-analyzer");
             executable(&exe);
-            let boundary =
-                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             let mut config = rust_with(exe.to_str().unwrap());
             config.env.insert(
                 "nodefaultcurrentdirectoryinexepath".to_owned(),
@@ -1338,8 +1344,7 @@ mod plan_tests {
             executable(&exe);
             let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/\xff"));
             let path = std::env::join_paths([fx.outside.clone(), non_utf8]).unwrap();
-            let boundary =
-                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
 
             let refused = harden_for_untrusted(
                 Cow::Owned(rust_with("rust-analyzer")),
@@ -1417,7 +1422,7 @@ mod plan_tests {
         fn working_dir_is_refused_when_nothing_lies_outside_the_boundary() {
             let fx = fixture();
             let temp = private_temp(&fx);
-            let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&temp)).unwrap();
+            let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&temp)).unwrap();
 
             let refused = working_dir_in(&boundary, None, &temp).unwrap_err();
 
@@ -1522,7 +1527,9 @@ mod plan_tests {
             std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
             executable(&shim);
             let mut config = LspServerConfig::typescript();
-            config.command = ServerCommand::new(shim.to_str().unwrap().to_owned()).unwrap();
+            config.command = ServerCommand::new(shim.to_str().unwrap().to_owned())
+                .unwrap()
+                .into();
             config
         }
 
@@ -1534,7 +1541,7 @@ mod plan_tests {
             with_user_pin.initialization_options =
                 Some(serde_json::json!({"tsserver": {"path": "/opt/ts/tsserver.js"}}));
             for config in [typescript_shim(&fx, ".volta/bin"), with_user_pin] {
-                let command = config.command.clone();
+                let command = config.command.server_command().clone();
 
                 let plan = plan(
                     &config_with(vec![config], untrusted_allowing_typescript()),
@@ -1573,7 +1580,9 @@ mod plan_tests {
             let node = fx.outside.join("node");
             executable(&node);
             let mut config = LspServerConfig::typescript();
-            config.command = ServerCommand::new(node.to_str().unwrap().to_owned()).unwrap();
+            config.command = ServerCommand::new(node.to_str().unwrap().to_owned())
+                .unwrap()
+                .into();
             config.args = vec!["node_modules/typescript-language-server/lib/cli.mjs".to_owned()];
 
             let plan = plan(
@@ -1779,8 +1788,9 @@ mod plan_tests {
             let exe = fx.outside.join("rust-analyzer");
             executable(&exe);
             let mut config = config;
-            config.lsp_servers[0].command =
-                ServerCommand::new(exe.to_str().unwrap().to_owned()).unwrap();
+            config.lsp_servers[0].command = ServerCommand::new(exe.to_str().unwrap().to_owned())
+                .unwrap()
+                .into();
             std::fs::write(fx.workspace.join("go.mod"), "").unwrap();
 
             let (admitted, refused, failures) = plan(&config, &fx.roots).into_parts();
@@ -1840,7 +1850,7 @@ mod refusal_spawn_tests {
         std::fs::write(workspace.join("Cargo.toml"), "").unwrap();
         let marker = base.join("started");
         let server = server(&outside, &marker);
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         Case {
             _dir: dir,
             workspace,
@@ -1963,7 +1973,9 @@ mod refusal_spawn_tests {
             let body = answer_initialize_script(Some(marker), None);
             executable(&script, &format!("#!/usr/bin/env sh\n{body}"));
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = ServerCommand::new(script.to_string_lossy().into_owned()).unwrap();
+            config.command = ServerCommand::new(script.to_string_lossy().into_owned())
+                .unwrap()
+                .into();
             config
         });
         let interpreter_marker = case.outside.join("interpreter-ran");
@@ -2039,13 +2051,15 @@ mod windows_spawn_tests {
         )
         .unwrap();
         let mut server = LspServerConfig::rust_analyzer();
-        server.command = ServerCommand::new(script.to_string_lossy().into_owned()).unwrap();
+        server.command = ServerCommand::new(script.to_string_lossy().into_owned())
+            .unwrap()
+            .into();
         let config = ServerConfig {
             lsp_servers: vec![server],
             workspace_trust: WorkspaceTrust::untrusted([ServerId::from_static("rust")]),
             ..ServerConfig::default()
         };
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let redactions = Arc::new(Redactions::for_servers(
             &config.lsp_servers,
             lsp::current_environment(),

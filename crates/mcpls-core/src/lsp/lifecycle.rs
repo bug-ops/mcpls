@@ -423,7 +423,7 @@ impl ServerInitConfig {
             }
             if plan.has_unpinnable_launcher() {
                 return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                    command: self.server_config.command.clone(),
+                    command: self.server_config.command.server_command().clone(),
                 }));
             }
         }
@@ -443,7 +443,7 @@ impl ServerInitConfig {
         Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: self.server_config.id(),
             language_id: self.server_config.language_id.clone(),
-            command: self.server_config.command.clone(),
+            command: self.server_config.command.server_command().clone(),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         }))
     }
@@ -1260,7 +1260,7 @@ async fn contain(
 ) -> ServerStartOutcome {
     let server_id = config.server_config.id();
     let language_id = config.server_config.language_id.clone();
-    let command = config.server_config.command.clone();
+    let command = config.server_config.command.server_command().clone();
     let started = Instant::now();
 
     let reason = match crate::util::catch_panic(start).await {
@@ -1736,7 +1736,7 @@ mod tests {
         let config = ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pyright-langserver"),
+                command: ServerCommand::from_static("pyright-langserver").into(),
                 args: vec!["--stdio".to_string()],
                 env,
                 file_patterns: vec![FilePattern::from_static("**/*.py")],
@@ -1748,7 +1748,6 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             WorkspaceRoots::for_test(vec![PathBuf::from("/workspace")], vec![]),
             PositionEncodings::DEFAULT,
@@ -1933,7 +1932,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_nonexistent_command_is_server_not_found() {
         let mut server_config = LspServerConfig::rust_analyzer();
-        server_config.command = ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+        server_config.command = ServerCommand::from_static("nonexistent-lsp-cmd-xyz").into();
         let config = ServerInitConfig::new(
             server_config,
             WorkspaceRoots::default(),
@@ -2670,7 +2669,7 @@ sleep 5
             let temp_dir = TempDir::new().unwrap();
             let base = dunce::canonicalize(temp_dir.path()).unwrap();
             let workspace_roots =
-                crate::bridge::WorkspaceRoots::from_configured_with(&[PathBuf::from(".")], || {
+                crate::bridge::WorkspaceRoots::from_paths_with(&[PathBuf::from(".")], || {
                     Ok(crate::bridge::ProcessCwd::new(base.clone(), None))
                 })
                 .unwrap()
@@ -2713,7 +2712,7 @@ sleep 5
     fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
-            command: ServerCommand::from_static("irrelevant-for-build-command"),
+            command: ServerCommand::from_static("irrelevant-for-build-command").into(),
             args: vec![],
             env,
             file_patterns: vec![],
@@ -2725,7 +2724,6 @@ sleep 5
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -2905,7 +2903,7 @@ sleep 5
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pyright-langserver"),
+                command: ServerCommand::from_static("pyright-langserver").into(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2917,11 +2915,10 @@ sleep 5
                 name: Some(ServerId::from_static("pyright-diag")),
                 handles: Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap()),
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pylsp"),
+                command: ServerCommand::from_static("pylsp").into(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2933,7 +2930,6 @@ sleep 5
                 name: Some(ServerId::from_static("pylsp")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();

@@ -99,7 +99,12 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
             ServerId::from_static("rust"),
             LanguageId::from_static("rust"),
         )]));
-    translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_path]).unwrap());
+    translator.set_workspace_roots(
+        WorkspaceRoots::from_configured(&[
+            mcpls_core::config::ConfiguredRoot::new(workspace_path).unwrap()
+        ])
+        .unwrap(),
+    );
     translator.register_server_complete(server);
 
     Arc::new(Mutex::new(translator))
@@ -111,7 +116,7 @@ async fn spawn_rust_analyzer() -> LspServer {
 
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: ServerCommand::from_static("rust-analyzer"),
+        command: ServerCommand::from_static("rust-analyzer").into(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -123,12 +128,15 @@ async fn spawn_rust_analyzer() -> LspServer {
         name: None,
         handles: None,
         indexing: mcpls_core::bridge::IndexingPolicy::Auto,
-        selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
     let server_init_config = ServerInitConfig::new(
         lsp_config,
-        WorkspaceRoots::from_configured(std::slice::from_ref(&workspace_path)).unwrap(),
+        WorkspaceRoots::from_configured(&[mcpls_core::config::ConfiguredRoot::new(
+            workspace_path.clone(),
+        )
+        .unwrap()])
+        .unwrap(),
         PositionEncodings::DEFAULT,
         std::sync::Arc::default(),
     );
@@ -1087,7 +1095,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
     let workspace_path = rust_workspace_path();
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: ServerCommand::from_static("rust-analyzer"),
+        command: ServerCommand::from_static("rust-analyzer").into(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -1099,12 +1107,14 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         name: None,
         handles: None,
         indexing: mcpls_core::bridge::IndexingPolicy::Auto,
-        selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
     let server_init_config = ServerInitConfig::new(
         lsp_config,
-        WorkspaceRoots::from_configured(&[workspace_path]).unwrap(),
+        WorkspaceRoots::from_configured(&[
+            mcpls_core::config::ConfiguredRoot::new(workspace_path).unwrap()
+        ])
+        .unwrap(),
         PositionEncodings::DEFAULT,
         std::sync::Arc::default(),
     );

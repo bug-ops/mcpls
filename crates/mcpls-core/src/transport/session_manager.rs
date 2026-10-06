@@ -908,7 +908,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("lib.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(

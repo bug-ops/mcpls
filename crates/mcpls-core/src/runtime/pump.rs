@@ -1062,7 +1062,7 @@ mod pump_tests {
 
         let cache = make_cache();
         let id = ServerId::from_static("rust");
-        let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root]).unwrap();
         let published = bridge::resolve_one(&bridge::path_to_uri(&cleared_file).unwrap(), &roots)
             .await
             .unwrap();
@@ -1313,7 +1313,7 @@ mod pump_tests {
 
         let (tx, _cancel_tx) = spawn_test_pump_with_cache(
             subs,
-            WorkspaceRoots::from_configured(&[root]).unwrap(),
+            WorkspaceRoots::from_paths(&[root]).unwrap(),
             Arc::clone(&cache),
         );
         let error = lsp_types::Diagnostic {
@@ -1370,8 +1370,7 @@ mod pump_tests {
             PumpShared {
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
-                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
-                    .unwrap(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             },
             PublishedPathResolver::with_canonicalizer(failing),
         ));
@@ -1422,8 +1421,7 @@ mod pump_tests {
             PumpShared {
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
-                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
-                    .unwrap(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             },
             PublishedPathResolver::with_canonicalizer(slow),
         ));
@@ -1488,8 +1486,7 @@ mod pump_tests {
             PumpShared {
                 notification_cache: make_cache(),
                 subs: make_subs(),
-                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
-                    .unwrap(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             },
             PublishedPathResolver::with_canonicalizer(slow),
         ));
@@ -1582,8 +1579,7 @@ mod pump_tests {
             PumpShared {
                 notification_cache: Arc::clone(&cache),
                 subs: make_subs(),
-                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
-                    .unwrap(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             },
             PublishedPathResolver::with_canonicalizer(slow),
         ));
@@ -1647,8 +1643,7 @@ mod pump_tests {
             PumpShared {
                 notification_cache: make_cache(),
                 subs: make_subs(),
-                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
-                    .unwrap(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             },
             PublishedPathResolver::with_canonicalizer(hung),
         ));
@@ -1682,7 +1677,7 @@ mod pump_tests {
         let cache = make_cache();
         let (tx, _cancel_tx) = spawn_test_pump_with_cache(
             make_subs(),
-            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             Arc::clone(&cache),
         );
         let error = lsp_types::Diagnostic {
@@ -1752,7 +1747,7 @@ mod pump_tests {
         std::fs::write(real.join("main.rs"), "fn main() {}").unwrap();
         let link = base.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&link)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&link)).unwrap();
         assert_eq!(roots.canonical(), std::slice::from_ref(&real));
 
         let cache = make_cache();
@@ -1815,7 +1810,7 @@ mod pump_tests {
             .unwrap();
         let (tx, _cancel_tx) = spawn_test_pump_with_cache(
             subs,
-            WorkspaceRoots::from_configured(&[root]).unwrap(),
+            WorkspaceRoots::from_paths(&[root]).unwrap(),
             Arc::clone(&cache),
         );
         let error = lsp_types::Diagnostic {
@@ -1937,7 +1932,7 @@ mod pump_tests {
         let server = mcp::McplsServer::new(
             Arc::new(Translator::new()),
             make_cache(),
-            WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+            WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             subs.clone(),
             ProjectConfigStatus::NotIgnored,
             config::McpConfig::default(),
@@ -1973,8 +1968,7 @@ mod pump_tests {
             "subscribe failed: {response}"
         );
 
-        let (tx, _cancel_tx) =
-            spawn_test_pump(subs, WorkspaceRoots::from_configured(&[root]).unwrap());
+        let (tx, _cancel_tx) = spawn_test_pump(subs, WorkspaceRoots::from_paths(&[root]).unwrap());
         tx.send(LspNotification::PublishDiagnostics(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&file).unwrap(),
@@ -2024,7 +2018,7 @@ mod pump_tests {
                     LanguageId::from_static("rust"),
                 )]));
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap(),
+                WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
             );
             translator.set_expected_servers(HashSet::from([id]));
             let translator = Arc::new(translator);
@@ -2033,7 +2027,7 @@ mod pump_tests {
             let server = mcp::McplsServer::new(
                 Arc::clone(&translator),
                 make_cache(),
-                WorkspaceRoots::from_configured(&[root]).unwrap(),
+                WorkspaceRoots::from_paths(&[root]).unwrap(),
                 subs.clone(),
                 ProjectConfigStatus::NotIgnored,
                 config::McpConfig::default(),

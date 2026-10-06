@@ -141,7 +141,7 @@ pub(super) fn translator_with_capabilities(
                 LanguageId::from_static("rust"),
             )]));
     translator
-        .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
+        .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);
@@ -173,7 +173,7 @@ pub(super) fn translator_with_capabilities_and_encoding(
                 LanguageId::from_static("rust"),
             )]));
     translator
-        .set_workspace_roots(WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap());
+        .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
     let (client, server) = fake_lsp_client();
     translator.register_client(server_id.clone(), client);
@@ -255,7 +255,7 @@ mod sh_servers {
         ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::new(id).unwrap(),
-                command: ServerCommand::from_static("sh"),
+                command: ServerCommand::from_static("sh").into(),
                 args: vec![script.to_string_lossy().to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -271,7 +271,6 @@ mod sh_servers {
                 name: Some(ServerId::new(id).unwrap()),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             WorkspaceRoots::default(),
             PositionEncodings::DEFAULT,

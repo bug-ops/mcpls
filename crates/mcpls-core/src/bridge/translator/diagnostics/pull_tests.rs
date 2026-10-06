@@ -82,9 +82,8 @@ impl Fixture {
                 ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let (client, server, _lanes) = fake_lsp_client_with_redactions(redactions);
         translator.register_client(ServerId::from_static("rust"), client);
         let wiring = Arc::new(RecordingWiring {
