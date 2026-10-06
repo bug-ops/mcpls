@@ -166,11 +166,19 @@ enforces the following, and nothing more:
   refused: package runners (`npm`, `npx`, `bunx`, `pnpm`, `pnpx`, `yarn`, `uvx`,
   `corepack`, `deno npm:`), task runners (`make`, `just`, `task`, `rake`, `mvn`,
   `sbt`), programs that run their arguments (`xargs`, `find`, `awk`, `gawk`,
-  `mawk`, `nawk`, `script`, `su`, `flock`, `watch`) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
+  `mawk`, `nawk`, `script`, `su`, `flock`, `watch`), wrappers whose options are not
+  analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`, `setpriv`,
+  `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`,
+  `unshare`, `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`:
+  they change the user, root, directory or environment, or take optional
+  arguments) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
   `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
   `./node_modules/.bin/<name>` from the working directory before anything else
   and reads a workspace `.npmrc`, so the planted package would run. `env` is
-  unwrapped; `env -S` cannot be analyzed and is refused. A command string
+  unwrapped; `env -S`, `env -P`, a `PATH=` assignment and a relative program that `env -C`
+  itself starts cannot be analyzed and are refused (a program a nested wrapper
+  starts is resolved from mcpls' working directory and spawned by its absolute
+  path). A command string
   cannot be analyzed either, so it is refused for these shells (`-c`, `--command`,
   `--commands`, `/c`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
   `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`,
@@ -179,13 +187,21 @@ enforces the following, and nothing more:
   `-c`, `-p`, `-r`, `--eval`, `--print`, also with the value glued on or after
   `=`): `node`, `nodejs`,
   `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`.
-  Wrappers that start the command in their arguments (`time`, `nice`, `nohup`,
-  `timeout`, `setsid`, `stdbuf`, `ionice`, `chrt`, `taskset`, `sudo`, `doas`,
-  `arch`, `caffeinate`, `chroot`, `unshare`, `nsenter`, `strace`, `systemd-run`, and `env`;
-  `sudo`/`doas` with `-s`, `-i` or a `NAME=value` argument are refused outright) are refused when any argument would start a refused
-  command, and when they nest deeper than 8 levels. `deno lsp` is allowed. These
-  lists are closed, not exhaustive: a shell or interpreter that is not named here
-  is admitted with its command string unexamined. The list matches the command's
+  The wrappers with a small option grammar (`time`, `nice`, `nohup`, `timeout`,
+  `setsid`, `stdbuf`, `caffeinate`, `arch`, and `env`, also under their Homebrew GNU
+  names `gtime`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`, `genv` and as `busybox`,
+  `toybox` or `coreutils` applets) are parsed against a closed table of their options: the first
+  non-option after the options (and `timeout`'s duration) is the program they
+  start, and what follows it belongs to that program. An option the table does
+  not list, a missing value or command, and nesting deeper than 8 levels are
+  refused and the refusal names the option (never its value). Each program a
+  wrapper starts is then resolved, refused when it lies inside the workspace,
+  and replaced by its absolute path, as the server's own executable is. `deno lsp`
+  is allowed. These lists are closed, not exhaustive: a shell, interpreter or
+  wrapper that is not named here (`numactl`, `prlimit`, `ltrace`, `valgrind`,
+  `firejail`, `sg`, `run-parts`) is admitted without unwrapping it, so the program it starts is not
+  checked, and its command string is unexamined. A resolved wrapped-program path
+  that contains `=` is refused, because `env` would read it as an assignment. The list matches the command's
   file stem and arguments and is best-effort: the trusted configuration is the
   boundary, so install the server globally and give its absolute path as
   `command`.

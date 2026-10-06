@@ -157,8 +157,7 @@ impl Translator {
             .position_request::<lsp_types::CompletionRequest>(
                 &file_path,
                 position,
-                Capability::Completions,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::Completions),
                 context,
             )
             .await?;

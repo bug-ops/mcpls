@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
-use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ErrorCode, Implementation, ListResourcesResult,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
@@ -25,6 +25,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::handlers::BridgeContext;
+use super::parameters::Parameters;
 use super::schema_shape::shape_tool_schemas;
 use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionRegistry, Target};
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
@@ -43,13 +44,13 @@ use crate::bridge::{
     AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
     ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
     DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
-    DocumentHighlightsResult, DocumentSymbolsResult, FoldingRangesResult, FormatDocumentResult,
-    HierarchyItem, HoverResult, IncomingCallsResult, Indexed, InlayHintsResult, KindFilter,
-    KindFilterField, KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult,
-    Position, PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
-    RestartServerResult, RouteSignals, SelectionRangesResult, ServerLogsResult,
-    ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult,
-    WorkspaceRoots, WorkspaceSymbolResult,
+    DocumentHighlightsResult, DocumentSymbolsResult, DocumentVersion, FoldingRangesResult,
+    FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, Indexed,
+    InlayHintsResult, KindFilter, KindFilterField, KindFilterInput, LocationsResult,
+    NotificationCache, OutgoingCallsResult, Position, PositionEncoding, PositionRange,
+    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, RouteSignals,
+    SelectionRangesResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
+    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -268,15 +269,20 @@ fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
     Position::from_client(line, character).map_err(client_input_error)
 }
 
-/// Resolves a `kind_filter` input to its typed kind, so an unknown kind is
-/// `-32602`.
+/// Resolves a kind input to its typed kind, so an unknown kind is `-32602`.
+fn parse_kind<K: KindFilter>(
+    input: KindFilterInput<K>,
+    field: KindFilterField,
+) -> Result<K, McpError> {
+    input.into_known(field).map_err(client_input_error)
+}
+
+/// Resolves an optional `kind_filter` input; absent stays absent.
 fn parse_kind_filter<K: KindFilter>(
     input: Option<KindFilterInput<K>>,
     field: KindFilterField,
 ) -> Result<Option<K>, McpError> {
-    input
-        .map(|input| input.into_known(field).map_err(client_input_error))
-        .transpose()
+    input.map(|input| parse_kind(input, field)).transpose()
 }
 
 /// Parses a client-supplied hierarchy item, so a bad range is `-32602`.
@@ -453,7 +459,7 @@ struct DiagnosticsResponse {
 #[derive(serde::Serialize)]
 struct ResourceDiagnosticsResponse {
     tracked: bool,
-    version: Option<i32>,
+    version: Option<DocumentVersion>,
     diagnostics: Vec<lsp_types::Diagnostic>,
     availability: DiagnosticsAvailability,
     #[serde(flatten)]
@@ -469,9 +475,7 @@ impl ResourceDiagnosticsResponse {
     ) -> Self {
         Self {
             tracked,
-            version: entry
-                .and_then(|e| e.version)
-                .map(crate::bridge::DocumentVersion::get),
+            version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
             availability,
             signals,
@@ -1177,7 +1181,7 @@ impl McplsServer {
         Parameters(FoldingRangesParams { file_path, kind }): Parameters<FoldingRangesParams>,
     ) -> Result<Json<FoldingRangesResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        let kind = parse_kind_filter(Some(kind), KindFilterField::Kind)?.unwrap_or_default();
+        let kind = parse_kind(kind, KindFilterField::Kind)?;
         self.structured_result(
             self.context
                 .translator
@@ -5252,7 +5256,7 @@ sleep 0.3
             lsp_types::Uri::from(Url::parse("file:///sample.rs").unwrap().as_str());
         DiagnosticInfo {
             uri,
-            version: Some(crate::bridge::DocumentVersion::FIRST),
+            version: Some(DocumentVersion::FIRST),
             diagnostics,
         }
     }
@@ -5323,7 +5327,7 @@ sleep 0.3
             RouteSignals::default(),
         );
         assert!(response.tracked);
-        assert_eq!(response.version, Some(1));
+        assert_eq!(response.version, Some(DocumentVersion::new(1)));
         assert_eq!(response.diagnostics.len(), 1);
         assert_eq!(response.diagnostics[0].message, "boom".into());
 
@@ -5775,6 +5779,29 @@ sleep 0.3
                 message.contains(&format!("`{accepted}`")),
                 "{tool}: {message}"
             );
+        }
+    }
+
+    /// #716: a client key or value of any length is bounded in the rejection.
+    #[tokio::test]
+    async fn test_over_long_argument_text_is_bounded_in_the_rejection() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file = temp_dir.path().join("main.rs").display().to_string();
+        let long_key = "k".repeat(2048);
+        let cases = [
+            serde_json::json!({"file_path": file, "line": 1, "character": 1, long_key.clone(): 1}),
+            serde_json::json!({"file_path": file, "line": "z".repeat(1 << 20), "character": 1}),
+        ];
+        for arguments in cases {
+            let params = serde_json::json!({"name": "get_hover", "arguments": arguments});
+
+            let response = tools_call_over_the_wire(server_over(temp_dir.path()), params).await;
+
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            let message = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(message.starts_with("failed to deserialize parameters:"));
+            assert!(!message.contains(&long_key));
+            assert!(message.len() <= crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES + 64);
         }
     }
 

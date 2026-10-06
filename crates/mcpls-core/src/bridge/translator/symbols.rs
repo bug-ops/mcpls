@@ -14,7 +14,8 @@ use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::routing::{
-    Capability, IndexingGate, PreparedDocument, WorkspaceRouteLookup, lookup_workspace_route,
+    Capability, FileLocalCapability, IndexingGate, PreparedDocument, WorkspaceRouteLookup,
+    lookup_workspace_route,
 };
 use crate::bridge::ClientPath;
 use crate::config::ToolKind;
@@ -183,8 +184,7 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 file_path,
-                Capability::DocumentSymbols,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::DocumentSymbols),
             )
             .await?;
         self.fetch_document_symbols(doc).await

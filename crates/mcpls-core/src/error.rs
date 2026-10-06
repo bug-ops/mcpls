@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::bridge::resources::ResourceUriError;
 use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
+    MAX_SYMBOL_NAME_BYTES,
 };
 use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
@@ -21,7 +22,9 @@ use crate::config::{
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
-use crate::util::{SizeExceeded, escape_control, truncate_str};
+use crate::util::{
+    SizeExceeded, escape_control, escape_control_owned, truncate_str, truncate_string,
+};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -250,6 +253,316 @@ impl fmt::Display for ResolvedItem {
     }
 }
 
+/// A piece of configured launch text that may be shown to callers: an option
+/// name or a program name, never a value, an inline program or an
+/// assignment's value.
+///
+/// The text is cut at the first `=` or whitespace, escaped and bounded to
+/// [`MAX_SYMBOL_NAME_BYTES`] (the escaped text is what is bounded), because
+/// configured arguments can hold secrets and reach MCP clients unredacted.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::EchoedArgument;
+///
+/// assert_eq!(EchoedArgument::name("--token=abc").as_str(), "--token");
+/// assert_eq!(EchoedArgument::name("API_KEY=abc").as_str(), "API_KEY");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoedArgument(String);
+
+impl EchoedArgument {
+    /// The option or program name `arg` spells: the text before the first `=`
+    /// or whitespace, so an assignment's value or an argument glued to the
+    /// name is not echoed. A short cluster is named by its offending letter
+    /// (`-x`), built by the caller.
+    #[must_use]
+    pub fn name(arg: &str) -> Self {
+        let name = arg
+            .split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        Self(bounded_escaped(name, MAX_SYMBOL_NAME_BYTES))
+    }
+
+    /// The echoed text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `text` with control and deceptive characters escaped, then bounded: escaping
+/// first, because it can multiply the length.
+fn bounded_escaped(text: &str, max_bytes: usize) -> String {
+    truncate_string(escape_control_owned(text.to_owned()), max_bytes)
+}
+
+/// Most bytes of a workspace-controlled path shown in a refusal.
+const MAX_ECHOED_PATH_BYTES: usize = 1024;
+
+/// `Display` adapter for a path the workspace names (a symlink target's final
+/// component is its choice): bounded and escaped like [`EchoedArgument`].
+struct EchoedPath<'a>(&'a Path);
+
+impl fmt::Display for EchoedPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&bounded_escaped(
+            &self.0.display().to_string(),
+            MAX_ECHOED_PATH_BYTES,
+        ))
+    }
+}
+
+impl fmt::Display for EchoedArgument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A subcommand of a runner that starts a program the workspace chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerSubcommand {
+    /// `run`.
+    Run,
+    /// `x`.
+    X,
+    /// `task`.
+    Task,
+    /// `eval`.
+    Eval,
+    /// `repl`.
+    Repl,
+    /// `tool`.
+    Tool,
+    /// `exec`.
+    Exec,
+}
+
+impl RunnerSubcommand {
+    /// The subcommand as written on a command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::X => "x",
+            Self::Task => "task",
+            Self::Eval => "eval",
+            Self::Repl => "repl",
+            Self::Tool => "tool",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+impl fmt::Display for RunnerSubcommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The flag that gives a shell a command string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFlag {
+    /// `-c`, alone or inside a cluster such as `-lc`.
+    DashC,
+    /// `--command` or `--commands`.
+    LongCommand,
+    /// `cmd`'s `/c`, `/k` or `/r`.
+    SlashC,
+    /// PowerShell's `-Command`, `-CommandWithArgs`, `-EncodedCommand` or an
+    /// abbreviation of them.
+    PowerShellCommand,
+}
+
+impl fmt::Display for ShellFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::DashC => "-c",
+            Self::LongCommand => "--command",
+            Self::SlashC => "/c",
+            Self::PowerShellCommand => "-Command",
+        })
+    }
+}
+
+/// The flag that gives an interpreter a program to run inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineFlag {
+    /// A short flag letter (`-e`, `-c`), alone or inside a cluster.
+    Short(char),
+    /// `--eval`.
+    Eval,
+    /// `--print`.
+    Print,
+}
+
+impl InlineFlag {
+    /// The long spelling, for the long flags.
+    #[must_use]
+    pub const fn long_name(self) -> Option<&'static str> {
+        match self {
+            Self::Short(_) => None,
+            Self::Eval => Some("--eval"),
+            Self::Print => Some("--print"),
+        }
+    }
+}
+
+impl fmt::Display for InlineFlag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Short(letter) => write!(f, "-{letter}"),
+            Self::Eval => f.write_str("--eval"),
+            Self::Print => f.write_str("--print"),
+        }
+    }
+}
+
+/// A positional operand a wrapper takes before the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandKind {
+    /// `timeout`'s `DURATION`.
+    Duration,
+}
+
+impl fmt::Display for OperandKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Duration => "DURATION",
+        })
+    }
+}
+
+/// What about a launcher lets the workspace choose the program that runs.
+///
+/// The values are matched from closed tables, never from configured text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaunchTrigger {
+    /// Every use of the program does (a package or task runner, or a wrapper
+    /// whose options are not analyzed).
+    Always,
+    /// This subcommand does.
+    Subcommand(RunnerSubcommand),
+    /// This flag gives it a command string.
+    CommandString(ShellFlag),
+    /// This flag gives an interpreter a program to run inline.
+    InlineProgram(InlineFlag),
+    /// An argument names an npm package to run (`npm:`).
+    NpmSpecifier,
+}
+
+impl fmt::Display for LaunchTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Always => f.write_str("every use of it does"),
+            Self::Subcommand(name) => write!(f, "its `{name}` subcommand does"),
+            Self::CommandString(flag) => {
+                write!(
+                    f,
+                    "`{flag}` gives it a command string, which cannot be analyzed"
+                )
+            }
+            Self::InlineProgram(flag) => write!(f, "`{flag}` gives it a program to run"),
+            Self::NpmSpecifier => f.write_str("an `npm:` argument names a package to run"),
+        }
+    }
+}
+
+/// Why a launch cannot be analyzed, so untrusted mode cannot tell which
+/// program it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnanalyzableLaunch {
+    /// The wrapper has an option its option table does not list.
+    UnknownOption(EchoedArgument),
+    /// A listed option that takes a value is the last argument.
+    MissingValue(EchoedArgument),
+    /// No command follows the wrapper's options.
+    MissingCommand,
+    /// A positional operand before the command is not of the expected shape.
+    MalformedOperand(OperandKind),
+    /// `PATH` is assigned, which bypasses the sanitized search path.
+    PathAssignment,
+    /// A string is split into arguments (`env -S`).
+    SplitString,
+    /// A relative program follows a directory change.
+    RelativeProgramAfterChdir,
+    /// The program name is empty.
+    BlankProgram,
+    /// The vetted path of a wrapped program contains `=`, which `env` would
+    /// read as an assignment.
+    PathContainsEquals,
+}
+
+impl fmt::Display for UnanalyzableLaunch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownOption(option) => write!(f, "unknown option '{option}'"),
+            Self::MissingValue(option) => write!(f, "option '{option}' has no value"),
+            Self::MissingCommand => f.write_str("no command follows its options"),
+            Self::MalformedOperand(name) => write!(f, "its {name} operand is malformed"),
+            Self::PathAssignment => f.write_str("it assigns PATH"),
+            Self::SplitString => f.write_str("it splits a string into arguments"),
+            Self::RelativeProgramAfterChdir => {
+                f.write_str("it starts a relative program after changing directory")
+            }
+            Self::BlankProgram => f.write_str("the program name is empty"),
+            Self::PathContainsEquals => {
+                f.write_str("its resolved path contains '=', which env reads as an assignment")
+            }
+        }
+    }
+}
+
+/// Why a launcher lets the workspace choose the program that runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LauncherRefusal {
+    /// A launcher selects workspace code.
+    SelectsWorkspaceCode {
+        /// The launcher's name.
+        program: EchoedArgument,
+        /// What about it does.
+        trigger: LaunchTrigger,
+    },
+    /// The launch cannot be analyzed, which untrusted mode treats as unsafe.
+    Unanalyzable {
+        /// The launcher's name.
+        program: EchoedArgument,
+        /// Why it cannot be analyzed.
+        reason: UnanalyzableLaunch,
+    },
+    /// Wrappers are nested deeper than the analysis follows.
+    TooDeep,
+}
+
+impl fmt::Display for LauncherRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelectsWorkspaceCode { program, trigger } => write!(
+                f,
+                "its launcher '{program}' chooses the server from files in the workspace \
+                 ({trigger}), which untrusted mode never runs; install the server globally \
+                 and give its absolute path as `command`"
+            ),
+            Self::Unanalyzable { program, reason } => write!(
+                f,
+                "its launcher '{program}' cannot be analyzed ({reason}), so untrusted mode \
+                 cannot tell which program it starts; give the absolute path of the server \
+                 as `command`"
+            ),
+            Self::TooDeep => f.write_str(
+                "its launchers are nested too deeply to analyze, so untrusted mode cannot \
+                 tell which program they start; give the absolute path of the server as \
+                 `command`",
+            ),
+        }
+    }
+}
+
 /// Why untrusted-workspace mode refused to start a server.
 ///
 /// # Examples
@@ -324,6 +637,15 @@ pub enum UntrustedRefusal {
     ProjectLauncher {
         /// The configured `command`.
         command: ServerCommand,
+        /// What about the launch the analysis refused.
+        cause: LauncherRefusal,
+    },
+    /// A program an exec wrapper or `env` starts was not found on a search
+    /// path outside the workspace, so untrusted mode cannot tell what would
+    /// run.
+    UnresolvedWrappedProgram {
+        /// The wrapped program, as configured.
+        program: EchoedArgument,
     },
     /// The configured command starts the TypeScript server through a launcher
     /// that untrusted mode cannot pin to a binary outside the workspace.
@@ -361,7 +683,7 @@ impl fmt::Display for UntrustedRefusal {
             Self::WorkspaceExecutable { executable } => write!(
                 f,
                 "its executable {} lies inside the workspace, which untrusted mode never runs",
-                executable.display()
+                EchoedPath(executable)
             ),
             Self::UnresolvedExecutable { command } => write!(
                 f,
@@ -386,19 +708,19 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its {variable}, {}, lies inside the workspace and the login home directory is \
                  unknown, so untrusted mode cannot give it a safe one",
-                home.display()
+                EchoedPath(home)
             ),
             Self::WorkspaceTsserver { tsserver } => write!(
                 f,
                 "the tsserver it would use, {}, lies inside the workspace, which untrusted \
                  mode never runs",
-                tsserver.display()
+                EchoedPath(tsserver)
             ),
-            Self::ProjectLauncher { command } => write!(
+            Self::ProjectLauncher { cause, .. } => cause.fmt(f),
+            Self::UnresolvedWrappedProgram { program } => write!(
                 f,
-                "its launcher '{command}' chooses the server from files in the workspace, \
-                 which untrusted mode never runs; install the server globally and give its \
-                 absolute path as `command`"
+                "the program '{program}' its launcher starts was not found where the child \
+                 would look it up, which untrusted mode requires"
             ),
             Self::UnpinnedTypescriptLauncher { command } => write!(
                 f,
@@ -409,7 +731,7 @@ impl fmt::Display for UntrustedRefusal {
             Self::NonUtf8Path { what, path } => write!(
                 f,
                 "its {what}, {}, is not valid UTF-8, so untrusted mode cannot pass it on",
-                path.display()
+                EchoedPath(path)
             ),
             Self::NoSafeWorkingDirectory => f.write_str(
                 "no directory outside the workspace is available to start it in, which \
@@ -488,6 +810,7 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::UnknownHome
                     | UntrustedRefusal::WorkspaceTsserver { .. }
                     | UntrustedRefusal::ProjectLauncher { .. }
+                    | UntrustedRefusal::UnresolvedWrappedProgram { .. }
                     | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
                     | UntrustedRefusal::NonUtf8Path { .. }
                     | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
@@ -1104,7 +1427,7 @@ pub enum ConfigError {
 
     /// A configured workspace root cannot be canonicalized.
     #[error(
-        "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
+        "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized",
         .written.display(), .base_dir.display(), .probe.display()
     )]
     UnresolvableWorkspaceRoot {
@@ -1328,8 +1651,8 @@ pub enum Error {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    /// I/O error.
-    #[error("I/O error: {0}")]
+    /// I/O error; displays the OS text once, with no prefix.
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     /// JSON serialization/deserialization error.
@@ -2093,7 +2416,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "LSP server initialization failed: Initialize request failed: I/O error: server not found"
+            "LSP server initialization failed: Initialize request failed: server not found"
         );
     }
 
@@ -2276,7 +2599,7 @@ mod tests {
         };
         assert_eq!(
             failed.to_string(),
-            "LSP server initialization failed: Initialize request failed: I/O error: boom; stderr: fatal: bad config"
+            "LSP server initialization failed: Initialize request failed: boom; stderr: fatal: bad config"
         );
         let exited = Error::ServerExitedDuringInit {
             command: crate::config::ServerCommand::from_static("gopls"),
@@ -2445,6 +2768,16 @@ mod tests {
         let errors = [
             Error::from(toml_err),
             Error::from(ConfigError::NotUtf8(non_utf8)),
+            Error::from(ConfigError::UnresolvableWorkspaceRoot {
+                written: PathBuf::from("root"),
+                base_dir: PathBuf::from("base"),
+                probe: PathBuf::from("base/root"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory"),
+            }),
+            Error::from(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access refused",
+            )),
         ];
         for err in errors {
             let mut chain = vec![err.to_string()];
@@ -2579,7 +2912,7 @@ mod tests {
         );
         assert_eq!(
             failure.to_string(),
-            "rust [rust] (rust-analyzer): LSP server initialization failed: Initialize request failed: I/O error: boom"
+            "rust [rust] (rust-analyzer): LSP server initialization failed: Initialize request failed: boom"
         );
     }
 
@@ -2735,9 +3068,41 @@ mod tests {
     }
 
     #[test]
+    fn test_untrusted_refusal_paths_are_escaped_and_bounded() {
+        let hostile = PathBuf::from(format!("/ws/evil{}", "\n\u{202e}".repeat(3000)));
+        for refusal in [
+            UntrustedRefusal::WorkspaceExecutable {
+                executable: hostile.clone(),
+            },
+            UntrustedRefusal::WorkspaceTsserver {
+                tsserver: hostile.clone(),
+            },
+            UntrustedRefusal::WorkspaceHome {
+                variable: HomeVariable::Home,
+                home: hostile.clone(),
+            },
+            UntrustedRefusal::NonUtf8Path {
+                what: ResolvedItem::Executable,
+                path: hostile,
+            },
+        ] {
+            let text = refusal.to_string();
+            assert!(!text.contains('\n'), "{text}");
+            assert!(!text.contains('\u{202e}'), "{text}");
+            assert!(text.len() < MAX_ECHOED_PATH_BYTES + 512, "{}", text.len());
+        }
+        let name = EchoedArgument::name(&"\u{202e}".repeat(5000));
+        assert!(name.as_str().len() < MAX_SYMBOL_NAME_BYTES + 64);
+    }
+
+    #[test]
     fn test_untrusted_refusal_new_variants_name_their_cause() {
         let launcher = UntrustedRefusal::ProjectLauncher {
             command: ServerCommand::from_static("npx"),
+            cause: LauncherRefusal::SelectsWorkspaceCode {
+                program: EchoedArgument::name("npx"),
+                trigger: LaunchTrigger::Always,
+            },
         };
         assert!(launcher.to_string().contains("'npx'"), "{launcher}");
         let unpinned = UntrustedRefusal::UnpinnedTypescriptLauncher {

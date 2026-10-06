@@ -1251,4 +1251,91 @@ mod tests {
         assert!(properties.contains_key("end_character"));
         assert!(!properties.contains_key("range"));
     }
+
+    /// mcp/016 FR-010: `null` is absent for an `Option` parameter and a type
+    /// error for a defaulted non-`Option` one, whose schema is non-nullable.
+    #[test]
+    fn null_is_absent_for_option_fields_and_rejected_for_defaulted_ones() {
+        use serde::de::DeserializeOwned;
+        use serde_json::{Value, json};
+
+        fn accepts<P: DeserializeOwned>(base: &Value, field: &str) -> bool {
+            let mut args = base.clone();
+            args[field] = Value::Null;
+            serde_json::from_value::<P>(args).is_ok()
+        }
+
+        let range = json!({
+            "file_path": "/a.rs", "start_line": 1, "start_character": 1,
+            "end_line": 2, "end_character": 3,
+        });
+        let named = json!({"file_path": "/a.rs", "symbol_name": "f"});
+        let file = json!({"file_path": "/a.rs"});
+        let position = json!({"file_path": "/a.rs", "line": 1, "character": 1});
+
+        for field in ["line", "character", "symbol_kind", "container"] {
+            assert!(accepts::<ReferencesParams>(&named, field), "{field}");
+        }
+        assert!(accepts::<ReferencesParams>(&position, "symbol_name"));
+        assert!(accepts::<CompletionsParams>(&position, "trigger"));
+        assert!(accepts::<CodeActionsParams>(&range, "kind_filter"));
+        assert!(accepts::<WorkspaceSymbolParams>(
+            &json!({"query": "q"}),
+            "kind_filter"
+        ));
+        assert!(accepts::<ServerLogsParams>(&json!({}), "min_level"));
+        assert!(accepts::<ToolSupportParams>(&json!({}), "file_path"));
+        assert!(accepts::<RestartServerParams>(
+            &json!({"all": true}),
+            "servers"
+        ));
+
+        assert!(!accepts::<ReferencesParams>(&named, "include_declaration"));
+        assert!(!accepts::<ReferencesParams>(&named, "context"));
+        assert!(!accepts::<NavigationParams>(&named, "context"));
+        assert!(!accepts::<DeclarationParams>(&position, "context"));
+        assert!(!accepts::<DiagnosticsParams>(&file, "context"));
+        assert!(!accepts::<FormatDocumentParams>(&file, "tab_size"));
+        assert!(!accepts::<FormatDocumentParams>(&file, "insert_spaces"));
+        assert!(!accepts::<FormatRangeParams>(&range, "tab_size"));
+        assert!(!accepts::<FormatRangeParams>(&range, "insert_spaces"));
+        assert!(!accepts::<FoldingRangesParams>(&file, "kind"));
+        assert!(!accepts::<WorkspaceSymbolParams>(
+            &json!({"query": "q"}),
+            "limit"
+        ));
+        assert!(!accepts::<ServerLogsParams>(&json!({}), "limit"));
+        assert!(!accepts::<ServerMessagesParams>(&json!({}), "limit"));
+        assert!(!accepts::<RestartServerParams>(
+            &json!({"servers": ["a"]}),
+            "all"
+        ));
+    }
+
+    /// `HierarchyItemInput` mirrors `HierarchyItem` by hand: a full output
+    /// item must come back unchanged when a client passes it to a walking tool.
+    #[test]
+    fn hierarchy_item_input_round_trips_a_full_output_item() {
+        let at = |line, character| Position2D { line, character };
+        let item = HierarchyItem {
+            name: "Base".into(),
+            kind: 5,
+            detail: Some("trait".into()),
+            uri: "file:///a.rs".into(),
+            range: Range {
+                start: at(1, 2),
+                end: at(3, 4),
+            },
+            selection_range: Range {
+                start: at(1, 6),
+                end: at(1, 10),
+            },
+            data: Some(serde_json::json!({"opaque": [1, "x"]})),
+            out_of_workspace: true,
+        };
+        let wire = serde_json::to_value(&item).unwrap();
+        let input: HierarchyItemInput = serde_json::from_value(wire.clone()).unwrap();
+        let back = serde_json::to_value(HierarchyItem::from(input)).unwrap();
+        assert_eq!(back, wire);
+    }
 }

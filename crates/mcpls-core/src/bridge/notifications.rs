@@ -388,6 +388,8 @@ enum Origin {
     /// Delivered by `textDocument/publishDiagnostics`.
     Pushed {
         spelling: Spelling,
+        /// Document version the server published the diagnostics for, if any.
+        version: Option<DocumentVersion>,
         /// The tracked opening of the document when the publish arrived, or
         /// `None` without a tracker or an open document.
         opening: Option<Opening>,
@@ -409,6 +411,14 @@ enum Origin {
 }
 
 impl Origin {
+    /// Document version the entry's diagnostics were produced for.
+    const fn version(&self) -> Option<DocumentVersion> {
+        match self {
+            Self::Pushed { version, .. } => *version,
+            Self::Pulled { version, .. } => Some(*version),
+        }
+    }
+
     const fn provenance(&self) -> Provenance {
         match self {
             Self::Pushed { .. } => Provenance::Pushed,
@@ -421,7 +431,9 @@ impl Origin {
 /// derived from it are only ever touched by `insert_entry`/`take_entry`.
 #[derive(Debug)]
 struct CachedEntry {
-    info: DiagnosticInfo,
+    /// URI the entry is stored under.
+    uri: Uri,
+    diagnostics: Vec<LspDiagnostic>,
     /// Server that published the entry.
     owner: ServerId,
     /// Position in `owner`'s write order.
@@ -430,6 +442,15 @@ struct CachedEntry {
 }
 
 impl CachedEntry {
+    /// The entry as a [`DiagnosticInfo`], with the version taken from its origin.
+    fn info(&self) -> DiagnosticInfo {
+        DiagnosticInfo {
+            uri: self.uri.clone(),
+            version: self.origin.version(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
     /// Key of the file this entry belongs to, given the entry's own `key`.
     const fn file<'a>(&'a self, key: &'a SlotKey) -> &'a DiagnosticsKey {
         match &self.origin {
@@ -1176,7 +1197,7 @@ impl NotificationCache {
     fn is_empty_entry(&self, key: &SlotKey) -> bool {
         self.entries
             .get(key)
-            .is_some_and(|entry| entry.info.diagnostics.is_empty())
+            .is_some_and(|entry| entry.diagnostics.is_empty())
     }
 
     /// Whether `key` is a slot of the file `protect` names.
@@ -1363,11 +1384,7 @@ impl NotificationCache {
             self.evict_entry(&oldest_alias);
         }
 
-        let info = DiagnosticInfo {
-            uri: published.source().clone(),
-            version,
-            diagnostics: BoundedDiagnostics::new(published.source(), diagnostics).0,
-        };
+        let diagnostics = BoundedDiagnostics::new(published.source(), diagnostics).0;
 
         self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
@@ -1396,11 +1413,13 @@ impl NotificationCache {
         self.insert_entry(
             source_key,
             CachedEntry {
-                info,
+                uri: published.source().clone(),
+                diagnostics,
                 owner: server_id.clone(),
                 seq,
                 origin: Origin::Pushed {
                     spelling,
+                    version,
                     opening,
                     covered: Covered::default(),
                 },
@@ -1590,7 +1609,7 @@ impl NotificationCache {
 
         let opening = self.document_opening(file);
         let same_state = self.entries.get(&slot_key).is_some_and(|entry| {
-            entry.info.diagnostics == items.0
+            entry.diagnostics == items.0
                 && matches!(
                     entry.origin,
                     Origin::Pulled { opening: stored, version, .. }
@@ -1625,11 +1644,8 @@ impl NotificationCache {
         self.insert_entry(
             slot_key,
             CachedEntry {
-                info: DiagnosticInfo {
-                    uri: file.clone(),
-                    version: Some(stamp.version),
-                    diagnostics: items.0,
-                },
+                uri: file.clone(),
+                diagnostics: items.0,
                 owner: server_id.clone(),
                 seq,
                 origin: Origin::Pulled {
@@ -1689,7 +1705,7 @@ impl NotificationCache {
             .entry(entry.file(&key).clone())
             .or_default()
             .insert(key.clone());
-        if entry.info.diagnostics.is_empty() {
+        if entry.diagnostics.is_empty() {
             self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_add(1);
         }
         self.entries.insert(key, entry);
@@ -1737,7 +1753,7 @@ impl NotificationCache {
                 self.files.remove(file);
             }
         }
-        if entry.info.diagnostics.is_empty() {
+        if entry.diagnostics.is_empty() {
             self.empty_diagnostics_count = self.empty_diagnostics_count.saturating_sub(1);
         }
         Some(entry)
@@ -1760,7 +1776,7 @@ impl NotificationCache {
         let Some(members) = self.files.get(&slot.uri) else {
             return Vec::new();
         };
-        let index = PulledIndex::new(&pulled.info.diagnostics);
+        let index = PulledIndex::new(&pulled.diagnostics);
         members
             .iter()
             .filter(|key| key.provenance == Provenance::Pushed)
@@ -1775,13 +1791,12 @@ impl NotificationCache {
                     return None;
                 };
                 let same_state = entry.owner == pulled.owner
-                    && entry.info.version == Some(*version)
+                    && entry.origin.version() == Some(*version)
                     && pushed_opening.is_none_or(|pushed| Some(pushed) == *opening);
                 if !same_state {
                     return None;
                 }
                 let gained: BTreeSet<usize> = entry
-                    .info
                     .diagnostics
                     .iter()
                     .enumerate()
@@ -1832,7 +1847,7 @@ impl NotificationCache {
         else {
             return Freshness::Current;
         };
-        let Some(version) = entry.info.version else {
+        let Some(version) = entry.origin.version() else {
             return Freshness::Current;
         };
         let DocumentSync::Synced(synced) = self.document_sync(&entry.owner, requested) else {
@@ -1861,7 +1876,6 @@ impl NotificationCache {
         if same_opening && let Some(learned) = self.pull_sources.get(&entry.owner) {
             covered.0.extend(
                 entry
-                    .info
                     .diagnostics
                     .iter()
                     .enumerate()
@@ -1908,7 +1922,7 @@ impl NotificationCache {
         let Some(entry) = self.take_entry(key) else {
             return;
         };
-        if entry.info.diagnostics.is_empty() {
+        if entry.diagnostics.is_empty() {
             self.record_empty_eviction(entry.file(key).clone(), std::time::Instant::now());
         }
     }
@@ -1922,7 +1936,7 @@ impl NotificationCache {
         let entry = self.entries.get(key)?;
         let file = entry.file(key).clone();
         let owner = entry.owner.clone();
-        let content = if entry.info.diagnostics.is_empty() {
+        let content = if entry.diagnostics.is_empty() {
             EvictedContent::Clean
         } else {
             EvictedContent::Lost
@@ -1987,7 +2001,7 @@ impl NotificationCache {
         let empty = self
             .entries
             .values()
-            .filter(|entry| entry.info.diagnostics.is_empty())
+            .filter(|entry| entry.diagnostics.is_empty())
             .count();
         assert_eq!(empty, self.empty_diagnostics_count);
 
@@ -2160,10 +2174,10 @@ impl NotificationCache {
     /// use [`Self::diagnostic_sources`] to read the union.
     #[inline]
     #[must_use]
-    pub fn diagnostics(&self, uri: &Uri) -> Option<&DiagnosticInfo> {
+    pub fn diagnostics(&self, uri: &Uri) -> Option<DiagnosticInfo> {
         self.entries
             .get(&SlotKey::pushed(DiagnosticsKey::of(uri)))
-            .map(|entry| &entry.info)
+            .map(CachedEntry::info)
     }
 
     /// Snapshot of every entry cached for the file `uri` names, to be
@@ -2193,7 +2207,7 @@ impl NotificationCache {
             .filter_map(|source| {
                 let entry = self.entries.get(&source)?;
                 Some(SourceEntry {
-                    info: entry.info.clone(),
+                    info: entry.info(),
                     origin: SourceOrigin::from(&entry.origin),
                     freshness: self.push_freshness(&key, uri, entry),
                 })

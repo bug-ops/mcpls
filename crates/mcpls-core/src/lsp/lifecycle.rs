@@ -37,8 +37,8 @@ use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::lsp::{
-    CONTENT_MODIFIED_RETRY_METHODS, HostOs, ManagedEnvVar, NotificationInbox, NotificationSink,
-    ParentEnv, PublishReader, process_env, tsserver_pin,
+    CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
+    PublishReader, process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -533,12 +533,11 @@ impl std::fmt::Debug for LspServer {
 pub fn child_env_var(
     config: &LspServerConfig,
     key: &str,
-    host: HostOs,
     parent_env: impl ParentEnv,
 ) -> Option<std::ffi::OsString> {
     config
         .env
-        .get(key, host)
+        .get(key)
         .map(std::ffi::OsString::from)
         .or_else(|| parent_env(key))
 }
@@ -809,13 +808,13 @@ impl LspServer {
         }
 
         for key in ENV_PASSTHROUGH {
-            if let Some(value) = child_env_var(config, key, HostOs::CURRENT, &parent_env) {
+            if let Some(value) = child_env_var(config, key, &parent_env) {
                 command.env(key, value);
             }
         }
         #[cfg(windows)]
         for key in ENV_PASSTHROUGH_WINDOWS {
-            if let Some(value) = child_env_var(config, key, HostOs::CURRENT, &parent_env) {
+            if let Some(value) = child_env_var(config, key, &parent_env) {
                 command.env(key, value);
             }
         }
@@ -1528,6 +1527,7 @@ mod tests {
     use super::*;
     use crate::bridge::PositionEncoding;
     use crate::config::{FilePattern, LanguageId, TimeoutSecs, ToolSet};
+    use crate::lsp::HostOs;
 
     #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
@@ -1771,11 +1771,7 @@ mod tests {
         });
 
         let mut env = crate::config::ServerEnv::default();
-        env.insert(
-            "PYTHONPATH".to_string(),
-            "/usr/lib".to_string(),
-            HostOs::CURRENT,
-        );
+        env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
 
         let config = ServerInitConfig::new(
             LspServerConfig {
@@ -2206,16 +2202,14 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
         );
-        config.server_config.env.insert(
-            "OTHER_VALUE".to_string(),
-            "bravo-secret-222".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
-        config.server_config.env.insert(
-            "API_TOKEN".to_string(),
-            "s3cr3t-value".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .server_config
+            .env
+            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
             "bravo-secret-222".to_owned(),
@@ -2240,13 +2234,11 @@ echo 'fatal: bad toolchain' >&2
         config.server_config.env.insert(
             "RUSTUP_TOOLCHAIN".to_string(),
             "nightly-2024-01-01".to_string(),
-            crate::lsp::HostOs::CURRENT,
         );
-        config.server_config.env.insert(
-            "API_TOKEN".to_string(),
-            "s3cr3t-value".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2328,11 +2320,10 @@ sleep 5
             .server_config
             .args
             .push("--api-key=SuperSecretArg456".to_string());
-        config.server_config.env.insert(
-            "API_TOKEN".to_string(),
-            "SuperSecretValue123".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
 
         let mut server = LspServer::spawn(config).await.unwrap();
         let mut rx = server.take_notification_rx();
@@ -2366,11 +2357,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config.server_config.env.insert(
-            "API_TOKEN".to_string(),
-            "SuperSecretValue123".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2391,11 +2381,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config.server_config.env.insert(
-            "API_TOKEN".to_string(),
-            "SuperSecretValue123".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .server_config
+            .env
+            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2771,17 +2760,19 @@ sleep 5
     /// so resolution must read it too; elsewhere it is another variable.
     #[test]
     fn child_env_var_compares_names_as_the_host_does() {
-        let config = bare_server_config(HashMap::from([("Path".to_string(), "/over".to_string())]));
         let parent = |_: &str| Some(std::ffi::OsString::from("/parent"));
+        let on = |host| {
+            let mut config = bare_server_config(HashMap::new());
+            config.env = crate::config::ServerEnv::from_entries(
+                [("Path".to_string(), "/over".to_string())],
+                host,
+            )
+            .unwrap();
+            child_env_var(&config, "PATH", parent)
+        };
 
-        assert_eq!(
-            child_env_var(&config, "PATH", HostOs::Windows, parent),
-            Some(std::ffi::OsString::from("/over"))
-        );
-        assert_eq!(
-            child_env_var(&config, "PATH", HostOs::Other, parent),
-            Some(std::ffi::OsString::from("/parent"))
-        );
+        assert_eq!(on(HostOs::Windows), Some(std::ffi::OsString::from("/over")));
+        assert_eq!(on(HostOs::Other), Some(std::ffi::OsString::from("/parent")));
     }
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only

@@ -4,6 +4,7 @@
 //! to AI agents.
 
 mod handlers;
+mod parameters;
 mod schema_shape;
 mod server;
 mod session;
@@ -17,7 +18,7 @@ pub(crate) use session::{SessionHandle, Target};
 
 // `mcp::tools`'s param structs (e.g. `PositionParams`, `ReferencesParams`)
 // are intentionally not re-exported here: every tool handler in `server.rs`
-// extracts them via `Parameters<T>` from `super::tools` directly, and no
+// extracts them via the bounded `Parameters<T>` from `super::tools` directly, and no
 // in-tree caller ever names one through this module. A caller that needs to
 // construct MCP tool arguments should send JSON matching each tool's
 // published schema rather than depend on these internal Rust types -- don't

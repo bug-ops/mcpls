@@ -118,13 +118,13 @@ Kind filters (`kind_filter` of `workspace_symbol_search` and `get_code_actions`,
 
 ## Errors
 
-Failures are returned as MCP errors with a code and a message. Common ones:
+Failures are returned as MCP errors with a code and a message, except malformed arguments, which come back as a tool result with `isError: true`. Common ones:
 
 | Situation | What to do |
 |-----------|-----------|
 | No server for the file's language | Add an `[[lsp_servers]]` entry, or install the server |
 | `-32602` invalid params | Fix the path or parameters; a path outside every root is rejected |
-| `failed to deserialize parameters: unknown field ...` | Use only the arguments the tool declares; the message lists them |
+| Tool result with `isError: true` and `failed to deserialize parameters: ...` (unknown field, wrong type, `null` for a defaulted argument) | Use only the arguments the tool declares, with the declared types; the message names the field and lists the accepted ones |
 | Server still starting (`ServerInitializing`, `-32051`, retryable) | Wait and retry |
 | Server still indexing (`-32050`, retryable) | Wait and retry, or raise `workspace.indexing_ready_timeout_seconds` |
 | Server restarted while a request was in flight (`-32054`, retryable) | Retry the request |

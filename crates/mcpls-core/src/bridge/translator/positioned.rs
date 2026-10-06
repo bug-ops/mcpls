@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use lsp_types::{
     CallHierarchyPrepareParams, CompletionContext, CompletionParams, DeclarationParams,
-    DefinitionParams, DocumentHighlightParams, HoverParams, ImplementationParams,
+    DefinitionParams, DocumentHighlightParams, HoverParams, ImplementationParams, InlayHintParams,
     PartialResultParams, PrepareRenameParams, ReferenceContext, ReferenceParams, RenameParams,
     SignatureHelpParams, TextDocumentIdentifier, TextDocumentPositionParams, TypeDefinitionParams,
     TypeHierarchyPrepareParams, WorkDoneProgressParams,
@@ -21,26 +21,35 @@ use crate::config::ServerId;
 use crate::error::Result;
 use crate::lsp::{LspClient, UnclassifiedError};
 
+/// The timeout applied to a request carrying these params.
+///
+/// Every request sent through [`PositionedCall`] or [`DisclosedDocument`]
+/// reads its timeout here, so a request kind with its own budget (completion)
+/// cannot lose it on one of the two paths.
+pub(super) trait RequestTimeout {
+    /// The timeout for this request on `client`.
+    fn timeout(client: &LspClient) -> Duration {
+        client.request_timeout()
+    }
+}
+
 /// LSP request params built from a resolved document position.
 ///
 /// Implemented once per position-taking request so [`Translator::position_request`]
 /// builds every one of them through the same path.
-pub(super) trait FromPosition: Sized {
+pub(super) trait FromPosition: RequestTimeout + Sized {
     /// Request-specific input beyond the position (`()` when there is none).
     type Extra;
 
     /// Builds the params from the converted position, defaulting the
     /// work-done and partial-result progress fields.
     fn from_position(position: TextDocumentPositionParams, extra: Self::Extra) -> Self;
-
-    /// The timeout applied to this request.
-    fn timeout(client: &LspClient) -> Duration {
-        client.request_timeout()
-    }
 }
 
 macro_rules! from_position_work_done {
     ($($params:ty),+ $(,)?) => {$(
+        impl RequestTimeout for $params {}
+
         impl FromPosition for $params {
             type Extra = ();
 
@@ -56,6 +65,8 @@ macro_rules! from_position_work_done {
 
 macro_rules! from_position_with_partial {
     ($($params:ty),+ $(,)?) => {$(
+        impl RequestTimeout for $params {}
+
         impl FromPosition for $params {
             type Extra = ();
 
@@ -85,6 +96,8 @@ from_position_with_partial!(
     DocumentHighlightParams,
 );
 
+impl RequestTimeout for ReferenceParams {}
+
 impl FromPosition for ReferenceParams {
     type Extra = ReferenceContext;
 
@@ -98,6 +111,12 @@ impl FromPosition for ReferenceParams {
             partial_result_params: PartialResultParams::default(),
             context,
         }
+    }
+}
+
+impl RequestTimeout for CompletionParams {
+    fn timeout(client: &LspClient) -> Duration {
+        client.completion_timeout()
     }
 }
 
@@ -115,11 +134,9 @@ impl FromPosition for CompletionParams {
             context,
         }
     }
-
-    fn timeout(client: &LspClient) -> Duration {
-        client.completion_timeout()
-    }
 }
+
+impl RequestTimeout for SignatureHelpParams {}
 
 impl FromPosition for SignatureHelpParams {
     type Extra = ();
@@ -132,6 +149,10 @@ impl FromPosition for SignatureHelpParams {
         }
     }
 }
+
+impl RequestTimeout for RenameParams {}
+
+impl RequestTimeout for InlayHintParams {}
 
 impl FromPosition for RenameParams {
     type Extra = String;
@@ -182,7 +203,7 @@ where
     pub(super) async fn send(self) -> Result<Positioned<R::Result>> {
         let client = self.doc.client();
         let result = client
-            .request_typed::<R>(self.params, <R::Params as FromPosition>::timeout(client))
+            .request_typed::<R>(self.params, <R::Params as RequestTimeout>::timeout(client))
             .await?;
         Ok(Positioned {
             result,
@@ -200,7 +221,7 @@ where
         let result = client
             .request_typed_classified::<R>(
                 self.params,
-                <R::Params as FromPosition>::timeout(client),
+                <R::Params as RequestTimeout>::timeout(client),
             )
             .await;
         Positioned {
@@ -223,7 +244,11 @@ pub(super) struct DisclosedDocument<'a> {
     doc: PreparedDocument,
 }
 
-impl DisclosedDocument<'_> {
+impl<'a> DisclosedDocument<'a> {
+    pub(super) const fn new(translator: &'a Translator, doc: PreparedDocument) -> Self {
+        Self { translator, doc }
+    }
+
     pub(super) const fn server_id(&self) -> &ServerId {
         self.doc.server_id()
     }
@@ -239,14 +264,15 @@ impl DisclosedDocument<'_> {
     /// # Errors
     ///
     /// Returns an error if the LSP request fails.
-    pub(super) async fn request<R: lsp_types::Request>(
-        &self,
-        params: R::Params,
-    ) -> Result<Indexed<R::Result>> {
+    pub(super) async fn request<R>(&self, params: R::Params) -> Result<Indexed<R::Result>>
+    where
+        R: lsp_types::Request,
+        R::Params: RequestTimeout,
+    {
         let client = self.doc.client();
         let before = self.translator.sample_indexing(self.server_id()).await;
         let result = client
-            .request_typed::<R>(params, client.request_timeout())
+            .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
             .await?;
         let after = self.translator.sample_indexing(self.server_id()).await;
         Ok(Indexed::new(result, before.union(after)))
@@ -269,29 +295,6 @@ impl Translator {
             Some(cache) => IndexingSignal::sample(&*cache.lock().await, Some(server_id)),
             None => IndexingSignal::default(),
         }
-    }
-
-    /// Opens `file_path` for a name-resolving tool that discloses indexing
-    /// instead of waiting for it, after the capability gate and the line check
-    /// of every one of `positions`.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::prepare_positioned_document`], without the
-    /// indexing wait.
-    pub(super) async fn prepare_disclosed_document(
-        &self,
-        file_path: &ClientPath,
-        capability: Capability,
-        positions: &[Position],
-    ) -> Result<DisclosedDocument<'_>> {
-        let doc = self
-            .prepare_positioned_document(file_path, capability, IndexingGate::FileLocal, positions)
-            .await?;
-        Ok(DisclosedDocument {
-            translator: self,
-            doc,
-        })
     }
 
     async fn positioned_params<P: FromPosition>(
@@ -322,7 +325,6 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
         indexing_gate: IndexingGate,
         extra: <R::Params as FromPosition>::Extra,
     ) -> Result<PositionedCall<R>>
@@ -331,7 +333,7 @@ impl Translator {
         R::Params: FromPosition,
     {
         let doc = self
-            .prepare_positioned_document(file_path, capability, indexing_gate, &[position])
+            .prepare_positioned_document(file_path, indexing_gate, &[position])
             .await?;
         let (ctx, params) = self
             .positioned_params::<R::Params>(doc.server_id(), doc.uri(), position, extra)
@@ -348,7 +350,6 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
         indexing_gate: IndexingGate,
         extra: <R::Params as FromPosition>::Extra,
     ) -> Result<Positioned<R::Result>>
@@ -356,7 +357,7 @@ impl Translator {
         R: lsp_types::Request,
         R::Params: FromPosition,
     {
-        self.position_call::<R>(file_path, position, capability, indexing_gate, extra)
+        self.position_call::<R>(file_path, position, indexing_gate, extra)
             .await?
             .send()
             .await
@@ -447,6 +448,24 @@ mod tests {
         assert_eq!(
             params.context.and_then(|c| c.trigger_character).as_deref(),
             Some(".")
+        );
+    }
+
+    #[test]
+    fn test_request_timeout_is_per_params_type() {
+        let client = LspClient::new(crate::config::LspServerConfig::rust_analyzer());
+        assert_eq!(
+            <CompletionParams as RequestTimeout>::timeout(&client),
+            client.completion_timeout()
+        );
+        assert!(client.completion_timeout() < client.request_timeout());
+        assert_eq!(
+            <InlayHintParams as RequestTimeout>::timeout(&client),
+            client.request_timeout()
+        );
+        assert_eq!(
+            <SignatureHelpParams as RequestTimeout>::timeout(&client),
+            client.request_timeout()
         );
     }
 }

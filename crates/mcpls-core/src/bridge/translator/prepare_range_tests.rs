@@ -504,8 +504,7 @@ async fn an_untracked_document_passes_the_line_check() {
     let doc = translator
         .prepare_gated_document(
             &client_path(path.to_string_lossy().into_owned()),
-            Capability::PrepareRename,
-            IndexingGate::FileLocal,
+            IndexingGate::Required(Capability::PrepareRename),
         )
         .await
         .unwrap();

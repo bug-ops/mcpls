@@ -18,9 +18,10 @@ use crate::config::{
     login_home_dir,
 };
 use crate::error::{
-    HomeVariable, ResolvedItem, ServerSpawnFailure, StartupFailure, UntrustedRefusal,
+    EchoedArgument, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure,
+    StartupFailure, UnanalyzableLaunch, UntrustedRefusal,
 };
-use crate::lsp::command_path::HostOs;
+use crate::lsp::command_path::{HostOs, ResolvedCommand};
 use crate::lsp::tsserver_pin::UntrustedVetting;
 use crate::lsp::{
     self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
@@ -85,42 +86,27 @@ fn allowlist_refusal(
 }
 
 /// Refuses `configured` when its launcher lets the workspace choose the
-/// program that runs (a package runner, task runner or toolchain wrapper).
+/// program that runs (a package runner, task runner or toolchain wrapper), or
+/// cannot be analyzed.
 fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
-    launcher::launches_from_workspace(configured.command.as_str(), &configured.args).then(|| {
-        UntrustedRefusal::ProjectLauncher {
+    launcher::analyze_launch(configured.command.as_str(), &configured.args)
+        .err()
+        .map(|cause| UntrustedRefusal::ProjectLauncher {
             command: configured.command.server_command().clone(),
-        }
-    })
+            cause,
+        })
 }
 
-/// `effective` pinned to what untrusted mode vetted: the executable resolved
-/// to an absolute path, and a `PATH` without workspace, relative or empty
-/// entries.
+/// The path `resolved` is spawned by, after untrusted mode vetted it.
 ///
-/// Spawning the resolved path, rather than the bare name, closes the window
-/// between the check and a spawn (restart, respawn) in which a workspace
-/// could add a binary. The sanitized `PATH` is what a `#!/usr/bin/env`
-/// interpreter and the tools the server itself starts are looked up on. On
-/// Windows the server is also told not to search the current directory for
-/// executables it starts by name.
-///
-/// Refuses when the executable is not found, or lies inside `boundary`;
-/// naming the server in `--allow-server` is not consent to a binary the
-/// workspace supplies.
-fn harden_for_untrusted(
-    effective: Cow<'_, LspServerConfig>,
+/// Refuses an executable inside `boundary`. The spawn path is kept, not the
+/// canonical one, because a program may act on the name it is started as;
+/// the canonical path is used only when the directory it was found in is
+/// itself workspace-controlled.
+fn vetted_spawn_path(
+    resolved: ResolvedCommand,
     boundary: &WorkspaceRoots,
-    login_home: Option<&Path>,
-    host: HostOs,
-    parent_env: &dyn ParentEnv,
-) -> Result<LspServerConfig, UntrustedRefusal> {
-    let mut effective = effective.into_owned();
-    let unresolved = || UntrustedRefusal::UnresolvedExecutable {
-        command: effective.command.server_command().clone(),
-    };
-    let resolved =
-        lsp::command_path::resolve_command(host, &effective, parent_env).ok_or_else(unresolved)?;
+) -> Result<String, UntrustedRefusal> {
     if boundary.contains_canonical(&resolved.canonical) {
         return Err(UntrustedRefusal::WorkspaceExecutable {
             executable: resolved.canonical,
@@ -135,14 +121,90 @@ fn harden_for_untrusted(
     } else {
         resolved.spawn
     };
-    let command = executable.into_os_string().into_string().map_err(|path| {
-        UntrustedRefusal::NonUtf8Path {
+    executable
+        .into_os_string()
+        .into_string()
+        .map_err(|path| UntrustedRefusal::NonUtf8Path {
             what: ResolvedItem::Executable,
             path: PathBuf::from(path),
-        }
-    })?;
-    let path = lsp::child_env_var(&effective, ManagedEnvVar::Path.name(), host, parent_env)
-        .unwrap_or_default();
+        })
+}
+
+/// The argument indices of the programs `effective`'s wrappers start, each
+/// with the vetted absolute path that replaces it.
+fn vetted_wrapped_programs(
+    effective: &LspServerConfig,
+    boundary: &WorkspaceRoots,
+    parent_env: &dyn ParentEnv,
+) -> Result<Vec<(usize, String)>, UntrustedRefusal> {
+    let programs =
+        launcher::analyze_launch(effective.command.as_str(), &effective.args).map_err(|cause| {
+            UntrustedRefusal::ProjectLauncher {
+                command: effective.command.server_command().clone(),
+                cause,
+            }
+        })?;
+    programs
+        .indices()
+        .iter()
+        .map(|&index| {
+            let program = effective.args.get(index).map_or("", String::as_str);
+            let unresolved = || UntrustedRefusal::UnresolvedWrappedProgram {
+                program: EchoedArgument::name(program),
+            };
+            let resolved =
+                lsp::command_path::resolve_named(Path::new(program), effective, parent_env)
+                    .ok_or_else(unresolved)?;
+            let path = vetted_spawn_path(resolved, boundary)?;
+            if path.contains('=') {
+                return Err(UntrustedRefusal::ProjectLauncher {
+                    command: effective.command.server_command().clone(),
+                    cause: LauncherRefusal::Unanalyzable {
+                        program: EchoedArgument::name(program),
+                        reason: UnanalyzableLaunch::PathContainsEquals,
+                    },
+                });
+            }
+            Ok((index, path))
+        })
+        .collect()
+}
+
+/// `effective` pinned to what untrusted mode vetted: the executable resolved
+/// to an absolute path, and a `PATH` without workspace, relative or empty
+/// entries.
+///
+/// Spawning the resolved path, rather than the bare name, closes the window
+/// between the check and a spawn (restart, respawn) in which a workspace
+/// could add a binary. The sanitized `PATH` is what a `#!/usr/bin/env`
+/// interpreter and the tools the server itself starts are looked up on. On
+/// Windows the server is also told not to search the current directory for
+/// executables it starts by name.
+///
+/// The programs an exec wrapper or `env` in the command line starts are vetted
+/// the same way and replaced by their vetted absolute paths, so a wrapped
+/// program cannot be swapped between the check and a spawn either.
+///
+/// Refuses when an executable is not found, or lies inside `boundary`;
+/// naming the server in `--allow-server` is not consent to a binary the
+/// workspace supplies.
+fn harden_for_untrusted(
+    effective: Cow<'_, LspServerConfig>,
+    boundary: &WorkspaceRoots,
+    login_home: Option<&Path>,
+    parent_env: &dyn ParentEnv,
+) -> Result<LspServerConfig, UntrustedRefusal> {
+    let mut effective = effective.into_owned();
+    let host = effective.env.host();
+    let unresolved = || UntrustedRefusal::UnresolvedExecutable {
+        command: effective.command.server_command().clone(),
+    };
+    let resolved =
+        lsp::command_path::resolve_command(&effective, parent_env).ok_or_else(unresolved)?;
+    let command = vetted_spawn_path(resolved, boundary)?;
+    let wrapped = vetted_wrapped_programs(&effective, boundary, parent_env)?;
+    let path =
+        lsp::child_env_var(&effective, ManagedEnvVar::Path.name(), parent_env).unwrap_or_default();
     let path = lsp::command_path::or_system_path(
         host,
         lsp::command_path::path_outside(&path, boundary),
@@ -153,7 +215,7 @@ fn harden_for_untrusted(
         what: ResolvedItem::SearchPath,
         path: PathBuf::from(path),
     })?;
-    let home_env = home_overrides(&effective, boundary, login_home, host, parent_env)?;
+    let home_env = home_overrides(&effective, boundary, login_home, parent_env)?;
     let hardened_command = ServerCommand::new(command).map_err(|_| unresolved())?;
     effective.command = effective
         .command
@@ -163,11 +225,16 @@ fn harden_for_untrusted(
             executable: hardened_command,
             cause,
         })?;
+    for (index, program) in wrapped {
+        if let Some(arg) = effective.args.get_mut(index) {
+            *arg = program;
+        }
+    }
     effective
         .env
-        .insert(ManagedEnvVar::Path.name().to_owned(), path, host);
+        .insert(ManagedEnvVar::Path.name().to_owned(), path);
     for (name, value) in home_env {
-        effective.env.insert(name, value, host);
+        effective.env.insert(name, value);
     }
     if host == HostOs::Windows {
         effective.env.insert(
@@ -175,7 +242,6 @@ fn harden_for_untrusted(
                 .name()
                 .to_owned(),
             "1".to_owned(),
-            host,
         );
     }
     Ok(effective)
@@ -194,12 +260,12 @@ fn home_overrides(
     effective: &LspServerConfig,
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
-    host: HostOs,
     parent_env: &dyn ParentEnv,
 ) -> Result<Vec<(String, String)>, UntrustedRefusal> {
+    let host = effective.env.host();
     let unset = HomeVariable::ALL
         .into_iter()
-        .filter(|variable| !effective.env.contains_key(variable.name(), host));
+        .filter(|variable| !effective.env.contains_key(variable.name()));
     if let Some(login_home) = login_home.and_then(Path::to_str) {
         return Ok(unset
             .map(|variable| (variable.name().to_owned(), login_home.to_owned()))
@@ -346,14 +412,8 @@ fn admit(
     let (effective, working_dir) = match boundary {
         None => (selected.into_owned(), ChildWorkingDir::Inherit),
         Some(boundary) => {
-            let hardened = harden_for_untrusted(
-                selected,
-                boundary,
-                login_home,
-                HostOs::CURRENT,
-                &process_env,
-            )
-            .map_err(configured)?;
+            let hardened = harden_for_untrusted(selected, boundary, login_home, &process_env)
+                .map_err(configured)?;
             let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
             (hardened, working_dir)
         }
@@ -683,11 +743,9 @@ mod plan_tests {
 
         fn rust_with_path(path: &Path) -> LspServerConfig {
             let mut config = rust_with("rust-analyzer");
-            config.env.insert(
-                "PATH".into(),
-                path.to_string_lossy().into_owned(),
-                crate::lsp::HostOs::CURRENT,
-            );
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
             config
         }
 
@@ -814,20 +872,15 @@ mod plan_tests {
                 fx.outside.clone(),
             ])
             .unwrap();
-            config.env.insert(
-                "PATH".into(),
-                path.to_string_lossy().into_owned(),
-                crate::lsp::HostOs::CURRENT,
-            );
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
 
             let plan = plan_allowing_rust(config, &fx);
 
             let admitted = &plan.admitted[0].server_config();
             assert_eq!(admitted.command, exe.to_str().unwrap());
-            assert_eq!(
-                admitted.env.get("PATH", crate::lsp::HostOs::CURRENT),
-                fx.outside.to_str()
-            );
+            assert_eq!(admitted.env.get("PATH"), fx.outside.to_str());
         }
 
         #[test]
@@ -885,16 +938,11 @@ mod plan_tests {
             config.env.insert(
                 "PATH".into(),
                 fx.workspace.join("bin").to_string_lossy().into_owned(),
-                crate::lsp::HostOs::CURRENT,
             );
 
             let plan = plan_allowing_rust(config, &fx);
 
-            let path = plan.admitted[0]
-                .server_config()
-                .env
-                .get("PATH", crate::lsp::HostOs::CURRENT)
-                .unwrap();
+            let path = plan.admitted[0].server_config().env.get("PATH").unwrap();
             assert_eq!(path, "/usr/bin:/bin");
         }
 
@@ -908,10 +956,7 @@ mod plan_tests {
 
             let home = login_home_dir().unwrap();
             assert_eq!(
-                plan.admitted[0]
-                    .server_config()
-                    .env
-                    .get("HOME", crate::lsp::HostOs::CURRENT),
+                plan.admitted[0].server_config().env.get("HOME"),
                 home.to_str()
             );
         }
@@ -955,7 +1000,6 @@ mod plan_tests {
                 Cow::Owned(rust_with(exe.to_str().unwrap())),
                 &boundary,
                 login_home,
-                HostOs::CURRENT,
                 &parent_env,
             )
         }
@@ -966,13 +1010,7 @@ mod plan_tests {
 
             let hardened = harden_with(&fx, &[], Some(&fx.outside)).unwrap();
 
-            assert_eq!(
-                hardened
-                    .env
-                    .get("PATH", crate::lsp::HostOs::CURRENT)
-                    .unwrap(),
-                "/usr/bin:/bin"
-            );
+            assert_eq!(hardened.env.get("PATH").unwrap(), "/usr/bin:/bin");
         }
 
         #[test]
@@ -983,14 +1021,8 @@ mod plan_tests {
 
             let hardened = harden_with(&fx, &[("HOME", &fx.workspace)], Some(&home)).unwrap();
 
-            assert_eq!(
-                hardened.env.get("HOME", crate::lsp::HostOs::CURRENT),
-                home.to_str()
-            );
-            assert_eq!(
-                hardened.env.get("USERPROFILE", crate::lsp::HostOs::CURRENT),
-                home.to_str()
-            );
+            assert_eq!(hardened.env.get("HOME"), home.to_str());
+            assert_eq!(hardened.env.get("USERPROFILE"), home.to_str());
         }
 
         #[test]
@@ -1002,7 +1034,7 @@ mod plan_tests {
             let passed = harden_with(&fx, &[("HOME", &fx.outside)], None).unwrap();
 
             std::assert_matches!(refused, UntrustedRefusal::WorkspaceHome { .. });
-            assert!(!passed.env.contains_key("HOME", crate::lsp::HostOs::CURRENT));
+            assert!(!passed.env.contains_key("HOME"));
         }
 
         #[test]
@@ -1027,10 +1059,7 @@ mod plan_tests {
             let known = harden_with(&fx, &[], Some(&fx.outside)).unwrap();
 
             std::assert_matches!(refused, UntrustedRefusal::UnknownHome);
-            assert_eq!(
-                known.env.get("HOME", crate::lsp::HostOs::CURRENT),
-                fx.outside.to_str()
-            );
+            assert_eq!(known.env.get("HOME"), fx.outside.to_str());
         }
 
         #[test]
@@ -1115,11 +1144,9 @@ mod plan_tests {
                 Path::new("/bin"),
             ])
             .unwrap();
-            config.env.insert(
-                "PATH".into(),
-                path.to_string_lossy().into_owned(),
-                crate::lsp::HostOs::CURRENT,
-            );
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
             config
         }
 
@@ -1286,13 +1313,20 @@ mod plan_tests {
                     .map(|(_, value)| value.clone())
             };
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
-            harden_for_untrusted(
-                Cow::Owned(rust_with(exe.to_str().unwrap())),
+            let hardened = harden_for_untrusted(
+                Cow::Owned(rust_on(host, exe.to_str().unwrap())),
                 &boundary,
                 Some(&fx.outside),
-                host,
                 &parent_env,
-            )
+            )?;
+            assert_eq!(hardened.env.host(), host);
+            Ok(hardened)
+        }
+
+        fn rust_on(host: HostOs, command: &str) -> LspServerConfig {
+            let mut config = rust_with(command);
+            config.env = crate::config::ServerEnv::new(host);
+            config
         }
 
         #[test]
@@ -1313,16 +1347,16 @@ mod plan_tests {
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
 
             let hardened = harden_for_untrusted(
-                Cow::Owned(rust_with(exe.to_str().unwrap())),
+                Cow::Owned(rust_on(HostOs::Windows, exe.to_str().unwrap())),
                 &boundary,
                 None,
-                HostOs::Windows,
                 &parent_env,
             )
             .unwrap();
 
+            assert_eq!(hardened.env.host(), HostOs::Windows);
             assert_eq!(
-                hardened.env.get("PATH", HostOs::Windows),
+                hardened.env.get("PATH"),
                 system_root.join("System32").to_str()
             );
         }
@@ -1335,10 +1369,9 @@ mod plan_tests {
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             let on = |host, exe: &Path| {
                 harden_for_untrusted(
-                    Cow::Owned(rust_with(exe.to_str().unwrap())),
+                    Cow::Owned(rust_on(host, exe.to_str().unwrap())),
                     &boundary,
                     None,
-                    host,
                     &none,
                 )
             };
@@ -1367,7 +1400,6 @@ mod plan_tests {
                 Cow::Owned(LspServerConfig::typescript()),
                 &boundary,
                 Some(&fx.outside),
-                HostOs::CURRENT,
                 &parent_env,
             )
             .unwrap_err();
@@ -1387,11 +1419,8 @@ mod plan_tests {
             let windows = harden_on(HostOs::Windows, &fx, &[]).unwrap();
             let other = harden_on(HostOs::Other, &fx, &[]).unwrap();
 
-            assert_eq!(
-                windows.env.get(name, crate::lsp::HostOs::CURRENT),
-                Some("1")
-            );
-            assert!(!other.env.contains_key(name, crate::lsp::HostOs::CURRENT));
+            assert_eq!(windows.env.get(name), Some("1"));
+            assert!(!other.env.contains_key(name));
         }
 
         #[test]
@@ -1399,27 +1428,23 @@ mod plan_tests {
             let fx = fixture();
             let exe = host_executable(HostOs::Windows, &fx);
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
-            let mut config = rust_with(exe.to_str().unwrap());
+            let mut config = rust_on(HostOs::Windows, exe.to_str().unwrap());
             config.env.insert(
                 "nodefaultcurrentdirectoryinexepath".to_owned(),
                 "0".to_owned(),
-                crate::lsp::HostOs::CURRENT,
             );
 
             let hardened = harden_for_untrusted(
                 Cow::Owned(config),
                 &boundary,
                 Some(&fx.outside),
-                HostOs::Windows,
                 &|_: &str| -> Option<std::ffi::OsString> { None },
             )
             .unwrap();
+            assert_eq!(hardened.env.host(), HostOs::Windows);
 
             let name = ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.name();
-            assert_eq!(
-                hardened.env.get(name, crate::lsp::HostOs::CURRENT),
-                Some("1")
-            );
+            assert_eq!(hardened.env.get(name), Some("1"));
             assert_eq!(
                 hardened
                     .env
@@ -1442,10 +1467,9 @@ mod plan_tests {
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
 
             let refused = harden_for_untrusted(
-                Cow::Owned(rust_with("rust-analyzer")),
+                Cow::Owned(rust_on(HostOs::Other, "rust-analyzer")),
                 &boundary,
                 Some(&fx.outside),
-                HostOs::Other,
                 &|key: &str| (key == "PATH").then(|| path.clone()),
             )
             .unwrap_err();
@@ -1575,14 +1599,200 @@ mod plan_tests {
                 let plan = plan_allowing_rust(rust_launched_by(command, args), &fx);
 
                 assert!(plan.admitted.is_empty(), "{command} {args:?}");
-                assert_eq!(
+                std::assert_matches!(
                     refusal_of(&plan),
-                    Some(&UntrustedRefusal::ProjectLauncher {
-                        command: ServerCommand::new(command).unwrap()
-                    }),
+                    Some(UntrustedRefusal::ProjectLauncher { command: refused, .. })
+                        if *refused == ServerCommand::new(command).unwrap(),
                     "{command} {args:?}"
                 );
             }
+        }
+
+        /// A launch of `wrapper` (a fake binary in `fx.outside`) with `args`,
+        /// looking programs up on `fx.outside` and the workspace `bin`.
+        fn wrapped_launch(fx: &Fixture, wrapper: &str, args: &[&str]) -> LspServerConfig {
+            let mut config = rust_launched_by(fx.outside.join(wrapper).to_str().unwrap(), args);
+            let path = std::env::join_paths([&fx.outside, &fx.workspace.join("bin")]).unwrap();
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config
+        }
+
+        fn outside_tools(fx: &Fixture, names: &[&str]) {
+            for name in names {
+                executable(&fx.outside.join(name));
+            }
+        }
+
+        fn launched_args(plan: &StartPlan) -> Vec<String> {
+            plan.admitted[0].server_config().args.clone()
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_wrapped_program_inside_the_workspace() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "env", "timeout", "busybox"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let srv = srv.to_str().unwrap();
+            for (wrapper, args) in [
+                ("nice", vec![srv]),
+                ("nice", vec!["-n", "5", srv]),
+                ("busybox", vec!["nice", srv]),
+                ("env", vec![srv]),
+                ("env", vec!["nice", "env", "FOO=1", "timeout", "5", srv]),
+                ("timeout", vec!["5", "env", "nice", "busybox", "nice", srv]),
+            ] {
+                let plan = plan_allowing_rust(wrapped_launch(&fx, wrapper, &args), &fx);
+
+                assert!(plan.admitted.is_empty(), "{wrapper} {args:?}");
+                std::assert_matches!(
+                    refusal_of(&plan),
+                    Some(UntrustedRefusal::WorkspaceExecutable { executable })
+                        if executable.ends_with("bin/srv"),
+                    "{wrapper} {args:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn plan_untrusted_pins_a_wrapped_program_to_its_vetted_absolute_path() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "env", "timeout", "srv"]);
+            let outside = |name: &str| fx.outside.join(name).to_str().unwrap().to_owned();
+
+            let plan =
+                plan_allowing_rust(wrapped_launch(&fx, "nice", &["-n", "5", "srv", "-x"]), &fx);
+            assert_eq!(launched_args(&plan), ["-n", "5", &outside("srv"), "-x"]);
+
+            let plan = plan_allowing_rust(
+                wrapped_launch(&fx, "nice", &["env", "FOO=1", "timeout", "5", "srv"]),
+                &fx,
+            );
+            assert_eq!(
+                launched_args(&plan),
+                [
+                    outside("env").as_str(),
+                    "FOO=1",
+                    &outside("timeout"),
+                    "5",
+                    &outside("srv")
+                ]
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_wrapped_program_when_the_workspace_shadows_it_on_path() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "srv"]);
+            executable(&fx.workspace.join("bin/srv"));
+            let mut config = wrapped_launch(&fx, "nice", &["srv"]);
+            let path = std::env::join_paths([&fx.workspace.join("bin"), &fx.outside]).unwrap();
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
+
+            let plan = plan_allowing_rust(config, &fx);
+
+            std::assert_matches!(
+                refusal_of(&plan),
+                Some(UntrustedRefusal::WorkspaceExecutable { .. })
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_wrapped_program_whose_path_env_would_read_as_an_assignment() {
+            let fx = fixture();
+            outside_tools(&fx, &["env"]);
+            let odd = fx.outside.join("a=b");
+            std::fs::create_dir_all(&odd).unwrap();
+            executable(&odd.join("srv"));
+            let mut config = wrapped_launch(&fx, "env", &["srv"]);
+            let path = std::env::join_paths([&odd, &fx.outside]).unwrap();
+            config
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
+
+            let plan = plan_allowing_rust(config, &fx);
+
+            std::assert_matches!(
+                refusal_of(&plan),
+                Some(UntrustedRefusal::ProjectLauncher {
+                    cause: LauncherRefusal::Unanalyzable {
+                        reason: UnanalyzableLaunch::PathContainsEquals,
+                        ..
+                    },
+                    ..
+                })
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_wrapped_program_that_is_not_found() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice"]);
+
+            let plan = plan_allowing_rust(wrapped_launch(&fx, "nice", &["missing-srv"]), &fx);
+
+            assert_eq!(
+                refusal_of(&plan),
+                Some(&UntrustedRefusal::UnresolvedWrappedProgram {
+                    program: EchoedArgument::name("missing-srv")
+                })
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_does_not_echo_an_assignment_value_of_a_missing_program() {
+            let fx = fixture();
+            outside_tools(&fx, &["timeout"]);
+
+            let plan = plan_allowing_rust(
+                wrapped_launch(&fx, "timeout", &["5", "API_TOKEN=abc123", "srv"]),
+                &fx,
+            );
+
+            let Some(refusal) = refusal_of(&plan) else {
+                panic!("expected a refusal");
+            };
+            assert!(!refusal.to_string().contains("abc123"), "{refusal}");
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_wrapper_shapes_it_cannot_analyze() {
+            let fx = fixture();
+            outside_tools(&fx, &["timeout", "nice", "sudo", "srv"]);
+            for (wrapper, args) in [
+                ("timeout", &["srv", "x"][..]),
+                ("nice", &["-5", "srv"]),
+                ("sudo", &["-u", "x", "nice", "srv"]),
+            ] {
+                let plan = plan_allowing_rust(wrapped_launch(&fx, wrapper, args), &fx);
+
+                assert!(plan.admitted.is_empty(), "{wrapper} {args:?}");
+                std::assert_matches!(
+                    refusal_of(&plan),
+                    Some(UntrustedRefusal::ProjectLauncher { .. }),
+                    "{wrapper} {args:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn plan_trusted_leaves_wrapper_arguments_alone() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "srv"]);
+
+            let plan = plan(
+                &config_with(
+                    vec![wrapped_launch(&fx, "nice", &["srv"])],
+                    WorkspaceTrust::Trusted,
+                ),
+                &fx.roots,
+            );
+
+            assert_eq!(launched_args(&plan), ["srv"]);
         }
 
         #[test]
@@ -2084,9 +2294,7 @@ mod refusal_spawn_tests {
         );
         let mut case = case;
         let path = format!("{}:/usr/bin:/bin", case.workspace.join("bin").display());
-        case.config.lsp_servers[0]
-            .env
-            .insert("PATH".into(), path, crate::lsp::HostOs::CURRENT);
+        case.config.lsp_servers[0].env.insert("PATH".into(), path);
         (case, interpreter_marker)
     }
 

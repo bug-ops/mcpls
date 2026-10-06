@@ -9,7 +9,7 @@ use super::Translator;
 use super::dto::{FoldingKind, FoldingKindFilter, FoldingRangesResult, FoldingRegion};
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{FileLocalCapability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
 use crate::util::escape_control_owned;
@@ -104,8 +104,7 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                Capability::FoldingRange,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::FoldingRange),
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());

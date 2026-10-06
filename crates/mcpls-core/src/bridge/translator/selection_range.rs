@@ -7,7 +7,7 @@ use lsp_types::{
 use super::Translator;
 use super::dto::{MAX_SELECTION_CHAIN, Position, SelectionRangesResult};
 use super::navigation::ItemBudget;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{FileLocalCapability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
 
@@ -51,8 +51,7 @@ impl Translator {
         let doc = self
             .prepare_positioned_document(
                 &file_path,
-                Capability::SelectionRange,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::SelectionRange),
                 &[position],
             )
             .await?;

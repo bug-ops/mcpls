@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::Translator;
+use super::positioned::DisclosedDocument;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath};
 use crate::config::{
@@ -53,11 +54,21 @@ impl PreparedDocument {
     }
 }
 
-/// Whether a [`Translator::prepare_gated_document`] call site also needs
-/// [`Translator::wait_for_indexing_ready`] applied, declared explicitly at
-/// the same place capability-gating is declared so a newly added (or newly
-/// gated) tool can't silently ship without an indexing-readiness decision
-/// either way.
+/// Whether opening a document waits for the routed server to finish indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingWait {
+    Wait,
+    Skip,
+}
+
+/// The capability a [`Translator::prepare_gated_document`] call site gates
+/// on, together with whether it also applies
+/// [`Translator::wait_for_indexing_ready`], declared explicitly at the same
+/// place capability-gating is declared so a newly added (or newly gated) tool
+/// can't silently ship without an indexing-readiness decision either way.
+///
+/// Only a [`FileLocalCapability`] fits [`Self::FileLocal`], so a
+/// name-resolving tool cannot skip the indexing wait by accident.
 ///
 /// This only covers call sites that actually go through
 /// `prepare_gated_document` -- two production handlers bypass that
@@ -87,19 +98,60 @@ impl PreparedDocument {
 pub(super) enum IndexingGate {
     /// This tool's answer depends on whole-workspace analysis (e.g. hover,
     /// definition, references, rename, completions, code actions, call
-    /// hierarchy incoming/outgoing calls).
-    Required,
+    /// hierarchy incoming/outgoing calls): wait for indexing before opening.
+    Required(Capability),
     /// This tool's answer is file-local, so it is valid mid-index and carries
     /// no signal: document symbols (also used by name addressing and
     /// `enclosing_symbol`), folding ranges, selection ranges, document
     /// highlights, format document and format range.
     ///
     /// Name-resolving tools that must not stall a cold start (signature help,
-    /// inlay hints, prepare call/type hierarchy; the #423 scope decision) are
-    /// not `FileLocal`: they open through `Translator::prepare_disclosed_document`, whose
+    /// inlay hints, prepare call/type hierarchy; the #423 scope decision) do
+    /// not fit here: they open through `Translator::prepare_disclosed_document`, whose
     /// `DisclosedDocument` can only answer with an `Indexed` result carrying
     /// `indexing_in_progress` (#668).
-    FileLocal,
+    FileLocal(FileLocalCapability),
+}
+
+impl IndexingGate {
+    /// The capability the call site gates on.
+    pub(super) fn capability(self) -> Capability {
+        match self {
+            Self::Required(capability) => capability,
+            Self::FileLocal(capability) => capability.into(),
+        }
+    }
+}
+
+/// The capabilities whose answer is file-local and so valid mid-index; the
+/// only ones [`IndexingGate::FileLocal`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileLocalCapability {
+    /// [`Capability::DocumentSymbols`].
+    DocumentSymbols,
+    /// [`Capability::FoldingRange`].
+    FoldingRange,
+    /// [`Capability::SelectionRange`].
+    SelectionRange,
+    /// [`Capability::DocumentHighlights`].
+    DocumentHighlights,
+    /// [`Capability::FormatDocument`].
+    FormatDocument,
+    /// [`Capability::FormatRange`].
+    FormatRange,
+}
+
+impl From<FileLocalCapability> for Capability {
+    fn from(capability: FileLocalCapability) -> Self {
+        match capability {
+            FileLocalCapability::DocumentSymbols => Self::DocumentSymbols,
+            FileLocalCapability::FoldingRange => Self::FoldingRange,
+            FileLocalCapability::SelectionRange => Self::SelectionRange,
+            FileLocalCapability::DocumentHighlights => Self::DocumentHighlights,
+            FileLocalCapability::FormatDocument => Self::FormatDocument,
+            FileLocalCapability::FormatRange => Self::FormatRange,
+        }
+    }
 }
 
 /// An LSP server capability mcpls gates a tool on before dispatching its request.
@@ -1041,20 +1093,13 @@ impl Translator {
     pub(super) async fn prepare_gated_document(
         &self,
         file_path: &ClientPath,
-        capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
-            .resolve_validated_client_for_file(file_path, capability.tool_kind())
+            .resolve_validated_client_for_file(file_path, indexing_gate.capability().tool_kind())
             .await?;
-        self.finish_prepare_gated_document(
-            server_id,
-            client,
-            validated_path,
-            capability,
-            indexing_gate,
-        )
-        .await
+        self.finish_prepare_gated_document(server_id, client, validated_path, indexing_gate)
+            .await
     }
 
     /// As [`Self::prepare_gated_document`], then rejects every one of
@@ -1072,16 +1117,13 @@ impl Translator {
     pub(super) async fn prepare_positioned_document(
         &self,
         file_path: &ClientPath,
-        capability: Capability,
         indexing_gate: IndexingGate,
         positions: &[Position],
     ) -> Result<PreparedDocument> {
         let doc = self
-            .prepare_gated_document(file_path, capability, indexing_gate)
+            .prepare_gated_document(file_path, indexing_gate)
             .await?;
-        for position in positions {
-            self.require_line_in_document(&doc, *position)?;
-        }
+        self.require_lines_in_document(&doc, positions)?;
         Ok(doc)
     }
 
@@ -1092,20 +1134,64 @@ impl Translator {
     pub(super) async fn prepare_gated_document_for_path(
         &self,
         path: &WorkspacePath,
-        capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) = self
-            .resolve_validated_client_for_path(path, capability.tool_kind())
+            .resolve_validated_client_for_path(path, indexing_gate.capability().tool_kind())
             .await?;
-        self.finish_prepare_gated_document(
-            server_id,
-            client,
-            validated_path,
-            capability,
-            indexing_gate,
-        )
-        .await
+        self.finish_prepare_gated_document(server_id, client, validated_path, indexing_gate)
+            .await
+    }
+
+    /// Opens `file_path` for a name-resolving tool that discloses indexing
+    /// instead of waiting for it, after the capability gate and the line check
+    /// of every one of `positions`.
+    ///
+    /// Takes a bare [`Capability`] rather than an [`IndexingGate`]: it never
+    /// waits, and [`IndexingGate::FileLocal`] is reserved for file-local tools.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prepare_positioned_document`], without the
+    /// indexing wait.
+    pub(super) async fn prepare_disclosed_document(
+        &self,
+        file_path: &ClientPath,
+        capability: Capability,
+        positions: &[Position],
+    ) -> Result<DisclosedDocument<'_>> {
+        let (server_id, client, validated_path) = self
+            .resolve_validated_client_for_file(file_path, capability.tool_kind())
+            .await?;
+        let doc = self
+            .open_checked(
+                server_id,
+                client,
+                &validated_path,
+                capability,
+                IndexingWait::Skip,
+            )
+            .await?;
+        self.require_lines_in_document(&doc, positions)?;
+        Ok(DisclosedDocument::new(self, doc))
+    }
+
+    /// Checks that the server routed for `file_path` advertises `capability`,
+    /// without opening the document.
+    ///
+    /// # Errors
+    ///
+    /// Returns the routing errors of [`Self::prepare_gated_document`] and
+    /// [`Error::CapabilityNotSupported`].
+    pub(super) async fn require_routed_capability(
+        &self,
+        file_path: &ClientPath,
+        capability: Capability,
+    ) -> Result<()> {
+        let (server_id, _client, _path) = self
+            .resolve_validated_client_for_file(file_path, capability.tool_kind())
+            .await?;
+        self.require_capability(&server_id, capability)
     }
 
     /// Shared tail of [`Self::prepare_gated_document`] and
@@ -1116,14 +1202,47 @@ impl Translator {
         server_id: ServerId,
         client: LspClient,
         validated_path: PathBuf,
-        capability: Capability,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
+        let wait = match indexing_gate {
+            IndexingGate::Required(_) => IndexingWait::Wait,
+            IndexingGate::FileLocal(_) => IndexingWait::Skip,
+        };
+        self.open_checked(
+            server_id,
+            client,
+            &validated_path,
+            indexing_gate.capability(),
+            wait,
+        )
+        .await
+    }
+
+    /// Capability-gates, optionally waits for indexing, then opens: the tail
+    /// every document preparation shares.
+    async fn open_checked(
+        &self,
+        server_id: ServerId,
+        client: LspClient,
+        validated_path: &Path,
+        capability: Capability,
+        wait: IndexingWait,
+    ) -> Result<PreparedDocument> {
         self.require_capability(&server_id, capability)?;
-        if indexing_gate == IndexingGate::Required {
+        if wait == IndexingWait::Wait {
             self.wait_for_indexing_ready(&server_id).await?;
         }
-        self.open_prepared(server_id, client, &validated_path).await
+        self.open_prepared(server_id, client, validated_path).await
+    }
+
+    fn require_lines_in_document(
+        &self,
+        doc: &PreparedDocument,
+        positions: &[Position],
+    ) -> Result<()> {
+        positions
+            .iter()
+            .try_for_each(|position| self.require_line_in_document(doc, *position))
     }
 
     /// Sends the `textDocument/didClose` notifications still owed after
@@ -1309,6 +1428,37 @@ mod tests {
     use crate::test_lsp::client_path;
 
     type JsonValue = serde_json::Value;
+
+    #[test]
+    fn test_indexing_gate_capability_is_the_gated_capability() {
+        assert_eq!(
+            IndexingGate::Required(Capability::Hover).capability(),
+            Capability::Hover
+        );
+        let file_local = [
+            (
+                FileLocalCapability::DocumentSymbols,
+                Capability::DocumentSymbols,
+            ),
+            (FileLocalCapability::FoldingRange, Capability::FoldingRange),
+            (
+                FileLocalCapability::SelectionRange,
+                Capability::SelectionRange,
+            ),
+            (
+                FileLocalCapability::DocumentHighlights,
+                Capability::DocumentHighlights,
+            ),
+            (
+                FileLocalCapability::FormatDocument,
+                Capability::FormatDocument,
+            ),
+            (FileLocalCapability::FormatRange, Capability::FormatRange),
+        ];
+        for (file_local, capability) in file_local {
+            assert_eq!(IndexingGate::FileLocal(file_local).capability(), capability);
+        }
+    }
 
     #[test]
     fn test_client_for_file_server_initializing_when_expected() {

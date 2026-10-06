@@ -24,9 +24,6 @@ use crate::lsp::{DropLog, NotificationSink};
 use crate::redaction::{RedactedText, Redactions};
 use crate::util::WarnLimiter;
 
-/// LSP error code returned when the server cancels a request and wants the client to retry.
-const SERVER_CANCELLED_CODE: i32 = -32802;
-
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
 
@@ -733,7 +730,7 @@ impl LspClient {
                     code,
                     message,
                     data,
-                }) if (code == SERVER_CANCELLED_CODE
+                }) if (LspErrorCodes::from(code) == LspErrorCodes::ServerCancelled
                     || (LspErrorCodes::from(code) == LspErrorCodes::ContentModified
                         && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
                     && Self::should_retrigger(data.as_ref()) =>
@@ -2871,7 +2868,7 @@ mod tests {
                 write_retryable_error_response(
                     &mut server.read_half_stdin,
                     &id,
-                    SERVER_CANCELLED_CODE,
+                    i32::from(LspErrorCodes::ServerCancelled),
                     "server cancelled the request",
                     true,
                 )
@@ -2889,7 +2886,7 @@ mod tests {
                     // Assert the exact original error surfaces, not merely
                     // "some error with this code" -- a freshly constructed
                     // placeholder error would satisfy a code-only check.
-                    assert_eq!(code, SERVER_CANCELLED_CODE);
+                    assert_eq!(code, i32::from(LspErrorCodes::ServerCancelled));
                     assert_eq!(message, "server cancelled the request");
                     assert_eq!(data, Some(serde_json::json!({ "retriggerRequest": true })));
                 }
@@ -2944,7 +2941,7 @@ mod tests {
             write_retryable_error_response(
                 &mut server.read_half_stdin,
                 &id,
-                SERVER_CANCELLED_CODE,
+                i32::from(LspErrorCodes::ServerCancelled),
                 "server cancelled the request",
                 false,
             )
@@ -2963,7 +2960,7 @@ mod tests {
 
             match result {
                 Err(Error::LspServerError { code, .. }) => {
-                    assert_eq!(code, SERVER_CANCELLED_CODE);
+                    assert_eq!(code, i32::from(LspErrorCodes::ServerCancelled));
                 }
                 other => panic!("expected immediate ServerCancelled error, got {other:?}"),
             }
@@ -2998,7 +2995,7 @@ mod tests {
             write_retryable_error_response(
                 &mut server.read_half_stdin,
                 &first["id"].clone(),
-                SERVER_CANCELLED_CODE,
+                i32::from(LspErrorCodes::ServerCancelled),
                 "server cancelled the request",
                 true,
             )
@@ -3336,7 +3333,7 @@ mod tests {
             write_retryable_error_response(
                 &mut server.read_half_stdin,
                 &first["id"].clone(),
-                SERVER_CANCELLED_CODE,
+                i32::from(LspErrorCodes::ServerCancelled),
                 "server cancelled the request",
                 true,
             )

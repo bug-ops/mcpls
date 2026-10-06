@@ -749,7 +749,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let diag_info = cache.diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key);
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -857,7 +857,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let diag_info = cache.diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key);
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -977,7 +977,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let diag_info = cache.diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key);
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,
@@ -1038,7 +1038,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let diag_info = cache.diagnostics(&cache_key).cloned();
+        let diag_info = cache.diagnostics(&cache_key);
         let diags = Translator::diagnostics_from_cache_entry(
             diag_info.as_ref(),
             PositionEncoding::Utf16,

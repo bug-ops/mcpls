@@ -6,7 +6,7 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{FileLocalCapability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
 
@@ -45,8 +45,7 @@ impl Translator {
             .position_request::<lsp_types::DocumentHighlightRequest>(
                 &file_path,
                 position,
-                Capability::DocumentHighlights,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::DocumentHighlights),
                 (),
             )
             .await?;

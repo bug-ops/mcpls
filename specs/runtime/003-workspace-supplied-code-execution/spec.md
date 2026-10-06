@@ -104,16 +104,34 @@ related:
   `--commands` or `/c` for `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`, `oksh`, `yash`,
   `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`, `powershell`, `pwsh` (also as a `busybox`
   applet) and an inline program for `node`, `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`,
-  `julia`, `osascript` and `deno eval`. `xargs`, `find` and the `awk` family are refused outright; the
-  exec wrappers `time`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `ionice`, `chrt`, `taskset`, `sudo`,
-  `doas`, `script` are refused when any argument would start a refused command, and past 8 nested
-  wrappers (fail closed). `deno lsp` is allowed. The lists are closed, not exhaustive (#686).
+  `julia`, `osascript` and `deno eval`. `xargs`, `find` and the `awk` family are refused outright, and so
+  are the wrappers whose options are not analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`,
+  `setpriv`, `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`, `unshare`,
+  `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`, `script`): they change the user, root, directory or environment, or take optional arguments (#709).
+  `analyze_launch` parses the wrappers with a small grammar (`time`, `nice`, `nohup`, `timeout`, `setsid`,
+  `stdbuf`, `caffeinate`, `arch`, `env`, their Homebrew GNU names `g<name>`, and `busybox`/`toybox`/`coreutils`
+  applets of them) against a closed option table per
+  wrapper: the first non-option after the options (and `timeout`'s `DURATION`) is the program, and only that
+  program's arguments are analyzed further. An unlisted option, a missing value or command, a malformed
+  operand, `env -S`/`-P`, a `PATH=` assignment, a relative program that `env -C` itself starts, and more than 8 nested
+  wrappers are refused as `LauncherRefusal::Unanalyzable`/`TooDeep` (fail closed). The refusal echoes only a
+  bounded, escaped option or program name (`EchoedArgument`), never a value, an inline program or an
+  assignment's value. `deno lsp` is allowed. The lists are closed, not exhaustive (#686); a wrapper on no list
+  (`numactl`, `valgrind`, `sg`, ...) is not unwrapped. `env` stops option parsing at a lone `-` and at the
+  first `NAME=VALUE`; assignments (with the `PATH` refusal) are also accepted after `--`.
   `UntrustedRefusal::UnpinnedTypescriptLauncher` refuses a TypeScript server whose launcher no tsserver
   can be pinned for (`PackageRunner` or `UnsupportedLauncher` resolution), also when the user set
   `tsserver.path`. An unresolved pin for another reason (no `typescript` next to the server) stays
   admitted. `UntrustedRefusal::AutoSelectionTarget` refuses an auto-selected TypeScript command whose
   `PATH` entry resolves to another program (#697). The list is best-effort; the trusted configuration is the
   boundary (`SECURITY.md`).
+- **Wrapped programs (#710).** Each program a parsed wrapper or `env` starts (`WrappedPrograms`, indices into
+  `args`, outermost first) goes through the same vetting as the server's own executable
+  (`vetted_spawn_path`): resolved on the child `PATH` as it was before hardening, refused as
+  `WorkspaceExecutable` when it canonicalizes inside the boundary, as `UnresolvedWrappedProgram` when it is
+  not found, refused as `ProjectLauncher` when its path contains `=` (`env` would read it as an assignment),
+  and replaced in `args` by its vetted absolute spawn path, so a restart or respawn cannot find a
+  binary the workspace adds later. Trusted mode neither analyzes nor rewrites.
 - **Working directory and Windows lookups (#653).** An untrusted server starts in the login home, else the
   system temporary directory when it is not writable by group or others (a shared `/tmp` is not used), whichever lies outside the boundary (`ChildWorkingDir::Fixed`), else the
   server is refused as `NoSafeWorkingDirectory`; a non-UTF-8 executable or `PATH` is refused as
@@ -294,9 +312,10 @@ the committed minimum, the rest is gated on the open decisions.
 | FR-008 | WHERE an "untrusted workspace" mode exists AND a server is classified as executing workspace code WHEN a tool call would spawn it THE SYSTEM SHALL refuse with a typed error that names the server and the consent mechanism | should |
 | FR-009 | THE SYSTEM SHALL publish a security policy (`SECURITY.md`) describing the private reporting route | should |
 | FR-010 | THE SYSTEM SHALL record, for each default server, whether built-in hardening exists, so the documentation and any classification stay consistent | could |
-| FR-011 | WHERE untrusted mode exists THE SYSTEM SHALL refuse an allowed server launched through a package runner, task runner or toolchain wrapper that selects the program from workspace files, and a TypeScript server launched in a way no tsserver can be pinned for, with a typed refusal that names the launcher | must |
+| FR-011 | WHERE untrusted mode exists THE SYSTEM SHALL refuse an allowed server launched through a package runner, task runner or toolchain wrapper that selects the program from workspace files, through a wrapper whose options it does not parse, or through a parsed wrapper with an option it does not know, and a TypeScript server launched in a way no tsserver can be pinned for, with a typed refusal that names the launcher and the option or trigger and never echoes a value | must |
 | FR-012 | WHERE untrusted mode exists THE SYSTEM SHALL start the server in a directory outside the workspace and, on Windows, set `NoDefaultCurrentDirectoryInExePath=1`, so no lookup the server makes resolves into the workspace through the current directory | must |
 | FR-013 | THE SYSTEM SHALL resolve the tsserver once per server start so the path checked against the workspace is the path sent, and SHALL resolve a pin it chose again, with the same check, when it no longer resolves to the same file at respawn | must |
+| FR-014 | WHERE untrusted mode exists THE SYSTEM SHALL resolve every program an exec wrapper or `env` starts on the same `PATH` as the server's executable, refuse one that lies inside the workspace (`WorkspaceExecutable`) or is not found (`UnresolvedWrappedProgram`), and spawn the rest by their vetted absolute paths (#710) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -332,6 +351,10 @@ No persistent storage is introduced.
 | Untrusted-workspace mode enabled and a configured server is not classified | Refused like every other server unless allowed; the message says the workspace code it may run is unknown |
 | Windows path and extension differences for tsserver | Pin must be resolved with platform-correct paths (NFR-002) |
 | Untrusted mode and `command = "npx"` (or `make`, `cargo run`, `env npx`, `sh -c`) | Refused as `ProjectLauncher`; the message tells the user to install the server globally and give its absolute path (FR-011) |
+| Untrusted mode and `nice -n 5 gopls`, `timeout 5 rust-analyzer make`, `env FOO=1 srv` | Admitted when the wrapped program resolves outside the workspace; the arguments of the program are not analyzed as commands (FR-011, FR-014) |
+| Untrusted mode and `nice <workspace>/bin/srv`, `busybox nice <workspace>/bin/srv` | Refused as `WorkspaceExecutable` for the wrapped program (FR-014) |
+| Untrusted mode and `sudo -u nobody gopls`, `strace`, `unshare`, `chroot` | Refused outright as `ProjectLauncher` (FR-011) |
+| Untrusted mode and a wrapper option the table does not list (`nice -5`, `time --bogus`), `timeout srv x` | Refused as `ProjectLauncher` with `Unanalyzable`; the option name is echoed, never its value (FR-011) |
 | Untrusted mode and a Volta, asdf or mise shim for the TypeScript server | Refused as `UnpinnedTypescriptLauncher`, also with a user `tsserver.path` (FR-011); trusted mode starts it unpinned with a warning (#645) |
 | Untrusted mode, no directory outside the workspace for the server to start in | Refused as `NoSafeWorkingDirectory` (FR-012) |
 | Respawn of a TypeScript server whose pinned install was upgraded | The tsserver is resolved again; in untrusted mode a result inside the workspace is refused (FR-013) |
