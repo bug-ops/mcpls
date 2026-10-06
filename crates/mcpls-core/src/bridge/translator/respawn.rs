@@ -284,7 +284,9 @@ impl Translator {
     /// 2. The previous notification task for `id` is aborted. Abort is
     ///    asynchronous: it may still finish one cache write already in
     ///    progress.
-    /// 3. `id`'s indexing state is reset, and for the diagnostics-route
+    /// 3. `id`'s indexing state is reset (a server that reported a readiness
+    ///    signal before reads `Loading` until its replacement reports one or
+    ///    the indexing-ready timeout elapses), and for the diagnostics-route
     ///    server its cached diagnostics are cleared and its push-degraded
     ///    flag updated per `routing`. This precedes step 4 so a readiness
     ///    signal or diagnostics push the replacement emitted during its own
@@ -361,7 +363,12 @@ impl Translator {
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
-            cache.reset_indexing_state(id, IndexingReset::Forget);
+            cache.reset_indexing_state(
+                id,
+                IndexingReset::AwaitReplacement {
+                    within: self.indexing_ready_timeout,
+                },
+            );
             if diagnostics_route {
                 cleared = cache.clear_server_diagnostics(id);
                 match routing {
@@ -1119,18 +1126,17 @@ fi
             drop(guard);
         }
 
-        /// A respawned server's tracked `IndexingState` must reset
-        /// to `Unknown`, not carry over stale state from the crashed
-        /// connection -- the replacement process has indexed nothing yet,
-        /// and its own `experimental/serverStatus` notifications are
-        /// discarded (see this method's doc), so a stale `Ready` would let
-        /// whole-workspace queries through against an empty index. Unlike
-        /// diagnostics-cache clearing, this must happen regardless of
-        /// diagnostics-route status -- indexing readiness gates every
-        /// routed server's whole-workspace tools, not just the one that
+        /// A respawned server that reported a readiness signal before must
+        /// read `Loading` until its replacement reports one (#667), not carry
+        /// over the stale `Ready` of the crashed connection -- the
+        /// replacement has indexed nothing yet, so a stale `Ready` or an open
+        /// `Unknown` would let whole-workspace queries through against an
+        /// empty index. Unlike diagnostics-cache clearing, this must happen
+        /// regardless of diagnostics-route status -- indexing readiness gates
+        /// every routed server's whole-workspace tools, not just the one that
         /// owns diagnostics.
         #[tokio::test]
-        async fn test_respawn_if_dead_resets_indexing_state() {
+        async fn test_respawn_if_dead_awaits_replacement_indexing_signal() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
             let id = ServerId::from("rust");
@@ -1171,9 +1177,45 @@ fi
 
             assert_eq!(
                 cache.lock().await.indexing_state(&id),
-                crate::bridge::IndexingState::Unknown,
-                "a respawned server must not carry over a stale Ready/Loading state \
-                 from the crashed connection"
+                crate::bridge::IndexingState::Loading,
+                "a respawned server that reported signals before is loading until its \
+                 replacement reports one"
+            );
+        }
+
+        /// #667: a server that never reported a readiness signal is not
+        /// gated after a respawn (no new fixed delay, bridge/012 US-004).
+        #[tokio::test]
+        async fn test_respawn_if_dead_without_signal_history_stays_unknown() {
+            let dir = TempDir::new().unwrap();
+            let seed_script = write_crash_after_init_script(dir.path());
+            let id = ServerId::from("rust");
+            let seed = LspServer::spawn(stub_server_config("rust", &seed_script))
+                .await
+                .unwrap();
+
+            let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
+                .with_notification_cache(Arc::clone(&cache));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            wait_until_dead(&translator, &id).await;
+
+            let respawn_script = write_responder_script(dir.path(), 1);
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
+            translator.respawn_if_dead(&id).await.unwrap();
+
+            assert_eq!(
+                cache.lock().await.indexing_state(&id),
+                crate::bridge::IndexingState::Unknown
             );
         }
 

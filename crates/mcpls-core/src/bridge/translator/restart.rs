@@ -1847,6 +1847,76 @@ mod tests {
                 "{result:?}"
             );
         }
+
+        /// #667: right after a restart of a server that reported readiness
+        /// before, the result says `loading` and a gated call holds until the
+        /// replacement's own signal arrives instead of reading an empty index.
+        #[tokio::test]
+        async fn test_restart_of_a_signalling_server_gates_until_its_signal() {
+            let (fx, _log) = protocol_fixture(None).await;
+            fx.cache.lock().await.observe_indexing_signal(
+                &fx.id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::Restarted {
+                    indexing_state: IndexingState::Loading,
+                    ..
+                },
+                "{result:?}"
+            );
+
+            let translator = Arc::clone(&fx.translator);
+            let id = fx.id.clone();
+            let gated = tokio::spawn(async move { translator.wait_for_indexing_ready(&id).await });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!gated.is_finished(), "the gate must hold before the signal");
+
+            fx.cache.lock().await.observe_indexing_signal(
+                &fx.id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+            tokio::time::timeout(Duration::from_secs(5), gated)
+                .await
+                .expect("the gate releases once the replacement is ready")
+                .unwrap()
+                .unwrap();
+        }
+
+        /// #667: a server that never reported a signal is restarted without a
+        /// gate (no new fixed delay).
+        #[tokio::test]
+        async fn test_restart_of_a_silent_server_reports_unknown() {
+            let (fx, _log) = protocol_fixture(None).await;
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::Restarted {
+                    indexing_state: IndexingState::Unknown,
+                    ..
+                },
+                "{result:?}"
+            );
+            fx.translator
+                .wait_for_indexing_ready(&fx.id)
+                .await
+                .unwrap();
+        }
     }
 }
 

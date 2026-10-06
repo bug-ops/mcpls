@@ -1517,7 +1517,9 @@ impl NotificationCache {
     }
 
     /// Reset `server_id`'s tracked [`IndexingState`] as `reset` says;
-    /// [`IndexingReset::Forget`] reverts it to [`IndexingState::Unknown`].
+    /// [`IndexingReset::Forget`] reverts it to [`IndexingState::Unknown`],
+    /// [`IndexingReset::AwaitReplacement`] to [`IndexingState::Loading`] until
+    /// the replacement's first signal when the server has reported one before.
     ///
     /// `Translator::respawn_if_dead` calls this after replacing a crashed
     /// server's process, since the new process starts indexing from
@@ -1527,9 +1529,7 @@ impl NotificationCache {
     /// production caller: a timed-out [`Self::indexing_state`] read does
     /// *not* call this, so one caller's wait can never affect another's.
     pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId, reset: IndexingReset) {
-        match reset {
-            IndexingReset::Forget => self.indexing.reset(server_id),
-        }
+        self.indexing.reset(server_id, reset);
     }
 
     /// Get diagnostics for a document URI.
