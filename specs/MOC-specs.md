@@ -13,6 +13,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 |---|------|------|----------|--------|-------|
 | 001 | [[config/001-config-discovery-and-heuristics/spec\|config-discovery-and-heuristics]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | implemented | #615, #634 |
+| 003 | [[config/003-unsupported-file-pattern-forms/spec\|unsupported-file-pattern-forms]] | bug | P3 | draft | #669 |
 
 ## lsp
 
@@ -29,6 +30,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
 | 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve) |
 | 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery) |
+| 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | draft | #665 |
 
 ## mcp
 
@@ -63,6 +65,9 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
 | 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648, #649 (follow-ups) |
 | 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
+| 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | draft | #666 |
+| 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | draft | #667 |
+| 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | draft | #668 |
 
 ## runtime
 
@@ -105,7 +110,7 @@ subsystem.
 >
 > Within each block, specs are ordered: any new retroactive foundational spec first (documents the
 > subsystem itself), then the original historical bug/enhancement specs in their original relative
-> order, then research/tracking specs last. `config` has two specs today — a real reflection of
+> order, then research/tracking specs last. `config` has three specs today — a real reflection of
 > the `config/` module's spec coverage, not a placeholder.
 >
 > Numbers are **block-scoped**, not global: `bridge/001` and `lsp/001` are different, unrelated
