@@ -49,7 +49,7 @@ impl std::fmt::Display for SessionFingerprint<'_> {
 /// Enforcement lives here, at the `SessionManager` layer, rather than in Axum
 /// middleware sniffing request headers, because that is the only place
 /// guaranteed to run exactly when — and only when — a session is actually
-/// created. `rmcp` 3.2.0's `StreamableHttpService::handle_post` classifies
+/// created. `rmcp`'s `StreamableHttpService::handle_post` classifies
 /// every `initialize` request as legacy and always calls `create_session`,
 /// whatever protocol version it names — the handshake only exists in
 /// revisions before `2026-07-28`, so a version named in its params never
@@ -262,7 +262,7 @@ pub(super) fn spawn_bounded_close<E: std::fmt::Display + Send + 'static>(
 
 non_zero_duration! {
     /// Non-zero duration after which a session without inbound client activity
-    /// or open response stream is closed by [`run_idle_reaper`].
+    /// or open response stream is closed by the idle reaper.
     ///
     /// The sole session expiry owner: rmcp's own `keep_alive` is disabled
     /// because it measures any event on the session -- including outbound
@@ -270,7 +270,7 @@ non_zero_duration! {
     /// both never fired for an abandoned but subscribed session (#521) and cut
     /// off a healthy one (#573). An open response stream holds the session only
     /// while it is proven alive (a POST stream, or a probed GET stream).
-    pub IdleTimeout, 300, "5 minutes."
+    pub IdleTimeout, std::time::Duration::from_mins(5)
 }
 
 impl IdleTimeout {

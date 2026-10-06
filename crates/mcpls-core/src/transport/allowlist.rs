@@ -1,6 +1,9 @@
 //! `Host` and `Origin` allowlist types for the HTTP transport's DNS-rebinding
 //! protection.
 
+/// The loopback host names a loopback-bound server answers to.
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
 /// Why a string is not a valid [`HttpPath`].
 ///
 /// # Examples
@@ -203,7 +206,7 @@ impl AllowedOrigin {
     /// ```
     #[must_use]
     pub fn loopback(port: u16) -> [Self; 3] {
-        ["localhost", "127.0.0.1", "[::1]"].map(|host| Self {
+        LOOPBACK_HOSTS.map(|host| Self {
             scheme: OriginScheme::Http,
             host: host.into(),
             port,
@@ -407,7 +410,7 @@ impl AllowedHost {
     /// ```
     #[must_use]
     pub fn loopback() -> [Self; 3] {
-        ["localhost", "127.0.0.1", "[::1]"].map(|host| Self {
+        LOOPBACK_HOSTS.map(|host| Self {
             host: host.into(),
             port: None,
         })
@@ -730,7 +733,7 @@ mod tests {
                 .map(ToString::to_string)
                 .collect()
         };
-        let loopback = ["localhost", "127.0.0.1", "[::1]"];
+        let loopback = LOOPBACK_HOSTS;
 
         assert_eq!(names("127.0.0.1:3000", &[]), loopback);
         assert_eq!(names("[::1]:3000", &[]), loopback);

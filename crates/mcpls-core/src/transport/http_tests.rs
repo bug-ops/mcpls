@@ -997,13 +997,13 @@ async fn test_run_http_unknown_tool_is_in_band_invalid_params_with_http_200() {
 /// S1 non-regression: a non-`initialize` request carrying SEP-2575
 /// per-request `_meta` protocol-version metadata
 /// (`io.modelcontextprotocol/protocolVersion` = `2026-07-28` plus the
-/// required `clientCapabilities` key) takes rmcp 3.2.0's stateless
+/// required `clientCapabilities` key) takes rmcp's stateless
 /// discover-lifecycle path and never calls
 /// `SessionManager::create_session` — `rmcp` serves it directly
 /// without touching the session table — so it must not be rejected
 /// by the cap even while `max_concurrent_sessions` legacy sessions
 /// are already active. (An `initialize` request is always
-/// classified legacy in 3.2.0 regardless of the protocol version it
+/// classified legacy regardless of the protocol version it
 /// names, so it cannot be used to probe the stateless path.) This
 /// guards against a future refactor reintroducing request-header
 /// sniffing for the cap decision (the bug this design replaced).
@@ -1026,7 +1026,7 @@ async fn test_run_http_stateless_request_bypasses_session_cap() {
     );
 
     // A non-`initialize` request carrying per-request `_meta`
-    // protocol-version metadata takes rmcp 3.2.0's stateless
+    // protocol-version metadata takes rmcp's stateless
     // discover-lifecycle path and never creates a session, so it
     // must bypass the cap entirely even though the slot above is
     // still held. The `MCP-Protocol-Version` header must match the

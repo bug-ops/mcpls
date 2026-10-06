@@ -239,12 +239,18 @@ fn render_error(error: crate::error::Error, redactions: &Redactions) -> McpError
     mapped
 }
 
+/// Maps a typed client-input error to its JSON-RPC error, so every parse helper
+/// below reports a bad value the same way.
+fn client_input_error(error: impl Into<crate::error::Error>) -> McpError {
+    map_bridge_error(error.into())
+}
+
 /// Parses a client-supplied `file_path` at the tool boundary. Done in the
 /// tool method rather than while deserializing the parameters, because the MCP
 /// layer reports a deserialization failure as a tool-result error instead of
 /// a JSON-RPC `-32602`.
 fn parse_client_path(path: PathBuf) -> Result<ClientPath, McpError> {
-    ClientPath::try_from(path).map_err(|e| map_bridge_error(e.into()))
+    ClientPath::try_from(path).map_err(client_input_error)
 }
 
 /// Parses the file path and target of an addressed tool; a bad path or
@@ -253,15 +259,13 @@ fn parse_target(
     file_path: PathBuf,
     target: SymbolTargetInput,
 ) -> Result<(ClientPath, SymbolTarget), McpError> {
-    let target = target
-        .into_target()
-        .map_err(|e| map_bridge_error(e.into()))?;
+    let target = target.into_target().map_err(client_input_error)?;
     Ok((parse_client_path(file_path)?, target))
 }
 
 /// Parses a client-supplied 1-based position, so a bad value is `-32602`.
 fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
-    Position::from_client(line, character).map_err(|e| map_bridge_error(e.into()))
+    Position::from_client(line, character).map_err(client_input_error)
 }
 
 /// Resolves a `kind_filter` input to its typed kind, so an unknown kind is
@@ -276,7 +280,7 @@ fn parse_kind_filter<K: KindFilter>(
 
 /// Parses a client-supplied hierarchy item, so a bad range is `-32602`.
 fn parse_hierarchy_item(item: HierarchyItem) -> Result<CheckedHierarchyItem, McpError> {
-    CheckedHierarchyItem::from_client(item).map_err(|e| map_bridge_error(e.into()))
+    CheckedHierarchyItem::from_client(item).map_err(client_input_error)
 }
 
 /// Parses a client-supplied ordered range.
@@ -285,12 +289,12 @@ fn parse_range(range: &RangeParams) -> Result<PositionRange, McpError> {
         (range.start_line, range.start_character),
         (range.end_line, range.end_character),
     )
-    .map_err(|e| map_bridge_error(e.into()))
+    .map_err(client_input_error)
 }
 
 /// Parses a client-supplied ordered range of at most `MAX_RANGE_LINES` lines.
 fn parse_bounded_range(range: &RangeParams) -> Result<BoundedRange, McpError> {
-    BoundedRange::try_from(parse_range(range)?).map_err(|e| map_bridge_error(e.into()))
+    BoundedRange::try_from(parse_range(range)?).map_err(client_input_error)
 }
 
 /// Builds an error with `data` as its payload; a failed serialization is
@@ -1534,7 +1538,7 @@ impl McplsServer {
         &self,
         request: ReadResourceRequestParams,
     ) -> Result<ReadResourceResponse, McpError> {
-        let path = parse_uri(&request.uri).map_err(|e| map_bridge_error(e.into()))?;
+        let path = parse_uri(&request.uri).map_err(client_input_error)?;
         let response = self.resource_diagnostics_response(&path).await?;
 
         let json = serde_json::to_string(&response)
