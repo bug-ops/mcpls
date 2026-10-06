@@ -352,6 +352,8 @@ args = []
 file_patterns = ["**/*.go"]
 ```
 
+Each `file_patterns` entry must end in `*.EXT`: list one pattern per extension (`["**/*.cpp", "**/*.h"]`), not `**/*.{cpp,h}`. The directory part is ignored; see [Configuration Reference](configuration.md#file_patterns).
+
 ## PATH Configuration
 
 After installation, ensure the installation directory is in your PATH.

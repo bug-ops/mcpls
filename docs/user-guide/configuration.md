@@ -271,7 +271,8 @@ This is a preference, not a restriction: per the LSP spec, UTF-16 is a mandatory
 **Type**: Array of `LanguageExtensionMapping` objects
 **Default**: 30 built-in language mappings (see below)
 
-Custom file extension to language ID mappings. Allows you to:
+Custom file extension to language ID mappings. Extensions are written without the
+leading dot (`"nu"`, not `".nu"`) and are case-sensitive. Allows you to:
 - Add support for specialized file types
 - Override default extension associations
 - Reduce memory usage by including only languages you need
@@ -374,7 +375,7 @@ Raising this limit increases mcpls's steady-state memory usage, since each open 
 **Type**: Integer (bytes)
 **Default**: `10485760` (10MB)
 
-Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit. Values above 1 GiB (`1073741824`) are rejected at startup with an `InvalidConfig` error; use a lower value, or `0`.
+Maximum size, in bytes, of a single file mcpls will open. A file larger than this fails with a "file size limit exceeded" error. Set to `0` to disable the limit. Values above 1 GiB (`1073741824`) are rejected at startup with a configuration error; use a lower value, or `0`.
 
 The limit also derives the per-response disk-read budget used for position conversion with non-UTF-16 servers: 4 times the limit (4 times the default when `0`), at most 256 MiB.
 
@@ -489,10 +490,12 @@ args = ["--stdio"]  # Many servers require --stdio flag
 
 ### `file_patterns`
 
-**Type**: Array of strings (glob patterns)
+**Type**: Array of strings (`*.EXT` patterns)
 **Required**: No (defaults to empty array)
 
-File patterns to associate with this language server.
+File patterns to associate with this language server. mcpls routes a file by its
+extension, so a pattern's only effect is to map one extension to this server's
+`language_id`.
 
 ```toml
 [[lsp_servers]]
@@ -505,11 +508,23 @@ file_patterns = ["**/*.py", "**/*.pyi"]  # Python files
 file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]  # TS/JS files
 ```
 
-Glob pattern syntax:
-- `**` - Match any number of directories
-- `*` - Match any characters except `/`
-- `?` - Match single character
-- `[abc]` - Match any character in brackets
+Supported form: a final path segment of `*.EXT`, where `EXT` is a run of letters,
+digits, `_`, `-` or `+` (for example `**/*.rs`).
+
+- The directory part (`**/`, `src/**/`) is accepted for readability and **ignored**:
+  `src/**/*.rs` and `**/*.rs` both map every `.rs` file.
+- To cover several extensions, list one pattern per extension:
+  `file_patterns = ["**/*.cpp", "**/*.h"]`. Brace expansion (`**/*.{cpp,h}`) is not
+  supported.
+- Any other form is rejected at startup with an error naming the server entry and the
+  pattern, never ignored: character classes (`**/*.[ch]`), `?`, extensionless names
+  (`Makefile`, `src/**`, `**/*`), dotfiles (`.eslintrc`), single files
+  (`src/main.rs`) and multi-part extensions (`**/*.tar.gz`).
+- Extensionless files cannot be mapped through `file_patterns`.
+
+When a file has no mapping at all, tool calls fail with
+`no LSP server configured for language: plaintext`, followed by the file's extension and
+the `file_patterns` configured across servers, so an unmapped extension is easy to spot.
 
 ### `timeout_seconds`
 
