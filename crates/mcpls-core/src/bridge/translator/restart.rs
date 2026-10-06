@@ -375,7 +375,7 @@ impl DiagnosticsRole {
 }
 
 /// The part of notification handling that lives in `serve_with`'s scope
-/// (shutdown watch, subscription registry) and so cannot be built by the
+/// (shutdown token, subscription registry) and so cannot be built by the
 /// translator itself.
 pub trait NotificationWiring: std::fmt::Debug + Send + Sync {
     /// Start a diagnostics pump over `receivers` for `id`, returning a handle
@@ -925,7 +925,8 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use tempfile::TempDir;
-        use tokio::sync::{Mutex, watch};
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
 
         use super::*;
         use crate::bridge::translator::clock::{Clock, FakeClock};
@@ -945,7 +946,6 @@ mod tests {
             clock: Arc<FakeClock>,
             id: ServerId,
             _dir: TempDir,
-            _cancel: watch::Sender<bool>,
         }
 
         fn server_ids(names: &[&str]) -> RestartTarget {
@@ -980,14 +980,13 @@ mod tests {
             };
             translator.register_server_complete(server);
 
-            let (cancel, cancel_rx) = watch::channel(false);
             let wiring = PumpWiring::new(
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
-                cancel_rx,
+                CancellationToken::new(),
             );
             let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Authoritative);
             translator.set_notification_task(&id, pump);
@@ -1000,7 +999,6 @@ mod tests {
                 clock,
                 id,
                 _dir: dir,
-                _cancel: cancel,
             }
         }
 
@@ -1571,14 +1569,13 @@ mod tests {
             translator.set_workspace_roots(
                 WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
-            let (_cancel, cancel_rx) = watch::channel(false);
             let wiring = PumpWiring::new(
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
-                cancel_rx,
+                CancellationToken::new(),
             );
             let mut logs = Vec::new();
             for index in 0..6 {

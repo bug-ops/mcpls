@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
@@ -59,7 +60,7 @@ pub struct PumpShared {
 ///   returned `None`) -- in practice both senders live inside the same
 ///   `LspClient` and close together, but each lane is tracked independently
 ///   so one closing early can never stop the other from still being drained.
-/// - The cancellation watch fires (or the sender is dropped).
+/// - The cancellation token is cancelled.
 ///
 /// # Lock independence
 /// Cache writes acquire only `Arc<Mutex<NotificationCache>>`, a lock entirely
@@ -77,7 +78,7 @@ pub async fn diagnostics_pump(
     server_id: ServerId,
     rx: tokio::sync::mpsc::Receiver<LspNotification>,
     lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
     pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
@@ -86,7 +87,7 @@ pub async fn diagnostics_pump(
         server_id,
         rx,
         lifecycle_rx,
-        cancel_rx,
+        cancel,
         role_rx,
         pinned_tsserver,
         shared,
@@ -105,7 +106,7 @@ async fn diagnostics_pump_with_resolver(
     server_id: ServerId,
     mut rx: tokio::sync::mpsc::Receiver<LspNotification>,
     mut lifecycle_rx: tokio::sync::mpsc::Receiver<LspNotification>,
-    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
     pinned_tsserver: Option<PathBuf>,
     shared: PumpShared,
@@ -123,7 +124,7 @@ async fn diagnostics_pump_with_resolver(
             break;
         }
         tokio::select! {
-            () = cancelled(&mut cancel_rx) => break,
+            () = cancel.cancelled() => break,
             msg = rx.recv(), if !notification_closed => {
                 let Some(first) = msg else {
                     notification_closed = true;
@@ -170,7 +171,7 @@ async fn diagnostics_pump_with_resolver(
                         std::pin::pin!(resolver.resolve_batch(&uris, &workspace_roots));
                     loop {
                         tokio::select! {
-                            () = cancelled(&mut cancel_rx) => break 'pump,
+                            () = cancel.cancelled() => break 'pump,
                             done = &mut resolving => break done,
                             msg = lifecycle_rx.recv(), if !lifecycle_closed => match msg {
                                 Some(notif) => {
@@ -221,11 +222,6 @@ async fn diagnostics_pump_with_resolver(
 
 /// Notifications drained from the diagnostics lane per resolve round.
 const PUMP_BATCH: usize = 64;
-
-/// Completes when cancellation is requested or its sender is dropped.
-async fn cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
-    drop(cancel_rx.wait_for(|cancelled| *cancelled).await);
-}
 
 /// Whether `notif` is a publication this pump should canonicalize and cache.
 fn publication_admitted(
@@ -345,7 +341,7 @@ async fn degrade_after_pump_panic(cache: &Mutex<NotificationCache>, id: &ServerI
 pub async fn supervised_pump(
     server_id: ServerId,
     receivers: bridge::NotificationReceivers,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
     shared: PumpShared,
 ) {
@@ -354,7 +350,7 @@ pub async fn supervised_pump(
         server_id.clone(),
         receivers.notifications,
         receivers.lifecycle,
-        cancel_rx,
+        cancel,
         role_rx,
         receivers.pinned_tsserver,
         shared,
@@ -378,11 +374,11 @@ async fn contain_pump_panic(
 }
 
 /// Re-starts diagnostics pumps for manually restarted servers over the same
-/// shared state and shutdown watch the initial pumps use.
+/// shared state and shutdown token the initial pumps use.
 #[derive(Clone)]
 pub struct PumpWiring {
     shared: PumpShared,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for PumpWiring {
@@ -392,12 +388,9 @@ impl std::fmt::Debug for PumpWiring {
 }
 
 impl PumpWiring {
-    /// Wires restarted pumps to `shared` and to the shutdown watch `cancel_rx`.
-    pub(crate) const fn new(
-        shared: PumpShared,
-        cancel_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> Self {
-        Self { shared, cancel_rx }
+    /// Wires restarted pumps to `shared` and to the shutdown token `cancel`.
+    pub(crate) const fn new(shared: PumpShared, cancel: CancellationToken) -> Self {
+        Self { shared, cancel }
     }
 }
 
@@ -412,7 +405,7 @@ impl bridge::NotificationWiring for PumpWiring {
         tokio::spawn(supervised_pump(
             id,
             receivers,
-            self.cancel_rx.clone(),
+            self.cancel.clone(),
             role_rx,
             self.shared.clone(),
         ))
@@ -530,16 +523,14 @@ mod pump_tests {
         let subs = make_subs();
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        // Keep _cancel_tx alive: dropping it causes cancel_rx.changed() to return Err,
-        // which makes the pump exit before processing any messages.
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
 
         let c = Arc::clone(&cache);
         tokio::spawn(diagnostics_pump(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -590,7 +581,7 @@ mod pump_tests {
         let subs = make_subs();
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
 
         // See `test_admits_uri_under_root_and_alias`
         // for why Windows needs a drive-letter path here.
@@ -612,7 +603,7 @@ mod pump_tests {
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -669,20 +660,20 @@ mod pump_tests {
         );
     }
 
-    /// Pump exits cleanly when the cancel watch sends `true`.
+    /// Pump exits cleanly when the cancel token is cancelled.
     #[tokio::test]
     async fn test_pump_exits_on_cancel() {
         let cache = make_cache();
         let subs = make_subs();
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
 
         let handle = tokio::spawn(diagnostics_pump(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel.clone(),
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -692,7 +683,7 @@ mod pump_tests {
             },
         ));
 
-        cancel_tx.send(true).unwrap();
+        cancel.cancel();
         // Pump must finish within a short time after cancellation.
         tokio::time::timeout(std::time::Duration::from_millis(200), handle)
             .await
@@ -700,20 +691,21 @@ mod pump_tests {
             .unwrap();
     }
 
-    /// Pump exits when the cancel sender is dropped (Err branch).
+    /// Dropping the guard of the shutdown token cancels the pump.
     #[tokio::test]
-    async fn test_pump_exits_when_cancel_sender_dropped() {
+    async fn test_pump_exits_when_cancel_guard_dropped() {
         let cache = make_cache();
         let subs = make_subs();
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        let guard = cancel.clone().drop_guard();
 
         let handle = tokio::spawn(diagnostics_pump(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -723,11 +715,43 @@ mod pump_tests {
             },
         ));
 
-        drop(cancel_tx); // triggers Err in cancel_rx.changed()
+        drop(guard);
         tokio::time::timeout(std::time::Duration::from_millis(200), handle)
             .await
             .expect("pump did not exit within timeout")
             .unwrap();
+    }
+
+    /// Dropping a clone of the token is not a cancellation: the pump keeps running.
+    #[tokio::test]
+    async fn test_pump_survives_dropped_cancel_clone() {
+        let cache = make_cache();
+        let subs = make_subs();
+        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn(diagnostics_pump(
+            ServerId::from_static("rust"),
+            rx,
+            lifecycle_rx,
+            cancel.clone(),
+            tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
+            None,
+            PumpShared {
+                notification_cache: cache,
+                subs,
+                workspace_roots: test_workspace_roots(),
+            },
+        ));
+
+        drop(cancel);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "dropping a token clone must not stop the pump"
+        );
+        handle.abort();
     }
 
     /// Regression test for #104: the pump must cache a notification promptly
@@ -742,7 +766,7 @@ mod pump_tests {
         let subs = make_subs();
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
 
         // Simulate a slow in-flight MCP request (e.g. `pull_diagnostics`)
         // holding the translator lock across an LSP round-trip.
@@ -759,7 +783,7 @@ mod pump_tests {
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -813,14 +837,14 @@ mod pump_tests {
         let subs = make_subs();
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("rust");
 
         tokio::spawn(diagnostics_pump(
             server_id.clone(),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -871,14 +895,14 @@ mod pump_tests {
         let subs = make_subs();
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("gopls");
 
         tokio::spawn(diagnostics_pump(
             server_id.clone(),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -925,7 +949,7 @@ mod pump_tests {
         let subs = make_subs();
         let (tx, rx) = mpsc::channel(2);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("gopls");
 
         // Fill the notification lane to capacity before the pump drains it, forcing a backlog.
@@ -945,7 +969,7 @@ mod pump_tests {
             server_id.clone(),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -1097,14 +1121,14 @@ mod pump_tests {
             )
             .await
             .unwrap();
-        let (_cancel, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
                 notification_cache: cache,
                 subs,
                 workspace_roots: roots,
             },
-            cancel_rx,
+            cancel,
         };
 
         bridge::NotificationWiring::publish_invalidated(&wiring, &cleared).await;
@@ -1218,14 +1242,14 @@ mod pump_tests {
             .subscribe_for_test(&y, Target::Channel(tx_y.clone()))
             .await
             .unwrap();
-        let (_cancel, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
                 notification_cache: make_cache(),
                 subs,
                 workspace_roots: test_workspace_roots(),
             },
-            cancel_rx,
+            cancel,
         };
 
         bridge::NotificationWiring::publish_changed(&wiring, &test_uri("x.rs")).await;
@@ -1238,14 +1262,14 @@ mod pump_tests {
     /// With nobody subscribed a changed pull builds no URI and queues nothing.
     #[tokio::test]
     async fn test_publish_changed_without_subscribers_is_a_no_op() {
-        let (_cancel, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
                 notification_cache: make_cache(),
                 subs: make_subs(),
                 workspace_roots: test_workspace_roots(),
             },
-            cancel_rx,
+            cancel,
         };
 
         bridge::NotificationWiring::publish_changed(&wiring, &test_uri("x.rs")).await;
@@ -1258,14 +1282,14 @@ mod pump_tests {
         use crate::mcp::{SessionHandle, Target};
 
         let subs = make_subs();
-        let (_cancel, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let wiring = PumpWiring {
             shared: PumpShared {
                 notification_cache: make_cache(),
                 subs: subs.clone(),
                 workspace_roots: test_workspace_roots(),
             },
-            cancel_rx,
+            cancel,
         };
         assert!(!bridge::NotificationWiring::has_subscriptions(&wiring).await);
 
@@ -1359,12 +1383,12 @@ mod pump_tests {
         let cache = make_cache();
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         tokio::spawn(diagnostics_pump_with_resolver(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -1409,13 +1433,13 @@ mod pump_tests {
         let cache = make_cache();
         let (tx, rx) = mpsc::channel(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("rust");
         tokio::spawn(diagnostics_pump_with_resolver(
             server_id.clone(),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -1475,12 +1499,12 @@ mod pump_tests {
         });
         let (tx, rx) = mpsc::channel(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         tokio::spawn(diagnostics_pump_with_resolver(
             ServerId::from_static("tsls"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             Some(PathBuf::from("/pin/tsserver.js")),
             PumpShared {
@@ -1567,13 +1591,13 @@ mod pump_tests {
         let cache = make_cache();
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let (role_tx, role_rx) = watch::channel(DiagnosticsRole::Authoritative);
         tokio::spawn(diagnostics_pump_with_resolver(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel,
             role_rx,
             None,
             PumpShared {
@@ -1632,12 +1656,12 @@ mod pump_tests {
         });
         let (tx, rx) = mpsc::channel(8);
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
         let pump = tokio::spawn(diagnostics_pump_with_resolver(
             ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            cancel.clone(),
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             None,
             PumpShared {
@@ -1658,7 +1682,7 @@ mod pump_tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        cancel_tx.send(true).unwrap();
+        cancel.cancel();
 
         tokio::time::timeout(Duration::from_secs(2), pump)
             .await

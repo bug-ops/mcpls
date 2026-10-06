@@ -1814,6 +1814,7 @@ mod refusal_spawn_tests {
 
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::bridge::{NotificationCache, Translator};
@@ -1877,7 +1878,7 @@ mod refusal_spawn_tests {
         admitted: usize,
         refused: usize,
         task: JoinHandle<()>,
-        cancel_tx: tokio::sync::watch::Sender<bool>,
+        cancel: CancellationToken,
     }
 
     fn run_plan(case: &Case) -> Running {
@@ -1897,13 +1898,13 @@ mod refusal_spawn_tests {
         .unwrap();
         let translator = Arc::new(Translator::new().with_router(router));
         translator.record_refusals(&refusals);
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
         let task = spawn_lsp_servers_background(
             admitted,
             translator,
             Arc::new(Mutex::new(NotificationCache::new())),
             SubscriptionRegistry::new(),
-            cancel_rx,
+            cancel.clone(),
             case.roots.clone(),
             ServerStartConcurrency::DEFAULT,
         );
@@ -1911,7 +1912,7 @@ mod refusal_spawn_tests {
             admitted: admitted_count,
             refused: refused_count,
             task,
-            cancel_tx,
+            cancel,
         }
     }
 
@@ -1922,7 +1923,7 @@ mod refusal_spawn_tests {
             let settled = tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.task)
                 .await
                 .is_ok();
-            self.cancel_tx.send_replace(true);
+            self.cancel.cancel();
             if !settled {
                 self.task.await.unwrap();
             }
@@ -1948,7 +1949,7 @@ mod refusal_spawn_tests {
 
         assert_eq!((running.admitted, running.refused), (1, 0));
         assert!(marker_appears(&case.marker).await);
-        running.cancel_tx.send_replace(true);
+        running.cancel.cancel();
         running.task.await.unwrap();
     }
 
@@ -2002,7 +2003,7 @@ mod refusal_spawn_tests {
             marker_appears(&interpreter_marker).await,
             "the control must reach the workspace sh"
         );
-        running.cancel_tx.send_replace(true);
+        running.cancel.cancel();
         running.task.await.unwrap();
     }
 
@@ -2015,7 +2016,7 @@ mod refusal_spawn_tests {
         assert_eq!((running.admitted, running.refused), (1, 0));
         let started = marker_appears(&case.marker).await;
         let interpreter_ran = interpreter_marker.exists();
-        running.cancel_tx.send_replace(true);
+        running.cancel.cancel();
         running.task.await.unwrap();
 
         assert!(started, "the server outside the workspace must start");

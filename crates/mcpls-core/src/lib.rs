@@ -68,6 +68,7 @@ pub use error::Error;
 use mcp::SubscriptionRegistry;
 use runtime::{StartPlan, plan_server_starts, shutdown, spawn_lsp_servers_background};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]
@@ -296,8 +297,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // `SubscriptionRegistry`.
     let subscription_registry = SubscriptionRegistry::new();
 
-    // Cancellation for pump tasks: send `true` to request shutdown.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // Cancels the pump and startup tasks; dropping `serve_with` cancels it too.
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
 
     let lsp_init_handle = if applicable_configs.is_empty() {
         if refusals.is_empty() {
@@ -319,7 +321,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             subscription_registry.clone(),
-            cancel_rx.clone(),
+            cancel.clone(),
             workspace_roots.clone(),
             max_concurrent_server_starts,
         ))
@@ -345,7 +347,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
 
-    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
+    shutdown(&cancel, &translator, lsp_init_handle).await;
 
     info!("MCPLS server shutting down");
     result

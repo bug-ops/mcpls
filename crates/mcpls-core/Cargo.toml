@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true, optional = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["rt"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
@@ -66,7 +66,6 @@ transport-http = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:socket2",
-    "dep:tokio-util",
 ]
 
 [lints]

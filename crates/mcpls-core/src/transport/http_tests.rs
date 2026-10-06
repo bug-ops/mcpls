@@ -2180,7 +2180,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     use std::sync::Arc;
 
     use tokio::io::BufReader;
-    use tokio::sync::{Mutex, watch};
+    use tokio::sync::Mutex;
 
     use crate::bridge::{NotificationCache, ResultContext, Translator};
     use crate::config::{LanguageId, ServerId, ToolRouter};
@@ -2214,14 +2214,13 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     translator.set_workspace_roots(roots.clone());
     let (client, mut fake) = fake_lsp_client();
     translator.register_client(ServerId::from_static("rust"), client);
-    let (_cancel, cancel_rx) = watch::channel(false);
     translator.install_wiring(Arc::new(PumpWiring::new(
         PumpShared {
             notification_cache: Arc::clone(&cache),
             subs: registry.clone(),
             workspace_roots: roots.clone(),
         },
-        cancel_rx,
+        tokio_util::sync::CancellationToken::new(),
     )));
     let translator = Arc::new(translator);
 

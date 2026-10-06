@@ -15,8 +15,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _};
-use tokio::sync::watch;
 use tokio::time::{Duration, sleep, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::error::StderrExcerpt;
@@ -88,7 +88,7 @@ impl Ring {
 #[derive(Debug)]
 pub(super) struct StderrCapture {
     ring: Arc<StdMutex<Ring>>,
-    eof: watch::Receiver<bool>,
+    eof: CancellationToken,
 }
 
 /// Whether [`StderrCapture::finish`] waits for end-of-file before snapshotting.
@@ -104,8 +104,8 @@ impl StderrCapture {
     /// Starts draining `stderr` on a detached task.
     pub(super) fn start<R: AsyncRead + Unpin + Send + 'static>(stderr: R) -> Self {
         let ring = Arc::new(StdMutex::new(Ring::new()));
-        let (eof_tx, eof) = watch::channel(false);
-        tokio::spawn(drain(stderr, Arc::clone(&ring), eof_tx));
+        let eof = CancellationToken::new();
+        tokio::spawn(drain(stderr, Arc::clone(&ring), eof.clone()));
         Self { ring, eof }
     }
 
@@ -119,14 +119,8 @@ impl StderrCapture {
         eof_wait: EofWait,
         redactions: &Redactions,
     ) -> Option<StderrExcerpt> {
-        if eof_wait == EofWait::Grace {
-            let mut eof = self.eof.clone();
-            if timeout(EOF_GRACE, eof.wait_for(|done| *done))
-                .await
-                .is_err()
-            {
-                debug!("stderr still open after the server exited; using a partial snapshot");
-            }
+        if eof_wait == EofWait::Grace && timeout(EOF_GRACE, self.eof.cancelled()).await.is_err() {
+            debug!("stderr still open after the server exited; using a partial snapshot");
         }
         lock_std(&self.ring).excerpt(redactions)
     }
@@ -135,8 +129,9 @@ impl StderrCapture {
 async fn drain<R: AsyncRead + Unpin>(
     mut stderr: R,
     ring: Arc<StdMutex<Ring>>,
-    eof: watch::Sender<bool>,
+    eof: CancellationToken,
 ) {
+    let _signal_eof = eof.drop_guard();
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     let mut consecutive_errors = 0_u32;
     loop {
@@ -158,7 +153,6 @@ async fn drain<R: AsyncRead + Unpin>(
             }
         }
     }
-    eof.send_replace(true);
 }
 
 #[cfg(test)]
@@ -230,13 +224,12 @@ mod tests {
         script: Vec<std::io::Result<Vec<u8>>>,
     ) -> (Arc<StdMutex<Ring>>, usize, bool) {
         let ring = Arc::new(StdMutex::new(Ring::new()));
-        let (eof_tx, eof_rx) = watch::channel(false);
+        let eof = CancellationToken::new();
         let mut reader = ScriptedReader {
             script: script.into(),
         };
-        drain(&mut reader, Arc::clone(&ring), eof_tx).await;
-        let eof = *eof_rx.borrow();
-        (ring, reader.script.len(), eof)
+        drain(&mut reader, Arc::clone(&ring), eof.clone()).await;
+        (ring, reader.script.len(), eof.is_cancelled())
     }
 
     #[tokio::test(start_paused = true)]
