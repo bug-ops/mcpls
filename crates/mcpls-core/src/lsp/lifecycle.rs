@@ -2864,6 +2864,27 @@ sleep 5
         assert_eq!(respawn.pinned_tsserver(), config.pinned_tsserver());
     }
 
+    /// An auto-pinned server is re-planned on the blocking pool and the result
+    /// keeps the entry's identity; a pin that no longer resolves is dropped.
+    #[tokio::test]
+    async fn test_for_respawn_replans_an_auto_pinned_server_off_the_runtime() {
+        let mut server_config = LspServerConfig::typescript();
+        server_config.initialization_options =
+            Some(serde_json::json!({"tsserver": {"path": "/mcpls-test/stale/tsserver.js"}}));
+        let config = ServerInitConfig::new(
+            server_config,
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        )
+        .with_auto_pin(PathBuf::from("/mcpls-test/stale/tsserver.js"), None);
+
+        let respawn = config.for_respawn().await.unwrap();
+
+        assert_eq!(respawn.server_config().id(), config.server_config().id());
+        assert_ne!(respawn.pinned_tsserver(), config.pinned_tsserver());
+    }
+
     /// Regression test for #247: `LspServerConfig::env` entries must reach
     /// the spawned child (previously dead configuration).
     #[test]

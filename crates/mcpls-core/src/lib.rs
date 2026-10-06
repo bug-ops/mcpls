@@ -376,6 +376,16 @@ mod tests {
         assert_eq!(panicked.message(), "planning exploded");
     }
 
+    /// #679: the work runs on a blocking-pool thread, not on the caller's.
+    #[tokio::test]
+    async fn test_on_blocking_pool_runs_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let worker = on_blocking_pool(|| std::thread::current().id())
+            .await
+            .unwrap();
+        assert_ne!(caller, worker);
+    }
+
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
         use super::*;
@@ -444,6 +454,83 @@ mod tests {
                     "serve() must not fail fast now that LSP init is backgrounded; got: {err:?}"
                 ),
             }
+        }
+
+        /// #674: dropping the `serve_with` future cancels startup, so a server
+        /// still initializing is abandoned and its process killed, instead of
+        /// lingering until its init timeout.
+        #[tokio::test]
+        #[cfg(all(unix, feature = "transport-http"))]
+        async fn test_dropping_serve_with_abandons_a_server_still_initializing() {
+            use crate::config::{LspServerConfig, ServerStartConcurrency, WorkspaceConfig};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let pid_file = root.join("pid");
+            let script = format!("echo $$ > {}; exec sleep 600", pid_file.display());
+            let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
+                workspace: WorkspaceConfig {
+                    roots: vec![crate::config::ConfiguredRoot::new(&root).unwrap()],
+                    position_encodings: PositionEncodings::DEFAULT,
+                    language_extensions: vec![],
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: LanguageId::from_static("rust"),
+                    command: ServerCommand::from_static("sh").into(),
+                    args: vec!["-c".to_owned(), script],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
+                    initialization_options: None,
+                    settings: None,
+                    timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                    heuristics: None,
+                    name: None,
+                    handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
+                }],
+                project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
+            };
+            let http = crate::transport::HttpConfig::new("127.0.0.1:0".parse().unwrap());
+            let serving = tokio::spawn(serve_with(config, Transport::Http(http)));
+
+            let pid = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file)
+                        && let Some(pid) = text.trim().parse::<u32>().ok()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the server was never spawned");
+
+            serving.abort();
+            drop(serving.await);
+
+            let alive = |pid: u32| {
+                std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while alive(pid) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the abandoned server process is still running");
         }
 
         #[tokio::test]

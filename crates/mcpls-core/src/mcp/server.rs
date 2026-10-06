@@ -6673,6 +6673,48 @@ sleep 0.3
         assert_eq!(tool_entry(&report, "p_get_hover")["coverage"], "none");
     }
 
+    /// #676: the languages are those a file can be detected as through the
+    /// map built from the config, among them an extensionless name and the
+    /// derived `typescriptreact`.
+    #[tokio::test]
+    async fn test_get_tool_support_lists_languages_through_the_config_built_map() {
+        use crate::config::{ServerConfig, ToolRouter};
+
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [[lsp_servers]]
+            language_id = "typescript"
+            command = "typescript-language-server"
+            file_patterns = ["**/*.ts", "**/*.tsx"]
+
+            [[lsp_servers]]
+            language_id = "make"
+            command = "make-lsp"
+            file_patterns = ["**/Makefile", "**/*.mk"]
+            "#,
+        )
+        .unwrap();
+        let translator = Translator::new()
+            .with_extensions(config.build_effective_language_map())
+            .with_router(ToolRouter::from_configs(config.lsp_servers.iter()).unwrap());
+        let dir = tempfile::TempDir::new().unwrap();
+        let server = McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
+            SubscriptionRegistry::new(),
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+        );
+
+        let report = report_json(&server, None).await;
+
+        assert_eq!(
+            report["languages"],
+            serde_json::json!(["make", "typescript", "typescriptreact"])
+        );
+    }
+
     #[tokio::test]
     async fn test_get_tool_support_with_nothing_configured_reports_no_languages() {
         let server = create_test_server();

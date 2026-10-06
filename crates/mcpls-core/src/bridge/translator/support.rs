@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn languages_list_mapped_languages_with_a_route_including_the_react_base() {
+    fn test_languages_list_mapped_languages_with_a_route_including_the_react_base() {
         let mut language_map = LanguageMap::from(HashMap::from([
             (
                 FileExtension::from_static("ts"),

@@ -194,6 +194,25 @@ mod tests {
         assert!(!ring.elided);
     }
 
+    /// A drain that dies without reaching end-of-file still releases `finish`,
+    /// which would otherwise wait out the whole grace period.
+    #[tokio::test]
+    async fn test_a_dead_drain_releases_the_eof_signal() {
+        let (_kept_open, reader) = tokio::io::duplex(8);
+        let eof = CancellationToken::new();
+        let task = tokio::spawn(drain(
+            reader,
+            Arc::new(StdMutex::new(Ring::new())),
+            eof.clone(),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+
+        timeout(std::time::Duration::from_secs(5), eof.cancelled())
+            .await
+            .expect("a dead drain left the eof signal pending");
+    }
+
     /// Reader replaying scripted results, then reporting end-of-file.
     struct ScriptedReader {
         script: VecDeque<std::io::Result<Vec<u8>>>,
