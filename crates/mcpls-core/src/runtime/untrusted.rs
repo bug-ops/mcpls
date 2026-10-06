@@ -418,7 +418,9 @@ mod plan_tests {
         let (dir, roots) = rust_workspace();
         std::fs::write(dir.path().join("go.mod"), "").unwrap();
         let tools = tempfile::TempDir::new().unwrap();
-        let gopls = tools.path().join("gopls");
+        let gopls = tools
+            .path()
+            .join(if cfg!(windows) { "gopls.exe" } else { "gopls" });
         std::fs::write(&gopls, "").unwrap();
         #[cfg(unix)]
         {
