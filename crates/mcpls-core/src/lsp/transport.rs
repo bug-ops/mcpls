@@ -17,9 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tracing::{Level, debug, trace, warn};
 
 use crate::error::{Error, RedactedText, Result};
-use crate::lsp::types::{
-    InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
-};
+use crate::lsp::types::{InboundMessage, RequestId};
 use crate::redaction::Redactions;
 
 /// Maximum allowed Content-Length (10 MB)
@@ -171,16 +169,20 @@ impl LspTransportReader {
     /// Receive next message from LSP server.
     ///
     /// Reads headers, extracts Content-Length, reads exact message content,
-    /// and parses it as either a response or notification.
+    /// and parses it as a response, request or notification.
+    ///
+    /// A frame whose body cannot be decoded (not JSON, nested past the parser's
+    /// limit, a malformed message) does not fail the stream: it is returned as
+    /// one of the `Undecodable*` messages, which say what was lost so the
+    /// caller can fail one request or drop one notification and read on.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Reading headers fails
     /// - Content-Length header is missing or invalid
-    /// - Reading message content fails
-    /// - JSON parsing fails
-    /// - Message format is invalid
+    /// - Reading message content fails or is not UTF-8
+    /// - The stream ends
     pub async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
             let headers = self.read_headers().await?;
@@ -208,14 +210,15 @@ impl LspTransportReader {
                 trace!("Received LSP message: {}", self.redactions.apply(&content));
             }
 
-            // TODO(#643): a request or notification that cannot be decoded is still fatal.
             let value: Value = match serde_json::from_str(&content) {
                 Ok(value) => value,
                 Err(error) => {
-                    return undecodable_response_id(&content).map_or_else(
-                        || Err(error.into()),
-                        |id| Ok(InboundMessage::UndecodableResponse { id }),
+                    debug!(
+                        "{}",
+                        self.redactions
+                            .protocol_error(format_args!("Invalid JSON: {error}"))
                     );
+                    return Ok(undecodable_message(&content));
                 }
             };
 
@@ -233,7 +236,7 @@ impl LspTransportReader {
                 continue;
             }
 
-            return parse_inbound_message(value, &self.redactions);
+            return Ok(parse_inbound_message(value, &self.redactions));
         }
     }
 
@@ -311,7 +314,7 @@ impl LspTransportReader {
 }
 
 /// Whether a key is present, whatever its value (`null` included), the way
-/// `parse_inbound_message` tests `value.get(key).is_some()`.
+/// [`Keys::of`] tests `value.get(key).is_some()`.
 #[derive(Default)]
 struct Present(bool);
 
@@ -324,16 +327,77 @@ impl<'de> serde::Deserialize<'de> for Present {
     }
 }
 
-/// The `id` of a framed message that `parse_inbound_message` would take for a
-/// response (no `method`, a `result` or an `error`), recovered without
-/// building its body: skipping values with `IgnoredAny` is iterative and
+/// The `id` key of a message: whether it is present at all, and the request id
+/// it holds when that is a number or a string.
+#[derive(Default)]
+struct IdField {
+    present: bool,
+    id: Option<RequestId>,
+}
+
+impl<'de> serde::Deserialize<'de> for IdField {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self {
+            present: true,
+            id: Option::<RequestId>::deserialize(deserializer)?,
+        })
+    }
+}
+
+/// Which of the JSON-RPC keys a message carries; `outcome` is `result` or `error`.
+#[derive(Clone, Copy)]
+struct Keys {
+    method: bool,
+    id: bool,
+    outcome: bool,
+}
+
+/// What a message is, decided from its [`Keys`] alone, so a message that
+/// decodes and one that does not are classified by one rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    Request,
+    Notification,
+    Response,
+    /// An `id` with neither `result` nor `error` and no `method`.
+    IncompleteResponse,
+    Unrecognized,
+}
+
+impl Keys {
+    fn of(value: &Value) -> Self {
+        let has = |key: &str| value.get(key).is_some();
+        Self {
+            method: has("method"),
+            id: has("id"),
+            outcome: has("result") || has("error"),
+        }
+    }
+
+    const fn kind(self) -> MessageKind {
+        match (self.method, self.id, self.outcome) {
+            (true, true, _) => MessageKind::Request,
+            (true, false, _) => MessageKind::Notification,
+            (false, true, true) => MessageKind::Response,
+            (false, true, false) => MessageKind::IncompleteResponse,
+            (false, false, _) => MessageKind::Unrecognized,
+        }
+    }
+}
+
+/// The message to hand on for a frame whose body could not be decoded: what it
+/// was and, for a request or response, whom it addresses, recovered without
+/// building its body. Skipping values with `IgnoredAny` is iterative and
 /// tolerant, so what made the full decode fail (nesting past the parser's
 /// recursion limit, a lone surrogate escape, an out-of-range number) does not
 /// stop it.
-fn undecodable_response_id(content: &str) -> Option<RequestId> {
+fn undecodable_message(content: &str) -> InboundMessage {
     #[derive(serde::Deserialize)]
-    struct ResponseEnvelope {
-        id: Option<RequestId>,
+    struct Envelope {
+        #[serde(default)]
+        id: IdField,
         #[serde(default)]
         method: Present,
         #[serde(default)]
@@ -342,40 +406,77 @@ fn undecodable_response_id(content: &str) -> Option<RequestId> {
         error: Present,
     }
 
-    let envelope: ResponseEnvelope = serde_json::from_str(content).ok()?;
-    let is_response = !envelope.method.0 && (envelope.result.0 || envelope.error.0);
-    is_response.then_some(envelope.id).flatten()
+    // A top-level array would otherwise be read as the struct's fields in order.
+    let envelope = content
+        .trim_start()
+        .starts_with('{')
+        .then(|| serde_json::from_str::<Envelope>(content).ok())
+        .flatten();
+    let Some(envelope) = envelope else {
+        return InboundMessage::UndecodableFrame;
+    };
+    let kind = Keys {
+        method: envelope.method.0,
+        id: envelope.id.present,
+        outcome: envelope.result.0 || envelope.error.0,
+    }
+    .kind();
+    undecodable_of_kind(kind, envelope.id.id)
 }
 
-fn parse_inbound_message(value: Value, redactions: &Redactions) -> Result<InboundMessage> {
-    let invalid = |what: &str, e: serde_json::Error| {
-        redactions.protocol_error(format_args!("Invalid {what}: {e}"))
-    };
-    if value.get("method").is_some() {
-        if value.get("id").is_some() {
-            let request: JsonRpcRequest =
-                serde_json::from_value(value).map_err(|e| invalid("request", e))?;
-            Ok(InboundMessage::Request(request))
-        } else {
-            let notification: JsonRpcNotification =
-                serde_json::from_value(value).map_err(|e| invalid("notification", e))?;
-            Ok(InboundMessage::Notification(notification))
+fn undecodable_of_kind(kind: MessageKind, id: Option<RequestId>) -> InboundMessage {
+    match (kind, id) {
+        (MessageKind::Request, Some(id)) => InboundMessage::UndecodableRequest { id },
+        (MessageKind::Notification, _) => InboundMessage::UndecodableNotification,
+        (MessageKind::Response | MessageKind::IncompleteResponse, Some(id)) => {
+            InboundMessage::UndecodableResponse { id }
         }
-    } else if value.get("id").is_some()
-        && (value.get("result").is_some() || value.get("error").is_some())
-    {
-        let response: JsonRpcResponse =
-            serde_json::from_value(value).map_err(|e| invalid("response", e))?;
-        Ok(InboundMessage::Response(response))
-    } else if value.get("id").is_some() {
-        Err(Error::LspProtocolError(RedactedText::fixed(
-            "Response messages with an id must include either result or error",
-        )))
-    } else {
-        Err(Error::LspProtocolError(RedactedText::fixed(
-            "Message must be a request, response, or notification",
-        )))
+        _ => InboundMessage::UndecodableFrame,
     }
+}
+
+/// The request id `value` carries, when it is a number or a string.
+fn request_id_of(value: &Value) -> Option<RequestId> {
+    value
+        .get("id")
+        .and_then(|id| serde_json::from_value(id.clone()).ok())
+}
+
+/// Decodes `value` as the message its keys say it is. A message that does not
+/// decode becomes the matching `Undecodable*` message; what serde said is
+/// logged redacted, since it can echo server-controlled text.
+fn parse_inbound_message(value: Value, redactions: &Redactions) -> InboundMessage {
+    let kind = Keys::of(&value).kind();
+    let id = request_id_of(&value);
+    let decoded = match kind {
+        MessageKind::Request => decode(value, "request", redactions).map(InboundMessage::Request),
+        MessageKind::Notification => {
+            decode(value, "notification", redactions).map(InboundMessage::Notification)
+        }
+        MessageKind::Response => {
+            decode(value, "response", redactions).map(InboundMessage::Response)
+        }
+        MessageKind::IncompleteResponse | MessageKind::Unrecognized => None,
+    };
+    decoded.unwrap_or_else(|| {
+        debug!("Dropping a message that is not a request, response or notification ({kind:?})");
+        undecodable_of_kind(kind, id)
+    })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(
+    value: Value,
+    what: &str,
+    redactions: &Redactions,
+) -> Option<T> {
+    serde_json::from_value(value)
+        .inspect_err(|error| {
+            debug!(
+                "{}",
+                redactions.protocol_error(format_args!("Invalid {what}: {error}"))
+            );
+        })
+        .ok()
 }
 
 #[cfg(test)]
@@ -632,31 +733,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_undecodable_requests_notifications_and_syntax_errors_stay_fatal() {
+    async fn test_undecodable_request_is_attributed_to_its_id() {
+        let deep = frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":"r1","method":"m","params":{}}}"#,
+            deeply_nested(200)
+        ));
+        let next = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+
+        let received = receive_all(format!("{deep}{next}")).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableRequest { id: RequestId::String(id) }) if id == "r1"
+        );
+        assert_matches!(&received[1], Ok(InboundMessage::Notification(_)));
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_notification_is_dropped_and_the_stream_goes_on() {
+        let deep = frame(&format!(
+            r#"{{"jsonrpc":"2.0","method":"m","params":{}}}"#,
+            deeply_nested(200)
+        ));
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{deep}{next}")).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::UndecodableNotification));
+        assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
+    }
+
+    #[tokio::test]
+    async fn test_frames_that_identify_nothing_are_dropped_not_fatal() {
         let bodies = [
-            format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"m","params":{}}}"#,
-                deeply_nested(200)
-            ),
-            format!(
-                r#"{{"jsonrpc":"2.0","method":"m","params":{}}}"#,
-                deeply_nested(200)
-            ),
-            r#"{"jsonrpc":"2.0","id":1,"result":{"a":}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"a":}"#.to_owned(),
             format!(r#"{{"jsonrpc":"2.0","result":{}}}"#, deeply_nested(200)),
             format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":null,"result":{}}}"#,
+                r#"{{"jsonrpc":"2.0","id":null,"result":{}}}"#,
                 deeply_nested(200)
             ),
             format!(
                 r#"{{"jsonrpc":"2.0","id":1,"extra":{}}}"#,
                 deeply_nested(200)
             ),
+            r#"{"jsonrpc":"2.0","method":7,"id":{"a":1}}"#.to_owned(),
         ];
         for body in bodies {
             let received = receive_all(frame(&body)).await;
-            assert_matches!(&received[0], Err(_), "{body:.80}");
+            assert_matches!(
+                &received[0],
+                Ok(InboundMessage::UndecodableFrame | InboundMessage::UndecodableResponse { .. }),
+                "{body:.80}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn test_malformed_messages_of_each_kind_are_undecodable() {
+        let cases = [
+            (r#"{"jsonrpc":"2.0","id":3,"method":5}"#, "request"),
+            (r#"{"jsonrpc":"2.0","method":5}"#, "notification"),
+            (r#"{"jsonrpc":"2.0","id":3,"error":5}"#, "response"),
+            (r#"{"jsonrpc":"2.0","id":3}"#, "incomplete response"),
+            (r#"{"jsonrpc":"2.0"}"#, "unrecognized"),
+        ];
+        for (body, what) in cases {
+            let received = receive_all(frame(body)).await;
+            let message = received[0].as_ref().unwrap();
+            let expected = match what {
+                "request" => matches!(message, InboundMessage::UndecodableRequest { .. }),
+                "notification" => matches!(message, InboundMessage::UndecodableNotification),
+                "response" | "incomplete response" => {
+                    matches!(message, InboundMessage::UndecodableResponse { id } if *id == RequestId::Number(3))
+                }
+                _ => matches!(message, InboundMessage::UndecodableFrame),
+            };
+            assert!(expected, "{what}: {message:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_top_level_array_is_not_read_as_an_envelope() {
+        let nested_array = format!("[{}]", "[".repeat(200) + &"]".repeat(200));
+
+        let received = receive_all(frame(&nested_array)).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::UndecodableFrame));
+    }
+
+    #[test]
+    fn test_message_kind_is_decided_by_the_keys_alone() {
+        let kind = |value: serde_json::Value| Keys::of(&value).kind();
+
+        assert_eq!(
+            kind(serde_json::json!({"method": "m", "id": 1})),
+            MessageKind::Request
+        );
+        assert_eq!(
+            kind(serde_json::json!({"method": "m"})),
+            MessageKind::Notification
+        );
+        assert_eq!(
+            kind(serde_json::json!({"id": 1, "result": null})),
+            MessageKind::Response
+        );
+        assert_eq!(
+            kind(serde_json::json!({"id": 1, "error": {}})),
+            MessageKind::Response
+        );
+        assert_eq!(
+            kind(serde_json::json!({"id": 1})),
+            MessageKind::IncompleteResponse
+        );
+        assert_eq!(
+            kind(serde_json::json!({"result": 1})),
+            MessageKind::Unrecognized
+        );
+        assert_eq!(
+            kind(serde_json::json!({"method": "m", "id": 1, "result": 1})),
+            MessageKind::Request
+        );
     }
 
     #[test]
@@ -668,7 +864,7 @@ mod tests {
             "params": {"registrations": []}
         });
 
-        let message = parse_inbound_message(value, &Redactions::default()).unwrap();
+        let message = parse_inbound_message(value, &Redactions::default());
         match message {
             InboundMessage::Request(request) => {
                 assert_eq!(request.id, RequestId::String("ts1".to_string()));
@@ -679,35 +875,52 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_error_redacts_secret_echoed_by_serde() {
+    fn test_decode_failure_text_is_redacted_in_the_log() {
+        use tracing_subscriber::prelude::*;
+
+        use crate::test_lsp::CapturedLogs;
+
         let redactions =
             Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]);
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(logs.clone()),
+        );
         let value = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "error": {"code": "SuperSecretValue123", "message": "boom"}
         });
 
-        let error = parse_inbound_message(value, &redactions).unwrap_err();
+        let message = parse_inbound_message(value, &redactions);
 
-        let text = error.to_string();
+        assert_matches!(
+            message,
+            InboundMessage::UndecodableResponse {
+                id: RequestId::Number(1)
+            }
+        );
+        let text = logs.messages().join("\n");
         assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
         assert!(!text.contains("SuperSecretValue123"), "{text}");
     }
 
     #[test]
-    fn test_id_only_message_is_protocol_error() {
+    fn test_id_only_message_is_an_undecodable_response() {
         let value = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1
         });
 
-        let error = parse_inbound_message(value, &Redactions::default()).unwrap_err();
-        assert_matches!(error, Error::LspProtocolError(_));
-        assert!(
-            error
-                .to_string()
-                .contains("must include either result or error")
+        let message = parse_inbound_message(value, &Redactions::default());
+
+        assert_matches!(
+            message,
+            InboundMessage::UndecodableResponse {
+                id: RequestId::Number(1)
+            }
         );
     }
 
