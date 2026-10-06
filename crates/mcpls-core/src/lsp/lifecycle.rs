@@ -345,7 +345,9 @@ impl ServerInitConfig {
     /// # Errors
     ///
     /// [`Error::ServerFailedToStart`] with an untrusted-mode refusal when the
-    /// tsserver now resolves inside the workspace.
+    /// tsserver now resolves inside the workspace, or the server is now
+    /// launched in a way no tsserver can be pinned for (the same two checks
+    /// startup makes).
     pub(crate) fn for_respawn(&self) -> Result<Self> {
         let Some(pin) = self
             .auto_pin
@@ -357,10 +359,15 @@ impl ServerInitConfig {
         let mut unpinned = self.server_config.clone();
         unpinned.initialization_options = None;
         let plan = tsserver_pin::plan_typescript(unpinned, process_env);
-        if let Some(boundary) = &pin.untrusted_boundary
-            && let Some(tsserver) = plan.pin_inside(boundary)
-        {
-            return Err(self.refusal(UntrustedRefusal::WorkspaceTsserver { tsserver }));
+        if let Some(boundary) = &pin.untrusted_boundary {
+            if let Some(tsserver) = plan.pin_inside(boundary) {
+                return Err(self.refusal(UntrustedRefusal::WorkspaceTsserver { tsserver }));
+            }
+            if plan.has_unpinnable_launcher() {
+                return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
+                    command: self.server_config.command.to_string(),
+                }));
+            }
         }
         let (server_config, tsserver) = plan.apply(&self.workspace_roots);
         let auto_pin = tsserver.map(|tsserver| AutoPin {

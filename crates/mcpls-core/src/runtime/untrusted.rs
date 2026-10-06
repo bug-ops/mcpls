@@ -1650,6 +1650,48 @@ mod plan_tests {
             );
         }
 
+        /// Startup refuses a launcher no tsserver can be pinned for; so does a
+        /// respawn whose re-resolution now finds one (the install became a shim).
+        #[test]
+        fn respawn_untrusted_refuses_a_launcher_that_can_no_longer_be_pinned() {
+            let case = planned_typescript(untrusted_allowing_typescript());
+            std::fs::remove_dir_all(case.modules.join("typescript")).unwrap();
+            let launcher = case
+                .fx
+                .outside
+                .join("prefix/bin/typescript-language-server");
+            std::fs::remove_file(&launcher).unwrap();
+            executable(&launcher);
+
+            let refused = case.init.for_respawn().unwrap_err();
+
+            let Error::ServerFailedToStart(failure) = refused else {
+                panic!("expected a refusal, got {refused:?}");
+            };
+            std::assert_matches!(
+                failure.reason,
+                StartupFailure::RefusedUntrustedWorkspace(
+                    UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
+                )
+            );
+        }
+
+        #[test]
+        fn respawn_trusted_keeps_going_when_the_launcher_can_no_longer_be_pinned() {
+            let case = planned_typescript(WorkspaceTrust::Trusted);
+            std::fs::remove_dir_all(case.modules.join("typescript")).unwrap();
+            let launcher = case
+                .fx
+                .outside
+                .join("prefix/bin/typescript-language-server");
+            std::fs::remove_file(&launcher).unwrap();
+            executable(&launcher);
+
+            let respawn = case.init.for_respawn().unwrap();
+
+            assert_eq!(respawn.pinned_tsserver(), None);
+        }
+
         #[test]
         fn respawn_trusted_accepts_a_pin_that_now_lies_inside_the_workspace() {
             let case = planned_typescript(WorkspaceTrust::Trusted);
