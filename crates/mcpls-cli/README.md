@@ -1,14 +1,13 @@
 # mcpls
 
 [![Crates.io](https://img.shields.io/crates/v/mcpls)](https://crates.io/crates/mcpls)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](../../LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/bug-ops/mcpls/blob/main/LICENSE-MIT)
 
 **Give your AI agent a compiler's eye.**
 
-The mcpls CLI exposes language server intelligence through MCP. One binary, any language, zero runtime dependencies.
+The mcpls command-line tool bridges the Model Context Protocol (MCP) and the Language Server Protocol (LSP). It runs the language servers for your project and exposes their type information, references, diagnostics and refactoring to an AI client as 31 MCP tools. One binary, any language, no runtime dependencies.
 
-> [!TIP]
-> Graceful degradation means you don't need every language server installed. If one fails, mcpls continues with available servers.
+Documentation: <https://bug-ops.github.io/mcpls/>
 
 ## Installation
 
@@ -16,67 +15,41 @@ The mcpls CLI exposes language server intelligence through MCP. One binary, any 
 cargo install mcpls
 ```
 
+Prebuilt binaries and installer scripts are described in the [installation chapter](https://bug-ops.github.io/mcpls/getting-started/installation.html). You also need at least one language server, such as rust-analyzer.
+
 ## Usage
 
+Register mcpls with your client, which launches it over stdio. For Claude Code:
+
 ```bash
-mcpls                                      # stdio transport (default)
-mcpls --log-level debug                    # verbose output
-mcpls --config ./mcpls.toml               # custom config
-mcpls --listen 127.0.0.1:3000             # HTTP transport (transport-http feature)
+claude mcp add --scope user mcpls -- mcpls
 ```
 
-## Configuration
+Other invocations:
 
-> [!NOTE]
-> Configuration auto-discovery order: `$MCPLS_CONFIG` → `./mcpls.toml` (requires
-> `--trust-project-config`) → platform config dir
-> Auto-creates default config with 30 language mappings on first run.
-
-> [!WARNING]
-> A `./mcpls.toml` in the current directory is ignored by default, since it can
-> control which command mcpls spawns as an LSP server. Pass `--trust-project-config`
-> (or set `MCPLS_TRUST_PROJECT_CONFIG=true`) only for repositories you trust.
-
-Create or edit `mcpls.toml` in the appropriate location:
-- **Linux:** `~/.config/mcpls/mcpls.toml` (or `$XDG_CONFIG_HOME/mcpls/mcpls.toml`)
-- **macOS:** `~/Library/Application Support/mcpls/mcpls.toml`
-- **Windows:** `%APPDATA%\mcpls\mcpls.toml`
-
-See the main [README](../../README.md) for configuration examples and custom extension mapping.
-
-## Options
-
-| Flag | Env | Description |
-|------|-----|-------------|
-| `-c, --config <PATH>` | `MCPLS_CONFIG` | Configuration file path |
-| `--trust-project-config` | `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory |
-| `--workspace-trust <MODE>` | — | `trusted` (default) or `untrusted`: with `untrusted`, start only the servers named with `--allow-server`; conflicts with `--trust-project-config` |
-| `--allow-server <ID>` | — | Start this server in an untrusted workspace (repeatable; the server's `name`, else its `language_id`); requires `--workspace-trust untrusted` |
-| `-l, --log-level <LEVEL>` | `MCPLS_LOG` | trace, debug, info, warn, error (default: info) |
-| `--log-json` | `MCPLS_LOG_JSON` | JSON-formatted logs for tooling |
-| `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |
-| `--http-path <PATH>` | `MCPLS_HTTP_PATH` | URL prefix for HTTP transport (default: `/mcp`); must start with `/`, not be `/`, and use only letters, digits and `-._~` per segment, otherwise exit code 2 |
-| `--http-stream-liveness <MODE>` | `MCPLS_HTTP_STREAM_LIVENESS` | `probe` (default) or `off`: ping HTTP GET streams and close those whose client stops answering; with `off` an open GET stream no longer keeps a session alive past 5 minutes without requests |
-| `--http-allowed-origin <ORIGIN>` | `MCPLS_HTTP_ALLOWED_ORIGINS` | Extra browser origin (`http(s)://host[:port]`, repeatable or comma-separated) accepted besides loopback origins on the bound port; the `Host` must be allowed too |
-| `--http-allowed-host <HOST>` | `MCPLS_HTTP_ALLOWED_HOSTS` | Extra `Host` header value (`host[:port]`, no wildcards, repeatable or comma-separated) accepted besides `localhost`, `127.0.0.1`, `::1` and the bound IP; without a port any port matches; ports 80, 443 and 0 are rejected (clients omit the default ports) |
-
-> [!NOTE]
-> `MCPLS_TRUST_PROJECT_CONFIG` and `MCPLS_LOG_JSON` accept `1`/`0`, `true`/`false`, `yes`/`no`, `y`/`n`, and `on`/`off` (case-insensitive).
-
-## Claude Code Integration
-
-Add to your Claude Code configuration (`~/.claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "mcpls": { "command": "mcpls", "args": [] }
-  }
-}
+```bash
+mcpls --config ./mcpls.toml     # use a specific configuration file
+mcpls --log-level debug         # verbose logs on standard error
+mcpls --help                    # every option
 ```
 
-See the main [README](../../README.md) for full documentation.
+Rust projects work with no configuration. For other languages, see [Minimal Configuration](https://bug-ops.github.io/mcpls/getting-started/minimal-config.html).
+
+## Features
+
+- 31 tools: hover, definition, references, diagnostics, rename, code actions, call and type hierarchies, and more
+- Several language servers at once, with graceful degradation
+- stdio transport by default; optional HTTP transport behind the `transport-http` feature
+- Untrusted-workspace mode (`--workspace-trust untrusted`) for code you do not trust
+
+## Learn more
+
+- [Command line and environment reference](https://bug-ops.github.io/mcpls/reference/cli.html)
+- [Configuration reference](https://bug-ops.github.io/mcpls/reference/config.html)
+- [Tools overview](https://bug-ops.github.io/mcpls/tools/overview.html)
+- [Security and trust](https://bug-ops.github.io/mcpls/advanced/security.html)
+- [Troubleshooting](https://bug-ops.github.io/mcpls/guide/troubleshooting.html)
 
 ## License
 
-Dual-licensed under [Apache 2.0](../../LICENSE-APACHE) or [MIT](../../LICENSE-MIT).
+Dual-licensed under [Apache 2.0](https://github.com/bug-ops/mcpls/blob/main/LICENSE-APACHE) or [MIT](https://github.com/bug-ops/mcpls/blob/main/LICENSE-MIT).

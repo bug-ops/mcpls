@@ -2,7 +2,7 @@
 //!
 //! Drives a real `mcpls` process over MCP stdio against a pinned repository and
 //! a real language server, and records per-call latency with correctness
-//! checks. See `docs/benchmarks.md` for methodology.
+//! checks. See `book/src/reference/benchmarks.md` for methodology.
 
 pub mod lock;
 pub mod pin;

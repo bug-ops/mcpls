@@ -1,0 +1,25 @@
+[book]
+title = "mcpls"
+authors = ["Andrei G."]
+description = "User guide for mcpls, the bridge that exposes language servers (LSP) to AI agents over MCP."
+language = "en"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/bug-ops/mcpls"
+edit-url-template = "https://github.com/bug-ops/mcpls/edit/main/book/{path}"
+site-url = "/mcpls/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.search]
+enable = true
+limit-results = 20
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

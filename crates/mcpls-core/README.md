@@ -2,26 +2,13 @@
 
 [![Crates.io](https://img.shields.io/crates/v/mcpls-core)](https://crates.io/crates/mcpls-core)
 [![docs.rs](https://img.shields.io/docsrs/mcpls-core)](https://docs.rs/mcpls-core)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](../../LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](https://github.com/bug-ops/mcpls/blob/main/LICENSE-MIT)
 
-**The translation layer that makes AI understand code semantically.**
+**The translation layer that lets AI agents understand code semantically.**
 
-mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into language server requests and translating rich semantic responses back. It's the engine behind [mcpls](https://crates.io/crates/mcpls).
+mcpls-core is the library behind [mcpls](https://crates.io/crates/mcpls). It turns MCP tool calls into language server requests, manages the language server processes, and translates the answers back. Use it to embed the bridge in your own application; to just use mcpls, install the [`mcpls`](https://crates.io/crates/mcpls) binary.
 
-## What it does
-
-- **Protocol translation** — Converts MCP tool calls to LSP requests and back
-- **Position encoding** — Handles MCP's 1-based positions ↔ LSP's 0-based coordinates
-- **LSP lifecycle** — Manages language server processes (spawn, initialize, shutdown)
-- **Non-blocking startup** — MCP server accepts connections immediately; LSP initialization runs in the background
-- **Document tracking** — Lazy-loads files, maintains synchronization state
-- **Diagnostics cache** — Caches push-based `publishDiagnostics` notifications for fast polling via MCP
-- **Configuration** — Parses TOML configs, discovers LSP servers, manages language extension mappings
-- **Custom extension mapping** — Configurable file extension-to-language ID mappings with sensible defaults
-- **Graceful degradation** — Continues with available servers, even if some fail to initialize
-
-> [!NOTE]
-> This is the library crate. For the CLI, see [`mcpls`](https://crates.io/crates/mcpls).
+User documentation: <https://bug-ops.github.io/mcpls/>. API documentation: <https://docs.rs/mcpls-core>.
 
 ## Installation
 
@@ -30,50 +17,44 @@ mcpls-core bridges MCP and LSP protocols, transforming AI tool calls into langua
 mcpls-core = "0.6"
 ```
 
-## Architecture
+Enable the `transport-http` feature to serve over Streamable HTTP:
 
-```mermaid
-flowchart LR
-    subgraph mcpls-core
-        M["mcp/"] -->|"tool calls"| B["bridge/"]
-        B -->|"LSP requests"| L["lsp/"]
-        C["config/"] -.->|"settings"| L
-    end
+```toml
+[dependencies]
+mcpls-core = { version = "0.6", features = ["transport-http"] }
 ```
-
-| Module | Responsibility |
-|--------|----------------|
-| `mcp/` | MCP server implementation with rmcp, 31 tool handlers |
-| `bridge/` | Position encoding, document state, notification cache, request translation |
-| `lsp/` | JSON-RPC 2.0 client, process management, notification handling, protocol types |
-| `config/` | TOML parsing, server discovery, workspace configuration |
-| `runtime/` | Internal: diagnostics pump, background server startup, shutdown sequence |
-| `transport/` | Stdio and HTTP runners; HTTP config, `Host`/`Origin` allowlists, session management |
 
 ## Usage
 
-```rust
+```rust,ignore
 use mcpls_core::{ServerConfig, Transport};
 
 #[tokio::main]
 async fn main() {
     let config = ServerConfig::load().expect("failed to load config");
     let result = mcpls_core::serve_with(config, Transport::Stdio).await;
-    // `Transport::Stdio` is backed by `tokio::io::stdin()`, which parks an
-    // uncancellable blocking-pool thread; returning normally from `main`
-    // here can hang on SIGTERM/SIGINT while a client's stdin is still open.
-    // See `serve_with`'s "Shutdown" docs.
+    // Exit explicitly: the stdio reader parks an uncancellable thread, so
+    // returning from `main` can hang on SIGTERM. See `serve_with`'s docs.
     std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 ```
 
-## Design principles
+## Features
 
-- **Zero unsafe** — Memory safety enforced at compile time
-- **Async-native** — Built on Tokio for concurrent LSP management
-- **Error context** — Rich error types with `thiserror`, never panics
-- **Resource limits** — Bounded document tracking, configurable timeouts
+- Protocol translation between MCP tools and LSP requests, with 1-based to 0-based position and encoding conversion
+- Language server lifecycle management: spawn, initialize, restart, shutdown
+- Non-blocking startup: the MCP server accepts connections while language servers initialize
+- Lazy document tracking and a diagnostics cache for push-based notifications
+- TOML configuration, server discovery by project markers, and trust controls
+- stdio and optional HTTP transports
+
+## Learn more
+
+- [Architecture](https://bug-ops.github.io/mcpls/advanced/architecture.html)
+- [Configuration reference](https://bug-ops.github.io/mcpls/reference/config.html)
+- [Transports](https://bug-ops.github.io/mcpls/advanced/transports.html)
+- [Security and trust](https://bug-ops.github.io/mcpls/advanced/security.html)
 
 ## License
 
-Dual-licensed under [Apache 2.0](../../LICENSE-APACHE) or [MIT](../../LICENSE-MIT).
+Dual-licensed under [Apache 2.0](https://github.com/bug-ops/mcpls/blob/main/LICENSE-APACHE) or [MIT](https://github.com/bug-ops/mcpls/blob/main/LICENSE-MIT).

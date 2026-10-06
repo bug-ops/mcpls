@@ -1847,10 +1847,9 @@ file_patterns = ["**/*.ts", "**/*.tsx"]"#;
         let mut checked = 0;
         for file in [
             "README.md",
-            "docs/user-guide/getting-started.md",
-            "docs/user-guide/installation.md",
-            "docs/user-guide/troubleshooting.md",
-            "docs/user-guide/configuration.md",
+            "book/src/getting-started/installation.md",
+            "book/src/guide/language-servers.md",
+            "book/src/advanced/typescript.md",
         ] {
             for line in repo_file(file).lines() {
                 if !(line.contains("npm install -g") && line.contains("typescript")) {
@@ -1871,8 +1870,8 @@ file_patterns = ["**/*.ts", "**/*.tsx"]"#;
     }
 
     #[test]
-    fn test_documented_native_entry_is_in_the_user_guide() {
-        assert!(repo_file("docs/user-guide/configuration.md").contains(NATIVE_ENTRY));
+    fn test_documented_native_entry_is_in_the_book() {
+        assert!(repo_file("book/src/advanced/typescript.md").contains(NATIVE_ENTRY));
     }
 
     #[test]
