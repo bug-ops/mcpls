@@ -30,6 +30,9 @@ pub struct InvalidLanguageId;
 pub struct LanguageId(Cow<'static, str>);
 
 impl LanguageId {
+    /// Language reported for a file whose extension has no mapping.
+    pub const PLAINTEXT: Self = Self::from_static("plaintext");
+
     /// Builds an id from a literal, checked at compile time when evaluated in a
     /// `const` context.
     ///

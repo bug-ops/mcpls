@@ -1798,7 +1798,7 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 /// Detect the language ID from a file path.
 ///
 /// Consults the extension map to determine the language ID for a file.
-/// If the extension is not found in the map, returns [`PLAINTEXT_LANGUAGE`].
+/// If the extension is not found in the map, returns [`LanguageId::PLAINTEXT`].
 #[must_use]
 pub fn detect_language(
     path: &Path,
@@ -1809,11 +1809,8 @@ pub fn detect_language(
     extension_map
         .get(extension)
         .cloned()
-        .unwrap_or(PLAINTEXT_LANGUAGE)
+        .unwrap_or(LanguageId::PLAINTEXT)
 }
-
-/// Language id reported for a file whose extension is not in the extension map.
-pub const PLAINTEXT_LANGUAGE: LanguageId = LanguageId::from_static("plaintext");
 
 #[cfg(test)]
 mod tests {

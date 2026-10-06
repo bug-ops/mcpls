@@ -2524,6 +2524,8 @@ mod tests {
             ".eslintrc",
             "**/*.",
             "src/main.rs",
+            "Cargo.toml",
+            "**/*.tar.gz",
         ] {
             let toml = format!(
                 "[[lsp_servers]]\nlanguage_id = \"cpp\"\ncommand = \"clangd\"\n\

@@ -23,6 +23,31 @@ pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 use crate::util::{escape_control, truncate_str};
 
+/// Explains a `plaintext` routing failure: which extension had no mapping and
+/// which `file_patterns` were configured. Empty for any other language.
+fn no_server_detail(
+    language: &LanguageId,
+    extension: Option<&FileExtension>,
+    patterns: &[FilePattern],
+) -> String {
+    if *language != LanguageId::PLAINTEXT {
+        return String::new();
+    }
+    let subject = extension.map_or_else(
+        || "the file has no usable extension".to_owned(),
+        |ext| format!("file extension '{ext}' is not mapped to any language"),
+    );
+    let configured = if patterns.is_empty() {
+        "no file_patterns are configured".to_owned()
+    } else {
+        let list: Vec<&str> = patterns.iter().map(FilePattern::as_str).collect();
+        format!("configured file_patterns: {}", list.join(", "))
+    };
+    format!(
+        " ({subject}; {configured}; map it with a `*.EXT` file_patterns entry or workspace.language_extensions)"
+    )
+}
+
 /// Host platform, as far as [`NotFoundGuidance`] cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Platform {
@@ -1153,7 +1178,10 @@ pub enum Error {
     DocumentNotFound(PathBuf),
 
     /// No LSP server configured for the given language.
-    #[error("no LSP server configured for language: {language}")]
+    #[error(
+        "no LSP server configured for language: {language}{}",
+        no_server_detail(.language, .extension.as_ref(), .patterns)
+    )]
     NoServerForLanguage {
         /// The language detected for the file.
         language: LanguageId,
@@ -2672,6 +2700,59 @@ mod tests {
             extension: None,
             patterns: vec![],
         }
+    }
+
+    #[test]
+    fn test_no_server_for_plaintext_names_extension_and_patterns() {
+        let err = Error::NoServerForLanguage {
+            language: LanguageId::PLAINTEXT,
+            extension: Some(FileExtension::from_static("cpp")),
+            patterns: vec![
+                FilePattern::from_static("**/*.rs"),
+                FilePattern::from_static("**/*.h"),
+            ],
+        };
+        let message = err.to_string();
+        assert!(message.starts_with("no LSP server configured for language: plaintext ("));
+        assert!(
+            message.contains("file extension 'cpp' is not mapped"),
+            "{message}"
+        );
+        assert!(
+            message.contains("configured file_patterns: **/*.rs, **/*.h"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_no_server_for_plaintext_without_patterns_or_extension() {
+        let err = Error::NoServerForLanguage {
+            language: LanguageId::PLAINTEXT,
+            extension: None,
+            patterns: vec![],
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("the file has no usable extension"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no file_patterns are configured"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_no_server_for_other_language_text_is_unchanged() {
+        let err = Error::NoServerForLanguage {
+            language: LanguageId::from_static("nushell"),
+            extension: Some(FileExtension::from_static("nu")),
+            patterns: vec![FilePattern::from_static("**/*.rs")],
+        };
+        assert_eq!(
+            err.to_string(),
+            "no LSP server configured for language: nushell"
+        );
     }
 
     #[test]
