@@ -12,8 +12,9 @@ Your editor does not guess. It talks to a **language server** (rust-analyzer, py
 
 mcpls is a bridge. It speaks the Model Context Protocol (MCP) to your AI client and the Language Server Protocol (LSP) to the language servers:
 
-```text
-AI client  <--MCP-->  mcpls  <--LSP-->  rust-analyzer / pyright / gopls / ...
+```mermaid
+flowchart LR
+    C["AI client"] <-->|MCP| M["mcpls"] <-->|LSP| S["rust-analyzer / pyright / gopls / ..."]
 ```
 
 It starts the language servers it needs for your project, translates every question into LSP, and returns the answer in a form the assistant can use. It exposes 31 tools, from `get_hover` and `get_references` to `rename_symbol` and `get_diagnostics`.

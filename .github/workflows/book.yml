@@ -21,6 +21,7 @@ concurrency:
 
 env:
   MDBOOK_VERSION: 0.5.2
+  MDBOOK_MERMAID_VERSION: 0.17.1
   LYCHEE_VERSION: 0.24.2
   LYCHEE_SHA256: 1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
 
@@ -33,10 +34,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install mdBook
+      - name: Install mdBook and mdbook-mermaid
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
-          tool: mdbook@${{ env.MDBOOK_VERSION }}
+          tool: mdbook@${{ env.MDBOOK_VERSION }},mdbook-mermaid@${{ env.MDBOOK_MERMAID_VERSION }}
 
       - name: Cache lychee
         id: lychee-cache

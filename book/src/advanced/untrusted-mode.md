@@ -36,6 +36,17 @@ Neither flag has an environment variable or a configuration key, so a file plant
 
 ## What it enforces
 
+```mermaid
+flowchart TD
+    A["Server about to start"] --> B{"Named with --allow-server?"}
+    B -- no --> X["Refused"]
+    B -- yes --> C{"Config file outside workspace?"}
+    C -- no --> X
+    C -- yes --> D{"Executable resolved outside workspace and not a workspace-choosing launcher?"}
+    D -- no --> X
+    D -- yes --> E["Spawn with cleared environment, sanitized PATH, safe working directory"]
+```
+
 Every applicable server that is not allowed is refused before it can spawn, restart or respawn. A tool call routed to it returns an error naming the server and the flag that would start it.
 
 For the servers you allow, mcpls also checks:

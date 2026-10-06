@@ -11,8 +11,9 @@
 
 mcpls is a bridge between the Model Context Protocol (MCP) and the Language Server Protocol (LSP). It runs the language servers for your project (rust-analyzer, pyright, gopls, and others) and exposes their type information, references, diagnostics and refactoring as 31 MCP tools, so an AI client reasons about code the way an IDE does.
 
-```text
-AI client  <--MCP-->  mcpls  <--LSP-->  rust-analyzer / pyright / gopls / ...
+```mermaid
+flowchart LR
+    C["AI client"] <-->|MCP| M["mcpls"] <-->|LSP| S["rust-analyzer / pyright / gopls / ..."]
 ```
 
 ## Documentation

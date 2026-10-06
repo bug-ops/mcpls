@@ -17,6 +17,16 @@ MCP is request and response: an assistant asks for diagnostics when it needs the
 
 ## The cache
 
+```mermaid
+flowchart LR
+    S["Language server"] -->|"publishDiagnostics (push)"| K[("Diagnostics cache")]
+    S <-->|"textDocument/diagnostic (pull)"| G["get_diagnostics"]
+    G -->|"store full report"| K
+    K --> CD["get_cached_diagnostics"]
+    K --> R["lsp-diagnostics:// resource"]
+    K -.->|"resources/updated"| Sub["Subscribed clients"]
+```
+
 - Every push is stored per file, keyed by the file's canonical path. A server may publish one file under several spellings (a symlink and its target); mcpls returns the union with exact duplicates removed.
 - A full pull report from `get_diagnostics` is stored next to the pushed entries in a separate slot. Partial and `unchanged` reports, failed pulls, and reports that raced a later pull or an edit are returned to the caller but not stored.
 - The cache holds at most 1000 file entries. When a write evicts another file, that file becomes `evicted`, which is reported honestly instead of as clean.

@@ -8,6 +8,20 @@ In this chapter you follow a language server from selection to shutdown: how mcp
 
 ## 1. Selection
 
+```mermaid
+stateDiagram-v2
+    [*] --> Selected: heuristics match
+    Selected --> Starting: background start
+    Starting --> Ready: initialize and initialized
+    Starting --> Failed: spawn or handshake error
+    Ready --> Respawning: process died
+    Ready --> Restarting: restart_server
+    Respawning --> Ready: backoff 1 s to 30 s
+    Restarting --> Ready
+    Ready --> ShuttingDown: signal or client closed
+    ShuttingDown --> [*]: shutdown, exit, kill group
+```
+
 At startup mcpls takes the configured `[[lsp_servers]]` entries and keeps those that apply to the workspace: an entry applies when it has no `heuristics`, or when any of its `project_markers` exists in the workspace tree. The search is recursive up to `workspace.heuristics_max_depth` levels (default 10, at most 64) and skips well-known directories such as `node_modules`, `target` and `.git`.
 
 The remaining entries are checked for routing conflicts, and the config is refused if two applicable servers claim the same language identity or tool ([`handles`](../reference/config.md#handles)).

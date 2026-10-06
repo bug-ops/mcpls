@@ -8,18 +8,16 @@ In this chapter you learn how mcpls is built and how one tool call travels from 
 
 ## The big picture
 
-```text
-AI client
-   |  MCP (JSON-RPC 2.0) over stdio or HTTP
-   v
-+--------------------------------------------------+
-| mcpls                                            |
-|   MCP server  ->  translation layer  ->  LSP     |
-|   (31 tools)      (bridge)               clients |
-+--------------------------------------------------+
-   |  LSP (JSON-RPC 2.0) over each server's stdin/stdout
-   v
-rust-analyzer    pyright    typescript-language-server    ...
+```mermaid
+flowchart TB
+    Client["AI client"]
+    subgraph mcpls["mcpls (single binary)"]
+        direction LR
+        MCP["MCP server<br/>31 tools"] --> Bridge["Translation layer<br/>(bridge)"] --> LSPc["LSP clients"]
+    end
+    Servers["rust-analyzer, pyright,<br/>typescript-language-server, ..."]
+    Client <-->|"MCP over stdio or HTTP"| MCP
+    LSPc <-->|"LSP over each server's stdin/stdout"| Servers
 ```
 
 mcpls is a single Rust binary with no runtime dependencies. It is asynchronous (Tokio), runs several language servers concurrently, and forbids `unsafe` code across the workspace.
@@ -45,6 +43,23 @@ Inside `mcpls-core`:
 | `bridge` | The translation layer: positions, document state, diagnostics cache, routing |
 
 ## Life of a tool call
+
+```mermaid
+sequenceDiagram
+    participant C as AI client
+    participant M as MCP layer
+    participant B as Bridge
+    participant L as Language server
+    C->>M: tools/call get_hover
+    M->>M: validate arguments and path
+    M->>B: route by file extension
+    B->>L: didOpen (first use)
+    B->>B: wait for indexing, resolve name, convert position
+    B->>L: textDocument/hover
+    L-->>B: response
+    B-->>M: translate positions, flag, cap
+    M-->>C: tool result
+```
 
 Follow `get_hover` with a symbol name:
 
