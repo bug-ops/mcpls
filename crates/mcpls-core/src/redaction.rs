@@ -804,7 +804,10 @@ mod tests {
 
         let sanitized = set.sanitize_error(leaking);
 
-        assert!(!sanitized.to_string().contains("ghp_abcdefgh"), "{sanitized}");
+        assert!(
+            !sanitized.to_string().contains("ghp_abcdefgh"),
+            "{sanitized}"
+        );
         assert!(sanitized.to_string().contains("[redacted:API_TOKEN]"));
         assert_matches!(
             set.sanitize_error(Error::ServerTerminated),
