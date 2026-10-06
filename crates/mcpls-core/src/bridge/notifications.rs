@@ -130,6 +130,15 @@ struct PullTicket(u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ClearEpoch(u64);
 
+/// What the cache remembers of the pull behind a file's pulled slot.
+#[derive(Debug, Clone, Copy)]
+struct PullRecord {
+    ticket: PullTicket,
+    /// The tracked opening of the document when the report was stored, or
+    /// `None` without a tracker or an open document.
+    opening: Option<u64>,
+}
+
 /// A pull request's claim on the cache, issued by [`NotificationCache::begin_pull`]
 /// before the request is sent and redeemed by
 /// [`NotificationCache::store_pulled_diagnostics`].
@@ -263,13 +272,15 @@ pub enum DocumentSync {
 
 /// Whether a push supersedes the pulled slot of its file.
 ///
-/// A push carrying a newer document version than the pull answered does. A
-/// push with an equal or lower version does when the document is no longer at
-/// the pulled version (reopening a document restarts its version, and a closed
-/// document's pull is older than the file). A push without a version cannot be
-/// compared, so it supersedes the pull only when the document has moved on or
-/// is gone; while the document still is at the pulled version, a versionless
-/// flycheck push must not erase the pulled native diagnostics (bridge/004).
+/// A push carrying a newer document version than the pull answered does. Any
+/// push does when the tracked document is no longer at the pulled version
+/// (it moved on, or a closed or evicted document restarted its version) or is
+/// not open. While the document still is at the pulled version the pull
+/// stays, whether the push carries an equal, a lower or no version: servers
+/// that push and pull one version keep both slots, and a versionless flycheck
+/// push must not erase the pulled native diagnostics (bridge/004). A document
+/// closed and reopened since the pull is handled by [`NotificationCache`]
+/// itself, since its version can coincide with the pulled one again.
 ///
 /// Without a tracker ([`DocumentSync::Unattached`]) only a newer version counts.
 const fn pull_is_superseded(pulled: i32, pushed: Option<i32>, sync: DocumentSync) -> bool {
@@ -277,8 +288,7 @@ const fn pull_is_superseded(pulled: i32, pushed: Option<i32>, sync: DocumentSync
         (Some(pushed), _) if pushed > pulled => true,
         (_, DocumentSync::Unattached) => false,
         (_, DocumentSync::NotOpen) => true,
-        (Some(_), DocumentSync::Synced(current)) => current < pulled,
-        (None, DocumentSync::Synced(current)) => current != pulled,
+        (_, DocumentSync::Synced(current)) => current != pulled,
     }
 }
 
@@ -790,7 +800,7 @@ pub struct NotificationCache {
     /// Ticket of the pull behind each file's pulled slot. Written with the
     /// slot by `store_pulled_diagnostics` and dropped with it by `take_entry`,
     /// so a ticket exists exactly while a `Pulled` slot does.
-    pull_tickets: HashMap<DiagnosticsKey, PullTicket>,
+    pull_tickets: HashMap<DiagnosticsKey, PullRecord>,
     /// Per-server count of [`Self::clear_server_diagnostics`] calls; absent
     /// means epoch zero.
     clear_epochs: HashMap<ServerId, ClearEpoch>,
@@ -1277,7 +1287,12 @@ impl NotificationCache {
             return;
         };
         let sync = self.document_sync(&owner, canonical);
-        if pull_is_superseded(pulled, pushed_version, sync) {
+        let reopened = self.documents.is_some()
+            && self
+                .pull_tickets
+                .get(file)
+                .is_some_and(|record| record.opening != self.document_opening(canonical));
+        if reopened || pull_is_superseded(pulled, pushed_version, sync) {
             debug!(
                 "dropping the pulled diagnostics of {}: superseded by a push \
                  (pulled v{pulled}, pushed {pushed_version:?}, {sync:?})",
@@ -1303,6 +1318,13 @@ impl NotificationCache {
         uri_to_path(canonical)
             .and_then(|path| documents.synced_version(&path, owner))
             .map_or(DocumentSync::NotOpen, DocumentSync::Synced)
+    }
+
+    /// Which opening of the document `canonical` names the attached tracker
+    /// holds, `None` when none is attached or it is not open.
+    fn document_opening(&self, canonical: &Uri) -> Option<u64> {
+        let path = uri_to_path(canonical)?;
+        self.documents.as_ref()?.opening(&path)
     }
 
     /// Issues the claim a pull of `server`'s diagnostics for a document at
@@ -1361,7 +1383,7 @@ impl NotificationCache {
         if self
             .pull_tickets
             .get(&file_key)
-            .is_some_and(|stored| *stored >= stamp.ticket)
+            .is_some_and(|stored| stored.ticket >= stamp.ticket)
         {
             return discard(Discard::OlderTicket, items);
         }
@@ -1395,7 +1417,14 @@ impl NotificationCache {
         }
 
         let seq = self.next_seq();
-        self.pull_tickets.insert(file_key, stamp.ticket);
+        let opening = self.document_opening(file);
+        self.pull_tickets.insert(
+            file_key,
+            PullRecord {
+                ticket: stamp.ticket,
+                opening,
+            },
+        );
         self.insert_entry(
             slot_key,
             CachedEntry {

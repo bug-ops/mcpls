@@ -863,6 +863,8 @@ fn test_pull_supersession_rule() {
     let cases = [
         (4, Some(5), Synced(4), true),
         (4, Some(5), Unattached, true),
+        (4, Some(4), Synced(5), true),
+        (4, Some(2), Synced(5), true),
         (4, Some(4), Synced(4), false),
         (4, Some(2), Synced(4), false),
         (4, Some(2), Synced(1), true),
@@ -989,6 +991,36 @@ fn test_lower_versioned_push_drops_the_pull_of_a_reopened_document() {
     file.push(&mut cache, Some(1));
 
     assert_eq!(file.shown(&cache), ["pushed"]);
+}
+
+/// Pull v4, the document moves to v5, then a push still stamped v4 arrives.
+#[test]
+fn test_push_at_the_pulled_version_drops_the_pull_once_the_document_moved_on() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    file.set_version(5);
+
+    file.push(&mut cache, Some(4));
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+    cache.assert_consistent();
+}
+
+/// Pull, close (or LRU eviction), reopen at the very same version number:
+/// the pull answered an earlier opening, so it must not survive a push.
+#[test]
+fn test_push_drops_the_pull_of_a_document_closed_and_reopened_at_the_same_version() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    drop(file.tracker.close(&file.path));
+    file.open_at(4);
+
+    file.push(&mut cache, Some(4));
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+    cache.assert_consistent();
 }
 
 #[test]

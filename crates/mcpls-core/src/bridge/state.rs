@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
@@ -277,6 +278,9 @@ pub(super) struct DocumentState {
     text: DocumentText,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
+    /// Which opening of the path this state belongs to; a reopened path gets a
+    /// new one, so a cached result of an earlier opening is recognizably stale.
+    opened: u64,
     /// When this document was last accessed via `ensure_open`
     /// (`Self::touch`), used to pick the least-recently-used entry when
     /// `DocumentTracker::open` must evict to stay under
@@ -297,6 +301,7 @@ impl PartialEq for DocumentState {
             text,
             disk,
             synced,
+            opened: _,
             last_accessed: _,
         } = self;
         *uri == other.uri
@@ -313,7 +318,7 @@ impl Eq for DocumentState {}
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
     /// provenance and no server yet recorded as synced.
-    fn new(uri: Uri, language_id: LanguageId, text: DocumentText) -> Self {
+    fn new(uri: Uri, language_id: LanguageId, text: DocumentText, opened: u64) -> Self {
         Self {
             uri,
             language_id,
@@ -321,6 +326,7 @@ impl DocumentState {
             text,
             disk: None,
             synced: HashMap::new(),
+            opened,
             last_accessed: Instant::now(),
         }
     }
@@ -555,6 +561,8 @@ pub struct DocumentTracker {
     /// Under a path's lock, the servers pending for that path and the
     /// servers synced to it never overlap.
     pending_closes: StdMutex<HashMap<PathBuf, PendingClose>>,
+    /// Source of [`DocumentState::opened`].
+    next_opening: AtomicU64,
 }
 
 impl DocumentTracker {
@@ -569,6 +577,7 @@ impl DocumentTracker {
             limits,
             extension_map,
             pending_closes: StdMutex::new(HashMap::new()),
+            next_opening: AtomicU64::new(0),
         }
     }
 
@@ -606,6 +615,14 @@ impl DocumentTracker {
     #[must_use]
     pub(crate) fn synced_version(&self, path: &Path, server: &ServerId) -> Option<i32> {
         lock_std(&self.documents).get(path)?.synced_version(server)
+    }
+
+    /// Which opening of `path` is tracked; `None` when it is not tracked.
+    #[must_use]
+    pub(crate) fn opening(&self, path: &Path) -> Option<u64> {
+        lock_std(&self.documents)
+            .get(path)
+            .map(|state| state.opened)
     }
 
     /// Overwrites `server`'s synced version of `path`, to simulate a resync
@@ -740,7 +757,8 @@ impl DocumentTracker {
         let uri = path_to_uri(&path)?;
         let language_id = detect_language(&path, &self.extension_map);
 
-        let state = DocumentState::new(uri.clone(), language_id, text);
+        let opened = self.next_opening.fetch_add(1, Ordering::Relaxed);
+        let state = DocumentState::new(uri.clone(), language_id, text, opened);
 
         // Check document limit and insert under a single lock acquisition so
         // two concurrent `open` calls for different new paths can't both
@@ -2338,6 +2356,7 @@ mod tests {
             text: DocumentText::new("fn main() {}".to_string()),
             disk: None,
             synced: HashMap::new(),
+            opened: 0,
             last_accessed: Instant::now(),
         };
 
