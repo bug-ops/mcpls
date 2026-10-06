@@ -1084,11 +1084,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         let mut env = ServerEnv::default();
-        env.insert(
-            "RUST_LOG".to_string(),
-            "debug".to_string(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        env.insert("RUST_LOG".to_string(), "debug".to_string());
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
@@ -1109,10 +1105,7 @@ mod tests {
         assert_eq!(config.language_id, "custom");
         assert_eq!(config.command, "custom-lsp");
         assert_eq!(config.args, vec!["--flag"]);
-        assert_eq!(
-            config.env.get("RUST_LOG", crate::lsp::HostOs::CURRENT),
-            Some("debug")
-        );
+        assert_eq!(config.env.get("RUST_LOG"), Some("debug"));
         assert_eq!(config.file_patterns, ["**/*.custom"]);
         assert!(config.initialization_options.is_some());
         assert_eq!(config.timeout_seconds.get(), 60);

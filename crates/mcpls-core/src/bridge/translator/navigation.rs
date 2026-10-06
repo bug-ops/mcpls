@@ -453,8 +453,7 @@ impl Translator {
             .position_request::<lsp_types::HoverRequest>(
                 &file_path,
                 position,
-                Capability::Hover,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::Hover),
                 (),
             )
             .await?;
@@ -521,7 +520,7 @@ impl Translator {
             ctx,
             doc: _doc,
         } = self
-            .position_request::<R>(file_path, position, capability, IndexingGate::Required, ())
+            .position_request::<R>(file_path, position, IndexingGate::Required(capability), ())
             .await?;
 
         Ok(goto_response_to_locations(response, &ctx).await)
@@ -586,8 +585,7 @@ impl Translator {
             .position_request::<lsp_types::ReferencesRequest>(
                 &file_path,
                 position,
-                Capability::References,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::References),
                 ReferenceContext {
                     include_declaration,
                 },

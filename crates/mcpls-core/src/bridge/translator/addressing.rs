@@ -15,7 +15,7 @@ use serde::Serialize;
 use super::Translator;
 use super::dto::{Position, Position2D};
 use super::encoding_ctx::EncodingCtx;
-use super::routing::{Capability, IndexingGate};
+use super::routing::Capability;
 use crate::bridge::ClientPath;
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::state::uri_to_path;
@@ -583,10 +583,8 @@ impl Translator {
             SymbolTarget::Name(query) => query,
         };
 
-        drop(
-            self.prepare_gated_document(file_path, tool.capability(), IndexingGate::FileLocal)
-                .await?,
-        );
+        self.require_routed_capability(file_path, tool.capability())
+            .await?;
         let fetched = self.request_document_symbols(file_path).await?;
         let uri = fetched.doc.uri().clone();
         let entries = fetched.response.map_or_default(flatten_symbols);

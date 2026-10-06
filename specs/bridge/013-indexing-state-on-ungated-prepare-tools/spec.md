@@ -268,11 +268,14 @@ read that overlapped indexing is flagged even when indexing ends mid-request. On
 | `get_folding_ranges`, `get_selection_ranges` | file-local | exempt |
 | `format_document`, `format_range` | file-local | exempt |
 
-The classification is typed (#690): `IndexingGate` is `Required` or `FileLocal`, and the four
-flagged tools open through `Translator::prepare_disclosed_document`, whose `DisclosedDocument` has
-no client accessor and answers only through `request`, which samples around the call and returns
-`Indexed<T>`. A new name-resolving tool therefore cannot omit the flag. The incoming and outgoing
-call tools stay `Required` (FR-009).
+The classification is typed (#690, #714): `IndexingGate` is `Required(Capability)` or
+`FileLocal(FileLocalCapability)`, and `FileLocalCapability` lists only the file-local capabilities
+above, so a name-resolving tool does not compile with `FileLocal`. The four flagged tools open
+through `Translator::prepare_disclosed_document`, whose `DisclosedDocument` has no client accessor
+and answers only through `request`, which samples around the call and returns `Indexed<T>`; it
+sends with the timeout of the params type (`RequestTimeout`, the same one `FromPosition` requests
+use), so a request kind with its own budget keeps it on both paths. A new name-resolving tool
+therefore cannot omit the flag. The incoming and outgoing call tools stay `Required` (FR-009).
 
 **Shape.** The field is the flattened `IndexingSignal` (`indexing_in_progress`), not the full
 `RouteSignals` object: `push_notifications_degraded` concerns push-delivered diagnostics and has no

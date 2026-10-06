@@ -36,8 +36,8 @@ use crate::config::{
     BuiltinServer, CommandStem, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
-use crate::lsp::command_path::{HostOs, resolve_named, resolve_named_on};
-use crate::lsp::launcher::NPM_SPECIFIER_PREFIX;
+use crate::lsp::command_path::{HostOs, resolve_named};
+use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX};
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
@@ -53,7 +53,6 @@ const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
 const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
 const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
-const PACKAGE_RUNNERS: [&str; 7] = ["npx", "bunx", "pnpx", "pnpm", "yarn", "npm", "deno"];
 const PNPM_GLOBAL_DIR: &str = "global";
 /// Most `global/<store version>` entries a pnpm install is searched through;
 /// more is treated as ambiguous.
@@ -205,7 +204,10 @@ fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
     if let Some(script) = script {
         return Some(Launch::Script(script));
     }
-    let runner = CommandStem::of(config.command.as_str()).is_any(&PACKAGE_RUNNERS)
+    let stem = CommandStem::of(config.command.as_str());
+    // `deno run npm:<package>` starts a package although `deno` is not an npm runner.
+    let runner = stem.is_any(NPM_PACKAGE_RUNNERS)
+        || stem.is("deno")
         || config
             .args
             .iter()
@@ -670,46 +672,40 @@ pub enum TypescriptServerChoice {
 
 /// `binary` as the child would find it on its effective `PATH`.
 fn find_on_child_path(
-    host: HostOs,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
     binary: &str,
 ) -> Option<PathBuf> {
-    resolve_named_on(host, Path::new(binary), config, parent_env).map(|resolved| resolved.spawn)
+    resolve_named(Path::new(binary), config, parent_env).map(|resolved| resolved.spawn)
 }
 
 /// The `bin/tsc` of the native `typescript` package a `tsc` on the child's
 /// `PATH` belongs to. On Windows the npm shim is `tsc.cmd`, found explicitly
 /// because a bare `tsc` only matches `tsc.exe`, and mapped to its package
 /// through the install layout.
-fn native_tsc_on_path(
-    host: HostOs,
-    config: &LspServerConfig,
-    parent_env: impl ParentEnv,
-) -> Option<PathBuf> {
-    match host {
+fn native_tsc_on_path(config: &LspServerConfig, parent_env: impl ParentEnv) -> Option<PathBuf> {
+    match config.env.host() {
         HostOs::Windows => {
-            let shim = find_on_child_path(host, config, parent_env, NATIVE_TSC_WINDOWS_SHIM)?;
+            let shim = find_on_child_path(config, parent_env, NATIVE_TSC_WINDOWS_SHIM)?;
             locate_package(&shim, NpmPackage::Typescript).map(|package| native_tsc_in(&package))
         }
-        HostOs::Other => find_on_child_path(host, config, parent_env, NATIVE_TSC_NAME),
+        HostOs::Other => find_on_child_path(config, parent_env, NATIVE_TSC_NAME),
     }
 }
 
-/// How `tsc` is started on `host`, or why it cannot be.
+/// How `tsc` is started on the host of `config`, or why it cannot be.
 ///
 /// On Windows `node` comes from the child's `PATH` and must pass the check the
 /// `tsc` passed: canonical, and neither it nor the directory it was found in
 /// inside a root of `roots`.
 fn native_launch(
-    host: HostOs,
     tsc: &Path,
     roots: &WorkspaceRoots,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
 ) -> Result<NativeLaunch, TsserverKept> {
-    let node = || find_on_child_path(host, config, &parent_env, NODE_NAME);
-    match host {
+    let node = || find_on_child_path(config, &parent_env, NODE_NAME);
+    match config.env.host() {
         HostOs::Windows => {
             let found = node().ok_or(TsserverKept::NodeNotOnPath)?;
             let canonical = dunce::canonicalize(&found).map_err(|_| TsserverKept::NodeNotOnPath)?;
@@ -733,21 +729,13 @@ fn native_launch(
 /// child's `PATH`, is considered, and only when no JavaScript tsserver next to
 /// the server can be pinned. A candidate inside any root of `roots` is
 /// never selected.
+///
+/// The executable rules are those of the host the config's `env` was built
+/// for, so the Windows path is exercised on every OS.
 pub fn select_typescript_server(
     config: &LspServerConfig,
     roots: &WorkspaceRoots,
     parent_env: impl ParentEnv,
-) -> Option<TypescriptServerChoice> {
-    select_typescript_server_on(config, roots, parent_env, HostOs::CURRENT)
-}
-
-/// [`select_typescript_server`] with the executable rules of `host`, so the
-/// Windows path is exercised on every OS.
-fn select_typescript_server_on(
-    config: &LspServerConfig,
-    roots: &WorkspaceRoots,
-    parent_env: impl ParentEnv,
-    host: HostOs,
 ) -> Option<TypescriptServerChoice> {
     if config.command.is_explicit() {
         return None;
@@ -767,21 +755,23 @@ fn select_typescript_server_on(
             .map(|package| native_tsc_in(&package)),
         TsserverResolution::Unresolved(
             UnresolvedReason::NoTypescriptNextToServer | UnresolvedReason::ServerNotOnPath,
-        ) => native_tsc_on_path(host, config, &parent_env),
+        ) => native_tsc_on_path(config, &parent_env),
     };
     let Some(candidate) = candidate else {
         return kept(TsserverKept::NoNativeOutsideWorkspace);
     };
-    Some(match NativeTsc::from_candidate(&candidate, roots, host) {
-        Ok(mut tsc) => match native_launch(host, tsc.path(), roots, config, &parent_env) {
-            Ok(launch) => {
-                tsc.launch = launch;
-                TypescriptServerChoice::Native(tsc)
-            }
-            Err(kept) => TypescriptServerChoice::Tsserver(kept),
+    Some(
+        match NativeTsc::from_candidate(&candidate, roots, config.env.host()) {
+            Ok(mut tsc) => match native_launch(tsc.path(), roots, config, &parent_env) {
+                Ok(launch) => {
+                    tsc.launch = launch;
+                    TypescriptServerChoice::Native(tsc)
+                }
+                Err(kept) => TypescriptServerChoice::Tsserver(kept),
+            },
+            Err(rejected) => TypescriptServerChoice::Tsserver(rejected.into()),
         },
-        Err(rejected) => TypescriptServerChoice::Tsserver(rejected.into()),
-    })
+    )
 }
 
 /// Whether `tsc` starts with a `node` shebang, as the npm `bin/tsc` launcher
@@ -1242,12 +1232,13 @@ mod launch_tests {
         roots: &WorkspaceRoots,
         host: HostOs,
     ) -> Option<TypescriptServerChoice> {
-        select_typescript_server_on(
-            &config(SERVER_STEM, &[]),
-            roots,
-            env_with_path(env_dir),
-            host,
-        )
+        select_typescript_server(&config_on(host, SERVER_STEM), roots, env_with_path(env_dir))
+    }
+
+    fn config_on(host: HostOs, command: &str) -> LspServerConfig {
+        let mut config = config(command, &[]);
+        config.env = crate::config::ServerEnv::new(host);
+        config
     }
 
     /// An npm global prefix on Windows: the `tsc.cmd` shim, `node.exe` and the
@@ -1330,7 +1321,7 @@ mod launch_tests {
         let env = move |key: &str| (key == "PATH").then(|| path.clone());
 
         let choice =
-            select_typescript_server_on(&config(SERVER_STEM, &[]), &roots, env, HostOs::Windows);
+            select_typescript_server(&config_on(HostOs::Windows, SERVER_STEM), &roots, env);
 
         assert_eq!(
             choice,
@@ -1743,11 +1734,9 @@ mod tests {
     fn test_resolve_config_env_path_overrides_parent() {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
-        config.env.insert(
-            "PATH".into(),
-            layout.bin.to_str().unwrap().into(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        config
+            .env
+            .insert("PATH".into(), layout.bin.to_str().unwrap().into());
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }

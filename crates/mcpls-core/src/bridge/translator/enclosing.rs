@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use super::Translator;
 use super::dto::{Diagnostic, Location, Position2D, PositionDegradation, Range, Symbol};
-use super::routing::{Capability, IndexingGate};
+use super::routing::{FileLocalCapability, IndexingGate};
 use super::symbols::{DocumentSymbolTree, FetchedSymbols, FlatSymbol, symbol_tree};
 use crate::config::DocumentLimit;
 use crate::error::Error;
@@ -495,8 +495,7 @@ impl Translator {
             let doc = self
                 .prepare_gated_document_for_path(
                     &path,
-                    Capability::DocumentSymbols,
-                    IndexingGate::FileLocal,
+                    IndexingGate::FileLocal(FileLocalCapability::DocumentSymbols),
                 )
                 .await?;
             let FetchedSymbols { doc, ctx, response } = self.fetch_document_symbols(doc).await?;

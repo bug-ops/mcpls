@@ -165,6 +165,23 @@ fn test_pulled_slot_is_visible_to_every_read_path() {
 }
 
 #[test]
+fn test_snapshot_version_comes_from_the_origin() {
+    let mut cache = NotificationCache::new();
+    drop(pull(&mut cache, vec![error(1, "pulled")]));
+    let pulled = cache.diagnostic_sources(&file()).merge().unwrap();
+    assert_eq!(pulled.version, Some(DocumentVersion::FIRST));
+
+    push(&mut cache, Some(7), vec![error(2, "pushed")]);
+    assert_eq!(
+        cache.diagnostics(&file()).unwrap().version,
+        Some(DocumentVersion::new(7))
+    );
+
+    push(&mut cache, None, vec![error(2, "pushed")]);
+    assert_eq!(cache.diagnostics(&file()).unwrap().version, None);
+}
+
+#[test]
 fn test_diagnostics_returns_the_pushed_slot_only() {
     let mut cache = NotificationCache::new();
     drop(pull(&mut cache, vec![error(1, "pulled")]));
@@ -837,9 +854,9 @@ fn test_a_stored_pulled_slot_is_bounded_like_a_pushed_one() {
     drop(pull(&mut cache, items));
 
     let slot = &cache.entries[&SlotKey::pulled(DiagnosticsKey::of(&file()))];
-    let bytes = serde_json::to_vec(&slot.info.diagnostics).unwrap().len();
+    let bytes = serde_json::to_vec(&slot.diagnostics).unwrap().len();
     assert!(bytes <= MAX_DIAGNOSTICS_ENTRY_BYTES, "{bytes} bytes");
-    assert!(!slot.info.diagnostics.is_empty());
+    assert!(!slot.diagnostics.is_empty());
 }
 
 #[test]

@@ -112,8 +112,7 @@ impl Translator {
         let doc = self
             .prepare_gated_document_for_path(
                 &path,
-                Capability::TypeHierarchy,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::TypeHierarchy),
             )
             .await?;
         let (server_id, client) = (doc.server_id(), doc.client());

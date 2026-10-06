@@ -781,7 +781,7 @@ async fn test_pull_is_merged_with_pushed_diagnostics_in_the_result() {
     let result = Fixture::finish(pull).await.unwrap();
 
     assert_eq!(shown(&result), ["E0308", "flycheck warning"]);
-    let pushed = fx.cache.lock().await.diagnostics(&fx.uri).cloned().unwrap();
+    let pushed = fx.cache.lock().await.diagnostics(&fx.uri).unwrap();
     assert_eq!(pushed.diagnostics.len(), 1);
 }
 

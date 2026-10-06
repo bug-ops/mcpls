@@ -553,11 +553,9 @@ mod tests {
     #[test]
     fn test_for_servers_covers_every_configured_server_over_one_environment() {
         let mut first = server_config();
-        first.env.insert(
-            "FIRST_TOKEN".into(),
-            "first-secret-value".into(),
-            crate::lsp::HostOs::CURRENT,
-        );
+        first
+            .env
+            .insert("FIRST_TOKEN".into(), "first-secret-value".into());
         let mut second = server_config();
         second.args = vec!["--api-key=second-secret-value".into()];
 

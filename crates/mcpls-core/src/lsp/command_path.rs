@@ -87,37 +87,29 @@ pub struct ResolvedCommand {
 /// working directory; a bare name walks the child's `PATH` in order, relative
 /// entries again resolving against the process working directory. `PATH` is
 /// read as the child sees it: the config's `env` override, else `parent_env`.
+/// The spawn rules are those of the host the config's `env` was built for.
 pub fn resolve_command(
-    host: HostOs,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
 ) -> Option<ResolvedCommand> {
-    resolve_named_on(host, Path::new(&config.command), config, parent_env)
+    resolve_named(Path::new(&config.command), config, parent_env)
 }
 
 /// [`resolve_command`] for `name`: a program the child would look up on its own
 /// `PATH`, such as `node` or `tsc`, or a command given as a path.
+///
+/// On Windows a bare name matches `<name>.exe`, and a name with an extension
+/// (`tsc.cmd`) matches as given.
 pub fn resolve_named(
     name: &Path,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
 ) -> Option<ResolvedCommand> {
-    resolve_named_on(HostOs::CURRENT, name, config, parent_env)
-}
-
-/// [`resolve_named`] with the spawn rules of `host`: on Windows a bare name
-/// matches `<name>.exe`, and a name with an extension (`tsc.cmd`) matches
-/// as given.
-pub fn resolve_named_on(
-    host: HostOs,
-    name: &Path,
-    config: &LspServerConfig,
-    parent_env: impl ParentEnv,
-) -> Option<ResolvedCommand> {
+    let host = config.env.host();
     let found = if name.components().count() > 1 {
         spawn_target(host, name)
     } else {
-        let path_var = child_env_var(config, ManagedEnvVar::Path.name(), host, parent_env)?;
+        let path_var = child_env_var(config, ManagedEnvVar::Path.name(), parent_env)?;
         std::env::split_paths(&path_var).find_map(|dir| spawn_target(host, &dir.join(name)))
     }?;
     let canonical = dunce::canonicalize(&found).ok()?;
@@ -250,11 +242,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dunce::canonicalize(dir.path()).unwrap();
             executable(&root.join("bin/rust-analyzer"));
-            let resolved = resolve_command(
-                HostOs::CURRENT,
-                &config("rust-analyzer"),
-                path_env(&root.join("bin")),
-            );
+            let resolved = resolve_command(&config("rust-analyzer"), path_env(&root.join("bin")));
             assert_eq!(
                 resolved.map(|r| r.canonical),
                 Some(root.join("bin/rust-analyzer"))
@@ -269,9 +257,8 @@ mod tests {
             std::fs::write(root.join("first/tool"), "").unwrap();
             executable(&root.join("second/tool"));
             let path = std::env::join_paths([root.join("first"), root.join("second")]).unwrap();
-            let resolved = resolve_command(HostOs::CURRENT, &config("tool"), |key| {
-                (key == "PATH").then(|| path.clone())
-            });
+            let resolved =
+                resolve_command(&config("tool"), |key| (key == "PATH").then(|| path.clone()));
             assert_eq!(
                 resolved.map(|r| r.canonical),
                 Some(root.join("second/tool"))
@@ -285,12 +272,7 @@ mod tests {
             executable(&root.join("real/tool"));
             std::fs::create_dir_all(root.join("bin")).unwrap();
             std::os::unix::fs::symlink(root.join("real/tool"), root.join("bin/tool")).unwrap();
-            let resolved = resolve_command(
-                HostOs::CURRENT,
-                &config("tool"),
-                path_env(&root.join("bin")),
-            )
-            .unwrap();
+            let resolved = resolve_command(&config("tool"), path_env(&root.join("bin"))).unwrap();
             assert_eq!(resolved.canonical, root.join("real/tool"));
             assert_eq!(resolved.spawn, root.join("bin/tool"));
         }
@@ -301,14 +283,10 @@ mod tests {
             let root = dunce::canonicalize(dir.path()).unwrap();
             executable(&root.join("bin/tool"));
             let mut config = config("tool");
-            config.env.insert(
-                "PATH".into(),
-                root.join("bin").to_str().unwrap().into(),
-                crate::lsp::HostOs::CURRENT,
-            );
-            let resolved = resolve_command(HostOs::CURRENT, &config, |_| {
-                Some(OsString::from("/nonexistent"))
-            });
+            config
+                .env
+                .insert("PATH".into(), root.join("bin").to_str().unwrap().into());
+            let resolved = resolve_command(&config, |_| Some(OsString::from("/nonexistent")));
             assert_eq!(resolved.map(|r| r.canonical), Some(root.join("bin/tool")));
         }
 
@@ -317,11 +295,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dunce::canonicalize(dir.path()).unwrap();
             executable(&root.join("x.sh"));
-            let resolved = resolve_command(
-                HostOs::CURRENT,
-                &config(root.join("x.sh").to_str().unwrap()),
-                |_| None,
-            );
+            let resolved = resolve_command(&config(root.join("x.sh").to_str().unwrap()), |_| None);
             assert_eq!(resolved.map(|r| r.canonical), Some(root.join("x.sh")));
         }
 
@@ -341,14 +315,12 @@ mod tests {
         #[test]
         fn test_resolve_command_returns_none_without_a_match() {
             assert_eq!(
-                resolve_command(HostOs::CURRENT, &config("definitely-not-installed"), |_| {
-                    None
-                }),
+                resolve_command(&config("definitely-not-installed"), |_| None),
                 None
             );
             let dir = tempfile::tempdir().unwrap();
             assert_eq!(
-                resolve_command(HostOs::CURRENT, &config("missing"), path_env(dir.path())),
+                resolve_command(&config("missing"), path_env(dir.path())),
                 None
             );
         }

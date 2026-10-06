@@ -19,7 +19,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{Capability, FileLocalCapability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{Error, McpErrorKind, Result};
@@ -554,8 +554,7 @@ impl Translator {
             .position_request::<lsp_types::RenameRequest>(
                 &file_path,
                 position,
-                Capability::Rename,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::Rename),
                 new_name,
             )
             .await?;
@@ -609,8 +608,7 @@ impl Translator {
             .position_call::<lsp_types::PrepareRenameRequest>(
                 &file_path,
                 position,
-                Capability::PrepareRename,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::PrepareRename),
                 (),
             )
             .await?
@@ -664,8 +662,7 @@ impl Translator {
         let doc = self
             .prepare_gated_document(
                 &file_path,
-                Capability::FormatDocument,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::FormatDocument),
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -712,8 +709,7 @@ impl Translator {
         let doc = self
             .prepare_positioned_document(
                 &file_path,
-                Capability::FormatRange,
-                IndexingGate::FileLocal,
+                IndexingGate::FileLocal(FileLocalCapability::FormatRange),
                 &[start, end],
             )
             .await?;
@@ -772,8 +768,7 @@ impl Translator {
         let doc = self
             .prepare_positioned_document(
                 &file_path,
-                Capability::CodeActions,
-                IndexingGate::Required,
+                IndexingGate::Required(Capability::CodeActions),
                 &[start, end],
             )
             .await?;

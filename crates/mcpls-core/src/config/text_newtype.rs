@@ -22,6 +22,12 @@ macro_rules! impl_text_newtype {
             /// # Panics
             ///
             /// Panics if the literal is blank or not ASCII.
+            ///
+            /// # Examples
+            ///
+            #[doc = concat!("```\nuse mcpls_core::config::", stringify!($ty), ";\n")]
+            #[doc = concat!("const VALUE: ", stringify!($ty), " = ", stringify!($ty), "::from_static(\"value\");")]
+            #[doc = "assert_eq!(VALUE.as_str(), \"value\");\n```"]
             #[must_use]
             pub const fn from_static(text: &'static str) -> Self {
                 assert!(
@@ -36,6 +42,12 @@ macro_rules! impl_text_newtype {
             /// # Errors
             ///
             #[doc = concat!("Returns [`", stringify!($err), "`] if `text` is blank.")]
+            ///
+            /// # Examples
+            ///
+            #[doc = concat!("```\nuse mcpls_core::config::", stringify!($ty), ";\n")]
+            #[doc = concat!("assert!(", stringify!($ty), "::new(\"value\").is_ok());")]
+            #[doc = concat!("assert!(", stringify!($ty), "::new(\"  \").is_err());\n```")]
             pub fn new(text: impl Into<String>) -> ::std::result::Result<Self, $err> {
                 let text = text.into();
                 if text.trim().is_empty() {
