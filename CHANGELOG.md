@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The generated default TypeScript entry (`selection = "auto"`) starts the native `tsc --lsp --stdio` when TypeScript 7 is installed outside the workspace and no JavaScript tsserver can be pinned; new `ServerSelection`, `NativeTsc`, `TypescriptServerChoice` and `TsserverKept`. (#639)
 - `mcpls-bench` reports record the host (`os`, `arch`, `available_parallelism`), and `docs/benchmarks.md` describes how to publish results; no numbers are published. (#639)
 - `get_diagnostics` reports `availability` (`published`, `pending`, `evicted`) and `origin` (`pull`, `push_cache`), and the tool-support `push_only` route status marks servers without a pull provider. (#682)
-- `prepare_rename`, `get_signature_help` and `get_inlay_hints` report `indexing_in_progress` like the other name-resolving tools. (#682)
+- `get_signature_help`, `get_inlay_hints`, `prepare_call_hierarchy` and `prepare_type_hierarchy` report `indexing_in_progress` like the other name-resolving tools. (#682)
 - `restart_server` reports `loading` until the replacement server signals indexing. (#682)
 - `lsp::MAX_CONSECUTIVE_UNDECODABLE_FRAMES` and `HttpConfig::with_session_idle_timeout` with the exported `IdleTimeout`. (#682)
 - New typed config values `FilePattern`, `FileExtension`, `ProjectMarker`, `SearchDepth`, `ServerCommand`, `ToolSet`, `BoundedText`, `LogFormat` and `ConfigError`. (#682)
@@ -213,9 +213,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#637)
 - A pulled diagnostics result is dropped once the tracked document moved on, and a push that evicts a cache entry notifies its subscribers. (#682)
 - A panicked idle HTTP session reaper is restarted, and a panic in the SSE liveness forwarding task is logged. (#682)
-- `nodemon -e js` and `phpunit -r` are no longer refused as inline-eval launches in untrusted mode. (#682)
-- `LspInitFailed` text is redacted and no longer prints the cause twice. (#682)
-- A numeric symbol kind accepts plain digits only. (#682)
 
 ## [0.6.0] - 2026-09-21
 
