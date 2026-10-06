@@ -51,7 +51,7 @@ const MAX_LOG_ENTRIES: usize = 100;
 /// of it they actually use. Which single entry within the chosen server (or
 /// another over-share one) is actually removed is further refined by
 /// emptiness -- see the private `entry_to_evict` (#284).
-const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
+pub const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// A `file:` URI normalized for cache lookup; only built by [`Self::of`], so a
 /// raw URI string can never be mistaken for a key.
@@ -194,6 +194,14 @@ pub enum PullWrite {
         evicted: Vec<DiagnosticsKey>,
         items: BoundedDiagnostics,
     },
+}
+
+/// Result of [`NotificationCache::write_published_diagnostics`].
+#[derive(Debug)]
+#[must_use]
+pub struct PushWrite {
+    /// Files whose slots were evicted to make room for the published one.
+    pub evicted: Vec<DiagnosticsKey>,
 }
 
 /// Whether the merged diagnostics of a file differ before and after a write.
@@ -1017,13 +1025,16 @@ impl NotificationCache {
     /// dropped before anything is stored, but the canonical spelling is always
     /// admitted, evicting the oldest alias, so a server fanning one file out
     /// cannot suppress the canonical publishes.
-    pub(crate) fn store_published_diagnostics(
+    ///
+    /// The files whose entries were evicted to make room are returned so the
+    /// caller can tell their subscribers (#649).
+    pub(crate) fn write_published_diagnostics(
         &mut self,
         server_id: &ServerId,
         published: &PublishedDiagnosticsUri,
         version: Option<i32>,
         diagnostics: Vec<LspDiagnostic>,
-    ) {
+    ) -> PushWrite {
         let source_key = SlotKey::pushed(DiagnosticsKey::of(published.source()));
         let canonical_key = DiagnosticsKey::of(published.canonical());
 
@@ -1033,17 +1044,19 @@ impl NotificationCache {
             .is_some_and(|entry| entry.file(&source_key) == &canonical_key);
         let at_capacity = self.pushed_slot_count(&canonical_key) >= MAX_SOURCES_PER_FILE;
         if !already_indexed && at_capacity {
-            let evicted = published
+            let alias_to_evict = published
                 .is_canonical()
                 .then(|| self.oldest_alias_source(&canonical_key))
                 .flatten();
-            let Some(oldest_alias) = evicted else {
+            let Some(oldest_alias) = alias_to_evict else {
                 debug!(
                     "dropping diagnostics for {}: {MAX_SOURCES_PER_FILE} published URIs already cached for {}",
                     published.source().as_ref(),
                     published.canonical().as_ref()
                 );
-                return;
+                return PushWrite {
+                    evicted: Vec::new(),
+                };
             };
             self.evict_entry(&oldest_alias);
         }
@@ -1059,13 +1072,15 @@ impl NotificationCache {
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
         // never needs room; only a genuinely new URI can trigger eviction.
+        let mut evicted = Vec::new();
         let is_new_entry = self.take_entry(&source_key).is_none();
         if is_new_entry {
-            // TODO(#649): an eviction caused by a push is not announced to
-            // the evicted file's subscribers (FR-013 covers pull writes only).
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES
                 && let Some((_, _, evict_key)) = self.entry_to_evict(server_id, Protect::Nothing)
             {
+                if let Some(entry) = self.entries.get(&evict_key) {
+                    evicted.push(entry.file(&evict_key).clone());
+                }
                 self.evict_entry(&evict_key);
             }
         }
@@ -1085,6 +1100,20 @@ impl NotificationCache {
                 spelling,
             },
         );
+        PushWrite { evicted }
+    }
+
+    /// [`Self::write_published_diagnostics`] for tests that do not look at
+    /// what the write evicted.
+    #[cfg(test)]
+    pub(crate) fn store_published_diagnostics(
+        &mut self,
+        server_id: &ServerId,
+        published: &PublishedDiagnosticsUri,
+        version: Option<i32>,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        drop(self.write_published_diagnostics(server_id, published, version, diagnostics));
     }
 
     const fn next_seq(&mut self) -> u64 {
@@ -3696,6 +3725,38 @@ mod tests {
         assert!(!cache.has_diagnostics(&first_uri()));
         assert!(cache.is_listen_replayable(&first_uri()));
         assert!(!cache.is_listen_replayable(&Uri::from("file:///unrelated.rs")));
+    }
+
+    fn write_error(cache: &mut NotificationCache, file: &str) -> PushWrite {
+        let uri = Uri::from(file);
+        cache.write_published_diagnostics(
+            &test_server(),
+            &PublishedDiagnosticsUri::for_test(uri.clone(), uri),
+            None,
+            vec![error_diagnostic()],
+        )
+    }
+
+    /// #649: a push that needs room names the file whose entry it evicted.
+    #[test]
+    fn test_a_push_reports_the_file_it_evicts() {
+        let mut cache = full_cache(false);
+        let write = write_error(&mut cache, "file:///overflow.rs");
+        assert_eq!(write.evicted, vec![DiagnosticsKey::of(&first_uri())]);
+        assert!(!cache.has_diagnostics(&first_uri()));
+    }
+
+    /// #649: replacing a cached entry, or writing below capacity, evicts nothing.
+    #[test]
+    fn test_a_push_that_needs_no_room_reports_no_eviction() {
+        let mut cache = full_cache(false);
+        assert!(
+            write_error(&mut cache, "file:///first.rs")
+                .evicted
+                .is_empty()
+        );
+        let mut roomy = NotificationCache::new();
+        assert!(write_error(&mut roomy, "file:///a.rs").evicted.is_empty());
     }
 
     #[test]

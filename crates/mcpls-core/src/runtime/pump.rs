@@ -267,13 +267,16 @@ async fn apply_notification(
                 );
                 return;
             };
-            {
-                let mut cache = notification_cache.lock().await;
-                cache.store_published_diagnostics(server_id, &published, p.version, p.diagnostics);
-            }
+            let write = notification_cache.lock().await.write_published_diagnostics(
+                server_id,
+                &published,
+                p.version,
+                p.diagnostics,
+            );
 
             publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
                 .await;
+            publish_invalidated(subs, &write.evicted).await;
         }
         LspNotification::LogMessage(m) => {
             notification_cache
@@ -310,6 +313,19 @@ async fn publish_to_subscribers(
     for session in &subs.live_sessions() {
         session.publish_if_subscribed(&mcp_uri).await;
     }
+}
+
+/// Tells every session subscribed to a file in `files` that its diagnostics
+/// changed: cleared by a respawn, or evicted from the cache.
+async fn publish_invalidated(subs: &SubscriptionRegistry, files: &[bridge::DiagnosticsKey]) {
+    if files.is_empty() {
+        return;
+    }
+    let files: HashSet<&bridge::DiagnosticsKey> = files.iter().collect();
+    subs.publish_matching(|uri| {
+        bridge::diagnostics_cache_key(uri).is_some_and(|key| files.contains(&key))
+    })
+    .await;
 }
 
 /// Stops trusting a panicked pump's server: marks it push-degraded and resets
@@ -407,18 +423,7 @@ impl bridge::NotificationWiring for PumpWiring {
         &'a self,
         cleared: &'a [bridge::DiagnosticsKey],
     ) -> futures::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if cleared.is_empty() {
-                return;
-            }
-            let cleared: HashSet<&bridge::DiagnosticsKey> = cleared.iter().collect();
-            self.shared
-                .subs
-                .publish_matching(|uri| {
-                    bridge::diagnostics_cache_key(uri).is_some_and(|key| cleared.contains(&key))
-                })
-                .await;
-        })
+        Box::pin(publish_invalidated(&self.shared.subs, cleared))
     }
 
     fn has_subscriptions(&self) -> futures::future::BoxFuture<'_, bool> {
@@ -1145,6 +1150,54 @@ mod pump_tests {
                 .merge()
                 .is_some_and(|info| info.diagnostics.len() == 1)
         );
+    }
+
+    /// #649: a push that evicts another file's entry tells that file's
+    /// subscribers, and nobody who did not subscribe to it.
+    #[tokio::test]
+    async fn test_push_eviction_notifies_the_evicted_files_subscribers() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_evicted, mut rx_evicted) = mpsc::channel(8);
+        let (tx_other, mut rx_other) = mpsc::channel(8);
+        let (evicted, other) = (test_mcp_uri("first.rs"), test_mcp_uri("filler1.rs"));
+        session
+            .subscribe_for_test(&evicted, Target::Channel(tx_evicted.clone()))
+            .await
+            .unwrap();
+        session
+            .subscribe_for_test(&other, Target::Channel(tx_other.clone()))
+            .await
+            .unwrap();
+        let cache = make_cache();
+        let error = lsp_types::Diagnostic::default();
+        let mut guard = cache.lock().await;
+        let server = ServerId::from("rust");
+        guard.store_diagnostics(&server, &test_uri("first.rs"), None, vec![error.clone()]);
+        for i in 1..bridge::MAX_DIAGNOSTIC_ENTRIES {
+            guard.store_diagnostics(
+                &server,
+                &test_uri(&format!("filler{i}.rs")),
+                None,
+                vec![error.clone()],
+            );
+        }
+        drop(guard);
+
+        let (tx, _cancel_tx) =
+            spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
+        tx.send(publish("new.rs")).await.unwrap();
+
+        assert_eq!(recv_within(&mut rx_evicted).await, evicted.as_str());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_matches!(
+            rx_evicted.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "notified once"
+        );
+        assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
     }
 
     /// A pull that changed a file notifies the subscribers of that file only.

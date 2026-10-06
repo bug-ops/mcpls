@@ -91,7 +91,6 @@ report the same state.
   tracked (`DocumentTracker`) by any session's activity.
 - Retrying or extending the `ContentModified` handling ([[lsp/005-lsp-content-modified-retry/spec|lsp/005]]).
 - A trigger that needs no tool call (`didSave`, a file watcher, re-pulling subscribed files): #648.
-- Notifying subscribers of an entry that a push evicted: #649.
 - Notification payload changes: `notifications/resources/updated` stays URI-only; the client
   re-reads via `resources/read`.
 
@@ -180,13 +179,13 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | FR-004 | WHEN a pull report is stored, THE SYSTEM SHALL keep it as a source distinct from pushed diagnostics, so a push does not erase pull-sourced diagnostics and a pull does not erase flycheck-sourced pushed diagnostics, and a read returns their union. Pulled diagnostics come first and are never collapsed among themselves; a pushed diagnostic is dropped when it is the same problem as a pulled one (both carry a `code`, equal severity and code, and the ranges overlap or start within 3 lines, per [[bridge/004-get-diagnostics-flycheck-gap/spec\|bridge/004]]; otherwise equal range, severity, message and code), or an exact duplicate of an earlier pushed one. Severity (none reads as information) and code (an integer reads as its decimal string) are compared as `get_diagnostics` reports them. The union is ordered by a stable sort on range. | must |
 | FR-005 | WHEN a pull report arrives after the document was resynced to another version while the request was in flight, after a pull issued later already stored its report, or after the server's diagnostics were cleared (respawn), THE SYSTEM SHALL discard it for the cache, SHALL NOT publish, and SHALL still return it to the caller. The version comparison is best effort: the tracker is read under its own lock and a resync marks the new version after `didChange` is enqueued | must |
 | FR-006 | WHEN a pull request fails (timeout, `-32601`, `ContentModified`) or answers with an `unchanged` or partial report, THE SYSTEM SHALL leave the cache and subscribers unchanged | must |
-| FR-007 | WHILE a server pushes after every change, THE SYSTEM SHALL behave as before for that server: one `resources/updated` per accepted publish, including re-publishes with identical content. FR-002 applies to pull writes only; a push is never suppressed and never changes which URIs are notified | must |
+| FR-007 | WHILE a server pushes after every change, THE SYSTEM SHALL behave as before for that server: one `resources/updated` per accepted publish, including re-publishes with identical content. FR-002 applies to pull writes only; a push is never suppressed and never changes which URIs are notified for the pushed file itself; an eviction the push causes adds one notification for the evicted file (FR-013) | must |
 | FR-008 | WHEN a pull changes the merged view of a subscribed file, THE SYSTEM SHALL enqueue the notification before the pull's tool call returns | must |
 | FR-009 | Option B (`didSave` after resync) | not shipped, #648 |
 | FR-010 | Option C (file watcher) | not shipped, #648 |
 | FR-011 | Option D (`workspace/diagnostic/refresh`) | not shipped |
 | FR-012 | THE SYSTEM SHALL store pull-sourced entries under the same global budgets as pushed ones (`MAX_DIAGNOSTIC_ENTRIES`, `MAX_DIAGNOSTICS_ENTRY_BYTES`, per-owner fair-share eviction, #266, #276, #284). The pulled slot (one per file, canonical URI) is not counted toward `MAX_SOURCES_PER_FILE`, so a file holds at most 8 pushed slots plus one pulled slot; a pull write never evicts a slot of the file it writes | must |
-| FR-013 | WHEN a pull write evicts the entry of another file, THE SYSTEM SHALL publish `resources/updated` for the evicted file so its subscribers re-read. Evictions caused by a push are not announced (#649) | should |
+| FR-013 | WHEN a pull or push write evicts the entry of another file, THE SYSTEM SHALL publish `resources/updated` for the evicted file so its subscribers re-read (#649). The write returns the evicted files and the caller publishes after the cache lock is released | should |
 | FR-014 | THE SYSTEM SHALL deliver every publication through the existing per-session `Delivery` (coalescing pending-URI set plus capacity-1 doorbell), never awaiting a peer from the publishing task | must |
 | FR-015 | THE SYSTEM SHALL publish only to sessions that subscribed to the exact file URI (or a `subscriptions/listen` stream that listed it); a pull, resync or `didSave` caused by session A SHALL NOT notify, expose or delay any other session beyond the notification FR-001 prescribes for that session's own subscriptions | must |
 | FR-016 | WHEN the routed diagnostics server for a file has failed to start, is initializing, or has been marked `push_degraded` and no pull is possible, THE SYSTEM SHALL keep the existing mcp/002 FR-009..FR-012 behavior and SHALL NOT fabricate notifications | must |
@@ -294,7 +293,7 @@ All questions of the draft are resolved:
 - Provenance is the closed enum `{Pushed, Pulled}`; dedupe follows FR-004.
 - `file_watcher` is not reintroduced; rust-analyzer's `workspace/diagnostic/refresh` behavior is moot while Option D is not shipped.
 - Subscribing does not open the document.
-- Eviction of a subscribed entry is announced for pull-triggered evictions; push-triggered ones are #649.
+- Eviction of a subscribed entry is announced for pull-triggered and push-triggered evictions alike (#649); protecting subscribed entries from eviction was rejected because it breaks the fair-share and aggregate bounds.
 - `previous_result_id` stays `None`.
 
 ## 11. See Also
