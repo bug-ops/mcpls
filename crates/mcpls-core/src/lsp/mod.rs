@@ -5,6 +5,8 @@
 
 mod client;
 pub(crate) mod command_path;
+mod env;
+pub(crate) mod launcher;
 mod lifecycle;
 mod process;
 mod stderr;
@@ -15,14 +17,15 @@ pub(crate) mod types;
 pub(crate) use client::{
     CONTENT_MODIFIED_RETRY_METHODS, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
 };
-pub use client::{LspClient, SHUTDOWN_TIMEOUT};
+pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};
+pub(crate) use env::{ManagedEnvVar, ParentEnv, process_env};
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) use lifecycle::fake_lsp_server_with_dead_loop_and_live_child;
+pub use lifecycle::{ChildWorkingDir, LspServer, ServerInitConfig, ServerState};
 pub(crate) use lifecycle::{
     ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, child_env_var, current_environment,
 };
-pub use lifecycle::{LspServer, ServerInitConfig, ServerState};
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};
 pub use process::LIFELINE_SWEEP_BUDGET;

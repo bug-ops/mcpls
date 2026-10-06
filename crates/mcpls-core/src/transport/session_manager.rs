@@ -14,7 +14,7 @@ use super::config::{ResponseStreamDeadline, SessionLimit, StreamLiveness, non_ze
 use super::liveness::{
     ProbeId, SESSION_CLOSE_TIMEOUT, SessionLiveness, StreamProbe, is_common_channel_event_id,
 };
-use crate::bridge::lock_std;
+use crate::util::{catch_panic, lock_std};
 
 /// Log-safe correlation handle for a session: eight hex digits of a hash of
 /// the id, so log lines can be matched without disclosing the bearer secret.
@@ -49,7 +49,7 @@ impl std::fmt::Display for SessionFingerprint<'_> {
 /// Enforcement lives here, at the `SessionManager` layer, rather than in Axum
 /// middleware sniffing request headers, because that is the only place
 /// guaranteed to run exactly when — and only when — a session is actually
-/// created. `rmcp` 3.2.0's `StreamableHttpService::handle_post` classifies
+/// created. `rmcp`'s `StreamableHttpService::handle_post` classifies
 /// every `initialize` request as legacy and always calls `create_session`,
 /// whatever protocol version it names — the handshake only exists in
 /// revisions before `2026-07-28`, so a version named in its params never
@@ -227,40 +227,42 @@ impl CappedSessionManager {
             }
             ids
         };
-        for id in &idle_ids {
-            tracing::debug!(session = %SessionFingerprint(id), "closing idle HTTP session");
+        for id in idle_ids.iter().cloned() {
+            tracing::debug!(session = %SessionFingerprint(&id), "closing idle HTTP session");
             let inner = std::sync::Arc::clone(&self.inner);
-            let id = id.clone();
-            tokio::spawn(async move {
-                close_session_bounded(&id, inner.close_session(&id)).await;
+            let session = id.clone();
+            spawn_bounded_close("closing idle HTTP session", id, async move {
+                inner.close_session(&session).await
             });
         }
         idle_ids.len()
     }
 }
 
-/// Awaits `close` for at most [`liveness::SESSION_CLOSE_TIMEOUT`], so a wedged
-/// session worker cannot park the detached closing task forever.
-async fn close_session_bounded<E: std::fmt::Display>(
-    id: &SessionId,
-    close: impl std::future::Future<Output = Result<(), E>>,
-) {
-    match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, close).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::debug!(
-            session = %SessionFingerprint(id),
-            "closing idle HTTP session failed: {e}"
-        ),
-        Err(_elapsed) => tracing::debug!(
-            session = %SessionFingerprint(id),
-            "closing idle HTTP session timed out"
-        ),
-    }
+/// Runs `close` on a detached task for at most [`SESSION_CLOSE_TIMEOUT`], so a
+/// wedged session worker cannot park the task forever, and logs the outcome at
+/// debug level under `label`.
+pub(super) fn spawn_bounded_close<E: std::fmt::Display + Send + 'static>(
+    label: &'static str,
+    session: SessionId,
+    close: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, close).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(session = %SessionFingerprint(&session), "{label} failed: {e}");
+            }
+            Err(_elapsed) => {
+                tracing::debug!(session = %SessionFingerprint(&session), "{label} timed out");
+            }
+        }
+    })
 }
 
 non_zero_duration! {
     /// Non-zero duration after which a session without inbound client activity
-    /// or open response stream is closed by [`run_idle_reaper`].
+    /// or open response stream is closed by the idle reaper.
     ///
     /// The sole session expiry owner: rmcp's own `keep_alive` is disabled
     /// because it measures any event on the session -- including outbound
@@ -268,7 +270,7 @@ non_zero_duration! {
     /// both never fired for an abandoned but subscribed session (#521) and cut
     /// off a healthy one (#573). An open response stream holds the session only
     /// while it is proven alive (a POST stream, or a probed GET stream).
-    pub IdleTimeout, 300, "5 minutes."
+    pub IdleTimeout, std::time::Duration::from_mins(5)
 }
 
 impl IdleTimeout {
@@ -359,6 +361,43 @@ pub(super) async fn run_idle_reaper(
             _ = ticker.tick() => {
                 manager.reap_idle(tokio::time::Instant::now());
             }
+        }
+    }
+}
+
+/// Delay before a panicked idle reaper is started again.
+const REAPER_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Keeps [`run_idle_reaper`] alive until `cancel` fires: a panic is logged at
+/// error level and the reaper restarted, because a dead reaper silently stops
+/// session expiry until the session cap fills and every client gets 429.
+pub(super) async fn supervise_idle_reaper(
+    manager: std::sync::Arc<CappedSessionManager>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    supervise(
+        || run_idle_reaper(std::sync::Arc::clone(&manager), cancel.clone()),
+        &cancel,
+        REAPER_RESTART_DELAY,
+    )
+    .await;
+}
+
+/// Runs `run` to completion, rerunning it after `restart_delay` each time it
+/// panics, and stops once it returns or `cancel` fires during the delay.
+async fn supervise<Fut: std::future::Future<Output = ()>>(
+    mut run: impl FnMut() -> Fut,
+    cancel: &tokio_util::sync::CancellationToken,
+    restart_delay: std::time::Duration,
+) {
+    while let Err(panicked) = catch_panic(run()).await {
+        tracing::error!(
+            error = %panicked,
+            "idle HTTP session reaper panicked; restarting it, sessions do not expire until it runs again"
+        );
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(restart_delay) => {}
         }
     }
 }
@@ -1305,7 +1344,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_probing_fails_closed_when_session_slot_is_gone() {
         let (manager, id, serving) = probed_session().await;
-        crate::bridge::lock_std(&manager.slots).remove(&id);
+        crate::util::lock_std(&manager.slots).remove(&id);
 
         let error = manager.create_standalone_stream(&id).await.err().unwrap();
         assert_matches!(error, CappedSessionManagerError::SessionGone);
@@ -1314,7 +1353,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_close_session_bounded_drops_a_wedged_close_at_the_timeout() {
+    async fn test_spawn_bounded_close_drops_a_wedged_close_at_the_timeout() {
         struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for SetOnDrop {
             fn drop(&mut self) {
@@ -1325,12 +1364,9 @@ mod tests {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guard = SetOnDrop(std::sync::Arc::clone(&dropped));
         let id: SessionId = "wedged".into();
-        let closer = tokio::spawn(async move {
-            close_session_bounded(&id, async move {
-                let _guard = guard;
-                std::future::pending::<Result<(), std::convert::Infallible>>().await
-            })
-            .await;
+        let closer = spawn_bounded_close("closing wedged session", id, async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
         });
 
         tokio::task::yield_now().await;
@@ -1340,5 +1376,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_supervise_restarts_a_panicking_reaper_until_it_runs_and_ends_on_cancel() {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let supervisor = {
+            let (runs, cancel) = (std::sync::Arc::clone(&runs), cancel.clone());
+            tokio::spawn(async move {
+                let waiting = cancel.clone();
+                supervise(
+                    || {
+                        let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let waiting = waiting.clone();
+                        async move {
+                            assert!(run >= 2, "reaper boom");
+                            waiting.cancelled().await;
+                        }
+                    },
+                    &cancel,
+                    REAPER_RESTART_DELAY,
+                )
+                .await;
+            })
+        };
+
+        tokio::time::sleep(REAPER_RESTART_DELAY * 3).await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_supervise_stops_when_cancelled_during_the_restart_delay() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let supervisor = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                supervise(|| async { panic!("always") }, &cancel, REAPER_RESTART_DELAY).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

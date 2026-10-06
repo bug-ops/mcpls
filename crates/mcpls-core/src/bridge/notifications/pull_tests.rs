@@ -1,6 +1,8 @@
 //! Pulled slots of the diagnostics cache: provenance, dedupe, change
 //! detection, races and budgets.
 
+use std::assert_matches;
+
 use lsp_types::{Code, DiagnosticSeverity, Position, Range};
 
 use super::bounds::*;
@@ -368,7 +370,7 @@ fn test_a_clear_of_another_server_keeps_the_pull() {
         bounded(vec![]),
     );
 
-    assert!(matches!(write, PullWrite::Stored { .. }));
+    assert_matches!(write, PullWrite::Stored { .. });
 }
 
 #[test]
@@ -420,7 +422,7 @@ fn test_a_stale_pushed_version_does_not_block_the_pull() {
 
     let write = pull(&mut cache, vec![error(2, "fresh")]);
 
-    assert!(matches!(write, PullWrite::Stored { .. }));
+    assert_matches!(write, PullWrite::Stored { .. });
     assert_eq!(messages(&cache), ["left over", "fresh"]);
 }
 
@@ -630,13 +632,13 @@ fn test_keys_differing_in_drive_letter_case_name_one_slot() {
 
     let write = pull_for(&mut cache, &lower, 1, vec![error(1, "e")]);
 
-    assert!(matches!(
+    assert_matches!(
         write,
         PullWrite::Stored {
             slot: SlotChange::Identical,
             ..
         }
-    ));
+    );
     assert_eq!(cache.diagnostics_count(), 1);
 }
 
@@ -852,4 +854,195 @@ fn cache_overlay(items: Vec<LspDiagnostic>) -> DiagnosticSources {
     NotificationCache::new()
         .diagnostic_sources(&file())
         .with_pulled(&file(), Some(1), BoundedDiagnostics(items))
+}
+
+/// #670: when a push supersedes a pulled slot, by the document's synced
+/// version as the tracker reports it.
+#[test]
+fn test_pull_supersession_rule() {
+    use DocumentSync::{NotOpen, Synced, Unattached};
+
+    let cases = [
+        (4, Some(5), Synced(4), true),
+        (4, Some(5), Unattached, true),
+        (4, Some(4), Synced(5), true),
+        (4, Some(2), Synced(5), true),
+        (4, Some(4), Synced(4), false),
+        (4, Some(2), Synced(4), false),
+        (4, Some(2), Synced(1), true),
+        (4, Some(4), NotOpen, true),
+        (4, None, Synced(4), false),
+        (4, None, Synced(5), true),
+        (4, None, Synced(1), true),
+        (4, None, NotOpen, true),
+        (4, Some(4), Unattached, false),
+        (4, Some(2), Unattached, false),
+        (4, None, Unattached, false),
+    ];
+    for (pulled, pushed, sync, superseded) in cases {
+        assert_eq!(
+            pull_is_superseded(pulled, pushed, sync),
+            superseded,
+            "pulled {pulled}, pushed {pushed:?}, {sync:?}"
+        );
+    }
+}
+
+/// A file on disk, tracked by a tracker the cache is attached to.
+struct TrackedFile {
+    _dir: tempfile::TempDir,
+    tracker: Arc<DocumentTracker>,
+    path: std::path::PathBuf,
+    uri: Uri,
+}
+
+impl TrackedFile {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dunce::canonicalize(dir.path()).unwrap().join("main.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        let uri = crate::bridge::path_to_uri(&path).unwrap();
+        Self {
+            _dir: dir,
+            tracker: Arc::new(DocumentTracker::new(
+                crate::bridge::ResourceLimits::default(),
+                std::collections::HashMap::new(),
+            )),
+            path,
+            uri,
+        }
+    }
+
+    fn open_at(&self, version: i32) {
+        self.tracker
+            .open(self.path.clone(), "fn main() {}".to_owned())
+            .unwrap();
+        self.set_version(version);
+    }
+
+    fn set_version(&self, version: i32) {
+        self.tracker
+            .set_synced_version_for_test(&self.path, &server(), version);
+    }
+
+    fn cache_with_pull_at(&self, version: i32) -> NotificationCache {
+        let mut cache = NotificationCache::new();
+        cache.attach_documents(Arc::clone(&self.tracker));
+        drop(pull_for(
+            &mut cache,
+            &self.uri,
+            version,
+            vec![error(1, "pulled")],
+        ));
+        cache
+    }
+
+    fn push(&self, cache: &mut NotificationCache, version: Option<i32>) {
+        drop(cache.write_published_diagnostics(
+            &server(),
+            &PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone()),
+            version,
+            vec![error(2, "pushed")],
+        ));
+    }
+
+    fn shown(&self, cache: &NotificationCache) -> Vec<String> {
+        cache
+            .diagnostic_sources(&self.uri)
+            .merge()
+            .unwrap()
+            .diagnostics
+            .iter()
+            .map(|d| message_as_str(&d.message).to_owned())
+            .collect()
+    }
+}
+
+#[test]
+fn test_versionless_push_keeps_the_pull_while_the_document_is_at_its_version() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+
+    file.push(&mut cache, None);
+
+    assert_eq!(file.shown(&cache), ["pulled", "pushed"]);
+}
+
+#[test]
+fn test_versionless_push_drops_the_pull_once_the_document_moved_on() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    file.set_version(5);
+
+    file.push(&mut cache, None);
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+    cache.assert_consistent();
+}
+
+/// A document reopened after an LRU eviction restarts at a lower version.
+#[test]
+fn test_lower_versioned_push_drops_the_pull_of_a_reopened_document() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    file.set_version(1);
+
+    file.push(&mut cache, Some(1));
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+}
+
+/// Pull v4, the document moves to v5, then a push still stamped v4 arrives.
+#[test]
+fn test_push_at_the_pulled_version_drops_the_pull_once_the_document_moved_on() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    file.set_version(5);
+
+    file.push(&mut cache, Some(4));
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+    cache.assert_consistent();
+}
+
+/// Pull, close (or LRU eviction), reopen at the very same version number:
+/// the pull answered an earlier opening, so it must not survive a push.
+#[test]
+fn test_push_drops_the_pull_of_a_document_closed_and_reopened_at_the_same_version() {
+    let file = TrackedFile::new();
+    file.open_at(4);
+    let mut cache = file.cache_with_pull_at(4);
+    drop(file.tracker.close(&file.path));
+    file.open_at(4);
+
+    file.push(&mut cache, Some(4));
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+    cache.assert_consistent();
+}
+
+#[test]
+fn test_push_drops_the_pull_of_a_document_that_is_not_open() {
+    let file = TrackedFile::new();
+    let mut cache = file.cache_with_pull_at(4);
+
+    file.push(&mut cache, None);
+
+    assert_eq!(file.shown(&cache), ["pushed"]);
+}
+
+#[test]
+fn test_without_a_tracker_only_a_newer_version_supersedes_the_pull() {
+    let file = TrackedFile::new();
+    let mut cache = NotificationCache::new();
+    drop(pull_for(&mut cache, &file.uri, 4, vec![error(1, "pulled")]));
+
+    file.push(&mut cache, None);
+    assert_eq!(file.shown(&cache), ["pulled", "pushed"]);
+    file.push(&mut cache, Some(5));
+    assert_eq!(file.shown(&cache), ["pushed"]);
 }

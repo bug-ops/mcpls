@@ -1015,6 +1015,8 @@ pub enum InvalidHierarchyItem {
 /// # Examples
 ///
 /// ```
+/// use std::assert_matches;
+///
 /// use mcpls_core::bridge::{CheckedHierarchyItem, HierarchyItem, InvalidHierarchyItem};
 ///
 /// let wire = |line: u32| -> HierarchyItem {
@@ -1026,10 +1028,10 @@ pub enum InvalidHierarchyItem {
 ///     .unwrap()
 /// };
 /// assert!(CheckedHierarchyItem::from_client(wire(1)).is_ok());
-/// assert!(matches!(
+/// assert_matches!(
 ///     CheckedHierarchyItem::from_client(wire(0)),
 ///     Err(InvalidHierarchyItem::Range(_))
-/// ));
+/// );
 /// ```
 #[derive(Debug, Clone)]
 pub struct CheckedHierarchyItem {
@@ -1838,6 +1840,8 @@ impl ServerText for SelectionRangesResult {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     fn hierarchy_wire(range: [u32; 4], selection: [u32; 4]) -> HierarchyItem {
         let at = |line, character| serde_json::json!({"line": line, "character": character});
         serde_json::from_value(serde_json::json!({
@@ -1865,13 +1869,10 @@ mod tests {
         ] {
             let err =
                 CheckedHierarchyItem::from_client(hierarchy_wire(bad, [1, 1, 1, 1])).unwrap_err();
-            assert!(matches!(err, InvalidHierarchyItem::Range(_)), "{bad:?}");
+            assert_matches!(err, InvalidHierarchyItem::Range(_), "{bad:?}");
             let err =
                 CheckedHierarchyItem::from_client(hierarchy_wire([1, 1, 9, 1], bad)).unwrap_err();
-            assert!(
-                matches!(err, InvalidHierarchyItem::SelectionRange(_)),
-                "{bad:?}"
-            );
+            assert_matches!(err, InvalidHierarchyItem::SelectionRange(_), "{bad:?}");
         }
     }
 

@@ -312,7 +312,7 @@
   {
     "name": "get_cached_diagnostics",
     "title": "Cached Diagnostics",
-    "description": "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact.",
+    "description": "Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. `availability`: `published` (an empty list means clean), `pending` (nothing published yet) or `evicted` (a publish was dropped); an empty list next to `pending` or `evicted` is not clean. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -379,6 +379,23 @@
             }
           ]
         },
+        "DiagnosticsAvailability": {
+          "description": "Whether the diagnostics cache has an answer for a file.",
+          "oneOf": [
+            {
+              "const": "published",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "type": "string"
+            },
+            {
+              "const": "evicted",
+              "type": "string"
+            }
+          ]
+        },
         "Position2D": {
           "description": "Position in a document (1-based for MCP).",
           "properties": {
@@ -434,6 +451,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "availability": {
+          "$ref": "#/$defs/DiagnosticsAvailability",
+          "description": "Whether the cache has an answer for the file; an empty list next to\n`pending` or `evicted` is not a"
+        },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
           "items": {
@@ -456,6 +477,7 @@
       },
       "required": [
         "diagnostics",
+        "availability",
         "push_notifications_degraded",
         "indexing_in_progress"
       ],
@@ -471,7 +493,7 @@
   {
     "name": "get_code_actions",
     "title": "Code Actions",
-    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). The end line must exist in the file; a line past the end is rejected as invalid params. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -492,7 +514,17 @@
           "type": "string"
         },
         "kind_filter": {
-          "description": "Optional filter by action kind (quickfix, refactor, source, etc.).",
+          "description": "Optional filter by action kind, in any case; sent to the server in its canonical spelling.",
+          "enum": [
+            "quickfix",
+            "refactor",
+            "refactor.extract",
+            "refactor.inline",
+            "refactor.rewrite",
+            "source",
+            "source.organizeimports",
+            null
+          ],
           "type": [
             "string",
             "null"
@@ -1012,12 +1044,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -1372,7 +1443,7 @@
   {
     "name": "get_diagnostics",
     "title": "Diagnostics",
-    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `origin`: `pull`, or `push_cache` when the server has no pull provider. `availability`: `published` (an empty list means clean), `pending` (nothing published yet) or `evicted` (a publish was dropped); an empty list next to `pending` or `evicted` is not clean. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
@@ -1462,6 +1533,38 @@
             {
               "const": "hint",
               "description": "Hint diagnostic.",
+              "type": "string"
+            }
+          ]
+        },
+        "DiagnosticsAvailability": {
+          "description": "Whether the diagnostics cache has an answer for a file.",
+          "oneOf": [
+            {
+              "const": "published",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "type": "string"
+            },
+            {
+              "const": "evicted",
+              "type": "string"
+            }
+          ]
+        },
+        "DiagnosticsOrigin": {
+          "description": "Where a `get_diagnostics` answer came from.",
+          "oneOf": [
+            {
+              "const": "pull",
+              "description": "A `textDocument/diagnostic` pull, merged with the push cache.",
+              "type": "string"
+            },
+            {
+              "const": "push_cache",
+              "description": "The push cache alone, because the server advertises no pull provider.",
               "type": "string"
             }
           ]
@@ -1690,6 +1793,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "availability": {
+          "$ref": "#/$defs/DiagnosticsAvailability",
+          "description": "Whether the cache has an answer for the file; an empty list next to\n`pending` or `evicted` is not a"
+        },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
           "items": {
@@ -1705,6 +1812,10 @@
           "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
           "type": "boolean"
         },
+        "origin": {
+          "$ref": "#/$defs/DiagnosticsOrigin",
+          "description": "`pull` when a `textDocument/diagnostic` request answered (merged with\nthe push cache), `push_cache`"
+        },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
@@ -1716,6 +1827,8 @@
       },
       "required": [
         "diagnostics",
+        "availability",
+        "origin",
         "push_notifications_degraded",
         "indexing_in_progress"
       ],
@@ -2199,12 +2312,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -2631,7 +2783,7 @@
   {
     "name": "get_inlay_hints",
     "title": "Inlay Hints",
-    "description": "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. Keep the range end inside the file. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
+    "description": "Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. The end line must exist in the file; a line past the end is rejected as invalid params. `indexing_in_progress: true`: the routed server was still indexing, so an empty or partial result may be incomplete. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -2767,6 +2919,10 @@
           },
           "type": "array"
         },
+        "indexing_in_progress": {
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "type": "boolean"
+        },
         "positions_degraded": {
           "anyOf": [
             {
@@ -2784,7 +2940,8 @@
         }
       },
       "required": [
-        "hints"
+        "hints",
+        "indexing_in_progress"
       ],
       "type": "object"
     },
@@ -3117,12 +3274,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -3804,7 +4000,7 @@
   {
     "name": "get_signature_help",
     "title": "Signature Help",
-    "description": "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
+    "description": "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call. `indexing_in_progress: true`: the routed server was still indexing, so an empty or partial result may be incomplete. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -3916,6 +4112,10 @@
             "null"
           ]
         },
+        "indexing_in_progress": {
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "type": "boolean"
+        },
         "positions_degraded": {
           "anyOf": [
             {
@@ -3936,7 +4136,8 @@
         }
       },
       "required": [
-        "signatures"
+        "signatures",
+        "indexing_in_progress"
       ],
       "type": "object"
     },
@@ -4408,7 +4609,7 @@
   {
     "name": "get_tool_support",
     "title": "Tool Support",
-    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `push_only` (no pull provider: `get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -4440,6 +4641,24 @@
                 },
                 "status": {
                   "const": "supported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "server"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The routed server is registered and publishes diagnostics but advertises\nno pull provider, so",
+              "properties": {
+                "server": {
+                  "$ref": "#/$defs/ServerId",
+                  "description": "The server the call would be dispatched to."
+                },
+                "status": {
+                  "const": "push_only",
                   "type": "string"
                 }
               },
@@ -5006,12 +5225,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5430,12 +5688,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5797,7 +6094,7 @@
   {
     "name": "prepare_call_hierarchy",
     "title": "Prepare Call Hierarchy",
-    "description": "Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `indexing_in_progress: true`: the routed server was still indexing, so an empty or partial result may be incomplete. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -5834,12 +6131,51 @@
           ]
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -5999,6 +6335,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "indexing_in_progress": {
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "type": "boolean"
+        },
         "items": {
           "description": "List of callable items at the position.",
           "items": {
@@ -6034,7 +6374,8 @@
         }
       },
       "required": [
-        "items"
+        "items",
+        "indexing_in_progress"
       ],
       "type": "object"
     },
@@ -6210,7 +6551,7 @@
   {
     "name": "prepare_type_hierarchy",
     "title": "Prepare Type Hierarchy",
-    "description": "Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. `indexing_in_progress: true`: the routed server was still indexing, so an empty or partial result may be incomplete. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -6338,6 +6679,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "indexing_in_progress": {
+          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "type": "boolean"
+        },
         "items": {
           "description": "Type hierarchy items at the position, or the supertypes/subtypes of\nthe queried item.",
           "items": {
@@ -6355,7 +6700,8 @@
         }
       },
       "required": [
-        "items"
+        "items",
+        "indexing_in_progress"
       ],
       "type": "object"
     },
@@ -6410,12 +6756,51 @@
           "type": "string"
         },
         "symbol_kind": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": null,
-          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "description": "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...)"
         },
         "symbol_name": {
           "default": null,
@@ -6899,11 +7284,50 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "kind_filter": {
-          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "file",
+                    "module",
+                    "namespace",
+                    "package",
+                    "class",
+                    "method",
+                    "property",
+                    "field",
+                    "constructor",
+                    "enum",
+                    "interface",
+                    "function",
+                    "variable",
+                    "constant",
+                    "string",
+                    "number",
+                    "boolean",
+                    "array",
+                    "object",
+                    "key",
+                    "null",
+                    "enummember",
+                    "struct",
+                    "event",
+                    "operator",
+                    "typeparameter"
+                  ]
+                },
+                {
+                  "pattern": "^[0-9]+$"
+                }
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP"
         },
         "limit": {
           "default": 100,

@@ -3,7 +3,9 @@
 //! Tracks open documents and their versions for LSP synchronization.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
@@ -19,12 +21,11 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
-use super::lock_std;
-use crate::config::{LanguageId, ServerId};
+use crate::config::{DocumentLimit, FileExtension, LanguageId, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
 use crate::util::{
-    BoundedReadOutcome, OpenRegularFileError, RegularFile, bounded_read_cap, check_bounded_utf8,
+    BoundedUtf8Error, OpenRegularFileError, RegularFile, check_bounded_utf8, lock_std,
 };
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
@@ -277,6 +278,9 @@ pub(super) struct DocumentState {
     text: DocumentText,
     disk: Option<DiskSync>,
     synced: HashMap<ServerId, i32>,
+    /// Which opening of the path this state belongs to; a reopened path gets a
+    /// new one, so a cached result of an earlier opening is recognizably stale.
+    opened: u64,
     /// When this document was last accessed via `ensure_open`
     /// (`Self::touch`), used to pick the least-recently-used entry when
     /// `DocumentTracker::open` must evict to stay under
@@ -297,6 +301,7 @@ impl PartialEq for DocumentState {
             text,
             disk,
             synced,
+            opened: _,
             last_accessed: _,
         } = self;
         *uri == other.uri
@@ -313,7 +318,7 @@ impl Eq for DocumentState {}
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
     /// provenance and no server yet recorded as synced.
-    fn new(uri: Uri, language_id: LanguageId, text: DocumentText) -> Self {
+    fn new(uri: Uri, language_id: LanguageId, text: DocumentText, opened: u64) -> Self {
         Self {
             uri,
             language_id,
@@ -321,6 +326,7 @@ impl DocumentState {
             text,
             disk: None,
             synced: HashMap::new(),
+            opened,
             last_accessed: Instant::now(),
         }
     }
@@ -416,28 +422,20 @@ impl DocumentState {
     }
 }
 
-/// Default value for [`ResourceLimits::max_documents`], also used as the
-/// TOML default for `workspace.max_documents` (`config::default_max_documents`).
-pub const DEFAULT_MAX_DOCUMENTS: usize = 100;
-
-/// Default value for [`ResourceLimits::max_file_size`] (10MB), also used as
-/// the TOML default for `workspace.max_file_size` (`config::default_max_file_size`).
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
 /// Resource limits for document tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {
-    /// Maximum number of open documents (0 = unlimited).
-    pub max_documents: usize,
-    /// Maximum file size in bytes (0 = unlimited).
-    pub max_file_size: u64,
+    /// Maximum number of open documents.
+    pub max_documents: DocumentLimit,
+    /// Maximum file size in bytes.
+    pub max_file_size: SizeLimit,
 }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_documents: DEFAULT_MAX_DOCUMENTS,
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_documents: DocumentLimit::DEFAULT,
+            max_file_size: SizeLimit::DEFAULT,
         }
     }
 }
@@ -451,7 +449,7 @@ impl Default for ResourceLimits {
 /// installed) repeat that cheap-but-nonzero syscall for free against a
 /// per-response I/O budget (see #474's budget-bypass follow-up). Small
 /// enough to have no material effect on a legitimate response's budget
-/// (~10,000 failed opens before exhausting [`DEFAULT_MAX_FILE_SIZE`]'s
+/// (~10,000 failed opens before exhausting [`SizeLimit::DEFAULT`]'s
 /// worth of budget on their own), while still bounding the failed-open
 /// amplification to the same order of magnitude as other count caps in this
 /// crate.
@@ -555,7 +553,7 @@ pub struct DocumentTracker {
     /// Resource limits for tracking.
     limits: ResourceLimits,
     /// Custom file extension to language ID mappings.
-    extension_map: HashMap<String, LanguageId>,
+    extension_map: HashMap<FileExtension, LanguageId>,
     /// `didClose` notifications owed after `Self::open`'s LRU eviction (#495),
     /// per path and server. See [`PendingClose`].
     ///
@@ -563,12 +561,14 @@ pub struct DocumentTracker {
     /// Under a path's lock, the servers pending for that path and the
     /// servers synced to it never overlap.
     pending_closes: StdMutex<HashMap<PathBuf, PendingClose>>,
+    /// Source of [`DocumentState::opened`].
+    next_opening: AtomicU64,
 }
 
 impl DocumentTracker {
     /// Create a new document tracker with custom limits and extension mappings.
     #[must_use]
-    pub fn new(limits: ResourceLimits, extension_map: HashMap<String, LanguageId>) -> Self {
+    pub fn new(limits: ResourceLimits, extension_map: HashMap<FileExtension, LanguageId>) -> Self {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
@@ -577,6 +577,7 @@ impl DocumentTracker {
             limits,
             extension_map,
             pending_closes: StdMutex::new(HashMap::new()),
+            next_opening: AtomicU64::new(0),
         }
     }
 
@@ -614,6 +615,14 @@ impl DocumentTracker {
     #[must_use]
     pub(crate) fn synced_version(&self, path: &Path, server: &ServerId) -> Option<i32> {
         lock_std(&self.documents).get(path)?.synced_version(server)
+    }
+
+    /// Which opening of `path` is tracked; `None` when it is not tracked.
+    #[must_use]
+    pub(crate) fn opening(&self, path: &Path) -> Option<u64> {
+        lock_std(&self.documents)
+            .get(path)
+            .map(|state| state.opened)
     }
 
     /// Overwrites `server`'s synced version of `path`, to simulate a resync
@@ -748,7 +757,8 @@ impl DocumentTracker {
         let uri = path_to_uri(&path)?;
         let language_id = detect_language(&path, &self.extension_map);
 
-        let state = DocumentState::new(uri.clone(), language_id, text);
+        let opened = self.next_opening.fetch_add(1, Ordering::Relaxed);
+        let state = DocumentState::new(uri.clone(), language_id, text, opened);
 
         // Check document limit and insert under a single lock acquisition so
         // two concurrent `open` calls for different new paths can't both
@@ -762,8 +772,8 @@ impl DocumentTracker {
         // `path` itself were picked as the LRU candidate, evict and then
         // immediately re-insert it, queuing a spurious `didClose`).
         let mut documents = lock_std(&self.documents);
-        if self.limits.max_documents > 0
-            && documents.len() >= self.limits.max_documents
+        if let Some(max) = self.limits.max_documents.get()
+            && documents.len() >= max.get()
             && !documents.contains_key(&path)
         {
             let Some((evicted_path, evicted_state)) =
@@ -771,7 +781,7 @@ impl DocumentTracker {
             else {
                 return Err(Error::DocumentLimitExceeded {
                     current: documents.len(),
-                    max: self.limits.max_documents,
+                    max: max.get(),
                 });
             };
             self.record_pending_close(evicted_path, evicted_state);
@@ -832,10 +842,12 @@ impl DocumentTracker {
 
     /// Returns an error if `size` exceeds the configured file size limit.
     const fn check_file_size(&self, size: u64) -> Result<()> {
-        if self.limits.max_file_size > 0 && size > self.limits.max_file_size {
+        if let Some(max) = self.limits.max_file_size.get()
+            && size > max.get()
+        {
             return Err(Error::FileSizeLimitExceeded {
                 size,
-                max: self.limits.max_file_size,
+                max: max.get(),
             });
         }
         Ok(())
@@ -1265,7 +1277,7 @@ impl DocumentTracker {
         size_hint: u64,
     ) -> Result<String> {
         let max = self.limits.max_file_size;
-        let cap = bounded_read_cap(max);
+        let cap = max.read_cap();
         let mut buf = Vec::with_capacity(usize::try_from(size_hint.min(cap)).unwrap_or(0));
         let io_err = |e: std::io::Error| Error::FileIo {
             path: path.to_path_buf(),
@@ -1277,16 +1289,15 @@ impl DocumentTracker {
             .read_to_end(&mut buf)
             .await
             .map_err(io_err)?;
-        match check_bounded_utf8(buf, max) {
-            BoundedReadOutcome::Ok(s) => Ok(s),
-            BoundedReadOutcome::TooLarge { size } => {
-                Err(Error::FileSizeLimitExceeded { size, max })
+        check_bounded_utf8(buf, max).map_err(|e| match e {
+            BoundedUtf8Error::TooLarge { size } => Error::FileSizeLimitExceeded {
+                size,
+                max: max.get().map_or(0, NonZeroU64::get),
+            },
+            BoundedUtf8Error::InvalidUtf8(e) => {
+                io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
-            BoundedReadOutcome::InvalidUtf8(e) => Err(io_err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e,
-            ))),
-        }
+        })
     }
 
     /// Reads `path` through a single open file handle, checking its size and
@@ -1332,14 +1343,14 @@ impl DocumentTracker {
     /// terminator (or line 0 of an empty file) is `Some("")`.
     ///
     /// `budget` bounds this call's own read on top of
-    /// [`crate::util::bounded_read_cap`] of `max_file_size`: the actual cap
-    /// used is `min(bounded_read_cap(max_file_size), budget + 1)`, enforced
+    /// [`SizeLimit::read_cap`] of `max_file_size`: the actual cap
+    /// used is `min(max_file_size.read_cap(), budget + 1)`, enforced
     /// by wrapping the file handle itself in [`AsyncReadExt::take`] rather
     /// than checked after the fact -- so this call physically cannot scan
     /// more than one byte past `budget`, regardless of how large
     /// `max_file_size` is configured (including `max_file_size = 0`,
     /// meaning unlimited). The `+ 1` is the same disambiguation slack
-    /// `bounded_read_cap` already applies to `max_file_size`: without it, a
+    /// `SizeLimit::read_cap` already applies to `max_file_size`: without it, a
     /// read whose remaining budget exactly equals its target line's byte
     /// length (no trailing newline) is indistinguishable from one
     /// genuinely truncated by the cap. A caller enforcing its own I/O
@@ -1381,12 +1392,12 @@ impl DocumentTracker {
             });
         };
         let max = self.limits.max_file_size;
-        // `+1` slack on `budget`, same trick `bounded_read_cap` already
+        // `+1` slack on `budget`, same trick `SizeLimit::read_cap` already
         // applies to `max_file_size`: without it, a read whose remaining
         // budget exactly equals its target line's byte length (no trailing
         // newline) is indistinguishable from one truncated by the cap, and
         // was misreported as truncated (see #474's correctness-gate fix).
-        let cap = bounded_read_cap(max).min(budget.saturating_add(1));
+        let cap = max.read_cap().min(budget.saturating_add(1));
         let mut reader = tokio::io::BufReader::new(file.take(cap));
         let io_err = |e: std::io::Error| Error::FileIo {
             path: path.to_path_buf(),
@@ -1805,19 +1816,19 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 /// Detect the language ID from a file path.
 ///
 /// Consults the extension map to determine the language ID for a file.
-/// If the extension is not found in the map, returns [`PLAINTEXT_LANGUAGE`].
+/// If the extension is not found in the map, returns [`LanguageId::PLAINTEXT`].
 #[must_use]
-pub fn detect_language(path: &Path, extension_map: &HashMap<String, LanguageId>) -> LanguageId {
+pub fn detect_language(
+    path: &Path,
+    extension_map: &HashMap<FileExtension, LanguageId>,
+) -> LanguageId {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     extension_map
         .get(extension)
         .cloned()
-        .unwrap_or(PLAINTEXT_LANGUAGE)
+        .unwrap_or(LanguageId::PLAINTEXT)
 }
-
-/// Language id reported for a file whose extension is not in the extension map.
-pub const PLAINTEXT_LANGUAGE: LanguageId = LanguageId::from_static("plaintext");
 
 #[cfg(test)]
 mod tests {
@@ -1828,9 +1839,18 @@ mod tests {
     #[test]
     fn test_detect_language() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
-        map.insert("py".to_string(), LanguageId::from_static("python"));
-        map.insert("ts".to_string(), LanguageId::from_static("typescript"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
+        map.insert(
+            FileExtension::from_static("py"),
+            LanguageId::from_static("python"),
+        );
+        map.insert(
+            FileExtension::from_static("ts"),
+            LanguageId::from_static("typescript"),
+        );
 
         assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
         assert_eq!(detect_language(Path::new("script.py"), &map), "python");
@@ -1841,7 +1861,10 @@ mod tests {
     #[tokio::test]
     async fn test_document_tracker() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/file.rs");
@@ -1987,11 +2010,14 @@ mod tests {
     #[test]
     fn test_document_limit_evicts_lru_instead_of_failing() {
         let limits = ResourceLimits {
-            max_documents: 2,
-            max_file_size: 100,
+            max_documents: DocumentLimit::new(2),
+            max_file_size: SizeLimit::from_static(100),
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2027,8 +2053,8 @@ mod tests {
     #[test]
     fn test_document_limit_falls_back_to_error_when_only_candidate_is_locked() {
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 100,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::from_static(100),
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
 
@@ -2079,8 +2105,8 @@ mod tests {
     async fn test_open_does_not_evict_in_flight_document_until_guard_drops() {
         let dir = TempDir::new().unwrap();
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
         let path_a = ensure_open_disk_verified(&tracker, &dir, "a.rs").await;
@@ -2111,8 +2137,8 @@ mod tests {
     async fn test_in_flight_guards_are_refcounted_per_path() {
         let dir = TempDir::new().unwrap();
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
         let path_a = ensure_open_disk_verified(&tracker, &dir, "a.rs").await;
@@ -2157,8 +2183,8 @@ mod tests {
     #[test]
     fn test_evict_lru_skips_document_without_disk_snapshot() {
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
         let first = PathBuf::from("/test/first.rs");
@@ -2193,8 +2219,8 @@ mod tests {
         set_mtime(&path_b, settled_past());
 
         let limits = ResourceLimits {
-            max_documents: 2,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(2),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
@@ -2244,11 +2270,14 @@ mod tests {
     #[test]
     fn test_file_size_limit() {
         let limits = ResourceLimits {
-            max_documents: 10,
-            max_file_size: 10,
+            max_documents: DocumentLimit::new(10),
+            max_file_size: SizeLimit::from_static(10),
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2266,28 +2295,37 @@ mod tests {
     #[test]
     fn test_resource_limits_default() {
         let limits = ResourceLimits::default();
-        assert_eq!(limits.max_documents, 100);
-        assert_eq!(limits.max_file_size, 10 * 1024 * 1024);
+        assert_eq!(limits.max_documents, DocumentLimit::new(100));
+        assert_eq!(
+            limits.max_file_size,
+            SizeLimit::from_static(10 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn test_resource_limits_custom() {
         let limits = ResourceLimits {
-            max_documents: 50,
-            max_file_size: 5 * 1024 * 1024,
+            max_documents: DocumentLimit::new(50),
+            max_file_size: SizeLimit::from_static(5 * 1024 * 1024),
         };
-        assert_eq!(limits.max_documents, 50);
-        assert_eq!(limits.max_file_size, 5 * 1024 * 1024);
+        assert_eq!(limits.max_documents, DocumentLimit::new(50));
+        assert_eq!(
+            limits.max_file_size,
+            SizeLimit::from_static(5 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn test_resource_limits_zero_unlimited() {
         let limits = ResourceLimits {
-            max_documents: 0,
-            max_file_size: 0,
+            max_documents: DocumentLimit::UNLIMITED,
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2318,6 +2356,7 @@ mod tests {
             text: DocumentText::new("fn main() {}".to_string()),
             disk: None,
             synced: HashMap::new(),
+            opened: 0,
             last_accessed: Instant::now(),
         };
 
@@ -2381,58 +2420,190 @@ mod tests {
     )]
     fn test_detect_language_all_extensions() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
-        map.insert("py".to_string(), LanguageId::from_static("python"));
-        map.insert("pyw".to_string(), LanguageId::from_static("python"));
-        map.insert("pyi".to_string(), LanguageId::from_static("python"));
-        map.insert("js".to_string(), LanguageId::from_static("javascript"));
-        map.insert("mjs".to_string(), LanguageId::from_static("javascript"));
-        map.insert("cjs".to_string(), LanguageId::from_static("javascript"));
-        map.insert("ts".to_string(), LanguageId::from_static("typescript"));
-        map.insert("mts".to_string(), LanguageId::from_static("typescript"));
-        map.insert("cts".to_string(), LanguageId::from_static("typescript"));
         map.insert(
-            "tsx".to_string(),
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
+        map.insert(
+            FileExtension::from_static("py"),
+            LanguageId::from_static("python"),
+        );
+        map.insert(
+            FileExtension::from_static("pyw"),
+            LanguageId::from_static("python"),
+        );
+        map.insert(
+            FileExtension::from_static("pyi"),
+            LanguageId::from_static("python"),
+        );
+        map.insert(
+            FileExtension::from_static("js"),
+            LanguageId::from_static("javascript"),
+        );
+        map.insert(
+            FileExtension::from_static("mjs"),
+            LanguageId::from_static("javascript"),
+        );
+        map.insert(
+            FileExtension::from_static("cjs"),
+            LanguageId::from_static("javascript"),
+        );
+        map.insert(
+            FileExtension::from_static("ts"),
+            LanguageId::from_static("typescript"),
+        );
+        map.insert(
+            FileExtension::from_static("mts"),
+            LanguageId::from_static("typescript"),
+        );
+        map.insert(
+            FileExtension::from_static("cts"),
+            LanguageId::from_static("typescript"),
+        );
+        map.insert(
+            FileExtension::from_static("tsx"),
             LanguageId::from_static("typescriptreact"),
         );
         map.insert(
-            "jsx".to_string(),
+            FileExtension::from_static("jsx"),
             LanguageId::from_static("javascriptreact"),
         );
-        map.insert("go".to_string(), LanguageId::from_static("go"));
-        map.insert("c".to_string(), LanguageId::from_static("c"));
-        map.insert("h".to_string(), LanguageId::from_static("c"));
-        map.insert("cpp".to_string(), LanguageId::from_static("cpp"));
-        map.insert("cc".to_string(), LanguageId::from_static("cpp"));
-        map.insert("cxx".to_string(), LanguageId::from_static("cpp"));
-        map.insert("hpp".to_string(), LanguageId::from_static("cpp"));
-        map.insert("hh".to_string(), LanguageId::from_static("cpp"));
-        map.insert("hxx".to_string(), LanguageId::from_static("cpp"));
-        map.insert("java".to_string(), LanguageId::from_static("java"));
-        map.insert("rb".to_string(), LanguageId::from_static("ruby"));
-        map.insert("php".to_string(), LanguageId::from_static("php"));
-        map.insert("swift".to_string(), LanguageId::from_static("swift"));
-        map.insert("kt".to_string(), LanguageId::from_static("kotlin"));
-        map.insert("kts".to_string(), LanguageId::from_static("kotlin"));
-        map.insert("scala".to_string(), LanguageId::from_static("scala"));
-        map.insert("sc".to_string(), LanguageId::from_static("scala"));
-        map.insert("zig".to_string(), LanguageId::from_static("zig"));
-        map.insert("lua".to_string(), LanguageId::from_static("lua"));
-        map.insert("sh".to_string(), LanguageId::from_static("shellscript"));
-        map.insert("bash".to_string(), LanguageId::from_static("shellscript"));
-        map.insert("zsh".to_string(), LanguageId::from_static("shellscript"));
-        map.insert("json".to_string(), LanguageId::from_static("json"));
-        map.insert("toml".to_string(), LanguageId::from_static("toml"));
-        map.insert("yaml".to_string(), LanguageId::from_static("yaml"));
-        map.insert("yml".to_string(), LanguageId::from_static("yaml"));
-        map.insert("xml".to_string(), LanguageId::from_static("xml"));
-        map.insert("html".to_string(), LanguageId::from_static("html"));
-        map.insert("htm".to_string(), LanguageId::from_static("html"));
-        map.insert("css".to_string(), LanguageId::from_static("css"));
-        map.insert("scss".to_string(), LanguageId::from_static("scss"));
-        map.insert("less".to_string(), LanguageId::from_static("less"));
-        map.insert("md".to_string(), LanguageId::from_static("markdown"));
-        map.insert("markdown".to_string(), LanguageId::from_static("markdown"));
+        map.insert(
+            FileExtension::from_static("go"),
+            LanguageId::from_static("go"),
+        );
+        map.insert(
+            FileExtension::from_static("c"),
+            LanguageId::from_static("c"),
+        );
+        map.insert(
+            FileExtension::from_static("h"),
+            LanguageId::from_static("c"),
+        );
+        map.insert(
+            FileExtension::from_static("cpp"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("cc"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("cxx"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("hpp"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("hh"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("hxx"),
+            LanguageId::from_static("cpp"),
+        );
+        map.insert(
+            FileExtension::from_static("java"),
+            LanguageId::from_static("java"),
+        );
+        map.insert(
+            FileExtension::from_static("rb"),
+            LanguageId::from_static("ruby"),
+        );
+        map.insert(
+            FileExtension::from_static("php"),
+            LanguageId::from_static("php"),
+        );
+        map.insert(
+            FileExtension::from_static("swift"),
+            LanguageId::from_static("swift"),
+        );
+        map.insert(
+            FileExtension::from_static("kt"),
+            LanguageId::from_static("kotlin"),
+        );
+        map.insert(
+            FileExtension::from_static("kts"),
+            LanguageId::from_static("kotlin"),
+        );
+        map.insert(
+            FileExtension::from_static("scala"),
+            LanguageId::from_static("scala"),
+        );
+        map.insert(
+            FileExtension::from_static("sc"),
+            LanguageId::from_static("scala"),
+        );
+        map.insert(
+            FileExtension::from_static("zig"),
+            LanguageId::from_static("zig"),
+        );
+        map.insert(
+            FileExtension::from_static("lua"),
+            LanguageId::from_static("lua"),
+        );
+        map.insert(
+            FileExtension::from_static("sh"),
+            LanguageId::from_static("shellscript"),
+        );
+        map.insert(
+            FileExtension::from_static("bash"),
+            LanguageId::from_static("shellscript"),
+        );
+        map.insert(
+            FileExtension::from_static("zsh"),
+            LanguageId::from_static("shellscript"),
+        );
+        map.insert(
+            FileExtension::from_static("json"),
+            LanguageId::from_static("json"),
+        );
+        map.insert(
+            FileExtension::from_static("toml"),
+            LanguageId::from_static("toml"),
+        );
+        map.insert(
+            FileExtension::from_static("yaml"),
+            LanguageId::from_static("yaml"),
+        );
+        map.insert(
+            FileExtension::from_static("yml"),
+            LanguageId::from_static("yaml"),
+        );
+        map.insert(
+            FileExtension::from_static("xml"),
+            LanguageId::from_static("xml"),
+        );
+        map.insert(
+            FileExtension::from_static("html"),
+            LanguageId::from_static("html"),
+        );
+        map.insert(
+            FileExtension::from_static("htm"),
+            LanguageId::from_static("html"),
+        );
+        map.insert(
+            FileExtension::from_static("css"),
+            LanguageId::from_static("css"),
+        );
+        map.insert(
+            FileExtension::from_static("scss"),
+            LanguageId::from_static("scss"),
+        );
+        map.insert(
+            FileExtension::from_static("less"),
+            LanguageId::from_static("less"),
+        );
+        map.insert(
+            FileExtension::from_static("md"),
+            LanguageId::from_static("markdown"),
+        );
+        map.insert(
+            FileExtension::from_static("markdown"),
+            LanguageId::from_static("markdown"),
+        );
 
         assert_eq!(detect_language(Path::new("main.rs"), &map), "rust");
         assert_eq!(detect_language(Path::new("script.py"), &map), "python");
@@ -2640,7 +2811,10 @@ mod tests {
     #[tokio::test]
     async fn test_document_tracker_concurrent_operations() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path1 = PathBuf::from("/test/file1.rs");
@@ -2665,7 +2839,10 @@ mod tests {
     #[test]
     fn test_empty_content() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/empty.rs");
@@ -2678,7 +2855,10 @@ mod tests {
     #[test]
     fn test_unicode_content() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/unicode.rs");
@@ -2694,11 +2874,14 @@ mod tests {
     #[test]
     fn test_document_limit_exact_boundary() {
         let limits = ResourceLimits {
-            max_documents: 5,
-            max_file_size: 1000,
+            max_documents: DocumentLimit::new(5),
+            max_file_size: SizeLimit::from_static(1000),
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2722,11 +2905,14 @@ mod tests {
     #[test]
     fn test_file_size_exact_boundary() {
         let limits = ResourceLimits {
-            max_documents: 10,
-            max_file_size: 100,
+            max_documents: DocumentLimit::new(10),
+            max_file_size: SizeLimit::from_static(100),
         };
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(limits, map);
 
@@ -2743,7 +2929,10 @@ mod tests {
     #[test]
     fn test_detect_language_with_custom_extension() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
+        map.insert(
+            FileExtension::from_static("nu"),
+            LanguageId::from_static("nushell"),
+        );
 
         assert_eq!(detect_language(Path::new("script.nu"), &map), "nushell");
 
@@ -2757,7 +2946,10 @@ mod tests {
     #[test]
     fn test_detect_language_custom_overrides_default() {
         let mut custom_map = HashMap::new();
-        custom_map.insert("rs".to_string(), LanguageId::from_static("custom-rust"));
+        custom_map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("custom-rust"),
+        );
 
         assert_eq!(
             detect_language(Path::new("main.rs"), &custom_map),
@@ -2765,7 +2957,10 @@ mod tests {
         );
 
         let mut default_map = HashMap::new();
-        default_map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        default_map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         assert_eq!(detect_language(Path::new("main.rs"), &default_map), "rust");
     }
@@ -2773,7 +2968,10 @@ mod tests {
     #[test]
     fn test_detect_language_fallback_to_plaintext() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
+        map.insert(
+            FileExtension::from_static("nu"),
+            LanguageId::from_static("nushell"),
+        );
 
         // .rs not in custom map, should return plaintext
         assert_eq!(detect_language(Path::new("main.rs"), &map), "plaintext");
@@ -2788,7 +2986,10 @@ mod tests {
     #[test]
     fn test_document_tracker_with_extensions() {
         let mut map = HashMap::new();
-        map.insert("nu".to_string(), LanguageId::from_static("nushell"));
+        map.insert(
+            FileExtension::from_static("nu"),
+            LanguageId::from_static("nushell"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
 
@@ -2804,7 +3005,10 @@ mod tests {
     #[test]
     fn test_document_tracker_uses_provided_map() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/main.rs");
@@ -2819,9 +3023,18 @@ mod tests {
     #[test]
     fn test_multiple_extensions_same_language() {
         let mut map = HashMap::new();
-        map.insert("cpp".to_string(), LanguageId::from_static("c++"));
-        map.insert("cc".to_string(), LanguageId::from_static("c++"));
-        map.insert("cxx".to_string(), LanguageId::from_static("c++"));
+        map.insert(
+            FileExtension::from_static("cpp"),
+            LanguageId::from_static("c++"),
+        );
+        map.insert(
+            FileExtension::from_static("cc"),
+            LanguageId::from_static("c++"),
+        );
+        map.insert(
+            FileExtension::from_static("cxx"),
+            LanguageId::from_static("c++"),
+        );
 
         assert_eq!(detect_language(Path::new("main.cpp"), &map), "c++");
         assert_eq!(detect_language(Path::new("main.cc"), &map), "c++");
@@ -2831,7 +3044,10 @@ mod tests {
     #[test]
     fn test_case_sensitive_extensions() {
         let mut map = HashMap::new();
-        map.insert("NU".to_string(), LanguageId::from_static("nushell"));
+        map.insert(
+            FileExtension::from_static("NU"),
+            LanguageId::from_static("nushell"),
+        );
 
         // Lowercase .nu should not match uppercase "NU" in map
         assert_eq!(detect_language(Path::new("script.nu"), &map), "plaintext");
@@ -2884,7 +3100,10 @@ mod tests {
     #[test]
     fn test_open_paths_populated_tracker() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.open(PathBuf::from("/b.rs"), String::new()).unwrap();
@@ -2896,7 +3115,10 @@ mod tests {
     #[test]
     fn test_open_paths_after_close() {
         let mut map = HashMap::new();
-        map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         tracker.open(PathBuf::from("/a.rs"), String::new()).unwrap();
         tracker.close(Path::new("/a.rs"));
@@ -3159,8 +3381,8 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let limits = ResourceLimits {
-            max_documents: 10,
-            max_file_size: 10,
+            max_documents: DocumentLimit::new(10),
+            max_file_size: SizeLimit::from_static(10),
         };
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
@@ -3187,8 +3409,8 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
@@ -3664,8 +3886,8 @@ mod tests {
         let path = dir.path().join("boundary.rs");
         let tracker = DocumentTracker::new(
             ResourceLimits {
-                max_documents: 100,
-                max_file_size: 10,
+                max_documents: DocumentLimit::new(100),
+                max_file_size: SizeLimit::from_static(10),
             },
             HashMap::new(),
         );
@@ -3906,7 +4128,7 @@ mod tests {
         assert_eq!(tracker.line_text(&empty, 1), None);
     }
 
-    /// Regression for the `bounded_read_cap` off-by-one: a file whose size
+    /// Regression for the `SizeLimit::read_cap` off-by-one: a file whose size
     /// is exactly `max_file_size` must not be misreported as oversized when
     /// a request (for a line past the file's content) forces a full read to
     /// EOF. The cap is `max_file_size + 1` precisely so this exact-boundary
@@ -3919,8 +4141,8 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
 
         let limits = ResourceLimits {
-            max_documents: 100,
-            max_file_size: 20,
+            max_documents: DocumentLimit::new(100),
+            max_file_size: SizeLimit::from_static(20),
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
 
@@ -3949,7 +4171,7 @@ mod tests {
     /// bound the read (via the take-adapter), not just gate whether a read
     /// is attempted -- a read that starts with budget left must still stop
     /// at exactly that many bytes, never at the full `max_file_size`.
-    /// Distinguishes this from `bounded_read_cap(max_file_size)` alone by
+    /// Distinguishes this from `max_file_size.read_cap()` alone by
     /// using a `budget` far smaller than `max_file_size`.
     #[tokio::test]
     async fn test_read_line_checked_bounds_read_by_budget_not_just_max_file_size() {
@@ -3958,8 +4180,8 @@ mod tests {
         std::fs::write(&path, "a".repeat(1000)).unwrap();
 
         let limits = ResourceLimits {
-            max_documents: 100,
-            max_file_size: 1000,
+            max_documents: DocumentLimit::new(100),
+            max_file_size: SizeLimit::from_static(1000),
         };
         let tracker = DocumentTracker::new(limits, HashMap::new());
 
@@ -3976,7 +4198,7 @@ mod tests {
     }
 
     /// Regression for a correctness-gate finding: `cap`'s `budget` component
-    /// needs the same `+1` disambiguation slack `bounded_read_cap` already
+    /// needs the same `+1` disambiguation slack `SizeLimit::read_cap` already
     /// applies to `max_file_size` -- without it, a read whose remaining
     /// budget exactly equals its target line's byte length (no trailing
     /// newline) is indistinguishable from one genuinely truncated by the
@@ -4269,8 +4491,8 @@ mod tests {
     fn one_document_tracker() -> DocumentTracker {
         DocumentTracker::new(
             ResourceLimits {
-                max_documents: 1,
-                max_file_size: 0,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::UNLIMITED,
             },
             HashMap::new(),
         )

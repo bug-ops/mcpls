@@ -5,7 +5,7 @@ use super::body::enforce_body_inactivity;
 use super::config::{ConnectionLimit, HeaderReadTimeout, HttpConfig, WriteStallTimeout};
 use super::connection_io::ConnectionIo;
 use super::lease::attach_listen_lease;
-use super::session_manager::{CappedSessionManager, enforce_session_cap, run_idle_reaper};
+use super::session_manager::{CappedSessionManager, enforce_session_cap, supervise_idle_reaper};
 use super::shutdown::ShutdownSignal;
 
 /// Run the MCP server over Streamable HTTP (MCP spec 2025-11-25).
@@ -249,7 +249,7 @@ pub async fn serve_http(
     let reaper_cancel = cancel.child_token();
     // Stops the reaper on every return path below, not only on shutdown.
     let _reaper_guard = reaper_cancel.clone().drop_guard();
-    tokio::spawn(run_idle_reaper(reaper_manager, reaper_cancel));
+    tokio::spawn(supervise_idle_reaper(reaper_manager, reaper_cancel));
 
     tracing::info!(addr = %local_addr, path = %cfg.path, "MCP HTTP transport listening");
     if !local_addr.ip().is_loopback() {

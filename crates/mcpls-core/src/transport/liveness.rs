@@ -31,8 +31,8 @@ use tokio::time::Instant;
 
 use super::config::{ProbeDeadline, ProbeInterval};
 use super::saturating_deadline;
-use super::session_manager::{SessionFingerprint, StreamGuard};
-use crate::bridge::lock_std;
+use super::session_manager::{SessionFingerprint, StreamGuard, spawn_bounded_close};
+use crate::util::{catch_panic, lock_std};
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;
@@ -220,7 +220,14 @@ impl StreamProbe {
     {
         let token = self.liveness.claim_standalone();
         let (tx, mut rx) = mpsc::channel(OUTBOUND_CAPACITY);
-        tokio::spawn(self.run(token, inner, tx, guard));
+        tokio::spawn(async move {
+            if let Err(panicked) = catch_panic(self.run(token, inner, tx, guard)).await {
+                tracing::error!(
+                    "the SSE liveness forwarding task panicked: {}",
+                    panicked.message()
+                );
+            }
+        });
         futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
     }
 
@@ -296,29 +303,15 @@ impl StreamProbe {
     /// reconnected GET is promoted; detached and bounded so a wedged session
     /// worker cannot stall it.
     fn close_standalone_stream(self) {
-        tokio::spawn(async move {
-            let closed = tokio::time::timeout(SESSION_CLOSE_TIMEOUT, async {
-                let handle = self
-                    .manager
-                    .sessions
-                    .read()
-                    .await
-                    .get(&self.session)
-                    .cloned();
-                match handle {
-                    Some(handle) => handle.close_standalone_sse_stream(None).await.err(),
-                    None => None,
-                }
-            })
-            .await;
-            match closed {
-                Ok(None) => {}
-                Ok(Some(e)) => {
-                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream failed: {e}");
-                }
-                Err(_) => {
-                    tracing::debug!(session = %SessionFingerprint(&self.session), "closing standalone stream timed out");
-                }
+        let Self {
+            manager, session, ..
+        } = self;
+        let target = session.clone();
+        spawn_bounded_close("closing standalone stream", session, async move {
+            let handle = manager.sessions.read().await.get(&target).cloned();
+            match handle {
+                Some(handle) => handle.close_standalone_sse_stream(None).await,
+                None => Ok(()),
             }
         });
     }
@@ -369,6 +362,40 @@ mod tests {
 
     fn client_message(json: serde_json::Value) -> ClientJsonRpcMessage {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// #662: a panic in the forwarding task is logged, and the stream ends
+    /// instead of hanging open.
+    #[tokio::test]
+    async fn test_forwarding_task_panic_is_logged_and_ends_the_stream() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let captured = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (probe, _liveness) = probe(Duration::from_mins(1), Duration::from_mins(1));
+        let panicking =
+            futures::stream::poll_fn(|_| -> std::task::Poll<Option<ServerSseMessage>> {
+                panic!("inner stream failure")
+            });
+        let mut outbound = Box::pin(probe.forward(panicking, None));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), outbound.next())
+            .await
+            .expect("a panicked forwarder must end the stream");
+        assert!(ended.is_none());
+        let entries = captured.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::ERROR
+                    && message.contains("liveness forwarding task panicked")
+                    && message.contains("inner stream failure")),
+            "{entries:?}"
+        );
     }
 
     #[test]

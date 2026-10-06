@@ -105,6 +105,9 @@ pub(crate) use lease::ListenLeaseSlot;
 #[cfg(feature = "transport-http")]
 #[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
 pub use lease::{LeaseWindow, ListenLease};
+#[cfg(feature = "transport-http")]
+#[cfg_attr(docsrs, doc(cfg(feature = "transport-http")))]
+pub use session_manager::IdleTimeout;
 pub(crate) use shutdown::ShutdownSignal;
 pub(crate) use stdio::run_stdio;
 

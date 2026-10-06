@@ -11,14 +11,15 @@ use super::dto::{
     lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
+use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::routing::{
     Capability, IndexingGate, PreparedDocument, WorkspaceRouteLookup, lookup_workspace_route,
 };
-use crate::bridge::{ClientPath, lock_std};
+use crate::bridge::ClientPath;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
-use crate::lsp::SUPPORTED_SYMBOL_KINDS;
+use crate::util::lock_std;
 
 /// Validate `query`'s length for `handle_workspace_symbol`.
 fn validate_query_length(query: &str) -> Result<()> {
@@ -32,49 +33,6 @@ fn validate_query_length(query: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Resolve a `kind_filter` value to the numeric LSP `SymbolKind` it names.
-///
-/// Accepts either a `SymbolKind`'s `Debug`-derived name (case-insensitive,
-/// e.g. `"Function"`), validated against [`SUPPORTED_SYMBOL_KINDS`], or its
-/// numeric wire value directly (e.g. `"12"`) -- accepted as-is with no range
-/// check, since `SymbolKind::Custom(n)` is legitimately open-ended and has no
-/// fixed valid range to check against. A typo'd numeric filter therefore
-/// returns an empty result instead of `InvalidToolParams`, unlike a typo'd
-/// name.
-fn resolve_kind_filter(kind: &str) -> Result<u32> {
-    if let Ok(numeric) = kind.parse::<u32>() {
-        return Ok(numeric);
-    }
-
-    SUPPORTED_SYMBOL_KINDS
-        .iter()
-        .find(|k| format!("{k:?}").eq_ignore_ascii_case(kind))
-        .map(|&k| u32::from(k))
-        .ok_or_else(|| {
-            let valid: Vec<String> = SUPPORTED_SYMBOL_KINDS
-                .iter()
-                .map(|k| format!("{k:?}"))
-                .collect();
-            Error::InvalidToolParams(format!(
-                "Invalid kind_filter: '{kind}'. Valid values: {valid:?}, or the numeric LSP \
-                 SymbolKind value"
-            ))
-        })
-}
-
-/// Resolve a symbol kind given by name or by numeric LSP value, validating a
-/// name the way `workspace_symbol_search`'s `kind_filter` does.
-///
-/// # Errors
-///
-/// A message naming the valid kinds when `kind` is neither a known name nor a
-/// number.
-pub fn parse_symbol_kind(kind: &str) -> std::result::Result<lsp_types::SymbolKind, String> {
-    resolve_kind_filter(kind)
-        .map(lsp_types::SymbolKind::from)
-        .map_err(|error| error.to_string())
 }
 
 /// A `textDocument/documentSymbol` answer together with what is needed to
@@ -278,14 +236,11 @@ impl Translator {
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
-        kind_filter: Option<String>,
+        kind_filter: Option<SymbolKindFilter>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
         validate_query_length(&query)?;
-        let kind_filter = kind_filter
-            .as_deref()
-            .map(resolve_kind_filter)
-            .transpose()?;
+        let kind_filter = kind_filter.map(|filter| u32::from(filter.kind()));
 
         // Workspace search has no document, so it resolves via `resolve_any`
         // rather than a per-language route. If the resolved server is not
@@ -473,10 +428,10 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
-    use crate::config::{LanguageId, ServerId, TimeoutSecs, ToolRouter};
+    use crate::config::{LanguageId, ServerCommand, ServerId, TimeoutSecs, ToolRouter, ToolSet};
     use crate::test_lsp::client_path;
 
-    /// #355/#467 regression: `resolve_kind_filter`'s name-matching branch
+    /// #355/#467 regression: `SymbolKindFilter`'s name-matching branch
     /// accepts/rejects `kind_filter` values based on `SymbolKind`'s derived
     /// `Debug` output, since `gen-lsp-types` provides no `as_str()`/`Display`.
     /// This pins that assumption directly so a future `gen-lsp-types` bump
@@ -536,25 +491,6 @@ mod tests {
         assert_eq!(result.kind, 22u32);
     }
 
-    #[test]
-    fn test_resolve_kind_filter_accepts_known_name() {
-        assert_eq!(resolve_kind_filter("EnumMember").unwrap(), 22u32);
-    }
-
-    /// #467 S1: a client can feed back the numeric `kind` a result actually
-    /// carries, closing the round-trip the switch to a numeric output field
-    /// would otherwise have broken.
-    #[test]
-    fn test_resolve_kind_filter_accepts_numeric_value() {
-        assert_eq!(resolve_kind_filter("22").unwrap(), 22u32);
-    }
-
-    #[test]
-    fn test_resolve_kind_filter_rejects_unknown_name() {
-        let result = resolve_kind_filter("NotAKind");
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
     #[tokio::test]
     async fn test_handle_workspace_symbol_no_server() {
         let translator = Translator::new();
@@ -608,11 +544,11 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_failed_claimant() {
         let mut live = crate::config::LspServerConfig::pyright();
-        live.name = Some("live".to_string());
-        live.handles = Some(vec![ToolKind::Hover]);
+        live.name = Some(ServerId::from("live"));
+        live.handles = Some(ToolSet::new(vec![ToolKind::Hover]).unwrap());
         let mut failing = crate::config::LspServerConfig::rust_analyzer();
-        failing.name = Some("failing".to_string());
-        failing.handles = Some(vec![ToolKind::WorkspaceSymbols]);
+        failing.name = Some(ServerId::from("failing"));
+        failing.handles = Some(ToolSet::new(vec![ToolKind::WorkspaceSymbols]).unwrap());
         let router = ToolRouter::from_configs([&live, &failing]).unwrap();
         let failing_id = ServerId::from("failing");
 
@@ -663,7 +599,7 @@ mod tests {
     async fn test_handle_workspace_symbol_no_claimant_names_tool() {
         let configs = vec![crate::config::LspServerConfig {
             language_id: LanguageId::from_static("python"),
-            command: "pyright-langserver".to_string(),
+            command: ServerCommand::from_static("pyright-langserver"),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -672,8 +608,8 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: Some("pyright".to_string()),
-            handles: Some(vec![ToolKind::Hover]),
+            name: Some(ServerId::from("pyright")),
+            handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
         }];

@@ -13,8 +13,9 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::ClientPath;
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
+use crate::bridge::{ClientPath, Indexed, IndexingSignal};
+use crate::config::ServerId;
 use crate::error::{Error, Result};
 
 /// Extract hover contents as markdown string.
@@ -129,6 +130,31 @@ fn validate_completions_params(trigger: Option<&str>) -> Result<()> {
 }
 
 impl Translator {
+    /// Runs `request`, sampling the indexing state of `server_id` before and
+    /// after so a read that overlapped indexing is flagged even when indexing
+    /// ends mid-request.
+    ///
+    /// Samples nothing (not indexing) for a translator without a notification
+    /// cache. Never waits: ungated tools disclose the state rather than gate on
+    /// it (#668).
+    pub(super) async fn sampled_indexing<T>(
+        &self,
+        server_id: &ServerId,
+        request: impl Future<Output = Result<T>>,
+    ) -> Result<(T, IndexingSignal)> {
+        let before = self.sample_indexing(server_id).await;
+        let response = request.await?;
+        let after = self.sample_indexing(server_id).await;
+        Ok((response, before.union(after)))
+    }
+
+    async fn sample_indexing(&self, server_id: &ServerId) -> IndexingSignal {
+        match &self.notification_cache {
+            Some(cache) => IndexingSignal::sample(&*cache.lock().await, Some(server_id)),
+            None => IndexingSignal::default(),
+        }
+    }
+
     /// Handle completions request.
     ///
     /// # Errors
@@ -146,7 +172,12 @@ impl Translator {
         validate_completions_params(trigger.as_deref())?;
 
         let doc = self
-            .prepare_gated_document(&file_path, Capability::Completions, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::Completions,
+                IndexingGate::Required,
+                &[position],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -209,12 +240,13 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
-    ) -> Result<SignatureHelpResult> {
+    ) -> Result<Indexed<SignatureHelpResult>> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::SignatureHelp,
                 IndexingGate::NotRequired,
+                &[position],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -230,8 +262,14 @@ impl Translator {
             context: None,
         };
 
-        let response = client
-            .request_typed::<lsp_types::SignatureHelpRequest>(params, client.request_timeout())
+        let (response, indexing) = self
+            .sampled_indexing(
+                server_id,
+                client.request_typed::<lsp_types::SignatureHelpRequest>(
+                    params,
+                    client.request_timeout(),
+                ),
+            )
             .await?;
 
         let result = match response {
@@ -264,7 +302,7 @@ impl Translator {
             },
         };
 
-        Ok(result)
+        Ok(Indexed::new(result, indexing))
     }
 
     /// Handle inlay hints request (`textDocument/inlayHint`).
@@ -280,13 +318,14 @@ impl Translator {
         &self,
         file_path: ClientPath,
         range: PositionRange,
-    ) -> Result<InlayHintsResult> {
+    ) -> Result<Indexed<InlayHintsResult>> {
         let (start, end) = (range.start(), range.end());
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::InlayHints,
                 IndexingGate::NotRequired,
+                &[start, end],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -305,8 +344,12 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response = client
-            .request_typed::<lsp_types::InlayHintRequest>(params, client.request_timeout())
+        let (response, indexing) = self
+            .sampled_indexing(
+                server_id,
+                client
+                    .request_typed::<lsp_types::InlayHintRequest>(params, client.request_timeout()),
+            )
             .await?;
 
         let mut budget = ItemBudget::new();
@@ -336,11 +379,14 @@ impl Translator {
             });
         }
 
-        Ok(InlayHintsResult {
-            hints,
-            truncated: budget.truncated(),
-            positions_degraded: ctx.positions_degraded(),
-        })
+        Ok(Indexed::new(
+            InlayHintsResult {
+                hints,
+                truncated: budget.truncated(),
+                positions_degraded: ctx.positions_degraded(),
+            },
+            indexing,
+        ))
     }
 }
 
@@ -530,7 +576,7 @@ mod tests {
         )
         .await;
 
-        let result = handle.await.unwrap().unwrap();
+        let result = handle.await.unwrap().unwrap().result;
         assert_eq!(result.hints.len(), 1);
         assert_eq!(
             result.hints[0].kind,
@@ -586,7 +632,7 @@ mod tests {
         )
         .await;
 
-        handle.await.unwrap().unwrap()
+        handle.await.unwrap().unwrap().result
     }
 
     /// #487: inlay hints beyond `MAX_NORMALIZED_LOCATIONS` are dropped and
@@ -682,16 +728,34 @@ mod tests {
         assert!(wire.get("positions_degraded").is_none());
     }
 
+    /// #641: a line past the end is rejected before any request, so it can no
+    /// longer reach the request-degradation path.
     #[tokio::test]
-    async fn test_handle_completions_line_past_eof_with_column_is_request_degraded() {
-        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/completion").await;
-        assert_eq!(wire["positions_degraded"], "request");
-    }
+    async fn test_handle_completions_and_signature_help_line_past_eof_are_rejected() {
+        use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_handle_signature_help_line_past_eof_with_column_is_request_degraded() {
-        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/signatureHelp").await;
-        assert_eq!(wire["positions_degraded"], "request");
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            signature_help_provider: Some(lsp_types::SignatureHelpOptions::default()),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &ServerId::from("rust"),
+            caps,
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let file = || client_path(path.to_string_lossy().into_owned());
+
+        let completions = translator.handle_completions(file(), pos(5, 3), None).await;
+        assert_matches!(completions, Err(Error::PositionBeyondDocument { .. }));
+        let signature = translator.handle_signature_help(file(), pos(5, 3)).await;
+        assert_matches!(signature, Err(Error::PositionBeyondDocument { .. }));
     }
 
     #[tokio::test]
@@ -806,5 +870,151 @@ mod tests {
             labels,
             [Some("a"), Some("a"), Some("a, b, ...rest"), Some("...rest")]
         );
+    }
+
+    /// Answers `null` to the one request `call` makes while the cache tracks
+    /// `quiescent`, and returns the indexing signal the handler reported.
+    async fn indexing_signal_of<T, Fut>(
+        caps: lsp_types::ServerCapabilities,
+        method: &str,
+        quiescent: Option<bool>,
+        call: impl FnOnce(std::sync::Arc<Translator>, String) -> Fut + Send + 'static,
+    ) -> IndexingSignal
+    where
+        T: Send + 'static,
+        Fut: Future<Output = Result<Indexed<T>>> + Send + 'static,
+    {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use tokio::io::BufReader;
+        use tokio::sync::Mutex;
+
+        use crate::bridge::NotificationCache;
+
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from("rust");
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        if let Some(quiescent) = quiescent {
+            cache.lock().await.observe_indexing_signal(
+                &server_id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": quiescent})),
+            );
+        }
+        let translator = Arc::new(translator.with_notification_cache(cache));
+
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let handle = tokio::spawn(call(Arc::clone(&translator), path));
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let opened = read_framed_message(&mut wire).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], method);
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        handle.await.unwrap().unwrap().indexing
+    }
+
+    /// #668: every ungated name-resolving tool reports an index still loading,
+    /// and stays silent for a ready or unsignalled server (`Unknown` is not
+    /// evidence of indexing).
+    #[tokio::test]
+    async fn test_ungated_tools_report_indexing_only_while_loading() {
+        use crate::bridge::translator::testing::{pos, span};
+
+        let loading = IndexingSignal {
+            indexing_in_progress: true,
+        };
+        for (quiescent, expected) in [
+            (Some(false), loading),
+            (Some(true), IndexingSignal::default()),
+            (None, IndexingSignal::default()),
+        ] {
+            let call_hierarchy = lsp_types::ServerCapabilities {
+                call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
+                ..Default::default()
+            };
+            assert_eq!(
+                indexing_signal_of(
+                    call_hierarchy,
+                    "textDocument/prepareCallHierarchy",
+                    quiescent,
+                    |t, path| async move {
+                        t.handle_call_hierarchy_prepare(client_path(path), pos(1, 1))
+                            .await
+                    },
+                )
+                .await,
+                expected,
+                "prepare_call_hierarchy {quiescent:?}"
+            );
+
+            let type_hierarchy = lsp_types::ServerCapabilities {
+                type_hierarchy_provider: Some(lsp_types::TypeHierarchyProvider::Bool(true)),
+                ..Default::default()
+            };
+            assert_eq!(
+                indexing_signal_of(
+                    type_hierarchy,
+                    "textDocument/prepareTypeHierarchy",
+                    quiescent,
+                    |t, path| async move {
+                        t.handle_type_hierarchy_prepare(client_path(path), pos(1, 1))
+                            .await
+                    },
+                )
+                .await,
+                expected,
+                "prepare_type_hierarchy {quiescent:?}"
+            );
+
+            let signature_help = lsp_types::ServerCapabilities {
+                signature_help_provider: Some(lsp_types::SignatureHelpOptions::default()),
+                ..Default::default()
+            };
+            assert_eq!(
+                indexing_signal_of(
+                    signature_help,
+                    "textDocument/signatureHelp",
+                    quiescent,
+                    |t, path| async move {
+                        t.handle_signature_help(client_path(path), pos(1, 1)).await
+                    },
+                )
+                .await,
+                expected,
+                "get_signature_help {quiescent:?}"
+            );
+
+            let inlay_hints = lsp_types::ServerCapabilities {
+                inlay_hint_provider: Some(lsp_types::InlayHintProvider::Bool(true)),
+                ..Default::default()
+            };
+            assert_eq!(
+                indexing_signal_of(
+                    inlay_hints,
+                    "textDocument/inlayHint",
+                    quiescent,
+                    |t, path| async move {
+                        t.handle_inlay_hints(client_path(path), span(pos(1, 1), pos(1, 13)))
+                            .await
+                    },
+                )
+                .await,
+                expected,
+                "get_inlay_hints {quiescent:?}"
+            );
+        }
     }
 }

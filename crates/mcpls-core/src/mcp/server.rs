@@ -5,11 +5,9 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::FutureExt as _;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -44,13 +42,14 @@ use crate::bridge::resources::{
 use crate::bridge::{
     AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
     ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
-    DiagnosticsResult, DocumentDiagnosticsResult, DocumentHighlightsResult, DocumentSymbolsResult,
-    FoldingRangesResult, FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult,
-    IndexingState, InlayHintsResult, LocationsResult, NotificationCache, OutgoingCallsResult,
-    Position, PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
-    RestartServerResult, SelectionRangesResult, ServerLogsResult, ServerMessagesResult,
-    SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots,
-    WorkspaceSymbolResult,
+    DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
+    DocumentHighlightsResult, DocumentSymbolsResult, FoldingRangesResult, FormatDocumentResult,
+    HierarchyItem, HoverResult, IncomingCallsResult, Indexed, InlayHintsResult, KindFilter,
+    KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
+    PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
+    RestartServerResult, RouteSignals, SelectionRangesResult, ServerLogsResult,
+    ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult,
+    WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -134,6 +133,20 @@ macro_rules! enclosing_symbol_note {
     };
 }
 
+/// Tool-description sentence for the tools that report `indexing_in_progress`.
+macro_rules! indexing_note {
+    () => {
+        "`indexing_in_progress: true`: the routed server was still indexing, so an empty or partial result may be incomplete."
+    };
+}
+
+/// Tool-description sentences for the diagnostics tools that report `availability`.
+macro_rules! availability_note {
+    () => {
+        "`availability`: `published` (an empty list means clean), `pending` (nothing published yet) or `evicted` (a publish was dropped); an empty list next to `pending` or `evicted` is not clean."
+    };
+}
+
 /// Tool-description sentence for the tools whose results flag `out_of_workspace`.
 macro_rules! out_of_workspace_note {
     () => {
@@ -147,50 +160,17 @@ macro_rules! positions_note_response {
     };
 }
 
-/// Route-level health signals shared by every diagnostics reader
-/// (`get_diagnostics`, `get_cached_diagnostics`, and the diagnostics
-/// resource), so the three can never report different keys or semantics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, JsonSchema)]
-struct DiagnosticsRouteSignals {
-    /// `true` if the language server publishing this file's diagnostics crashed and was
-    /// restarted during this mcpls session. Diagnostics it delivers only by push (e.g.
-    /// rust-analyzer's flycheck/clippy) are no longer received, so the returned
-    /// diagnostics may be incomplete until mcpls restarts.
-    push_notifications_degraded: bool,
-    /// `true` if the routed language server reported its initial workspace indexing as
-    /// in progress during this read; the diagnostics may reflect a partial index.
-    indexing_in_progress: bool,
-}
-
-impl DiagnosticsRouteSignals {
-    // Keyed on the routing identity, not cache ownership, which a respawn clears (#359).
-    fn sample(cache: &NotificationCache, route_id: Option<&crate::config::ServerId>) -> Self {
-        Self {
-            push_notifications_degraded: route_id.is_some_and(|id| cache.is_push_degraded(id)),
-            indexing_in_progress: route_id
-                .is_some_and(|id| cache.indexing_state(id) == IndexingState::Loading),
-        }
-    }
-
-    /// Combines two samples taken at different times: a signal is set if it was set in
-    /// either.
-    const fn union(self, later: Self) -> Self {
-        Self {
-            push_notifications_degraded: self.push_notifications_degraded
-                || later.push_notifications_degraded,
-            indexing_in_progress: self.indexing_in_progress || later.indexing_in_progress,
-        }
-    }
-}
-
 /// Response shape for the `get_cached_diagnostics` tool: the shared diagnostics result plus
-/// the file's [`DiagnosticsRouteSignals`].
+/// the file's [`RouteSignals`].
 #[derive(serde::Serialize, JsonSchema)]
 struct CachedDiagnosticsResponse {
     #[serde(flatten)]
     result: DiagnosticsResult,
+    /// Whether the cache has an answer for the file; an empty list next to
+    /// `pending` or `evicted` is not a clean file.
+    availability: DiagnosticsAvailability,
     #[serde(flatten)]
-    signals: DiagnosticsRouteSignals,
+    signals: RouteSignals,
 }
 
 /// MCP server that exposes LSP capabilities as tools.
@@ -259,12 +239,18 @@ fn render_error(error: crate::error::Error, redactions: &Redactions) -> McpError
     mapped
 }
 
+/// Maps a typed client-input error to its JSON-RPC error, so every parse helper
+/// below reports a bad value the same way.
+fn client_input_error(error: impl Into<crate::error::Error>) -> McpError {
+    map_bridge_error(error.into())
+}
+
 /// Parses a client-supplied `file_path` at the tool boundary. Done in the
 /// tool method rather than while deserializing the parameters, because the MCP
 /// layer reports a deserialization failure as a tool-result error instead of
 /// a JSON-RPC `-32602`.
 fn parse_client_path(path: PathBuf) -> Result<ClientPath, McpError> {
-    ClientPath::try_from(path).map_err(|e| map_bridge_error(e.into()))
+    ClientPath::try_from(path).map_err(client_input_error)
 }
 
 /// Parses the file path and target of an addressed tool; a bad path or
@@ -273,20 +259,28 @@ fn parse_target(
     file_path: PathBuf,
     target: SymbolTargetInput,
 ) -> Result<(ClientPath, SymbolTarget), McpError> {
-    let target = target
-        .into_target()
-        .map_err(|e| map_bridge_error(e.into()))?;
+    let target = target.into_target().map_err(client_input_error)?;
     Ok((parse_client_path(file_path)?, target))
 }
 
 /// Parses a client-supplied 1-based position, so a bad value is `-32602`.
 fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
-    Position::from_client(line, character).map_err(|e| map_bridge_error(e.into()))
+    Position::from_client(line, character).map_err(client_input_error)
+}
+
+/// Resolves a `kind_filter` input to its typed kind, so an unknown kind is
+/// `-32602`.
+fn parse_kind_filter<K: KindFilter>(
+    input: Option<KindFilterInput<K>>,
+) -> Result<Option<K>, McpError> {
+    input
+        .map(|input| input.into_known().map_err(map_bridge_error))
+        .transpose()
 }
 
 /// Parses a client-supplied hierarchy item, so a bad range is `-32602`.
 fn parse_hierarchy_item(item: HierarchyItem) -> Result<CheckedHierarchyItem, McpError> {
-    CheckedHierarchyItem::from_client(item).map_err(|e| map_bridge_error(e.into()))
+    CheckedHierarchyItem::from_client(item).map_err(client_input_error)
 }
 
 /// Parses a client-supplied ordered range.
@@ -295,12 +289,12 @@ fn parse_range(range: &RangeParams) -> Result<PositionRange, McpError> {
         (range.start_line, range.start_character),
         (range.end_line, range.end_character),
     )
-    .map_err(|e| map_bridge_error(e.into()))
+    .map_err(client_input_error)
 }
 
 /// Parses a client-supplied ordered range of at most `MAX_RANGE_LINES` lines.
 fn parse_bounded_range(range: &RangeParams) -> Result<BoundedRange, McpError> {
-    BoundedRange::try_from(parse_range(range)?).map_err(|e| map_bridge_error(e.into()))
+    BoundedRange::try_from(parse_range(range)?).map_err(client_input_error)
 }
 
 /// Builds an error with `data` as its payload; a failed serialization is
@@ -397,9 +391,25 @@ fn paginate_resource_paths<'a>(
     Ok((page, next_cursor))
 }
 
+/// Moves the indexing signal a handler sampled outside the `resolved_symbol`
+/// that name addressing wraps around it.
+fn hoist_indexing<T>(addressed: Addressed<Indexed<T>>) -> Indexed<Addressed<T>> {
+    let Addressed {
+        result,
+        resolved_symbol,
+    } = addressed;
+    Indexed::new(
+        Addressed {
+            result: result.result,
+            resolved_symbol,
+        },
+        result.indexing,
+    )
+}
+
 /// `get_diagnostics`'s response shape.
 ///
-/// Wraps `DiagnosticsResult` with the route's [`DiagnosticsRouteSignals`]:
+/// Wraps `DiagnosticsResult` with the route's [`RouteSignals`]:
 /// `handle_diagnostics` deliberately stays ungated on workspace-indexing readiness (#445 -- it
 /// reads from the notification-cache poll path, not a live whole-workspace LSP request, so
 /// blocking it the way `IndexingGate::Required` blocks hover/definition/etc. would be the
@@ -410,8 +420,15 @@ fn paginate_resource_paths<'a>(
 struct DiagnosticsResponse {
     #[serde(flatten)]
     result: DocumentDiagnosticsResult,
+    /// Whether the cache has an answer for the file; an empty list next to
+    /// `pending` or `evicted` is not a clean file.
+    availability: DiagnosticsAvailability,
+    /// `pull` when a `textDocument/diagnostic` request answered (merged with
+    /// the push cache), `push_cache` when the server has no pull provider and
+    /// the push cache alone answered.
+    origin: DiagnosticsOrigin,
     #[serde(flatten)]
-    signals: DiagnosticsRouteSignals,
+    signals: RouteSignals,
 }
 
 /// `read_resource`'s diagnostics payload, distinguishing a file mcpls has no
@@ -427,7 +444,7 @@ struct DiagnosticsResponse {
 /// published yet. `uri` is deliberately omitted: the caller already knows it
 /// (it's the resource they requested).
 ///
-/// The shared [`DiagnosticsRouteSignals`] mirror `get_cached_diagnostics`
+/// The shared [`RouteSignals`] mirror `get_cached_diagnostics`
 /// (#359): a push-degraded route means `subscribe`'s replay and the pump's
 /// `notify_resource_updated` calls for it have gone dark until the whole
 /// mcpls process restarts, same as this cache-only read.
@@ -436,20 +453,23 @@ struct ResourceDiagnosticsResponse {
     tracked: bool,
     version: Option<i32>,
     diagnostics: Vec<lsp_types::Diagnostic>,
+    availability: DiagnosticsAvailability,
     #[serde(flatten)]
-    signals: DiagnosticsRouteSignals,
+    signals: RouteSignals,
 }
 
 impl ResourceDiagnosticsResponse {
-    fn new(
-        tracked: bool,
-        entry: Option<&DiagnosticInfo>,
-        signals: DiagnosticsRouteSignals,
-    ) -> Self {
+    fn new(tracked: bool, entry: Option<&DiagnosticInfo>, signals: RouteSignals) -> Self {
         Self {
             tracked,
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
+            // Refined from the cache's eviction history by `resource_diagnostics_response`.
+            availability: if entry.is_some() {
+                DiagnosticsAvailability::Published
+            } else {
+                DiagnosticsAvailability::Pending
+            },
             signals,
         }
     }
@@ -467,7 +487,7 @@ impl ResourceDiagnosticsResponse {
 fn build_resource_diagnostics_response(
     document_open: bool,
     entry: Option<&DiagnosticInfo>,
-    signals: DiagnosticsRouteSignals,
+    signals: RouteSignals,
 ) -> ResourceDiagnosticsResponse {
     ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry, signals)
 }
@@ -475,14 +495,23 @@ fn build_resource_diagnostics_response(
 // Diagnostics were redacted when they entered the cache or the pull path.
 impl ServerText for CachedDiagnosticsResponse {
     fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self { result, signals: _ } = self;
+        let Self {
+            result,
+            availability: _,
+            signals: _,
+        } = self;
         result.redact_server_text(redactions);
     }
 }
 
 impl ServerText for DiagnosticsResponse {
     fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self { result, signals: _ } = self;
+        let Self {
+            result,
+            availability: _,
+            origin: _,
+            signals: _,
+        } = self;
         result.redact_server_text(redactions);
     }
 }
@@ -734,7 +763,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
+        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `origin`: `pull`, or `push_cache` when the server has no pull provider. ", availability_note!(), " `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
@@ -763,7 +792,7 @@ impl McplsServer {
         // Sampled before and after the pull: indexing may finish, or a respawn may mark push-degraded, mid-pull.
         let before = {
             let cache = self.context.notification_cache.lock().await;
-            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref())
+            RouteSignals::sample(&cache, route_id.as_ref())
         };
 
         // Merging push-model (flycheck/clippy) diagnostics into the pull
@@ -781,11 +810,16 @@ impl McplsServer {
 
         let after = {
             let cache = self.context.notification_cache.lock().await;
-            DiagnosticsRouteSignals::sample(&cache, route_id.as_ref())
+            RouteSignals::sample(&cache, route_id.as_ref())
         };
         let signals = before.union(after);
 
-        self.structured_result(result.map(|result| DiagnosticsResponse { result, signals }))
+        self.structured_result(result.map(|answer| DiagnosticsResponse {
+            result: answer.result,
+            availability: answer.availability,
+            origin: answer.origin,
+            signals,
+        }))
     }
 
     /// Rename a symbol across the workspace.
@@ -897,6 +931,7 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<WorkspaceSymbolResult>, McpError> {
+        let kind_filter = parse_kind_filter(kind_filter)?;
         self.structured_result(
             self.context
                 .translator
@@ -909,7 +944,7 @@ impl McplsServer {
     // read-only: returns proposed CodeAction edits, does not apply them --
     // mcpls has no write-back path today; revisit if that changes.
     #[tool(
-        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). Keep the range end inside the file. ", positions_note_request!(), " ", out_of_workspace_note!()),
+        description = concat!("Code actions for range. Returns quick fixes, refactorings, and source actions with edits. Capped at a fixed maximum; `truncated: true` on the result means some actions, diagnostics, or edits were left out. An action's `edit.dropped` field, when non-empty, means some of that edit's changes were withheld (e.g. out-of-workspace files). The end line must exist in the file; a line past the end is rejected as invalid params. ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Code Actions"
     )]
     async fn get_code_actions(
@@ -921,6 +956,7 @@ impl McplsServer {
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<CodeActionsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
+        let kind_filter = parse_kind_filter(kind_filter)?;
         self.structured_result(
             self.context
                 .translator
@@ -931,13 +967,13 @@ impl McplsServer {
 
     /// Prepare call hierarchy at a position.
     #[tool(
-        description = concat!("Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", out_of_workspace_note!()),
+        description = concat!("Prepare call hierarchy for a symbol. Returns callable items for incoming/outgoing call analysis, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", name_addressing_note!(), " ", indexing_note!(), " ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Prepare Call Hierarchy"
     )]
     async fn prepare_call_hierarchy(
         &self,
         Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
-    ) -> Result<Json<Addressed<CallHierarchyPrepareResult>>, McpError> {
+    ) -> Result<Json<Indexed<Addressed<CallHierarchyPrepareResult>>>, McpError> {
         let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
         self.structured_result(
@@ -950,7 +986,8 @@ impl McplsServer {
                         translator.handle_call_hierarchy_prepare(file_path, position)
                     },
                 )
-                .await,
+                .await
+                .map(hoist_indexing),
         )
     }
 
@@ -990,7 +1027,7 @@ impl McplsServer {
 
     /// Prepare type hierarchy at a position.
     #[tool(
-        description = concat!("Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", positions_note_request!(), " ", out_of_workspace_note!()),
+        description = concat!("Prepare type hierarchy at position. Returns type items (classes, interfaces, structs) to pass to get_supertypes / get_subtypes, capped at a fixed maximum; `truncated: true` on the result means more exist than are returned. ", indexing_note!(), " ", positions_note_request!(), " ", out_of_workspace_note!()),
         title = "Prepare Type Hierarchy"
     )]
     async fn prepare_type_hierarchy(
@@ -1000,7 +1037,7 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<Json<TypeHierarchyResult>, McpError> {
+    ) -> Result<Json<Indexed<TypeHierarchyResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         self.structured_result(
             self.context
@@ -1160,7 +1197,7 @@ impl McplsServer {
 
     /// Get cached diagnostics for a file.
     #[tool(
-        description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
+        description = concat!("Cached diagnostics from server notifications. Faster than the pull-model diagnostics tool, no new analysis. Errors with a retryable `ServerInitializing` while the file's server is still starting, and with `ServerFailedToStart` if it failed to start, instead of returning an empty list. ", availability_note!(), " `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!()),
         title = "Cached Diagnostics"
     )]
     async fn get_cached_diagnostics(
@@ -1190,11 +1227,12 @@ impl McplsServer {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
-                let (sources, owner, signals) = {
+                let (sources, owner, availability, signals) = {
                     let cache = self.context.notification_cache.lock().await;
                     let owner = cache.diagnostics_owner(&uri).cloned();
-                    let signals = DiagnosticsRouteSignals::sample(&cache, route_id.as_ref());
-                    (cache.diagnostic_sources(&uri), owner, signals)
+                    let availability = cache.availability(&uri, route_id.as_ref());
+                    let signals = RouteSignals::sample(&cache, route_id.as_ref());
+                    (cache.diagnostic_sources(&uri), owner, availability, signals)
                 };
                 let diag_info = sources.merge();
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
@@ -1206,7 +1244,11 @@ impl McplsServer {
                     self.context.translator.document_tracker(),
                 )
                 .await;
-                Ok(CachedDiagnosticsResponse { result, signals })
+                Ok(CachedDiagnosticsResponse {
+                    result,
+                    availability,
+                    signals,
+                })
             }
             Err(e) => Err(e),
         };
@@ -1247,7 +1289,7 @@ impl McplsServer {
 
     /// Get signature help at a position.
     #[tool(
-        description = "Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
+        description = concat!("Signature help at position. Returns parameter info, active signature/parameter, and documentation while typing a call. ", indexing_note!(), " `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted."),
         title = "Signature Help"
     )]
     async fn get_signature_help(
@@ -1257,7 +1299,7 @@ impl McplsServer {
             line,
             character,
         }): Parameters<PositionParams>,
-    ) -> Result<Json<SignatureHelpResult>, McpError> {
+    ) -> Result<Json<Indexed<SignatureHelpResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         self.structured_result(
             self.context
@@ -1369,7 +1411,7 @@ impl McplsServer {
 
     /// Report which tools are usable for which languages.
     #[tool(
-        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `push_only` (no pull provider: `get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
         title = "Tool Support"
     )]
     async fn get_tool_support(
@@ -1392,13 +1434,13 @@ impl McplsServer {
 
     /// Get inlay hints for a range.
     #[tool(
-        description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. Keep the range end inside the file. ", positions_note_request!()),
+        description = concat!("Inlay hints in range. Returns inferred type/parameter annotations the editor would render inline. Capped at a fixed maximum; `truncated: true` on the result means more hints exist than are returned. The end line must exist in the file; a line past the end is rejected as invalid params. ", indexing_note!(), " ", positions_note_request!()),
         title = "Inlay Hints"
     )]
     async fn get_inlay_hints(
         &self,
         Parameters(InlayHintsParams { file_path, range }): Parameters<InlayHintsParams>,
-    ) -> Result<Json<InlayHintsResult>, McpError> {
+    ) -> Result<Json<Indexed<InlayHintsResult>>, McpError> {
         let file_path = parse_client_path(file_path)?;
         self.structured_result(
             self.context
@@ -1470,21 +1512,24 @@ impl McplsServer {
         // Only the snapshot is taken under the cache lock: merging the sources
         // (dedupe, sort, size cap) runs after it is released, since
         // `diagnostics_pump` needs the same lock.
-        let (sources, signals) = {
+        let (sources, availability, signals) = {
             let cache = self.context.notification_cache.lock().await;
             (
                 cache.diagnostic_sources(&lsp_uri),
-                DiagnosticsRouteSignals::sample(&cache, route_id.as_ref()),
+                cache.availability(&lsp_uri, route_id.as_ref()),
+                RouteSignals::sample(&cache, route_id.as_ref()),
             )
         };
         let diag_info = sources.merge();
-        Ok(build_resource_diagnostics_response(
+        let mut response = build_resource_diagnostics_response(
             self.context
                 .translator
                 .is_document_open(validated_path.as_path()),
             diag_info.as_ref(),
             signals,
-        ))
+        );
+        response.availability = availability;
+        Ok(response)
     }
 
     /// Body of `read_resource`, kept separate so it can run under
@@ -1493,7 +1538,7 @@ impl McplsServer {
         &self,
         request: ReadResourceRequestParams,
     ) -> Result<ReadResourceResponse, McpError> {
-        let path = parse_uri(&request.uri).map_err(|e| map_bridge_error(e.into()))?;
+        let path = parse_uri(&request.uri).map_err(client_input_error)?;
         let response = self.resource_diagnostics_response(&path).await?;
 
         let json = serde_json::to_string(&response)
@@ -1511,13 +1556,10 @@ async fn contain_panic<T>(
     handler: impl Future<Output = Result<T, McpError>>,
     operation: &'static str,
 ) -> Result<T, McpError> {
-    match AssertUnwindSafe(handler).catch_unwind().await {
+    match crate::util::catch_panic(handler).await {
         Ok(result) => result,
-        Err(payload) => {
-            tracing::error!(
-                "{operation} handler panicked: {}",
-                crate::util::panic_message(payload.as_ref())
-            );
+        Err(panicked) => {
+            tracing::error!("{operation} handler panicked: {}", panicked.message());
             Err(McpError::internal_error(
                 format!("{operation} handler panicked"),
                 None,
@@ -1548,7 +1590,7 @@ impl McplsServer {
             return Ok(None);
         }
         if accepted.is_empty() {
-            return Err(no_resolvable_listen_uris());
+            return Err(crate::error::Error::NoResolvableListenUris);
         }
         let permit = self.context.session.registry().try_reserve_listen()?;
         let roots = self.context.workspace_roots.clone();
@@ -1557,7 +1599,7 @@ impl McplsServer {
             .await
             .map_err(listen_join_error)?;
         if uris.is_empty() {
-            return Err(no_resolvable_listen_uris());
+            return Err(crate::error::Error::NoResolvableListenUris);
         }
         Ok(Some((permit, uris)))
     }
@@ -1613,75 +1655,6 @@ fn start_listen_lease(context: &SubscriptionContext) {
     {
         slot.start();
     }
-}
-
-/// A well-formed resource URI whose path cannot be resolved (deleted, outside
-/// the workspace): unsubscribing falls back to the recorded alias (#499).
-/// Every other failure is a malformed URI or an internal fault.
-const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
-    use crate::error::Error;
-    match error {
-        Error::MalformedPath { .. }
-        | Error::FileIo { .. }
-        | Error::PathOutsideWorkspace(..)
-        | Error::NoWorkspaceRoots(..) => true,
-        Error::LspInitFailed { .. }
-        | Error::LspServerError { .. }
-        | Error::McpServerStart(..)
-        | Error::TaskFailed { .. }
-        | Error::StdioCapture(..)
-        | Error::HttpBind { .. }
-        | Error::DocumentNotFound(..)
-        | Error::NoServerForLanguage(..)
-        | Error::NoServerForTool { .. }
-        | Error::ServerFailedToStart(..)
-        | Error::ServerInitializing { .. }
-        | Error::ServerRestarted { .. }
-        | Error::SymbolResolution(..)
-        | Error::UnknownServers { .. }
-        | Error::WorkspaceServersInitializing
-        | Error::NoServerConfigured
-        | Error::NoServerForWorkspaceTool { .. }
-        | Error::ConfigNotFound(..)
-        | Error::ConfigInsideWorkspace { .. }
-        | Error::InvalidConfig(..)
-        | Error::Io(..)
-        | Error::Json(..)
-        | Error::TomlDe(..)
-        | Error::TomlSer(..)
-        | Error::Timeout(..)
-        | Error::ServerSpawnFailed { .. }
-        | Error::ServerNotFound { .. }
-        | Error::LspProtocolError(..)
-        | Error::InvalidUri(..)
-        | Error::InvalidPositionInput(..)
-        | Error::InvalidRangeInput(..)
-        | Error::InvalidHierarchyItemInput(..)
-        | Error::PositionBeyondDocument { .. }
-        | Error::ResourceUri(..)
-        | Error::PathToUri(..)
-        | Error::ServerTerminated
-        | Error::ShutdownTimeout
-        | Error::ServerExitedDuringInit { .. }
-        | Error::ServerUnavailable { .. }
-        | Error::InvalidToolParams(..)
-        | Error::InvalidClientPath(..)
-        | Error::DocumentLimitExceeded { .. }
-        | Error::SubscriptionLimitReached { .. }
-        | Error::ListenStreamsExhausted { .. }
-        | Error::ListenFilterTooLarge { .. }
-        | Error::FileSizeLimitExceeded { .. }
-        | Error::NotARegularFile(..)
-        | Error::AllServersFailedToInit { .. }
-        | Error::CapabilityNotSupported { .. }
-        | Error::WorkspaceIndexing { .. } => false,
-    }
-}
-
-fn no_resolvable_listen_uris() -> crate::error::Error {
-    crate::error::Error::InvalidUri(
-        "none of the requested resource URIs resolve inside the workspace".to_owned(),
-    )
 }
 
 const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Error {
@@ -1870,7 +1843,7 @@ impl ServerHandler for McplsServer {
                 // Only a malformed URI errors; a deleted file resolves via its alias (#499).
                 let canonical = match self.resolve_resource(&request.uri).await {
                     Ok(resolved) => Some(resolved.uri),
-                    Err(e) if is_unresolvable_resource(&e) => None,
+                    Err(e) if e.is_unresolvable_resource() => None,
                     Err(e) => return Err(self.render_error(e)),
                 };
 
@@ -1982,16 +1955,13 @@ impl ServerHandler for McplsServer {
             self.context
                 .mcp
                 .title
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SERVER_TITLE.to_string()),
+                .as_ref()
+                .map_or_else(|| DEFAULT_SERVER_TITLE.to_string(), ToString::to_string),
         );
-        implementation.description = Some(
-            self.context
-                .mcp
-                .description
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SERVER_DESCRIPTION.to_string()),
-        );
+        implementation.description = Some(self.context.mcp.description.as_ref().map_or_else(
+            || DEFAULT_SERVER_DESCRIPTION.to_string(),
+            ToString::to_string,
+        ));
         implementation.website_url = Some("https://github.com/bug-ops/mcpls".to_string());
 
         let capabilities = ServerCapabilities::builder()
@@ -2001,15 +1971,18 @@ impl ServerHandler for McplsServer {
             .build();
         let mut server_info = RmcpServerConfig::new(capabilities);
         server_info.server_info = implementation;
-        let mut instructions = self.context.mcp.instructions.clone().unwrap_or_else(|| {
-            format!(
-                "{DEFAULT_INSTRUCTIONS} Call {} to see which tools work for which languages.",
-                prefixed_tool_name(
-                    self.context.mcp.tool_prefix.as_ref(),
-                    McpTool::GetToolSupport.name()
+        let mut instructions = self.context.mcp.instructions.as_ref().map_or_else(
+            || {
+                format!(
+                    "{DEFAULT_INSTRUCTIONS} Call {} to see which tools work for which languages.",
+                    prefixed_tool_name(
+                        self.context.mcp.tool_prefix.as_ref(),
+                        McpTool::GetToolSupport.name()
+                    )
                 )
-            )
-        });
+            },
+            ToString::to_string,
+        );
 
         if self.context.project_config_status == ProjectConfigStatus::IgnoredUntrusted {
             instructions.push_str(
@@ -2032,8 +2005,10 @@ mod tests {
 
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
-    use crate::bridge::{Capability, LogLevel, ResultContext};
-    use crate::config::LanguageId;
+    use crate::bridge::{Capability, IndexingSignal, LogLevel, ResultContext, RouteSignals};
+    #[cfg(unix)]
+    use crate::config::ServerCommand;
+    use crate::config::{FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle};
     #[cfg(unix)]
     use crate::config::{PositionEncodings, TimeoutSecs};
     use crate::mcp::tool_support::ToolBackend;
@@ -2210,7 +2185,11 @@ mod tests {
     /// `INTERNAL_ERROR` code, unchanged.
     #[test]
     fn test_map_bridge_error_other_variant_uses_internal_error_code() {
-        let err = crate::error::Error::NoServerForLanguage(LanguageId::from_static("python"));
+        let err = crate::error::Error::NoServerForLanguage {
+            language: LanguageId::from_static("python"),
+            extension: None,
+            patterns: vec![],
+        };
         let mcp_err = map_bridge_error(err);
 
         assert_eq!(mcp_err.code, ErrorCode::INTERNAL_ERROR);
@@ -2227,7 +2206,7 @@ mod tests {
             crate::error::Error::InvalidToolParams("bad params".to_string()),
             crate::error::Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
             crate::error::Error::NotARegularFile(PathBuf::from("/dev/null")),
-            crate::error::Error::InvalidUri("not a uri".to_string()),
+            crate::error::Error::NoResolvableListenUris,
             crate::error::Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             crate::error::Error::FileSizeLimitExceeded { size: 100, max: 10 },
             crate::error::Error::InvalidClientPath(crate::bridge::InvalidClientPath::Empty),
@@ -2370,7 +2349,10 @@ mod tests {
                 command: "pyright".to_owned(),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::LspInitFailed {
-                        message: "exited with token bravo-secret-222".to_owned(),
+                        phase: crate::error::InitPhase::Initialize,
+                        cause: Box::new(crate::error::Error::LspProtocolError(
+                            crate::error::RedactedText::fixed("exited with token bravo-secret-222"),
+                        )),
                         hint: None,
                         stderr: None,
                     },
@@ -2481,7 +2463,7 @@ mod tests {
     async fn test_resolve_resource_reports_a_malformed_uri_as_invalid_params() {
         let server = create_test_server();
         let error = server.resolve_resource("file:///a.rs").await.unwrap_err();
-        assert!(!is_unresolvable_resource(&error), "{error:?}");
+        assert!(!error.is_unresolvable_resource(), "{error:?}");
         assert_eq!(map_bridge_error(error).code, ErrorCode::INVALID_PARAMS);
     }
 
@@ -2559,6 +2541,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An unknown `kind_filter` keeps its `-32602` class, in any case a known
+    /// one passes the boundary, and a non-string value is a parameter error.
+    #[tokio::test]
+    async fn test_kind_filters_reject_unknown_kinds_as_invalid_params() {
+        let server = create_test_server();
+        let file = std::env::temp_dir().join("a.rs");
+        let code_actions = |kind: serde_json::Value| {
+            serde_json::from_value::<CodeActionsParams>(serde_json::json!({
+                "file_path": file,
+                "start_line": 1, "start_character": 1, "end_line": 1, "end_character": 2,
+                "kind_filter": kind,
+            }))
+        };
+        let symbols = |kind: serde_json::Value| {
+            serde_json::from_value::<WorkspaceSymbolParams>(
+                serde_json::json!({"query": "x", "kind_filter": kind}),
+            )
+        };
+
+        for (kind, rejected) in [
+            ("QuickFix", false),
+            ("SOURCE.organizeimports", false),
+            ("bogus", true),
+        ] {
+            let params = code_actions(kind.into()).unwrap();
+            let code = server
+                .get_code_actions(Parameters(params))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code;
+            assert_eq!(code == ErrorCode::INVALID_PARAMS, rejected, "{kind}");
+        }
+        for (kind, rejected) in [
+            ("Function", false),
+            ("function", false),
+            ("22", false),
+            ("NotAKind", true),
+        ] {
+            let params = symbols(kind.into()).unwrap();
+            let code = server
+                .workspace_symbol_search(Parameters(params))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code;
+            assert_eq!(code == ErrorCode::INVALID_PARAMS, rejected, "{kind}");
+        }
+        assert!(code_actions(serde_json::json!(3)).is_err());
+        assert!(symbols(serde_json::json!(true)).is_err());
+    }
+
+    /// The diagnostics responses carry `availability`, and `get_diagnostics`
+    /// also `origin`, beside the route signals.
+    #[test]
+    fn test_diagnostics_responses_carry_availability_and_origin() {
+        let pulled = serde_json::to_value(DiagnosticsResponse {
+            result: DocumentDiagnosticsResult {
+                diagnostics: Vec::new(),
+                positions_degraded: None,
+                enrichment: None,
+            },
+            availability: DiagnosticsAvailability::Pending,
+            origin: DiagnosticsOrigin::PushCache,
+            signals: RouteSignals::default(),
+        })
+        .unwrap();
+        assert_eq!(pulled["availability"], "pending");
+        assert_eq!(pulled["origin"], "push_cache");
+        assert_eq!(pulled["indexing_in_progress"], false);
+
+        let resource = serde_json::to_value(build_resource_diagnostics_response(
+            true,
+            None,
+            RouteSignals::default(),
+        ))
+        .unwrap();
+        assert_eq!(resource["availability"], "pending");
     }
 
     /// #636: an inverted `range` or `selectionRange` is `-32602`, while a
@@ -2834,9 +2896,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_info_reflects_configured_mcp_fields() {
         let mcp = McpConfig {
-            title: Some("Custom Title".to_string()),
-            description: Some("Custom description".to_string()),
-            instructions: Some("Custom instructions.".to_string()),
+            title: Some(McpTitle::new("Custom Title").unwrap()),
+            description: Some(McpDescription::new("Custom description").unwrap()),
+            instructions: Some(McpInstructions::new("Custom instructions.").unwrap()),
             tool_prefix: None,
         };
         let server = create_test_server_with_mcp_config(ProjectConfigStatus::NotIgnored, mcp);
@@ -2861,7 +2923,7 @@ mod tests {
         let mcp = McpConfig {
             title: None,
             description: None,
-            instructions: Some(instructions.clone()),
+            instructions: Some(McpInstructions::new(instructions.clone()).unwrap()),
             tool_prefix: None,
         };
         let server = create_test_server_with_mcp_config(ProjectConfigStatus::IgnoredUntrusted, mcp);
@@ -2980,7 +3042,7 @@ mod tests {
                 LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -3031,7 +3093,7 @@ mod tests {
         .await;
 
         let result = call.await.unwrap().unwrap();
-        assert!(result.0.signals.indexing_in_progress);
+        assert!(result.0.signals.indexing.indexing_in_progress);
         assert_eq!(result.0.result.diagnostics.len(), 0);
     }
 
@@ -3056,7 +3118,7 @@ mod tests {
                 LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -3102,7 +3164,7 @@ mod tests {
         .await;
 
         let result = call.await.unwrap().unwrap();
-        assert!(!result.0.signals.indexing_in_progress);
+        assert!(!result.0.signals.indexing.indexing_in_progress);
     }
 
     /// S2 regression: the server is `Loading` when the pull *starts* but
@@ -3130,7 +3192,7 @@ mod tests {
                 LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -3192,7 +3254,7 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(
-            result.0.signals.indexing_in_progress,
+            result.0.signals.indexing.indexing_in_progress,
             "the pre-pull sample must still catch a server that finished indexing mid-pull"
         );
     }
@@ -3220,7 +3282,7 @@ mod tests {
                 LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -3458,9 +3520,11 @@ mod tests {
         }
         assert!(visited > 0, "no outputSchema visited; the guard is a no-op");
 
-        let signals = DiagnosticsRouteSignals {
+        let signals = RouteSignals {
             push_notifications_degraded: true,
-            indexing_in_progress: true,
+            indexing: IndexingSignal {
+                indexing_in_progress: true,
+            },
         };
         let degraded = Some(crate::bridge::PositionDegradation::Request);
         let pulled = serde_json::to_value(DiagnosticsResponse {
@@ -3469,6 +3533,8 @@ mod tests {
                 positions_degraded: degraded,
                 enrichment: None,
             },
+            availability: DiagnosticsAvailability::Published,
+            origin: DiagnosticsOrigin::Pull,
             signals,
         })
         .unwrap();
@@ -3477,6 +3543,7 @@ mod tests {
                 diagnostics: Vec::new(),
                 positions_degraded: degraded,
             },
+            availability: DiagnosticsAvailability::Published,
             signals,
         })
         .unwrap();
@@ -3529,7 +3596,7 @@ mod tests {
                 LanguageId::from_static("rust"),
             )]))
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -3583,7 +3650,7 @@ mod tests {
 
         let result = call.await.unwrap().unwrap();
         assert!(
-            result.0.signals.indexing_in_progress,
+            result.0.signals.indexing.indexing_in_progress,
             "route resolution must follow the symlink to its .rs target, not \
              stop at the .txt extension of the raw client path"
         );
@@ -4184,7 +4251,7 @@ mod tests {
                     LanguageId::from_static("rust"),
                 )]))
                 .with_extensions(HashMap::from([(
-                    "rs".to_string(),
+                    FileExtension::from_static("rs"),
                     LanguageId::from_static("rust"),
                 )])),
         );
@@ -4249,7 +4316,7 @@ mod tests {
                     LanguageId::from_static("rust"),
                 )]))
                 .with_extensions(HashMap::from([(
-                    "rs".to_string(),
+                    FileExtension::from_static("rs"),
                     LanguageId::from_static("rust"),
                 )])),
         );
@@ -4308,7 +4375,7 @@ mod tests {
                     LanguageId::from_static("rust"),
                 )]))
                 .with_extensions(HashMap::from([(
-                    "rs".to_string(),
+                    FileExtension::from_static("rs"),
                     LanguageId::from_static("rust"),
                 )])),
         );
@@ -4388,10 +4455,10 @@ sleep 0.3
         .unwrap();
 
         let id = ServerId::from("rust");
-        let config = ServerInitConfig {
-            server_config: LspServerConfig {
+        let config = ServerInitConfig::new(
+            LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: "sh".to_string(),
+                command: ServerCommand::from_static("sh"),
                 args: vec![script_path.to_string_lossy().to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -4400,16 +4467,15 @@ sleep 0.3
                 timeout_seconds: TimeoutSecs::new(5).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                 heuristics: None,
-                name: Some("rust".to_string()),
+                name: Some(ServerId::from("rust")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
             },
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
         let seed = LspServer::spawn(config).await.unwrap();
 
@@ -4422,7 +4488,7 @@ sleep 0.3
                 )]))
                 .with_notification_cache(Arc::clone(&notification_cache))
                 .with_extensions(HashMap::from([(
-                    "rs".to_string(),
+                    FileExtension::from_static("rs"),
                     LanguageId::from_static("rust"),
                 )])),
         );
@@ -5050,8 +5116,7 @@ sleep 0.3
 
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
-        let response =
-            ResourceDiagnosticsResponse::new(false, None, DiagnosticsRouteSignals::default());
+        let response = ResourceDiagnosticsResponse::new(false, None, RouteSignals::default());
         assert!(!response.tracked);
         assert!(response.version.is_none());
         assert_eq!(response.diagnostics.len(), 0);
@@ -5065,8 +5130,7 @@ sleep 0.3
 
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
-        let response =
-            ResourceDiagnosticsResponse::new(true, None, DiagnosticsRouteSignals::default());
+        let response = ResourceDiagnosticsResponse::new(true, None, RouteSignals::default());
         assert!(response.tracked);
         assert!(response.version.is_none());
         assert_eq!(response.diagnostics.len(), 0);
@@ -5099,11 +5163,8 @@ sleep 0.3
             tags: None,
             data: None,
         }]);
-        let response = ResourceDiagnosticsResponse::new(
-            true,
-            Some(&entry),
-            DiagnosticsRouteSignals::default(),
-        );
+        let response =
+            ResourceDiagnosticsResponse::new(true, Some(&entry), RouteSignals::default());
         assert!(response.tracked);
         assert_eq!(response.version, Some(1));
         assert_eq!(response.diagnostics.len(), 1);
@@ -5129,16 +5190,14 @@ sleep 0.3
 
     #[test]
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
-        let response =
-            build_resource_diagnostics_response(false, None, DiagnosticsRouteSignals::default());
+        let response = build_resource_diagnostics_response(false, None, RouteSignals::default());
         assert!(!response.tracked);
         assert_eq!(response.diagnostics.len(), 0);
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
-        let response =
-            build_resource_diagnostics_response(true, None, DiagnosticsRouteSignals::default());
+        let response = build_resource_diagnostics_response(true, None, RouteSignals::default());
         assert!(response.tracked);
         assert_eq!(response.diagnostics.len(), 0);
     }
@@ -5172,11 +5231,8 @@ sleep 0.3
             data: None,
         }]);
 
-        let response = build_resource_diagnostics_response(
-            false,
-            Some(&entry),
-            DiagnosticsRouteSignals::default(),
-        );
+        let response =
+            build_resource_diagnostics_response(false, Some(&entry), RouteSignals::default());
         assert!(
             response.tracked,
             "a cached diagnostics entry must make the response tracked, \
@@ -5193,9 +5249,9 @@ sleep 0.3
         let response = build_resource_diagnostics_response(
             false,
             None,
-            DiagnosticsRouteSignals {
+            RouteSignals {
                 push_notifications_degraded: true,
-                indexing_in_progress: false,
+                indexing: IndexingSignal::default(),
             },
         );
         assert!(response.signals.push_notifications_degraded);
@@ -5212,12 +5268,14 @@ sleep 0.3
         let response = build_resource_diagnostics_response(
             false,
             None,
-            DiagnosticsRouteSignals {
+            RouteSignals {
                 push_notifications_degraded: false,
-                indexing_in_progress: true,
+                indexing: IndexingSignal {
+                    indexing_in_progress: true,
+                },
             },
         );
-        assert!(response.signals.indexing_in_progress);
+        assert!(response.signals.indexing.indexing_in_progress);
 
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["indexing_in_progress"], true);
@@ -5529,11 +5587,11 @@ sleep 0.3
         let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&base)).unwrap();
 
         let malformed = DiagnosticsResourceUri::resolve("file:///a.rs", &roots).unwrap_err();
-        assert!(!is_unresolvable_resource(&malformed), "{malformed:?}");
+        assert!(!malformed.is_unresolvable_resource(), "{malformed:?}");
 
         let missing = make_uri(&base.join("gone.rs")).unwrap();
         let deleted = DiagnosticsResourceUri::resolve(&missing, &roots).unwrap_err();
-        assert!(is_unresolvable_resource(&deleted), "{deleted:?}");
+        assert!(deleted.is_unresolvable_resource(), "{deleted:?}");
 
         let outside_path = if cfg!(windows) {
             r"C:\definitely\outside.rs"
@@ -5542,11 +5600,12 @@ sleep 0.3
         };
         let outside = make_uri(std::path::Path::new(outside_path)).unwrap();
         let escaped = DiagnosticsResourceUri::resolve(&outside, &roots).unwrap_err();
-        assert!(is_unresolvable_resource(&escaped), "{escaped:?}");
+        assert!(escaped.is_unresolvable_resource(), "{escaped:?}");
 
-        assert!(!is_unresolvable_resource(&crate::error::Error::PathToUri(
-            std::path::PathBuf::from("/x")
-        )));
+        assert!(
+            !crate::error::Error::PathToUri(std::path::PathBuf::from("/x"))
+                .is_unresolvable_resource()
+        );
     }
 
     /// subscribe cap enforced: after `MAX_SUBSCRIPTIONS` entries, the next call returns `Err`.
@@ -5791,8 +5850,14 @@ sleep 0.3
         let id = ServerId::from("rust");
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([
-                ("rs".to_string(), LanguageId::from_static("rust")),
-                ("py".to_string(), LanguageId::from_static("python")),
+                (
+                    FileExtension::from_static("rs"),
+                    LanguageId::from_static("rust"),
+                ),
+                (
+                    FileExtension::from_static("py"),
+                    LanguageId::from_static("python"),
+                ),
             ]))
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
@@ -6162,8 +6227,14 @@ sleep 0.3
                 |(id, language, _)| (ServerId::from(*id), LanguageId::new(*language).unwrap()),
             )))
             .with_extensions(std::collections::HashMap::from([
-                ("rs".to_string(), LanguageId::from_static("rust")),
-                ("py".to_string(), LanguageId::from_static("python")),
+                (
+                    FileExtension::from_static("rs"),
+                    LanguageId::from_static("rust"),
+                ),
+                (
+                    FileExtension::from_static("py"),
+                    LanguageId::from_static("python"),
+                ),
             ]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -6539,7 +6610,14 @@ sleep 0.3
 
         let diagnostics = tool_entry(&report, "get_diagnostics");
         assert_eq!(diagnostics["coverage"], "all");
-        assert!(diagnostics.get("routes").is_none());
+        assert_eq!(
+            diagnostics["routes"],
+            serde_json::json!([
+                {"languages": ["python"], "status": "push_only", "server": "py-srv"},
+                {"languages": ["rust"], "status": "push_only", "server": "rust-srv"},
+            ]),
+            "servers advertising no diagnosticProvider answer from the push cache"
+        );
 
         let workspace = tool_entry(&report, "workspace_symbol_search");
         assert_eq!(workspace["coverage"], "none");

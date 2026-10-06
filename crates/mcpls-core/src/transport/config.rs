@@ -71,7 +71,7 @@ pub struct HttpConfig {
     /// `429 Too Many Requests`. Defaults to [`SessionLimit::DEFAULT`].
     pub max_concurrent_sessions: SessionLimit,
     /// How long a session may go without client activity before it is closed.
-    pub(crate) session_idle_timeout: IdleTimeout,
+    pub session_idle_timeout: IdleTimeout,
     /// Longest a client may take to send a complete request header, and
     /// the longest it may pause between request-body chunks. It is also how
     /// long an idle keep-alive connection stays open.
@@ -301,6 +301,26 @@ impl HttpConfig {
         self
     }
 
+    /// Override how long a session may go without client activity before it
+    /// is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mcpls_core::HttpConfig;
+    /// use mcpls_core::transport::IdleTimeout;
+    ///
+    /// let cfg = HttpConfig::new("127.0.0.1:3000".parse().unwrap())
+    ///     .with_session_idle_timeout(IdleTimeout::new(Duration::from_mins(10)).unwrap());
+    /// assert_eq!(cfg.session_idle_timeout.get(), Duration::from_mins(10));
+    /// ```
+    #[must_use]
+    pub const fn with_session_idle_timeout(mut self, timeout: IdleTimeout) -> Self {
+        self.session_idle_timeout = timeout;
+        self
+    }
+
     /// Override how standalone GET streams are probed for liveness.
     ///
     /// # Examples
@@ -362,14 +382,14 @@ impl HttpConfig {
 }
 
 macro_rules! non_zero_duration {
-    ($(#[$meta:meta])* $vis:vis $name:ident, $default_secs:expr, $default_doc:literal) => {
+    ($(#[$meta:meta])* $vis:vis $name:ident, $default:expr) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         $vis struct $name(std::time::Duration);
 
         impl $name {
-            #[doc = $default_doc]
-            $vis const DEFAULT: Self = match Self::new(std::time::Duration::from_secs($default_secs)) {
+            /// The default duration.
+            $vis const DEFAULT: Self = match Self::new($default) {
                 Some(duration) => duration,
                 None => panic!("the default duration must be non-zero"),
             };
@@ -439,7 +459,7 @@ non_zero_duration! {
     /// let interval = ProbeInterval::new(Duration::from_mins(1)).unwrap();
     /// assert_eq!(interval.get(), Duration::from_mins(1));
     /// ```
-    pub ProbeInterval, 60, "60 seconds."
+    pub ProbeInterval, std::time::Duration::from_mins(1)
 }
 
 non_zero_duration! {
@@ -456,7 +476,7 @@ non_zero_duration! {
     /// let deadline = ProbeDeadline::new(Duration::from_secs(30)).unwrap();
     /// assert_eq!(deadline.get(), Duration::from_secs(30));
     /// ```
-    pub ProbeDeadline, 30, "30 seconds."
+    pub ProbeDeadline, std::time::Duration::from_secs(30)
 }
 
 non_zero_duration! {
@@ -478,7 +498,7 @@ non_zero_duration! {
     /// assert_eq!(deadline.get(), Duration::from_mins(5));
     /// assert_eq!(ResponseStreamDeadline::DEFAULT.get(), Duration::from_hours(1));
     /// ```
-    pub ResponseStreamDeadline, 3600, "1 hour."
+    pub ResponseStreamDeadline, std::time::Duration::from_hours(1)
 }
 
 const _: () = assert!(
@@ -562,7 +582,7 @@ non_zero_duration! {
     /// let timeout = HeaderReadTimeout::new(Duration::from_secs(10)).unwrap();
     /// assert_eq!(timeout.get(), Duration::from_secs(10));
     /// ```
-    pub HeaderReadTimeout, 30, "30 seconds."
+    pub HeaderReadTimeout, std::time::Duration::from_secs(30)
 }
 
 non_zero_duration! {
@@ -581,7 +601,7 @@ non_zero_duration! {
     /// assert!(WriteStallTimeout::new(Duration::ZERO).is_none());
     /// assert_eq!(WriteStallTimeout::DEFAULT.get(), Duration::from_secs(30));
     /// ```
-    pub WriteStallTimeout, 30, "30 seconds."
+    pub WriteStallTimeout, std::time::Duration::from_secs(30)
 }
 
 non_zero_limit! {

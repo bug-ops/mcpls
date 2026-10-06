@@ -2,25 +2,22 @@
 //! shared cache and fans publications out to subscribed MCP sessions.
 
 use std::collections::HashSet;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::FutureExt as _;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{debug, error};
 
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{
-    self, DiagnosticsRole, NotificationCache, Publication, PublicationKind, PublishedPathResolver,
-    WorkspaceRoots,
+    self, DiagnosticsRole, IndexingReset, NotificationCache, Publication, PublicationKind,
+    PublishedPathResolver, WorkspaceRoots,
 };
 use crate::config::ServerId;
 use crate::lsp::LspNotification;
-use crate::lsp::tsserver_pin::warn_if_pin_ignored;
 use crate::mcp::SubscriptionRegistry;
-use crate::util::panic_message;
+use crate::util::catch_panic;
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
@@ -177,11 +174,13 @@ async fn diagnostics_pump_with_resolver(
                             done = &mut resolving => break done,
                             msg = lifecycle_rx.recv(), if !lifecycle_closed => match msg {
                                 Some(notif) => {
-                                    bridge::apply_lifecycle_notification(
-                                        &mut *notification_cache.lock().await,
+                                    bridge::on_lifecycle(
+                                        Some(&notification_cache),
                                         &server_id,
+                                        pinned_tsserver.as_deref(),
                                         notif,
-                                    );
+                                    )
+                                    .await;
                                 }
                                 None => lifecycle_closed = true,
                             },
@@ -208,12 +207,13 @@ async fn diagnostics_pump_with_resolver(
                     lifecycle_closed = true;
                     continue;
                 };
-                warn_if_pin_ignored(pinned_tsserver.as_deref(), &notif, server_id.as_str());
-                bridge::apply_lifecycle_notification(
-                    &mut *notification_cache.lock().await,
+                bridge::on_lifecycle(
+                    Some(&notification_cache),
                     &server_id,
+                    pinned_tsserver.as_deref(),
                     notif,
-                );
+                )
+                .await;
             }
         }
     }
@@ -267,13 +267,16 @@ async fn apply_notification(
                 );
                 return;
             };
-            {
-                let mut cache = notification_cache.lock().await;
-                cache.store_published_diagnostics(server_id, &published, p.version, p.diagnostics);
-            }
+            let write = notification_cache.lock().await.write_published_diagnostics(
+                server_id,
+                &published,
+                p.version,
+                p.diagnostics,
+            );
 
             publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
                 .await;
+            publish_invalidated(subs, &write.evicted).await;
         }
         LspNotification::LogMessage(m) => {
             notification_cache
@@ -312,13 +315,66 @@ async fn publish_to_subscribers(
     }
 }
 
+/// Tells every session subscribed to a file in `files` that its diagnostics
+/// changed: cleared by a respawn, or evicted from the cache.
+async fn publish_invalidated(subs: &SubscriptionRegistry, files: &[bridge::DiagnosticsKey]) {
+    if files.is_empty() {
+        return;
+    }
+    let files: HashSet<&bridge::DiagnosticsKey> = files.iter().collect();
+    subs.publish_matching(|uri| {
+        bridge::diagnostics_cache_key(uri).is_some_and(|key| files.contains(&key))
+    })
+    .await;
+}
+
 /// Stops trusting a panicked pump's server: marks it push-degraded and resets
 /// its indexing state, so callers poll instead of waiting on pushes that no
 /// longer arrive.
-pub async fn degrade_after_pump_panic(cache: &Mutex<NotificationCache>, id: &ServerId) {
+async fn degrade_after_pump_panic(cache: &Mutex<NotificationCache>, id: &ServerId) {
     let mut cache = cache.lock().await;
     cache.mark_push_degraded(id);
-    cache.reset_indexing_state(id);
+    cache.reset_indexing_state(id, IndexingReset::Forget);
+}
+
+/// [`diagnostics_pump`] with its panic contained: a panic is logged and the
+/// server degraded ([`degrade_after_pump_panic`]) instead of unwinding the
+/// task.
+///
+/// The one way a pump is started, for the initial servers and for restarts.
+pub async fn supervised_pump(
+    server_id: ServerId,
+    receivers: bridge::NotificationReceivers,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    role_rx: tokio::sync::watch::Receiver<DiagnosticsRole>,
+    shared: PumpShared,
+) {
+    let cache = Arc::clone(&shared.notification_cache);
+    let pump = diagnostics_pump(
+        server_id.clone(),
+        receivers.notifications,
+        receivers.lifecycle,
+        cancel_rx,
+        role_rx,
+        receivers.pinned_tsserver,
+        shared,
+    );
+    contain_pump_panic(pump, &server_id, &cache).await;
+}
+
+/// Awaits `pump`, degrading `server_id` when it panics.
+async fn contain_pump_panic(
+    pump: impl Future<Output = ()>,
+    server_id: &ServerId,
+    cache: &Mutex<NotificationCache>,
+) {
+    if let Err(panicked) = catch_panic(pump).await {
+        error!(
+            "Diagnostics pump for LSP server '{server_id}' panicked: {}",
+            panicked.message()
+        );
+        degrade_after_pump_panic(cache, server_id).await;
+    }
 }
 
 /// Re-starts diagnostics pumps for manually restarted servers over the same
@@ -352,28 +408,14 @@ impl bridge::NotificationWiring for PumpWiring {
         receivers: bridge::NotificationReceivers,
         role: DiagnosticsRole,
     ) -> tokio::task::AbortHandle {
-        let shared = self.shared.clone();
-        let cancel_rx = self.cancel_rx.clone();
         let (_role_tx, role_rx) = tokio::sync::watch::channel(role);
-        let cache = Arc::clone(&shared.notification_cache);
-        tokio::spawn(async move {
-            let pump = diagnostics_pump(
-                id.clone(),
-                receivers.notifications,
-                receivers.lifecycle,
-                cancel_rx,
-                role_rx,
-                receivers.pinned_tsserver,
-                shared,
-            );
-            if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
-                error!(
-                    "Diagnostics pump for LSP server '{id}' panicked: {}",
-                    panic_message(payload.as_ref())
-                );
-                degrade_after_pump_panic(&cache, &id).await;
-            }
-        })
+        tokio::spawn(supervised_pump(
+            id,
+            receivers,
+            self.cancel_rx.clone(),
+            role_rx,
+            self.shared.clone(),
+        ))
         .abort_handle()
     }
 
@@ -381,18 +423,7 @@ impl bridge::NotificationWiring for PumpWiring {
         &'a self,
         cleared: &'a [bridge::DiagnosticsKey],
     ) -> futures::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if cleared.is_empty() {
-                return;
-            }
-            let cleared: HashSet<&bridge::DiagnosticsKey> = cleared.iter().collect();
-            self.shared
-                .subs
-                .publish_matching(|uri| {
-                    bridge::diagnostics_cache_key(uri).is_some_and(|key| cleared.contains(&key))
-                })
-                .await;
-        })
+        Box::pin(publish_invalidated(&self.shared.subs, cleared))
     }
 
     fn has_subscriptions(&self) -> futures::future::BoxFuture<'_, bool> {
@@ -1121,6 +1152,54 @@ mod pump_tests {
         );
     }
 
+    /// #649: a push that evicts another file's entry tells that file's
+    /// subscribers, and nobody who did not subscribe to it.
+    #[tokio::test]
+    async fn test_push_eviction_notifies_the_evicted_files_subscribers() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_evicted, mut rx_evicted) = mpsc::channel(8);
+        let (tx_other, mut rx_other) = mpsc::channel(8);
+        let (evicted, other) = (test_mcp_uri("first.rs"), test_mcp_uri("filler1.rs"));
+        session
+            .subscribe_for_test(&evicted, Target::Channel(tx_evicted.clone()))
+            .await
+            .unwrap();
+        session
+            .subscribe_for_test(&other, Target::Channel(tx_other.clone()))
+            .await
+            .unwrap();
+        let cache = make_cache();
+        let error = lsp_types::Diagnostic::default();
+        let mut guard = cache.lock().await;
+        let server = ServerId::from("rust");
+        guard.store_diagnostics(&server, &test_uri("first.rs"), None, vec![error.clone()]);
+        for i in 1..bridge::MAX_DIAGNOSTIC_ENTRIES {
+            guard.store_diagnostics(
+                &server,
+                &test_uri(&format!("filler{i}.rs")),
+                None,
+                vec![error.clone()],
+            );
+        }
+        drop(guard);
+
+        let (tx, _cancel_tx) =
+            spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
+        tx.send(publish("new.rs")).await.unwrap();
+
+        assert_eq!(recv_within(&mut rx_evicted).await, evicted.as_str());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_matches!(
+            rx_evicted.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "notified once"
+        );
+        assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
     /// A pull that changed a file notifies the subscribers of that file only.
     #[tokio::test]
     async fn test_publish_changed_notifies_only_subscribers_of_the_file() {
@@ -1375,6 +1454,105 @@ mod pump_tests {
         .await
         .expect("lifecycle lane must be serviced while the batch is still resolving");
         drop(release);
+    }
+
+    /// #658: a `$/typescriptVersion` taken by the lifecycle arm that runs
+    /// while a diagnostics batch resolves gets the pin-ignored warning too.
+    #[tokio::test]
+    async fn test_pump_warns_about_ignored_pin_while_a_batch_resolves() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        use crate::test_lsp::CapturedLogs;
+
+        let captured = CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let slow: Arc<bridge::CanonicalizeFn> = Arc::new(move |p: &std::path::Path| {
+            gate.lock().map(|rx| rx.recv()).ok();
+            Ok(p.to_path_buf())
+        });
+        let (tx, rx) = mpsc::channel(8);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        tokio::spawn(diagnostics_pump_with_resolver(
+            ServerId::from("tsls"),
+            rx,
+            lifecycle_rx,
+            cancel_rx,
+            tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
+            Some(PathBuf::from("/pin/tsserver.js")),
+            PumpShared {
+                notification_cache: make_cache(),
+                subs: make_subs(),
+                workspace_roots: WorkspaceRoots::from_configured(std::slice::from_ref(&root))
+                    .unwrap(),
+            },
+            PublishedPathResolver::with_canonicalizer(slow),
+        ));
+        tx.send(LspNotification::PublishDiagnostics(
+            PublishDiagnosticsParams {
+                uri: bridge::path_to_uri(&root.join("a.ts")).unwrap(),
+                diagnostics: vec![],
+                version: None,
+            },
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        lifecycle_tx
+            .send(LspNotification::Other {
+                method: "$/typescriptVersion".into(),
+                params: Some(serde_json::json!({"version": "5.0", "source": "bundled"})),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !captured
+                .messages()
+                .iter()
+                .any(|m| m.contains("ignored the configured tsserver.path"))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the warning must not depend on which arm took the notification");
+        drop(release);
+    }
+
+    /// #658: a pump panic is contained, logged, and degrades its server;
+    /// a pump that ends normally leaves the server alone.
+    #[tokio::test]
+    async fn test_contain_pump_panic_degrades_only_after_a_panic() {
+        let cache = Mutex::new(NotificationCache::new());
+        let id = ServerId::from("rust");
+        cache.lock().await.observe_indexing_signal(
+            &id,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({"quiescent": true})),
+        );
+
+        contain_pump_panic(async {}, &id, &cache).await;
+        assert!(!cache.lock().await.is_push_degraded(&id));
+        assert_eq!(cache.lock().await.indexing_state(&id), IndexingState::Ready);
+
+        contain_pump_panic(
+            async {
+                panic!("pump boom");
+            },
+            &id,
+            &cache,
+        )
+        .await;
+        let guard = cache.lock().await;
+        assert!(guard.is_push_degraded(&id));
+        assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
     }
 
     /// A demotion to `Secondary` while a batch is still resolving stops

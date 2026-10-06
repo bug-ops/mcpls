@@ -9,8 +9,10 @@ use super::dto::{Position, Position2D, PositionDegradation, PositionRange, Range
 use crate::bridge::encoding::{
     ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
 };
-use crate::bridge::state::{DEFAULT_MAX_FILE_SIZE, ResourceLimits, uri_to_path};
-use crate::bridge::{DocumentTracker, WorkspaceRoots, lock_std};
+use crate::bridge::state::{ResourceLimits, uri_to_path};
+use crate::bridge::{DocumentTracker, WorkspaceRoots};
+use crate::config::SizeLimit;
+use crate::util::lock_std;
 
 /// Multiple of `ResourceLimits::max_file_size` that [`read_line_text`]'s
 /// disk-read fallback (via [`DocumentTracker::read_line_checked`]) may scan
@@ -40,14 +42,16 @@ const LINE_READ_BUDGET_CEILING: u64 = 256 * 1024 * 1024;
 /// `ceiling / multiple` (64 MiB) a single maximal file read can exceed the
 /// budget; such a read is then reported as unconverted, not unbounded.
 ///
-/// `max_file_size == 0` disables the per-file limit, not the I/O budget: it
-/// falls back to the multiple of [`DEFAULT_MAX_FILE_SIZE`]. The result never
-/// exceeds [`LINE_READ_BUDGET_CEILING`].
+/// An unlimited `max_file_size` disables the per-file limit, not the I/O
+/// budget: it falls back to the multiple of [`SizeLimit::DEFAULT`]. The result
+/// never exceeds [`LINE_READ_BUDGET_CEILING`].
 const fn line_read_budget(limits: ResourceLimits) -> u64 {
-    let basis = if limits.max_file_size == 0 {
-        DEFAULT_MAX_FILE_SIZE
-    } else {
-        limits.max_file_size
+    let basis = match limits.max_file_size.get() {
+        Some(max) => max.get(),
+        None => match SizeLimit::DEFAULT.get() {
+            Some(default) => default.get(),
+            None => 0,
+        },
     };
     let budget = basis.saturating_mul(LINE_READ_BUDGET_FILE_MULTIPLE);
     if budget > LINE_READ_BUDGET_CEILING {
@@ -411,6 +415,7 @@ mod tests {
     use crate::bridge::path_to_uri;
     use crate::bridge::state::ResourceLimits;
     use crate::bridge::translator::testing::*;
+    use crate::config::{DocumentLimit, SizeLimit};
 
     #[test]
     fn test_is_out_of_workspace_false_when_uri_inside_configured_root() {
@@ -546,8 +551,8 @@ mod tests {
             PositionEncoding::Utf8,
             Arc::new(DocumentTracker::new(
                 ResourceLimits {
-                    max_documents: 100,
-                    max_file_size: 50,
+                    max_documents: DocumentLimit::new(100),
+                    max_file_size: SizeLimit::from_static(50),
                 },
                 HashMap::new(),
             )),
@@ -944,8 +949,8 @@ mod tests {
     fn test_line_read_budget_scales_with_max_file_size() {
         let budget = |max_file_size| {
             line_read_budget(ResourceLimits {
-                max_documents: 1,
-                max_file_size,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::from_static(max_file_size),
             })
         };
         assert_eq!(budget(1000), 4000);
@@ -956,15 +961,14 @@ mod tests {
     fn test_line_read_budget_is_capped_at_ceiling() {
         let budget = |max_file_size| {
             line_read_budget(ResourceLimits {
-                max_documents: 1,
-                max_file_size,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::from_static(max_file_size),
             })
         };
         assert_eq!(
             budget(crate::config::MAX_FILE_SIZE_LIMIT),
             LINE_READ_BUDGET_CEILING
         );
-        assert_eq!(budget(u64::MAX), LINE_READ_BUDGET_CEILING);
         assert_eq!(
             budget(LINE_READ_BUDGET_CEILING / 4),
             LINE_READ_BUDGET_CEILING
@@ -974,18 +978,18 @@ mod tests {
     #[test]
     fn test_line_read_budget_zero_limit_falls_back_to_default() {
         let budget = line_read_budget(ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         });
-        assert_eq!(budget, 4 * DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(budget, 4 * 10 * 1024 * 1024);
     }
 
     #[test]
     fn test_encoding_ctx_new_derives_budget_from_tracker_limits() {
         let tracker = Arc::new(DocumentTracker::new(
             ResourceLimits {
-                max_documents: 1,
-                max_file_size: 4096,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::from_static(4096),
             },
             HashMap::new(),
         ));

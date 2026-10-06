@@ -28,11 +28,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
+use crate::bridge::WorkspaceRoots;
 use crate::bridge::resources::{
     DiagnosticsResourceUri, MAX_LISTEN_STREAMS, MAX_SUBSCRIPTIONS, ResourceSubscriptions,
     SubscriptionError, parse_uri,
 };
-use crate::bridge::{WorkspaceRoots, lock_std};
+use crate::util::lock_std;
 
 /// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
 /// `tower.rs::is_legacy_request` uses to route a request through its

@@ -3,22 +3,23 @@
 //! diagnostics pumps until shutdown.
 
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::{FutureExt as _, Stream, StreamExt as _};
+use futures::{Stream, StreamExt as _};
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
-use super::pump::{PumpShared, PumpWiring, degrade_after_pump_panic, diagnostics_pump};
-use crate::bridge::{DiagnosticsRole, NotificationCache, Translator, WorkspaceRoots};
+use super::pump::{PumpShared, PumpWiring, supervised_pump};
+use crate::bridge::{
+    DiagnosticsRole, NotificationCache, NotificationReceivers, Translator, WorkspaceRoots,
+};
 use crate::config::{LanguageId, ServerId, ServerStartConcurrency};
 use crate::error::ServerSpawnFailure;
-use crate::lsp::{self, LspServer, ServerInitConfig, ServerStartOutcome};
+use crate::lsp::{LspServer, ServerInitConfig, ServerStartOutcome};
 use crate::mcp::SubscriptionRegistry;
-use crate::util::panic_message;
+use crate::util::catch_panic;
 
 /// Spawn the applicable LSP servers in a background task and register them into
 /// the shared `translator` once ready.
@@ -99,10 +100,10 @@ async fn run_init_supervised(
     configs: &[ServerInitConfig],
     body: impl std::future::Future<Output = ()>,
 ) -> InitOutcome {
-    if let Err(payload) = AssertUnwindSafe(body).catch_unwind().await {
+    if let Err(panicked) = catch_panic(body).await {
         error!(
             "Background LSP initialization task panicked: {}",
-            panic_message(payload.as_ref())
+            panicked.message()
         );
         translator.settle_after_init_panic(configs).await;
         InitOutcome::Panicked
@@ -159,6 +160,10 @@ async fn init_lsp_servers(
     if configs.is_empty() {
         return;
     }
+    notification_cache
+        .lock()
+        .await
+        .attach_documents(Arc::clone(translator.document_tracker()));
     let pump_shared = PumpShared {
         notification_cache: Arc::clone(&notification_cache),
         subs: subscription_registry,
@@ -180,17 +185,18 @@ async fn init_lsp_servers(
             .iter()
             .map(|config| {
                 (
-                    config.server_config.id(),
-                    config.server_config.language_id.clone(),
+                    config.server_config().id(),
+                    config.server_config().language_id.clone(),
                 )
             })
             .collect(),
         roles: HashMap::new(),
         pumps: JoinSet::new(),
-        pump_servers: HashMap::new(),
         tally: StartupTally::default(),
     };
 
+    // TODO(#648): subscribed-file disk re-pull needs a task owned by serve_with
+    // TODO(#674): any change of this watch, including `send(false)` and a dropped sender, cancels here, while pump.rs waits for `true`
     let mut cancel_rx = cancel_rx;
     let mut cancelled = *cancel_rx.borrow();
     let mut pending = (!cancelled).then(|| start_servers(configs, max_concurrent_starts));
@@ -217,8 +223,9 @@ async fn init_lsp_servers(
                     }
                 }
             }
-            Some(joined) = settler.pumps.join_next_with_id(), if !settler.pumps.is_empty() => {
-                handle_pump_exit(joined, &settler.pump_servers, &settler.notification_cache).await;
+            // A pump contains its own panic (`supervised_pump`); the set only owns the tasks.
+            Some(finished) = settler.pumps.join_next(), if !settler.pumps.is_empty() => {
+                drop(finished);
             }
         }
     }
@@ -256,7 +263,6 @@ struct StartupSettler<'a> {
     configured: Vec<(ServerId, LanguageId)>,
     roles: HashMap<ServerId, (LanguageId, tokio::sync::watch::Sender<DiagnosticsRole>)>,
     pumps: JoinSet<()>,
-    pump_servers: HashMap<tokio::task::Id, ServerId>,
     tally: StartupTally,
 }
 
@@ -276,11 +282,9 @@ impl StartupSettler<'_> {
         }
         let notification_rx = server.take_notification_rx();
         let lifecycle_rx = server.take_lifecycle_rx();
-        let pinned_tsserver = lsp::tsserver_pin::configured_tsserver_path(
-            server.init_config().initialization_options.as_ref(),
-        );
-        let policy = server.init_config().server_config.indexing;
-        let config_id = server.init_config().server_config.id();
+        let pinned_tsserver = server.init_config().pinned_tsserver();
+        let policy = server.init_config().server_config().indexing;
+        let config_id = server.init_config().server_config().id();
         self.notification_cache
             .lock()
             .await
@@ -293,24 +297,25 @@ impl StartupSettler<'_> {
         // becoming visible and its initial pump being registered.
         let respawn_lock = self
             .translator
-            .respawn_lock(&server.init_config().server_config.id());
+            .respawn_lock(&server.init_config().server_config().id());
         let serialized = respawn_lock.lock().await;
         let (id, language) = self.translator.settle_started(server);
         let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
-        let pump = self.pumps.spawn(diagnostics_pump(
+        let pump = self.pumps.spawn(supervised_pump(
             id.clone(),
-            notification_rx,
-            lifecycle_rx,
+            NotificationReceivers {
+                notifications: notification_rx,
+                lifecycle: lifecycle_rx,
+                pinned_tsserver,
+            },
             self.cancel_rx.clone(),
             role_rx,
-            pinned_tsserver,
             self.pump_shared.clone(),
         ));
-        self.translator.set_notification_task(&id, pump.clone());
+        self.translator.set_notification_task(&id, pump);
         drop(serialized);
-        self.pump_servers.insert(pump.id(), id.clone());
         self.tally.registered = self.tally.registered.saturating_add(1);
         self.publish_routes_served_by(&id).await;
     }
@@ -365,28 +370,11 @@ impl StartupSettler<'_> {
     }
 }
 
-/// A panicked pump stops caching its server's pushes: mark it push-degraded.
-async fn handle_pump_exit(
-    joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
-    pump_servers: &HashMap<tokio::task::Id, ServerId>,
-    notification_cache: &Mutex<NotificationCache>,
-) {
-    let Err(join_error) = joined else { return };
-    if !join_error.is_panic() {
-        return;
-    }
-    let Some(server_id) = pump_servers.get(&join_error.id()) else {
-        return;
-    };
-    error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
-    degrade_after_pump_panic(notification_cache, server_id).await;
-}
-
 #[cfg(test)]
 mod settler_tests {
     use super::*;
     use crate::bridge::WorkspaceRoots;
-    use crate::config::{LspServerConfig, ToolKind, ToolRouter};
+    use crate::config::{LspServerConfig, ToolKind, ToolRouter, ToolSet};
     use crate::error::StartupFailure;
 
     fn settler_for<'a>(
@@ -411,7 +399,6 @@ mod settler_tests {
                 .collect(),
             roles: HashMap::new(),
             pumps: JoinSet::new(),
-            pump_servers: HashMap::new(),
             tally: StartupTally::default(),
         }
     }
@@ -420,17 +407,17 @@ mod settler_tests {
         ServerStartOutcome::Failed(ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.clone(),
+            command: config.command.to_string(),
             reason: StartupFailure::InitTaskPanicked,
         })
     }
 
     fn explicit_and_catch_all_translator() -> (Translator, LspServerConfig, LspServerConfig) {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some("explicit".to_string());
-        explicit.handles = Some(vec![ToolKind::Diagnostics]);
+        explicit.name = Some(ServerId::from("explicit"));
+        explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some("catch-all".to_string());
+        catch_all.name = Some(ServerId::from("catch-all"));
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
@@ -564,10 +551,10 @@ mod settler_tests {
     #[tokio::test]
     async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some("explicit".to_string());
-        explicit.handles = Some(vec![ToolKind::Diagnostics]);
+        explicit.name = Some(ServerId::from("explicit"));
+        explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some("catch-all".to_string());
+        catch_all.name = Some(ServerId::from("catch-all"));
         let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
         let translator = Translator::new().with_router(router);
         translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
@@ -592,7 +579,7 @@ mod settler_tests {
             .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
                 server_id: explicit.id(),
                 language_id: LanguageId::from_static("rust"),
-                command: explicit.command.clone(),
+                command: explicit.command.to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             }))
             .await;
@@ -609,7 +596,7 @@ mod startup_tests {
 
     use super::*;
     use crate::bridge::{RouteSupport, WorkspaceRoots};
-    use crate::config::{ToolKind, ToolRouter};
+    use crate::config::{ServerCommand, ToolKind, ToolRouter};
     use crate::error::StartupFailure;
     use crate::test_lsp::{answer_initialize_script, named_sh_init_config};
 
@@ -624,13 +611,14 @@ mod startup_tests {
     }
 
     fn start_limited(configs: Vec<ServerInitConfig>, limit: ServerStartConcurrency) -> Startup {
-        let router = ToolRouter::from_configs(configs.iter().map(|c| &c.server_config)).unwrap();
+        let router =
+            ToolRouter::from_configs(configs.iter().map(ServerInitConfig::server_config)).unwrap();
         let translator = Arc::new(
             Translator::new()
                 .with_extensions(crate::test_lsp::test_extensions())
                 .with_router(router),
         );
-        translator.set_expected_servers(configs.iter().map(|c| c.server_config.id()).collect());
+        translator.set_expected_servers(configs.iter().map(|c| c.server_config().id()).collect());
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
         let task = spawn_lsp_servers_background(
@@ -730,7 +718,8 @@ mod startup_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let gate = dir.path().join("gate");
         let mut broken = named_sh_init_config(dir.path(), "broken", "rust", "exit 1\n");
-        broken.server_config.command = "mcpls-no-such-language-server".to_string();
+        broken.server_config_mut().command =
+            ServerCommand::from_static("mcpls-no-such-language-server");
         let slow = named_sh_init_config(
             dir.path(),
             "slow",
@@ -775,7 +764,8 @@ mod startup_tests {
         let configs = ["rust", "python", "go"]
             .map(|language| {
                 let mut config = named_sh_init_config(dir.path(), language, language, "exit 1\n");
-                config.server_config.command = "mcpls-no-such-language-server".to_string();
+                config.server_config_mut().command =
+                    ServerCommand::from_static("mcpls-no-such-language-server");
                 config
             })
             .to_vec();
@@ -903,7 +893,7 @@ mod init_supervision_tests {
     async fn test_run_init_supervised_records_panic_for_unregistered_servers() {
         let translator = Translator::new();
         let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
-        let id = config.server_config.id();
+        let id = config.server_config().id();
 
         run_init_supervised(&translator, &[config], async {
             panic!("init boom");
@@ -940,14 +930,14 @@ mod init_supervision_tests {
         use crate::mcp::{SessionHandle, Target};
 
         let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
-        let id = config.server_config.id();
+        let id = config.server_config().id();
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
                 id,
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_expected_servers(HashSet::from([config.server_config.id()]));
+        translator.set_expected_servers(HashSet::from([config.server_config().id()]));
         let registry = SubscriptionRegistry::new();
         let session = SessionHandle::new(registry.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -984,7 +974,7 @@ mod init_supervision_tests {
     async fn test_run_init_supervised_leaves_translator_alone_without_panic() {
         let translator = Translator::new();
         let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
-        let id = config.server_config.id();
+        let id = config.server_config().id();
 
         run_init_supervised(&translator, &[config], async {}).await;
 
@@ -995,7 +985,7 @@ mod init_supervision_tests {
     async fn test_run_init_supervised_keeps_existing_spawn_failure() {
         let translator = Translator::new();
         let config = crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer());
-        let id = config.server_config.id();
+        let id = config.server_config().id();
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: id.clone(),
             language_id: LanguageId::from_static("rust"),
@@ -1037,42 +1027,5 @@ mod init_supervision_tests {
         assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
         drop(guard);
         assert!(translator.startup_failure(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_drain_pumps_degrades_server_of_panicked_pump() {
-        let cache = Mutex::new(NotificationCache::new());
-        let id = ServerId::from("rust");
-        mark_ready(&mut *cache.lock().await, &id);
-
-        let mut pumps = JoinSet::new();
-        let pump = pumps.spawn(async {
-            panic!("pump boom");
-        });
-        let pump_servers = HashMap::from([(pump.id(), id.clone())]);
-
-        while let Some(joined) = pumps.join_next_with_id().await {
-            handle_pump_exit(joined, &pump_servers, &cache).await;
-        }
-
-        let guard = cache.lock().await;
-        assert!(guard.is_push_degraded(&id));
-        assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
-    }
-
-    #[tokio::test]
-    async fn test_drain_pumps_ignores_pump_that_finished_normally() {
-        let cache = Mutex::new(NotificationCache::new());
-        let id = ServerId::from("rust");
-
-        let mut pumps = JoinSet::new();
-        let pump = pumps.spawn(async {});
-        let pump_servers = HashMap::from([(pump.id(), id.clone())]);
-
-        while let Some(joined) = pumps.join_next_with_id().await {
-            handle_pump_exit(joined, &pump_servers, &cache).await;
-        }
-
-        assert!(!cache.lock().await.is_push_degraded(&id));
     }
 }

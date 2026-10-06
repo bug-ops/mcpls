@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
 use crate::bridge::state::detect_language;
-use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath, lock_std};
-use crate::config::{LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id};
+use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath};
+use crate::config::{
+    FileExtension, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
+};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
+use crate::util::lock_std;
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -86,25 +89,32 @@ pub(super) enum IndexingGate {
     /// definition, references, rename, completions, code actions, call
     /// hierarchy incoming/outgoing calls).
     Required,
-    /// This tool's answer is valid even mid-index (single-file analysis),
-    /// e.g. `document_symbols`. `handle_call_hierarchy_prepare` also uses
-    /// this variant, but not for the same reason: unlike `document_symbols`,
-    /// `prepareCallHierarchy` does perform position-based name resolution
-    /// (the same class of query as `textDocument/definition`, which *is*
-    /// [`Self::Required`]) -- leaving it ungated is a deliberate scope
-    /// decision for #423 (mid-index it degrades to an empty `prepare`
-    /// result rather than an explicit error), not a claim that it is
-    /// single-file analysis like `document_symbols`. The incoming/outgoing
-    /// calls that follow `prepare` use [`Self::Required`].
+    /// This tool does not wait for the workspace index. Every ungated tool is
+    /// one of:
+    /// - file-local, so its answer is valid mid-index and carries no signal:
+    ///   document symbols (also used by name addressing and `enclosing_symbol`),
+    ///   folding ranges, selection ranges, document highlights, format
+    ///   document and format range;
+    /// - name-resolving but ungated by the #423 scope decision, which keeps
+    ///   `prepare_call_hierarchy` and `prepare_type_hierarchy` from stalling a
+    ///   cold start for up to the bounded wait (the follow-up incoming and
+    ///   outgoing calls are [`Self::Required`]); `get_signature_help` and
+    ///   `get_inlay_hints` are in the same class. Instead of gating, each
+    ///   reports `indexing_in_progress` (#668): mid-index it still degrades to
+    ///   an empty result, but the caller can tell that from a genuinely empty
+    ///   one and retry. The trade-off is that the caller must read the flag,
+    ///   in exchange for no added latency.
+    ///
+    /// A new `NotRequired` site must say which of the two it is.
     NotRequired,
 }
 
-/// An LSP server capability mcpls gates a tool on before dispatching its
-/// request, tying the [`ServerCapabilities`](lsp_types::ServerCapabilities)
-/// field name (used only for the error message, via [`Self::name`]) to the
-/// predicate that actually checks it (via [`Self::is_supported`]) so the two
-/// cannot drift apart the way two independent, hand-picked call-site values
-/// could.
+/// An LSP server capability mcpls gates a tool on before dispatching its request.
+///
+/// Ties the [`ServerCapabilities`](lsp_types::ServerCapabilities) field name
+/// (used only for the error message, through `Display`) to the predicate that
+/// actually checks it, so the two cannot drift apart the way two independent,
+/// hand-picked call-site values could.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     /// `completionProvider` (`textDocument/completion`).
@@ -143,7 +153,7 @@ pub enum Capability {
     TypeHierarchy,
     /// `renameProvider.prepareProvider` (`textDocument/prepareRename`). Gated
     /// on the [`ToolKind::Rename`] route, so it is never the primary
-    /// capability of its tool; see [`Self::is_primary`].
+    /// capability of its tool.
     PrepareRename,
     /// `documentHighlightProvider` (`textDocument/documentHighlight`).
     DocumentHighlights,
@@ -458,7 +468,7 @@ impl serde::Serialize for Capability {
     }
 }
 
-/// Serialized as its [`Capability::name`] string.
+/// Serialized as the `ServerCapabilities` field name its `Display` prints.
 impl schemars::JsonSchema for Capability {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "Capability".into()
@@ -684,7 +694,7 @@ pub(super) fn check_capability(
     } else {
         Err(Error::CapabilityNotSupported {
             server_id: server_id.clone(),
-            capability: capability.name(),
+            capability,
         })
     }
 }
@@ -793,7 +803,14 @@ impl Translator {
                         tool,
                     })
                 } else {
-                    Err(Error::NoServerForLanguage(language))
+                    Err(Error::NoServerForLanguage {
+                        language,
+                        extension: path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .and_then(|ext| FileExtension::new(ext).ok()),
+                        patterns: self.file_patterns.to_vec(),
+                    })
                 }
             }
         }
@@ -1050,6 +1067,34 @@ impl Translator {
         .await
     }
 
+    /// As [`Self::prepare_gated_document`], then rejects every one of
+    /// `positions` whose line lies beyond the end of the opened document, so a
+    /// tool taking a position or range treats an out-of-document line the same
+    /// way whichever language server answers (#641).
+    ///
+    /// The line check runs after the capability and indexing gates, so a
+    /// refusal by a gate comes first; characters are never rejected.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prepare_gated_document`], and
+    /// [`Error::PositionBeyondDocument`] for the first position past the end.
+    pub(super) async fn prepare_positioned_document(
+        &self,
+        file_path: &ClientPath,
+        capability: Capability,
+        indexing_gate: IndexingGate,
+        positions: &[Position],
+    ) -> Result<PreparedDocument> {
+        let doc = self
+            .prepare_gated_document(file_path, capability, indexing_gate)
+            .await?;
+        for position in positions {
+            self.require_line_in_document(&doc, *position)?;
+        }
+        Ok(doc)
+    }
+
     /// As [`Self::prepare_gated_document`], but for a caller that already
     /// has a `&Path` it validated itself (e.g. `handle_incoming_calls`/`handle_outgoing_calls`,
     /// via `parse_file_uri`) -- see [`Self::resolve_validated_client_for_path`]'s
@@ -1265,8 +1310,9 @@ mod tests {
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
-        IndexingReadyTimeoutSecs, LanguageId, LspServerConfig, PositionEncodings, TimeoutSecs,
-        ToolRouter,
+        DocumentLimit, FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId,
+        LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit, TimeoutSecs,
+        ToolRouter, ToolSet,
     };
     use crate::error::Error;
     use crate::lsp::LspServer;
@@ -1308,7 +1354,7 @@ mod tests {
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert_matches!(err, Error::NoServerForLanguage(ref l) if *l == lang);
+        assert_matches!(err, Error::NoServerForLanguage { ref language, .. } if *language == lang);
     }
 
     use crate::test_lsp::test_extensions;
@@ -1332,7 +1378,7 @@ mod tests {
     ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::new(language).unwrap(),
-            command: "sh".to_string(),
+            command: ServerCommand::from_static("sh"),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -1341,8 +1387,8 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(5).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
             heuristics: None,
-            name: Some(name.to_string()),
-            handles,
+            name: Some(ServerId::from(name)),
+            handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
         }
@@ -1396,7 +1442,7 @@ mod tests {
             .client_for_file(Path::new("/ws/script.py"), ToolKind::Hover)
             .unwrap_err();
 
-        assert_matches!(err, Error::NoServerForLanguage(_), "got {err:?}");
+        assert_matches!(err, Error::NoServerForLanguage { .. }, "got {err:?}");
     }
 
     /// A failed explicit server must not mask a live catch-all it was
@@ -1778,15 +1824,24 @@ mod tests {
         fs::write(&test_file, "echo hello").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("nu".to_string(), LanguageId::from_static("nushell"));
+        extension_map.insert(
+            FileExtension::from_static("nu"),
+            LanguageId::from_static("nushell"),
+        );
 
         let translator = Translator::new().with_extensions(extension_map);
 
         let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
-        if let Err(Error::NoServerForLanguage(lang)) = result {
-            assert_eq!(lang, "nushell");
+        if let Err(Error::NoServerForLanguage {
+            language,
+            extension,
+            ..
+        }) = result
+        {
+            assert_eq!(language, "nushell");
+            assert_eq!(extension, Some(FileExtension::from_static("nu")));
         } else {
             panic!("Expected NoServerForLanguage(nushell) error");
         }
@@ -1799,15 +1854,27 @@ mod tests {
         fs::write(&test_file, "content").unwrap();
 
         let mut extension_map = HashMap::new();
-        extension_map.insert("rs".to_string(), LanguageId::from_static("rust"));
+        extension_map.insert(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        );
 
-        let translator = Translator::new().with_extensions(extension_map);
+        let translator = Translator::new()
+            .with_extensions(extension_map)
+            .with_file_patterns([FilePattern::from_static("**/*.rs")]);
 
         let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
-        if let Err(Error::NoServerForLanguage(lang)) = result {
-            assert_eq!(lang, "plaintext");
+        if let Err(Error::NoServerForLanguage {
+            language,
+            extension,
+            patterns,
+        }) = result
+        {
+            assert_eq!(language, "plaintext");
+            assert_eq!(extension, Some(FileExtension::from_static("xyz")));
+            assert_eq!(patterns, ["**/*.rs"]);
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
         }
@@ -1821,7 +1888,7 @@ mod tests {
 
         let mut extension_map = HashMap::new();
         extension_map.insert(
-            "tsx".to_string(),
+            FileExtension::from_static("tsx"),
             LanguageId::from_static("typescriptreact"),
         );
 
@@ -1850,16 +1917,16 @@ mod tests {
 
         let mut extension_map = HashMap::new();
         extension_map.insert(
-            "tsx".to_string(),
+            FileExtension::from_static("tsx"),
             LanguageId::from_static("typescriptreact"),
         );
 
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
-            command: "typescript-language-server".to_string(),
+            command: ServerCommand::from_static("typescript-language-server"),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
-            file_patterns: vec!["**/*.tsx".to_string()],
+            file_patterns: vec![FilePattern::from_static("**/*.tsx")],
             initialization_options: None,
             settings: None,
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -2155,16 +2222,19 @@ mod tests {
 
         let mut extension_map = HashMap::new();
         extension_map.insert(
-            "jsx".to_string(),
+            FileExtension::from_static("jsx"),
             LanguageId::from_static("javascriptreact"),
         );
 
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
-            command: "typescript-language-server".to_string(),
+            command: ServerCommand::from_static("typescript-language-server"),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
-            file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
+            file_patterns: vec![
+                FilePattern::from_static("**/*.js"),
+                FilePattern::from_static("**/*.jsx"),
+            ],
             initialization_options: None,
             settings: None,
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -2191,16 +2261,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_initializes_translator_with_extensions() {
-        use crate::bridge::state::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
         use crate::config::{LanguageExtensionMapping, WorkspaceConfig};
 
         let language_extensions = vec![
             LanguageExtensionMapping {
-                extensions: vec!["nu".to_string()],
+                extensions: vec![FileExtension::from_static("nu")],
                 language_id: LanguageId::from_static("nushell"),
             },
             LanguageExtensionMapping {
-                extensions: vec!["rs".to_string()],
+                extensions: vec![FileExtension::from_static("rs")],
                 language_id: LanguageId::from_static("rust"),
             },
         ];
@@ -2211,9 +2280,9 @@ mod tests {
                 roots: vec![PathBuf::from("/tmp/test-workspace")],
                 position_encodings: PositionEncodings::DEFAULT,
                 language_extensions: language_extensions.clone(),
-                heuristics_max_depth: 10,
-                max_documents: DEFAULT_MAX_DOCUMENTS,
-                max_file_size: DEFAULT_MAX_FILE_SIZE,
+                heuristics_max_depth: SearchDepth::DEFAULT,
+                max_documents: DocumentLimit::DEFAULT,
+                max_file_size: SizeLimit::DEFAULT,
                 indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                 max_concurrent_server_starts: crate::config::ServerStartConcurrency::DEFAULT,
             },
@@ -2254,8 +2323,14 @@ mod tests {
         // on an unrelated in-flight request.
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
-        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
+        extensions.insert(
+            FileExtension::from_static("aa"),
+            LanguageId::from_static("lang_a"),
+        );
+        extensions.insert(
+            FileExtension::from_static("bb"),
+            LanguageId::from_static("lang_b"),
+        );
 
         let mut translator =
             Translator::new()
@@ -2345,7 +2420,10 @@ mod tests {
         // so they can't both observe "not open yet" and both send didOpen.
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
+        extensions.insert(
+            FileExtension::from_static("aa"),
+            LanguageId::from_static("lang_a"),
+        );
 
         let mut translator =
             Translator::new()
@@ -2409,7 +2487,10 @@ mod tests {
         use crate::bridge::state::ResourceLimits;
 
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
+        extensions.insert(
+            FileExtension::from_static("aa"),
+            LanguageId::from_static("lang_a"),
+        );
 
         let mut translator = Translator::new()
             .with_extensions(extensions)
@@ -2418,8 +2499,8 @@ mod tests {
                 LanguageId::from_static("lang_a"),
             )]))
             .with_resource_limits(ResourceLimits {
-                max_documents: 1,
-                max_file_size: 0,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::UNLIMITED,
             });
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -2632,7 +2713,10 @@ mod tests {
     async fn test_prepare_document_releases_in_flight_guard_when_ensure_open_fails() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
+        extensions.insert(
+            FileExtension::from_static("bb"),
+            LanguageId::from_static("lang_b"),
+        );
 
         let mut translator =
             Translator::new()
@@ -2679,8 +2763,14 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("aa".to_string(), LanguageId::from_static("lang_a"));
-        extensions.insert("bb".to_string(), LanguageId::from_static("lang_b"));
+        extensions.insert(
+            FileExtension::from_static("aa"),
+            LanguageId::from_static("lang_a"),
+        );
+        extensions.insert(
+            FileExtension::from_static("bb"),
+            LanguageId::from_static("lang_b"),
+        );
 
         let mut translator = Translator::new()
             .with_extensions(extensions)
@@ -2689,8 +2779,8 @@ mod tests {
                 (ServerId::from("lang_b"), LanguageId::from_static("lang_b")),
             ]))
             .with_resource_limits(ResourceLimits {
-                max_documents: 1,
-                max_file_size: 0,
+                max_documents: DocumentLimit::new(1),
+                max_file_size: SizeLimit::UNLIMITED,
             });
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
@@ -2754,44 +2844,36 @@ mod tests {
     async fn test_dispatch_routes_hover_and_diagnostics_to_different_servers() {
         let dir = TempDir::new().unwrap();
         let mut extensions = HashMap::new();
-        extensions.insert("py".to_string(), LanguageId::from_static("python"));
+        extensions.insert(
+            FileExtension::from_static("py"),
+            LanguageId::from_static("python"),
+        );
 
         let pyright_id = ServerId::from("pyright");
         let pylsp_id = ServerId::from("pylsp");
-        let configs = vec![
-            LspServerConfig {
-                language_id: LanguageId::from_static("python"),
-                command: "pyright-langserver".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                file_patterns: vec![],
-                initialization_options: None,
-                settings: None,
-                timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                heuristics: None,
-                name: Some("pyright".to_string()),
-                handles: Some(vec![ToolKind::Hover]),
-                indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
-            },
-            LspServerConfig {
-                language_id: LanguageId::from_static("python"),
-                command: "pylsp".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                file_patterns: vec![],
-                initialization_options: None,
-                settings: None,
-                timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                heuristics: None,
-                name: Some("pylsp".to_string()),
-                handles: Some(vec![ToolKind::Diagnostics]),
-                indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
-            },
-        ];
+        let pyright = LspServerConfig {
+            language_id: LanguageId::from_static("python"),
+            command: ServerCommand::from_static("pyright-langserver"),
+            args: vec![],
+            env: HashMap::new(),
+            file_patterns: vec![],
+            initialization_options: None,
+            settings: None,
+            timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
+            heuristics: None,
+            name: Some(ServerId::from("pyright")),
+            handles: Some(ToolSet::single(ToolKind::Hover)),
+            indexing: crate::bridge::IndexingPolicy::Auto,
+            selection: crate::config::ServerSelection::Explicit,
+        };
+        let pylsp = LspServerConfig {
+            command: ServerCommand::from_static("pylsp"),
+            name: Some(ServerId::from("pylsp")),
+            handles: Some(ToolSet::single(ToolKind::Diagnostics)),
+            ..pyright.clone()
+        };
+        let configs = vec![pyright, pylsp];
         let router = ToolRouter::from_configs(&configs).unwrap();
 
         let mut translator = Translator::new()
@@ -2905,7 +2987,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "renameProvider",
+                capability: Capability::Rename,
                 ..
             })
         );
@@ -2949,7 +3031,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "renameProvider",
+                capability: Capability::Rename,
                 ..
             })
         );
@@ -2979,7 +3061,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "codeActionProvider",
+                capability: Capability::CodeActions,
                 ..
             })
         );
@@ -3008,7 +3090,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "signatureHelpProvider",
+                capability: Capability::SignatureHelp,
                 ..
             })
         );
@@ -3052,7 +3134,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "callHierarchyProvider",
+                capability: Capability::CallHierarchy,
                 ..
             })
         );
@@ -3093,7 +3175,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "callHierarchyProvider",
+                capability: Capability::CallHierarchy,
                 ..
             })
         );
@@ -3123,7 +3205,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "documentFormattingProvider",
+                capability: Capability::FormatDocument,
                 ..
             })
         );
@@ -3152,7 +3234,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "callHierarchyProvider",
+                capability: Capability::CallHierarchy,
                 ..
             })
         );
@@ -3181,7 +3263,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "inlayHintProvider",
+                capability: Capability::InlayHints,
                 ..
             })
         );
@@ -3210,7 +3292,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "hoverProvider",
+                capability: Capability::Hover,
                 ..
             })
         );
@@ -3240,7 +3322,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "definitionProvider",
+                capability: Capability::Definition,
                 ..
             })
         );
@@ -3271,7 +3353,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "referencesProvider",
+                capability: Capability::References,
                 ..
             })
         );
@@ -3315,7 +3397,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "completionProvider",
+                capability: Capability::Completions,
                 ..
             })
         );
@@ -3341,7 +3423,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "documentSymbolProvider",
+                capability: Capability::DocumentSymbols,
                 ..
             })
         );
@@ -3364,7 +3446,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "workspaceSymbolProvider",
+                capability: Capability::WorkspaceSymbols,
                 ..
             })
         );
@@ -3394,7 +3476,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "implementationProvider",
+                capability: Capability::Implementation,
                 ..
             })
         );
@@ -3424,7 +3506,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "typeDefinitionProvider",
+                capability: Capability::TypeDefinition,
                 ..
             })
         );
@@ -3454,7 +3536,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "declarationProvider",
+                capability: Capability::Declaration,
                 ..
             })
         );
@@ -3477,7 +3559,7 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::CapabilityNotSupported {
-                capability: "renameProvider",
+                capability: Capability::Rename,
                 ..
             })
         );

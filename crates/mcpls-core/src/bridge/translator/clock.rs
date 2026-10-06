@@ -43,7 +43,7 @@ impl FakeClock {
 
     /// Advance this clock's reported time by `duration`.
     pub(super) fn advance(&self, duration: std::time::Duration) {
-        let mut now = crate::bridge::lock_std(&self.now);
+        let mut now = crate::util::lock_std(&self.now);
         *now += duration;
     }
 }
@@ -51,6 +51,6 @@ impl FakeClock {
 #[cfg(test)]
 impl Clock for FakeClock {
     fn now(&self) -> Instant {
-        *crate::bridge::lock_std(&self.now)
+        *crate::util::lock_std(&self.now)
     }
 }

@@ -33,6 +33,7 @@ related:
 > - **No batch positions, no source-text context line;** `unspecified` regions match only `all`; both tools are `IndexingGate::NotRequired`.
 > - **Client capabilities:** `selectionRange` and `foldingRange` (columns on, `lineFoldingOnly: false`, the three standard kinds, `collapsedText: true`) are advertised at `initialize`.
 > - **Deep chains:** a response nested past the JSON recursion limit (about 125 levels) fails only its own request with `undecodable response`; the connection stays up (#642).
+> - **Undecodable server messages (#643):** a server request that cannot be decoded is answered with a `-32600` error and a notification or unrecognized frame is dropped, with one WARN per run; the connection stays up until `MAX_CONSECUTIVE_UNDECODABLE_FRAMES` (64) undecodable frames arrive in a row, a bound that stops a server emitting only garbage from being kept forever (it is torn down and respawned like any lost connection).
 > - **Live matrix (SC-002 to SC-004)** is recorded in the testing playbook, not here.
 
 > [!info] Metadata

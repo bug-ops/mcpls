@@ -21,11 +21,13 @@ use tokio::task::AbortHandle;
 use super::Translator;
 use super::respawn::BackoffPolicy;
 use super::servers::{Backend, Phase};
-use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
+use crate::bridge::indexing::IndexingReset;
+use crate::bridge::{DiagnosticsKey, IndexingState};
 use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
+use crate::util::lock_std;
 
 /// Minimum interval between two manual restart attempts of the same server.
 const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
@@ -184,7 +186,7 @@ impl RestartFailure {
             | Error::InvalidClientPath(_)
             | Error::MalformedPath { .. }
             | Error::DocumentNotFound(_)
-            | Error::NoServerForLanguage(_)
+            | Error::NoServerForLanguage { .. }
             | Error::NoServerForTool { .. }
             | Error::ServerFailedToStart(_)
             | Error::ServerInitializing { .. }
@@ -196,10 +198,10 @@ impl RestartFailure {
             | Error::NoServerForWorkspaceTool { .. }
             | Error::ConfigNotFound(_)
             | Error::ConfigInsideWorkspace { .. }
-            | Error::InvalidConfig(_)
+            | Error::Config(_)
             | Error::TomlDe(_)
             | Error::TomlSer(_)
-            | Error::InvalidUri(_)
+            | Error::NoResolvableListenUris
             | Error::ResourceUri(_)
             | Error::InvalidPositionInput(_)
             | Error::InvalidRangeInput(_)
@@ -680,7 +682,7 @@ impl Translator {
                 message: format!("LSP server '{id}' is not running"),
             };
         };
-        let language_id = config.server_config.language_id.clone();
+        let language_id = config.server_config().language_id.clone();
 
         if self.is_shutting_down() {
             self.invalidate_stopped_server(id, &language_id).await;
@@ -741,7 +743,7 @@ impl Translator {
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
-            cache.reset_indexing_state(id);
+            cache.reset_indexing_state(id, IndexingReset::Forget);
             if self.is_diagnostics_route(language_id, id) {
                 cleared = cache.clear_server_diagnostics(id);
                 cache.mark_push_degraded(id);
@@ -895,7 +897,7 @@ mod tests {
             write_responder_script, write_slow_exit_server_script,
         };
         use crate::bridge::{NotificationCache, WorkspaceRoots};
-        use crate::config::{LanguageId, ToolRouter};
+        use crate::config::{LanguageId, ServerCommand, ToolRouter};
         use crate::error::{ServerSpawnFailure, StartupFailure};
         use crate::mcp::SubscriptionRegistry;
         use crate::runtime::pump::{PumpShared, PumpWiring};
@@ -1108,7 +1110,7 @@ mod tests {
             translator.record_refusals(&[ServerSpawnFailure {
                 server_id: config.id(),
                 language_id: config.language_id.clone(),
-                command: config.command.clone(),
+                command: config.command.to_string(),
                 reason: StartupFailure::RefusedUntrustedWorkspace(
                     crate::error::UntrustedRefusal::NotAllowed { builtin: None },
                 ),
@@ -1472,7 +1474,8 @@ mod tests {
             let script = write_protocol_server_script(dir.path(), &log, None);
             let fx = fixture(dir, &script, true).await;
             let mut broken = stub_server_config("rust", &script);
-            broken.server_config.command = "mcpls-test-missing-server".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("mcpls-test-missing-server");
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1712,7 +1715,8 @@ mod tests {
             .await
             .expect("the seed server's diagnostics reach the cache");
             let mut broken = stub_server_config("rust", &script);
-            broken.server_config.command = "mcpls-test-missing-server".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("mcpls-test-missing-server");
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1842,6 +1846,73 @@ mod tests {
                 RestartOutcome::Restarted { .. },
                 "{result:?}"
             );
+        }
+
+        /// #667: right after a restart of a server that reported readiness
+        /// before, the result says `loading` and a gated call holds until the
+        /// replacement's own signal arrives instead of reading an empty index.
+        #[tokio::test]
+        async fn test_restart_of_a_signalling_server_gates_until_its_signal() {
+            let (fx, _log) = protocol_fixture(None).await;
+            fx.cache.lock().await.observe_indexing_signal(
+                &fx.id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::Restarted {
+                    indexing_state: IndexingState::Loading,
+                    ..
+                },
+                "{result:?}"
+            );
+
+            let translator = Arc::clone(&fx.translator);
+            let id = fx.id.clone();
+            let gated = tokio::spawn(async move { translator.wait_for_indexing_ready(&id).await });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!gated.is_finished(), "the gate must hold before the signal");
+
+            fx.cache.lock().await.observe_indexing_signal(
+                &fx.id,
+                "experimental/serverStatus",
+                Some(&serde_json::json!({"quiescent": true})),
+            );
+            tokio::time::timeout(Duration::from_secs(5), gated)
+                .await
+                .expect("the gate releases once the replacement is ready")
+                .unwrap()
+                .unwrap();
+        }
+
+        /// #667: a server that never reported a signal is restarted without a
+        /// gate (no new fixed delay).
+        #[tokio::test]
+        async fn test_restart_of_a_silent_server_reports_unknown() {
+            let (fx, _log) = protocol_fixture(None).await;
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            assert_matches!(
+                only_outcome(&result),
+                RestartOutcome::Restarted {
+                    indexing_state: IndexingState::Unknown,
+                    ..
+                },
+                "{result:?}"
+            );
+            fx.translator.wait_for_indexing_ready(&fx.id).await.unwrap();
         }
     }
 }

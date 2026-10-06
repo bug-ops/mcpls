@@ -109,6 +109,39 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
 
+/// Plans the server starts on the blocking pool, since it walks the workspace.
+///
+/// `initialize` still waits for the plan: it is needed to build the router the
+/// MCP server answers from. Only the runtime workers stay free.
+async fn plan_off_runtime(
+    config: &ServerConfig,
+    roots: &WorkspaceRoots,
+    redactions: &Arc<redaction::Redactions>,
+) -> Result<StartPlan, Error> {
+    let (config, roots, redactions) = (config.clone(), roots.clone(), Arc::clone(redactions));
+    on_blocking_pool(move || plan_server_starts(&config, &roots, &redactions))
+        .await
+        .map_err(|source| Error::TaskFailed {
+            task: error::BackgroundTask::ServerPlanning,
+            source,
+        })
+}
+
+/// Runs `work` on the blocking pool and returns its result, re-raising a panic
+/// in it on the caller. A join that failed for any other reason (the runtime
+/// shutting down cancelled it) is returned as the error.
+async fn on_blocking_pool<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Ok(value),
+        Err(error) => match error.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(cancelled) => Err(cancelled),
+        },
+    }
+}
+
 /// Start the MCPLS server with an explicit transport.
 ///
 /// Performs all shared setup (workspace discovery, LSP spawning, translator
@@ -181,20 +214,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
 
-    // `ServerConfig::load`/`load_from` already validate the TOML-loading
-    // path; this covers the other one -- a caller building `ServerConfig`
-    // programmatically (e.g. a library embedder) previously hit no
-    // diagnosable error here, only silent clamping at accessor level (e.g.
-    // `LspClient::request_timeout`). `serve` delegates to this function, so
-    // one call site here covers both public entry points (`serve` and
-    // `serve_with`); note this does mean a config loaded via the CLI's
-    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
-    // is a pure check with no side effects beyond a `tracing::warn!` for a
-    // non-fatal duplicate-name case, which will simply log twice).
-    //
-    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
-    // make "already validated" a compile-time guarantee instead of a runtime
-    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
+    // A programmatic `ServerConfig` skips the validation `load`/`load_from` run.
     config.validate()?;
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
@@ -204,12 +224,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let plan = plan_server_starts(&config, &workspace_roots, &startup_redactions);
-    let refusals = plan.failures();
-    let StartPlan {
-        admitted: applicable_configs,
-        refused,
-    } = plan;
+    let plan = plan_off_runtime(&config, &workspace_roots, &startup_redactions).await?;
+    let (applicable_configs, refused, refusals) = plan.into_parts();
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",
@@ -223,8 +239,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let router = ToolRouter::from_configs(
         applicable_configs
             .iter()
-            .map(|c| &c.server_config)
-            .chain(refused.iter().map(|r| &r.config)),
+            .map(lsp::ServerInitConfig::server_config)
+            .chain(&refused),
     )?;
 
     // Built here (rather than alongside `subscription_registry` below) so
@@ -240,6 +256,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
+        .with_file_patterns(
+            config
+                .lsp_servers
+                .iter()
+                .flat_map(|server| server.file_patterns.iter().cloned()),
+        )
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache))
         .with_indexing_ready_timeout(config.workspace.indexing_ready_timeout_seconds);
@@ -253,7 +275,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // (instead of "no server configured"), telling the caller to wait and retry.
     let expected_servers: HashSet<ServerId> = applicable_configs
         .iter()
-        .map(|c| c.server_config.id())
+        .map(|c| c.server_config().id())
         .collect();
     translator.set_expected_servers(expected_servers);
     translator.record_refusals(&refusals);
@@ -334,17 +356,29 @@ mod tests {
     use std::assert_matches;
     use std::path::PathBuf;
 
-    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
-
     use super::*;
     use crate::config::{
         IndexingReadyTimeoutSecs, LanguageId, PositionEncodings, ServerStartConcurrency,
         TimeoutSecs,
     };
 
+    /// #659: a panic in the planning work reaches the caller instead of
+    /// being swallowed by the blocking pool.
+    #[tokio::test]
+    async fn test_on_blocking_pool_returns_the_value_and_propagates_a_panic() {
+        assert_eq!(on_blocking_pool(|| 7).await.unwrap(), 7);
+
+        let panicked =
+            crate::util::catch_panic(on_blocking_pool(|| -> u8 { panic!("planning exploded") }))
+                .await
+                .unwrap_err();
+        assert_eq!(panicked.message(), "planning exploded");
+    }
+
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
         use super::*;
+        use crate::config::{DocumentLimit, FilePattern, SearchDepth, ServerCommand, SizeLimit};
 
         #[tokio::test]
         async fn test_serve_degrades_when_all_servers_fail_to_spawn() {
@@ -365,18 +399,18 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: "nonexistent-command-that-will-fail-12345".to_string(),
+                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345"),
                     args: vec![],
                     env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.rs".to_string()],
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
                     timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -424,9 +458,9 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
@@ -483,9 +517,9 @@ mod tests {
                     roots: vec![workspace_root],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
@@ -534,21 +568,21 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![PathBuf::new()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: String::new(),
+                    command: ServerCommand::from_static("rust-analyzer"),
                     args: vec![],
                     env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.rs".to_string()],
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
                     timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -578,9 +612,9 @@ mod tests {
                 ),
                 Ok(result) => assert_matches!(
                     result,
-                    Err(Error::InvalidConfig(_)),
-                    "serve() must reject a caller-supplied config with an empty `command` via \
-                     Error::InvalidConfig, matching the load_from path; got: {result:?}"
+                    Err(Error::Config(_)),
+                    "serve() must reject a caller-supplied config with an empty workspace root via \
+                     Error::Config, matching the load_from path; got: {result:?}"
                 ),
             }
         }

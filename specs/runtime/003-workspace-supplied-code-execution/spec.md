@@ -23,7 +23,7 @@ related:
 > [!info] Metadata
 > **Type**: research / security hardening (vulnerability-class sweep)
 > **Priority**: P3
-> **Related issues**: #566.
+> **Related issues**: #566, #603, #645, #652, #653, #657.
 
 ## Decision (#566): documentation plus a best-effort tsserver pin
 
@@ -50,8 +50,12 @@ related:
   runners (`npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`) are logged as `PackageRunner`;
   Volta, asdf, mise shims and relative-script wrappers as `UnsupportedLauncher`; both name
   `initialization_options.tsserver.path`. A missing or invalid `typescript` package is logged as
-  `NoTypescriptNextToServer`, a missing executable as `ServerNotOnPath`. None blocks startup
-  (NFR-005). Version-manager shims are tracked in #645.
+  `NoTypescriptNextToServer`, a missing executable as `ServerNotOnPath`. None blocks startup in
+  trusted mode (NFR-005); in untrusted mode `PackageRunner` and `UnsupportedLauncher` are refused
+  (#652, below). Version-manager shims are not resolved (#645): their install directory is only
+  reachable through the manager's own layout, and asdf and mise pick the version from workspace files
+  (`.tool-versions`, `mise.toml`), so reading it would let the workspace steer the pin. The documented
+  way to pin them is `initialization_options.tsserver.path`.
 - **Untrusted-workspace mode (#603, FR-007, FR-008).** `WorkspaceTrust { Trusted, Untrusted(ServerAllowlist) }`
   (`config/trust.rs`) is a closed typed value on `ServerConfig::workspace_trust`, never read from a
   config file. It is set only by `--workspace-trust untrusted` and repeatable `--allow-server <id>`;
@@ -80,13 +84,45 @@ related:
   directory (account database, never `$HOME`) are never taken for a checkout; violation is a startup error
   (`Error::ConfigInsideWorkspace`), and no default config file is created. Trusted mode runs none of
   this and logs nothing new.
+- **Resolved once (#657).** `plan_typescript` resolves the launch a single time per server (after
+  hardening, so the executable resolved is the one that runs) into a `TypescriptPlan`. The untrusted
+  check (`pin_inside`) and the value sent (`apply`) both read that plan, and the pin sent is the
+  canonical path that was checked. `UserTsserverPath { Absent, Path, Invalid }` is the one reading of
+  `initialization_options.tsserver.path` for selection, pinning and the check: a non-string value counts
+  as user-set, so nothing is pinned or selected over it. `lsp::command_path` holds the only `PATH`
+  walker. A respawn calls `ServerInitConfig::for_respawn`: a pin mcpls chose (remembered with its
+  untrusted boundary) whose canonical path changed (install upgraded, moved or retargeted through a
+  symlink) is resolved again and checked against the boundary it was vetted against, a refusal being
+  `Error::ServerFailedToStart`; a user pin is never re-resolved. Opt-in `selection = "auto"` runs its own
+  resolution first because native selection must precede hardening.
+- **Launchers (#652).** In untrusted mode an allowed server whose launch lets the workspace choose the
+  program is refused: `UntrustedRefusal::ProjectLauncher` for package runners (`npm`, `npx`, `bunx`,
+  `pnpm`, `pnpx`, `yarn`, `uvx`, `corepack`, any `npm:` argument), task runners (`make`, `just`, `task`,
+  `rake`, `mvn`, `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`, `poetry`,
+  `pdm`, `hatch`, `bundle`, `dotnet` (`lsp/launcher.rs`, a `LaunchRule` per command stem); `env` is
+  unwrapped, `env -S` and a shell with `-c` or `/c` are refused as unanalyzable, `deno lsp` is allowed.
+  `UntrustedRefusal::UnpinnedTypescriptLauncher` refuses a TypeScript server whose launcher no tsserver
+  can be pinned for (`PackageRunner` or `UnsupportedLauncher` resolution), also when the user set
+  `tsserver.path`. An unresolved pin for another reason (no `typescript` next to the server) stays
+  admitted. The list is best-effort; the trusted configuration is the boundary (`SECURITY.md`).
+- **Working directory and Windows lookups (#653).** An untrusted server starts in the login home, else the
+  system temporary directory when it is not writable by group or others (a shared `/tmp` is not used), whichever lies outside the boundary (`ChildWorkingDir::Fixed`), else the
+  server is refused as `NoSafeWorkingDirectory`; a non-UTF-8 executable or `PATH` is refused as
+  `NonUtf8Path`. On Windows `NoDefaultCurrentDirectoryInExePath=1` is set (any spelling of the name is
+  normalized, a configured value is overridden) and passes through in trusted mode, so `cmd.exe` running
+  an npm `.cmd` shim and libuv lookups of `node`, `python` or `git` skip the current directory. The
+  working directory change covers lookups that do not honor the variable (libuv support was not
+  verified).
+  Relative `args` and servers that treat their working directory as the workspace root no longer
+  resolve into the checkout. The Windows behavior is verified only by a `cfg(windows)` test that starts a
+  `.cmd` server and records `%CD%` and the variable.
 - **Inside the workspace.** A server installed inside the workspace is still pinned and a warning is
   logged: skipping would let the server walk the `rootUri` ancestors and pick the workspace tsserver.
 - **User options (FR-006).** A user `tsserver.path` wins. User options without `tsserver.path` skip
   the pin with a warning (no merge).
 - **Post-init check.** On `$/typescriptVersion` with a pinned `tsserver.path`, a `source` other than
-  `user-setting` logs a warning. This catches a stale pin on respawn, because resolution happens once
-  at startup.
+  `user-setting` logs a warning. This catches a pin that is stale on respawn after `for_respawn`
+  re-resolved it, or one the server ignores.
 - **Not covered.** Automatic type acquisition may fetch packages over the network, and tsconfig
   plugins are not loaded from the workspace by a pinned tsserver because `allowLocalPluginLoads` is
   never passed; this holds only while the pin applies. The startup read of the install layout adds no
@@ -249,6 +285,9 @@ the committed minimum, the rest is gated on the open decisions.
 | FR-008 | WHERE an "untrusted workspace" mode exists AND a server is classified as executing workspace code WHEN a tool call would spawn it THE SYSTEM SHALL refuse with a typed error that names the server and the consent mechanism | should |
 | FR-009 | THE SYSTEM SHALL publish a security policy (`SECURITY.md`) describing the private reporting route | should |
 | FR-010 | THE SYSTEM SHALL record, for each default server, whether built-in hardening exists, so the documentation and any classification stay consistent | could |
+| FR-011 | WHERE untrusted mode exists THE SYSTEM SHALL refuse an allowed server launched through a package runner, task runner or toolchain wrapper that selects the program from workspace files, and a TypeScript server launched in a way no tsserver can be pinned for, with a typed refusal that names the launcher | must |
+| FR-012 | WHERE untrusted mode exists THE SYSTEM SHALL start the server in a directory outside the workspace and, on Windows, set `NoDefaultCurrentDirectoryInExePath=1`, so no lookup the server makes resolves into the workspace through the current directory | must |
+| FR-013 | THE SYSTEM SHALL resolve the tsserver once per server start so the path checked against the workspace is the path sent, and SHALL resolve a pin it chose again, with the same check, when it no longer resolves to the same file at respawn | must |
 
 ## 4. Non-Functional Requirements
 
@@ -283,6 +322,10 @@ No persistent storage is introduced.
 | Server other than TypeScript (rust-analyzer build scripts, proc macros) | No upstream pin exists that avoids the behavior without breaking the server; documentation only (FR-001) |
 | Untrusted-workspace mode enabled and a configured server is not classified | Refused like every other server unless allowed; the message says the workspace code it may run is unknown |
 | Windows path and extension differences for tsserver | Pin must be resolved with platform-correct paths (NFR-002) |
+| Untrusted mode and `command = "npx"` (or `make`, `cargo run`, `env npx`, `sh -c`) | Refused as `ProjectLauncher`; the message tells the user to install the server globally and give its absolute path (FR-011) |
+| Untrusted mode and a Volta, asdf or mise shim for the TypeScript server | Refused as `UnpinnedTypescriptLauncher`, also with a user `tsserver.path` (FR-011); trusted mode starts it unpinned with a warning (#645) |
+| Untrusted mode, no directory outside the workspace for the server to start in | Refused as `NoSafeWorkingDirectory` (FR-012) |
+| Respawn of a TypeScript server whose pinned install was upgraded | The tsserver is resolved again; in untrusted mode a result inside the workspace is refused (FR-013) |
 
 ## 7. Success Criteria
 

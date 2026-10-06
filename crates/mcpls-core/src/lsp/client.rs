@@ -61,6 +61,18 @@ const READER_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
 /// may overrun it by a 50 ms settle.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many undecodable inbound frames in a row the reader tolerates before it
+/// treats the connection as broken.
+///
+/// A single frame that is not a valid message is dropped, so one bad message
+/// does not take the server down. A server that emits only garbage never makes
+/// progress, though: after this many consecutive undecodable frames the
+/// connection is torn down and the server respawned like any other lost
+/// connection.
+pub const MAX_CONSECUTIVE_UNDECODABLE_FRAMES: u32 = 64;
+
+const _: () = assert!(MAX_CONSECUTIVE_UNDECODABLE_FRAMES > 0);
+
 /// How long [`LspClient::shutdown_until`] waits for an aborted message loop
 /// to drop its command receiver before failing the pending requests.
 const SHUTDOWN_ABORT_SETTLE: Duration = Duration::from_millis(50);
@@ -167,8 +179,12 @@ fn spawn_reader_task(
 ) -> (JoinHandle<()>, mpsc::Receiver<Result<InboundMessage>>) {
     let (tx, rx) = mpsc::channel(READER_CHANNEL_CAPACITY);
     let handle = tokio::spawn(async move {
+        let mut run = UndecodableRun::default();
         loop {
-            let message = reader.receive().await;
+            let message = reader
+                .receive()
+                .await
+                .and_then(|message| run.observe(message));
             let is_err = message.is_err();
             if tx.send(message).await.is_err() || is_err {
                 break;
@@ -176,6 +192,39 @@ fn spawn_reader_task(
         }
     });
     (handle, rx)
+}
+
+/// The current run of consecutive undecodable inbound frames.
+#[derive(Debug, Default)]
+struct UndecodableRun(u32);
+
+impl UndecodableRun {
+    /// Passes `message` on. A decodable message ends the run; an undecodable
+    /// one extends it, logged at `warn` only when it starts the run so a server
+    /// that spams garbage cannot flood the log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LspProtocolError`] once the run reaches
+    /// [`MAX_CONSECUTIVE_UNDECODABLE_FRAMES`], so the connection is torn down.
+    fn observe(&mut self, message: InboundMessage) -> Result<InboundMessage> {
+        if !message.is_undecodable() {
+            self.0 = 0;
+            return Ok(message);
+        }
+        self.0 = self.0.saturating_add(1);
+        if self.0 >= MAX_CONSECUTIVE_UNDECODABLE_FRAMES {
+            return Err(Error::LspProtocolError(RedactedText::fixed(
+                "too many consecutive undecodable messages",
+            )));
+        }
+        if self.0 == 1 {
+            warn!("Dropped an undecodable LSP message; later ones in a row are logged at debug");
+        } else {
+            debug!("Dropped an undecodable LSP message ({} in a row)", self.0);
+        }
+        Ok(message)
+    }
 }
 
 /// Why requests still pending on a client are being failed, and so which
@@ -1167,6 +1216,21 @@ impl LspClient {
                     ))));
                 }
             }
+            InboundMessage::UndecodableRequest { id } => {
+                debug!("Answering an undecodable server request with an error: id={id:?}");
+                let response = JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION.to_string(),
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: "Invalid Request: the request could not be decoded".to_owned(),
+                        data: None,
+                    }),
+                };
+                transport.send(&serde_json::to_value(&response)?).await?;
+            }
+            InboundMessage::UndecodableNotification | InboundMessage::UndecodableFrame => {}
             InboundMessage::Request(request) => {
                 debug!(
                     "Received server request: {} (id={:?})",
@@ -1341,24 +1405,62 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
 pub struct UnclassifiedError(Option<Box<Unclassified>>);
 
+/// The two states of an [`UnclassifiedError`]: a failure already logged where
+/// it happened, and a server error response nobody has logged yet.
 #[derive(Debug)]
-struct Unclassified {
-    error: Error,
-    unlogged: Option<(String, RequestId)>,
+enum Unclassified {
+    Logged(Error),
+    ServerResponse {
+        error: Error,
+        method: String,
+        id: RequestId,
+    },
+}
+
+impl Unclassified {
+    const fn error(&self) -> &Error {
+        match self {
+            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
+        }
+    }
+
+    /// Hands over the error, first passing an unlogged server error response
+    /// to `report` as (method, id, code, message).
+    fn finish(self, report: impl FnOnce(&str, &RequestId, i32, &str)) -> Error {
+        if let Self::ServerResponse {
+            error: Error::LspServerError { code, message, .. },
+            method,
+            id,
+        } = &self
+        {
+            report(method, id, *code, message);
+        }
+        match self {
+            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
+        }
+    }
+}
+
+fn log_handled_error(method: &str, id: &RequestId, code: i32, message: &str) {
+    debug!(
+        "LSP error response handled by the caller: {} (code {}) on '{}' (id={:?})",
+        LspClient::truncate_error_message_for_log(message),
+        code,
+        method,
+        id
+    );
 }
 
 impl UnclassifiedError {
     fn logged(error: Error) -> Self {
-        Self(Some(Box::new(Unclassified {
-            error,
-            unlogged: None,
-        })))
+        Self(Some(Box::new(Unclassified::Logged(error))))
     }
 
     fn server_response(error: Error, method: &str, id: RequestId) -> Self {
-        Self(Some(Box::new(Unclassified {
+        Self(Some(Box::new(Unclassified::ServerResponse {
             error,
-            unlogged: Some((method.to_owned(), id)),
+            method: method.to_owned(),
+            id,
         })))
     }
 
@@ -1373,38 +1475,20 @@ impl UnclassifiedError {
     pub(crate) fn error(&self) -> &Error {
         self.0.as_ref().map_or_else(
             || unreachable!("an UnclassifiedError holds its error until classified"),
-            |inner| &inner.error,
+            |inner| inner.error(),
         )
     }
 
     /// The error returned to the caller as a failure; a server error response
     /// is logged at ERROR.
     pub(crate) fn surface(self) -> Error {
-        let Unclassified { error, unlogged } = self.take();
-        if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
-            (&unlogged, &error)
-        {
-            log_surfaced_error(method, id, *code, message);
-        }
-        error
+        self.take().finish(log_surfaced_error)
     }
 
     /// The error of an expected outcome; a server error response is logged at
     /// DEBUG.
     pub(crate) fn handled(self) -> Error {
-        let Unclassified { error, unlogged } = self.take();
-        if let (Some((method, id)), Error::LspServerError { code, message, .. }) =
-            (&unlogged, &error)
-        {
-            debug!(
-                "LSP error response handled by the caller: {} (code {}) on '{}' (id={:?})",
-                LspClient::truncate_error_message_for_log(message),
-                code,
-                method,
-                id
-            );
-        }
-        error
+        self.take().finish(log_handled_error)
     }
 }
 
@@ -1412,11 +1496,8 @@ impl UnclassifiedError {
 /// `.ok()`, `let _ =` or an ignoring match arm cannot hide it.
 impl Drop for UnclassifiedError {
     fn drop(&mut self) {
-        if let Some(inner) = self.0.take()
-            && let (Some((method, id)), Error::LspServerError { code, message, .. }) =
-                (&inner.unlogged, &inner.error)
-        {
-            log_surfaced_error(method, id, *code, message);
+        if let Some(inner) = self.0.take() {
+            drop(inner.finish(log_surfaced_error));
         }
     }
 }
@@ -2292,6 +2373,114 @@ mod tests {
             .await;
             assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("alive"));
             assert!(client.pending_requests.lock().await.is_empty());
+        }
+
+        fn deeply_nested() -> String {
+            format!("{}1{}", "{\"parent\":".repeat(200), "}".repeat(200))
+        }
+
+        #[tokio::test]
+        async fn test_undecodable_server_request_is_answered_with_an_error() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":"srv-1","method":"client/registerCapability","params":{}}}"#,
+                    deeply_nested()
+                ),
+            )
+            .await;
+            let reply = read_framed_message(&mut reader).await;
+
+            assert_eq!(reply["id"], serde_json::json!("srv-1"));
+            assert_eq!(reply["error"]["code"], serde_json::json!(-32600));
+
+            let hover = spawn_hover(&client);
+            let request = read_framed_message(&mut reader).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+            assert_eq!(hover.await.unwrap().unwrap(), serde_json::json!("alive"));
+        }
+
+        #[tokio::test]
+        async fn test_undecodable_notification_is_dropped_and_the_connection_stays_up() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let hover = spawn_hover(&client);
+            let request = read_framed_message(&mut reader).await;
+
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"window/logMessage","params":{}}}"#,
+                    deeply_nested()
+                ),
+            )
+            .await;
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+
+            assert_eq!(hover.await.unwrap().unwrap(), serde_json::json!("alive"));
+        }
+
+        #[tokio::test]
+        async fn test_a_run_of_undecodable_frames_ends_the_connection() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let hover = spawn_hover(&client);
+            let _request = read_framed_message(&mut reader).await;
+
+            for _ in 0..MAX_CONSECUTIVE_UNDECODABLE_FRAMES {
+                write_raw_frame(&mut server.read_half_stdin, "{not json").await;
+            }
+
+            assert_matches!(hover.await.unwrap(), Err(Error::ServerTerminated));
+        }
+
+        #[tokio::test]
+        async fn test_a_decodable_message_ends_a_run_of_undecodable_frames() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let hover = spawn_hover(&client);
+            let request = read_framed_message(&mut reader).await;
+
+            let almost = MAX_CONSECUTIVE_UNDECODABLE_FRAMES - 1;
+            for _ in 0..2 {
+                for _ in 0..almost {
+                    write_raw_frame(&mut server.read_half_stdin, "{not json").await;
+                }
+                write_raw_frame(
+                    &mut server.read_half_stdin,
+                    r#"{"jsonrpc":"2.0","method":"$/progress"}"#,
+                )
+                .await;
+            }
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+
+            assert_eq!(hover.await.unwrap().unwrap(), serde_json::json!("alive"));
         }
 
         #[tokio::test(start_paused = true)]

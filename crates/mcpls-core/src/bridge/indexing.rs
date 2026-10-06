@@ -25,6 +25,23 @@ use tokio::time::Instant;
 use crate::config::ServerId;
 use crate::lsp::types::ProgressKind;
 
+/// How a server's tracked [`IndexingState`] is reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexingReset {
+    /// Forget everything tracked: the state reverts to
+    /// [`IndexingState::Unknown`] until the next signal.
+    Forget,
+    /// The server was replaced by a new process: a server that has reported a
+    /// recognized signal before reads [`IndexingState::Loading`] for `within`
+    /// or until its replacement reports one, whichever comes first. A server
+    /// that never reported one behaves as after [`Self::Forget`], so it is not
+    /// delayed.
+    AwaitReplacement {
+        /// Upper bound of the pre-signal [`IndexingState::Loading`] reading.
+        within: Duration,
+    },
+}
+
 /// Workspace-indexing readiness of a routed LSP server.
 ///
 /// Tracked separately from the `initialize`/`initialized` handshake
@@ -122,6 +139,17 @@ enum IndexingSignalSource {
     ServerStatus,
     /// A generic `$/progress` `begin`/`end` sequence.
     Progress,
+}
+
+/// What is tracked for one server: the wait for a replacement's first signal,
+/// or the entry a real signal produced.
+#[derive(Debug, Clone)]
+enum TrackedIndexing {
+    /// A replacement process has not reported a signal yet; reads
+    /// [`IndexingState::Loading`] until `since + within` has elapsed.
+    AwaitingFirstSignal { since: Instant, within: Duration },
+    /// A real signal has been observed.
+    Signalled(IndexingEntry),
 }
 
 /// A tracked [`IndexingState`] plus the bookkeeping needed to derive it.
@@ -284,8 +312,12 @@ const PROGRESS_TOKEN_MAX_LEN: usize = 256;
 /// delegated to for every indexing-related call.
 #[derive(Debug, Default)]
 pub struct IndexingTracker {
-    entries: HashMap<ServerId, IndexingEntry>,
+    entries: HashMap<ServerId, TrackedIndexing>,
     policies: HashMap<ServerId, IndexingPolicy>,
+    /// The signal source each server last reported; survives [`Self::reset`]
+    /// like `policies` and decides whether a replacement is awaited
+    /// ([`IndexingReset::AwaitReplacement`]).
+    seen: HashMap<ServerId, IndexingSignalSource>,
 }
 
 impl IndexingTracker {
@@ -342,17 +374,22 @@ impl IndexingTracker {
             return;
         };
 
-        let sticky_ready = self.entries.get(server_id).is_some_and(|entry| {
-            entry.source == IndexingSignalSource::ServerStatus
-                && entry.state == IndexingState::Ready
-        });
+        let sticky_ready = matches!(
+            self.entries.get(server_id),
+            Some(TrackedIndexing::Signalled(entry))
+                if entry.source == IndexingSignalSource::ServerStatus
+                    && entry.state == IndexingState::Ready
+        );
         if sticky_ready {
             return;
         }
 
+        self.seen
+            .insert(server_id.clone(), IndexingSignalSource::ServerStatus);
+        self.log_wait_ended(server_id);
         self.entries.insert(
             server_id.clone(),
-            IndexingEntry {
+            TrackedIndexing::Signalled(IndexingEntry {
                 state: if quiescent {
                     IndexingState::Ready
                 } else {
@@ -363,7 +400,7 @@ impl IndexingTracker {
                 open: HashMap::new(),
                 empty_since: None,
                 latched: false,
-            },
+            }),
         );
     }
 
@@ -412,12 +449,19 @@ impl IndexingTracker {
         let Some(kind) = ProgressKind::from_value(&params.value) else {
             return;
         };
-        if self
-            .entries
-            .get(server_id)
-            .is_some_and(|entry| entry.source == IndexingSignalSource::ServerStatus)
-        {
-            return;
+        match self.entries.get(server_id) {
+            Some(TrackedIndexing::Signalled(entry))
+                if entry.source == IndexingSignalSource::ServerStatus =>
+            {
+                return;
+            }
+            // Progress frames of a server that reports `serverStatus` are not the signal awaited.
+            Some(TrackedIndexing::AwaitingFirstSignal { .. })
+                if self.seen.get(server_id) != Some(&IndexingSignalSource::Progress) =>
+            {
+                return;
+            }
+            _ => {}
         }
         if let ProgressToken::String(token) = &params.token
             && token.len() > PROGRESS_TOKEN_MAX_LEN
@@ -426,10 +470,20 @@ impl IndexingTracker {
             return;
         }
 
-        let entry = self
+        self.seen
+            .entry(server_id.clone())
+            .or_insert(IndexingSignalSource::Progress);
+        self.log_wait_ended(server_id);
+        let tracked = self
             .entries
             .entry(server_id.clone())
-            .or_insert_with(IndexingEntry::fresh_progress);
+            .or_insert_with(|| TrackedIndexing::Signalled(IndexingEntry::fresh_progress()));
+        if matches!(tracked, TrackedIndexing::AwaitingFirstSignal { .. }) {
+            *tracked = TrackedIndexing::Signalled(IndexingEntry::fresh_progress());
+        }
+        let TrackedIndexing::Signalled(entry) = tracked else {
+            return;
+        };
         if entry.latched {
             return;
         }
@@ -503,9 +557,20 @@ impl IndexingTracker {
         if self.is_disabled(server_id) {
             return IndexingState::Unknown;
         }
-        let Some(entry) = self.entries.get(server_id) else {
-            return IndexingState::Unknown;
-        };
+        match self.entries.get(server_id) {
+            None => IndexingState::Unknown,
+            Some(TrackedIndexing::AwaitingFirstSignal { since, within }) => {
+                if since.elapsed() < *within {
+                    IndexingState::Loading
+                } else {
+                    IndexingState::Unknown
+                }
+            }
+            Some(TrackedIndexing::Signalled(entry)) => Self::signalled_state(entry),
+        }
+    }
+
+    fn signalled_state(entry: &IndexingEntry) -> IndexingState {
         match entry.source {
             IndexingSignalSource::ServerStatus => {
                 if entry.state == IndexingState::Loading
@@ -547,12 +612,35 @@ impl IndexingTracker {
         }
     }
 
-    /// Forget `server_id`'s tracked entry, reverting it to
-    /// [`IndexingState::Unknown`]. Does not touch its [`IndexingPolicy`]
-    /// (see [`Self::set_policy`]) -- a respawned process still honors
-    /// whatever the static config said.
-    pub(crate) fn reset(&mut self, server_id: &ServerId) {
+    /// Reset `server_id`'s tracked entry as `reset` says. Touches neither its
+    /// [`IndexingPolicy`] (see [`Self::set_policy`]) -- a respawned process
+    /// still honors whatever the static config said -- nor which signal
+    /// source it has reported before.
+    pub(crate) fn reset(&mut self, server_id: &ServerId, reset: IndexingReset) {
         self.entries.remove(server_id);
+        let IndexingReset::AwaitReplacement { within } = reset else {
+            return;
+        };
+        if self.is_disabled(server_id) || !self.seen.contains_key(server_id) {
+            return;
+        }
+        tracing::debug!(%server_id, ?within, "replacement awaits its first indexing signal");
+        self.entries.insert(
+            server_id.clone(),
+            TrackedIndexing::AwaitingFirstSignal {
+                since: Instant::now(),
+                within,
+            },
+        );
+    }
+
+    fn log_wait_ended(&self, server_id: &ServerId) {
+        if matches!(
+            self.entries.get(server_id),
+            Some(TrackedIndexing::AwaitingFirstSignal { .. })
+        ) {
+            tracing::debug!(%server_id, "indexing signal ends the pre-signal wait");
+        }
     }
 }
 
@@ -1047,7 +1135,7 @@ mod tests {
         let server = test_server();
         tracker.set_policy(server.clone(), IndexingPolicy::Disabled);
         tracker.observe_progress(&server, &progress("begin", 1));
-        tracker.reset(&server);
+        tracker.reset(&server, IndexingReset::Forget);
         assert_eq!(
             tracker.state(&server),
             IndexingState::Unknown,
@@ -1056,8 +1144,150 @@ mod tests {
 
         let mut auto_tracker = IndexingTracker::new();
         auto_tracker.observe_progress(&server, &progress("begin", 1));
-        auto_tracker.reset(&server);
+        auto_tracker.reset(&server, IndexingReset::Forget);
         assert_eq!(auto_tracker.state(&server), IndexingState::Unknown);
+    }
+
+    const WITHIN: Duration = Duration::from_secs(30);
+
+    fn server_status(tracker: &mut IndexingTracker, server: &ServerId, quiescent: bool) {
+        tracker.observe_server_status(
+            server,
+            "experimental/serverStatus",
+            Some(&serde_json::json!({ "quiescent": quiescent })),
+        );
+    }
+
+    fn await_replacement(tracker: &mut IndexingTracker, server: &ServerId) {
+        tracker.reset(server, IndexingReset::AwaitReplacement { within: WITHIN });
+    }
+
+    #[test]
+    fn test_await_replacement_without_history_stays_unknown() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Unknown);
+    }
+
+    #[test]
+    fn test_await_replacement_after_ready_reads_loading() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+    }
+
+    #[test]
+    fn test_await_replacement_after_loading_reads_loading() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, false);
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_await_replacement_ends_after_within() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+
+        tokio::time::advance(WITHIN.saturating_sub(Duration::from_secs(1))).await;
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(tracker.state(&server), IndexingState::Unknown);
+    }
+
+    #[test]
+    fn test_await_replacement_ready_signal_ends_wait_at_once() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+        server_status(&mut tracker, &server, true);
+        assert_eq!(tracker.state(&server), IndexingState::Ready);
+    }
+
+    #[test]
+    fn test_await_replacement_loading_signal_is_a_real_loading_entry() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+        server_status(&mut tracker, &server, false);
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+        server_status(&mut tracker, &server, true);
+        assert_eq!(tracker.state(&server), IndexingState::Ready);
+    }
+
+    #[test]
+    fn test_await_replacement_ignores_progress_of_a_server_status_server() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+        tracker.observe_progress(&server, &progress("begin", 1));
+        tracker.observe_progress(&server, &progress("end", 1));
+        assert_eq!(
+            tracker.state(&server),
+            IndexingState::Loading,
+            "startup progress must not end the wait for the serverStatus signal"
+        );
+    }
+
+    #[test]
+    fn test_await_replacement_progress_server_is_replaced_by_progress_entry() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        tracker.observe_progress(&server, &progress("begin", 1));
+        tracker.observe_progress(&server, &progress("end", 1));
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+
+        tracker.observe_progress(&server, &progress("begin", 2));
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+        tracker.observe_progress(&server, &progress("end", 2));
+        assert_eq!(
+            tracker.state(&server),
+            IndexingState::Loading,
+            "settle window of the fresh progress entry"
+        );
+    }
+
+    #[test]
+    fn test_await_replacement_twice_restarts_the_wait() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        server_status(&mut tracker, &server, true);
+        await_replacement(&mut tracker, &server);
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Loading);
+        tracker.reset(&server, IndexingReset::Forget);
+        assert_eq!(tracker.state(&server), IndexingState::Unknown);
+    }
+
+    #[test]
+    fn test_await_replacement_respects_disabled_policy() {
+        let mut tracker = IndexingTracker::new();
+        let server = test_server();
+        tracker.set_policy(server.clone(), IndexingPolicy::Disabled);
+        await_replacement(&mut tracker, &server);
+        assert_eq!(tracker.state(&server), IndexingState::Unknown);
+    }
+
+    #[test]
+    fn test_await_replacement_tracks_servers_independently() {
+        let mut tracker = IndexingTracker::new();
+        let rust = ServerId::from("rust");
+        let python = ServerId::from("python");
+        server_status(&mut tracker, &rust, true);
+        server_status(&mut tracker, &python, true);
+        await_replacement(&mut tracker, &rust);
+        assert_eq!(tracker.state(&rust), IndexingState::Loading);
+        assert_eq!(tracker.state(&python), IndexingState::Ready);
     }
 
     /// End-to-end `$/progress` handling over a real [`LspClient`] on a mock

@@ -237,14 +237,15 @@ THEN it is answered without a fixed delay beyond what a cold start of that serve
 - Return an unqualified empty result as the answer to a gated call on a replaced server.
 - Leave a gate armed without a bound.
 
-## 9. Open Questions
+## 9. Resolutions
 
-- [NEEDS CLARIFICATION: root cause to confirm before the plan. The working hypothesis is that the reset to `Unknown` on replacement opens the gate until the first `quiescent: false`, while a cold start does not hit it because the signal arrives before the server is registered. Verify with a debug log of the notification order for both paths.]
-- [NEEDS CLARIFICATION: source of "this server will report a signal" (FR-006). Options: (a) history of the server id (`Ready` or `Loading` was ever observed), which is empty if nothing was queried before the restart; (b) the server kind (a rust-analyzer command), which is server-specific knowledge in the generic layer; (c) a short fixed grace window after any replacement, which delays non-signalling servers; (d) a per-server configuration value. Recommended default: (a), with (b) as a fallback only if (a) proves too weak.]
-- [NEEDS CLARIFICATION: should the restart result report `loading` for a replacement in the pre-signal condition, or a new value such as `starting`? Recommended default: reuse `loading` so callers need no new branch.]
-- [NEEDS CLARIFICATION: how long does the pre-signal condition last when the replacement is a signalling server that never reports? Recommended default: the existing 30 s gate bound counted from the replacement.]
-- [NEEDS CLARIFICATION: the automatic respawn path is unverified live; find a reliable way to terminate the server process without the process-group watchdog interfering.]
-- [NEEDS CLARIFICATION: the playbook for [[mcp/008-manual-lsp-server-restart/spec|mcp/008]] states the expected behavior; was it ever exercised live with an immediate query? Record the answer in the coverage status.]
+- **Root cause (confirmed).** The reset to `Unknown` on replacement opens the gate until the first `quiescent: false`: the live trace logged the restart result 0.8 ms before the first `quiescent: false`. A cold start is not affected because its first status notification precedes server registration.
+- **Source of the signalling knowledge (FR-006): option (a).** The tracker keeps, per server id, the signal source it has ever reported; the record survives a reset like the indexing policy. A server without that history is not gated.
+- **Restart result.** The pre-signal condition reads `loading`; no new `indexing_state` value.
+- **Duration.** The configured indexing-ready timeout (`workspace.indexing_ready_timeout_seconds`, default 30 s) counted from the replacement; a signal ends it at once.
+- **Shape.** The tracked state is a typed `TrackedIndexing { AwaitingFirstSignal { since, within }, Signalled(entry) }`; `IndexingReset::AwaitReplacement { within }` seeds it in `respawn_locked` before the replacement's notification consumer starts, for both the restart and the automatic respawn (the consumer of an automatic respawn forwards the lifecycle lane too, so signals arrive). While awaiting, `$/progress` frames of a server whose history is `experimental/serverStatus` do not end the wait.
+- **Automatic respawn, live check.** Still pending (no reliable way to kill the server process without the watchdog); the unit tests cover the shared path.
+- **Playbook.** Whether the mcp/008 playbook was exercised live with an immediate query is recorded in the coverage status under `.local/testing/`.
 
 ## 10. See Also
 

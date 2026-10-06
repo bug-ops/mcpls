@@ -928,16 +928,82 @@ async fn test_run_http_rejects_new_session_at_capacity_with_429() {
     server_task.abort();
 }
 
+/// `GHSA-9pj6-vhgr-3mwh` regression guard: well-formed non-`initialize`
+/// POSTs without a session id must not allocate or leak a session permit,
+/// so a legitimate `initialize` still succeeds on a server capped at one.
+#[tokio::test]
+async fn test_run_http_invalid_non_initialize_posts_do_not_leak_session_permits() {
+    let (addr, server_task) = spawn_http_server(test_server(), |cfg| {
+        cfg.with_max_concurrent_sessions(crate::SessionLimit::new(1).unwrap())
+    })
+    .await;
+
+    let accept_headers =
+        "Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\n";
+    let non_initialize = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    for _ in 0..3 {
+        let response = raw_http_post(addr, "/mcp", accept_headers, non_initialize).await;
+        assert!(
+            !response.starts_with("HTTP/1.1 2") && !response.starts_with("HTTP/1.1 429"),
+            "a sessionless non-initialize POST must be rejected without touching the cap, got: {response}"
+        );
+    }
+
+    let initialize_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+    let initialize = raw_http_post(addr, "/mcp", accept_headers, initialize_body).await;
+    assert!(
+        initialize.starts_with("HTTP/1.1 200"),
+        "initialize must still succeed after rejected POSTs, got: {initialize}"
+    );
+
+    server_task.abort();
+}
+
+/// rmcp 3.5.1 keeps handler-generated `-32602` errors in-band: an unknown
+/// tool answers HTTP 200 with the JSON-RPC error in the body, not HTTP 400.
+#[tokio::test]
+async fn test_run_http_unknown_tool_is_in_band_invalid_params_with_http_200() {
+    let (addr, server_task) = spawn_http_server(test_server(), |cfg| cfg).await;
+    let session_id = initialize_legacy_session(addr).await;
+    let initialized = post_in_session(
+        addr,
+        &session_id,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await;
+    assert!(
+        initialized.starts_with("HTTP/1.1 202"),
+        "got: {initialized}"
+    );
+
+    let response = post_in_session(
+        addr,
+        &session_id,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unknown tool must not map to an HTTP error, got: {response}"
+    );
+    assert!(
+        response.contains("-32602"),
+        "the in-band error must carry code -32602, got: {response}"
+    );
+
+    server_task.abort();
+}
+
 /// S1 non-regression: a non-`initialize` request carrying SEP-2575
 /// per-request `_meta` protocol-version metadata
 /// (`io.modelcontextprotocol/protocolVersion` = `2026-07-28` plus the
-/// required `clientCapabilities` key) takes rmcp 3.2.0's stateless
+/// required `clientCapabilities` key) takes rmcp's stateless
 /// discover-lifecycle path and never calls
 /// `SessionManager::create_session` — `rmcp` serves it directly
 /// without touching the session table — so it must not be rejected
 /// by the cap even while `max_concurrent_sessions` legacy sessions
 /// are already active. (An `initialize` request is always
-/// classified legacy in 3.2.0 regardless of the protocol version it
+/// classified legacy regardless of the protocol version it
 /// names, so it cannot be used to probe the stateless path.) This
 /// guards against a future refactor reintroducing request-header
 /// sniffing for the cap decision (the bug this design replaced).
@@ -960,7 +1026,7 @@ async fn test_run_http_stateless_request_bypasses_session_cap() {
     );
 
     // A non-`initialize` request carrying per-request `_meta`
-    // protocol-version metadata takes rmcp 3.2.0's stateless
+    // protocol-version metadata takes rmcp's stateless
     // discover-lifecycle path and never creates a session, so it
     // must bypass the cap entirely even though the slot above is
     // still held. The `MCP-Protocol-Version` header must match the

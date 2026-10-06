@@ -16,17 +16,21 @@ use self::clock::{Clock, SystemClock};
 use self::encoding_ctx::EncodingCtx;
 use self::servers::{Backend, Phase, Servers};
 use crate::bridge::encoding::PositionEncoding;
+use crate::bridge::indexing::IndexingReset;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots, lock_std};
+use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots};
 use crate::config::{
-    IndexingReadyTimeoutSecs, LanguageId, ServerId, ServerSettlement, ToolKind, ToolRouter,
+    FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId, ServerId, ServerSettlement,
+    ToolKind, ToolRouter,
 };
 use crate::error::{ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspServer, ServerInitConfig};
 use crate::redaction::Redactions;
+use crate::util::lock_std;
 
 mod addressing;
 mod assist;
+mod availability;
 mod call_hierarchy;
 #[cfg(test)]
 mod characterization;
@@ -41,9 +45,11 @@ mod encoding_ctx;
 mod folding_range;
 mod hierarchy;
 mod highlights;
+mod kind_filter;
 mod navigation;
 #[cfg(test)]
 mod prepare_range_tests;
+mod pull_support;
 mod respawn;
 mod restart;
 mod routing;
@@ -59,10 +65,14 @@ pub use addressing::{
     AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
     ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
 };
+pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
     EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
+};
+pub use kind_filter::{
+    CodeActionKindFilter, KindFilter, KindFilterInput, RejectedKindFilter, SymbolKindFilter,
 };
 pub use restart::{
     DiagnosticsRole, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers,
@@ -71,7 +81,6 @@ pub use restart::{
 };
 pub use routing::Capability;
 pub use support::{RouteSupport, ToolSupportSnapshot};
-pub use symbols::parse_symbol_kind;
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
@@ -114,7 +123,10 @@ pub struct Translator {
     workspace_roots: WorkspaceRoots,
     /// Custom file extension to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
-    extension_map: Arc<HashMap<String, LanguageId>>,
+    extension_map: Arc<HashMap<FileExtension, LanguageId>>,
+    /// The `file_patterns` configured across all servers, reported when a
+    /// file's language has no server. Read-only after `serve()` setup.
+    file_patterns: Arc<[FilePattern]>,
     /// Per-tool routing table: resolves `(language, tool)` to a `ServerId`.
     /// Locked independently so a rebind (called from the background init task
     /// as each server settles) never contends with an in-flight LSP round
@@ -173,6 +185,7 @@ impl Translator {
             resource_limits: ResourceLimits::default(),
             workspace_roots: WorkspaceRoots::default(),
             extension_map: Arc::new(HashMap::new()),
+            file_patterns: Arc::default(),
             router: Arc::new(StdMutex::new(Arc::new(ToolRouter::default()))),
             configured_router: Arc::new(ToolRouter::default()),
             notification_cache: None,
@@ -326,11 +339,11 @@ impl Translator {
         let registered: HashSet<ServerId> = {
             let mut servers = lock_std(&self.servers);
             servers.fail_unsettled(configs.iter().map(|config| {
-                let server_config = &config.server_config;
+                let server_config = &config.server_config();
                 ServerSpawnFailure {
                     server_id: server_config.id(),
                     language_id: server_config.language_id.clone(),
-                    command: server_config.command.clone(),
+                    command: server_config.command.to_string(),
                     reason: StartupFailure::InitTaskPanicked,
                 }
             }));
@@ -347,7 +360,7 @@ impl Translator {
             let mut cache = cache.lock().await;
             for id in &registered {
                 cache.mark_push_degraded(id);
-                cache.reset_indexing_state(id);
+                cache.reset_indexing_state(id, IndexingReset::Forget);
             }
         }
     }
@@ -394,7 +407,7 @@ impl Translator {
 
     /// Registers the server in one step, then re-derives routes.
     pub(crate) fn settle_started(&self, server: LspServer) -> (ServerId, LanguageId) {
-        let id = server.init_config().server_config.id();
+        let id = server.init_config().server_config().id();
         let language = server.client().language_id().clone();
         let registered = lock_std(&self.servers).register(id.clone(), Backend::Process(server));
         drop(registered.displaced);
@@ -500,6 +513,15 @@ impl Translator {
         ));
     }
 
+    /// Configure the `file_patterns` reported by no-server-for-language errors.
+    ///
+    /// Only called during single-owner setup, before the translator is shared.
+    #[must_use]
+    pub fn with_file_patterns(mut self, patterns: impl IntoIterator<Item = FilePattern>) -> Self {
+        self.file_patterns = patterns.into_iter().collect();
+        self
+    }
+
     /// Configure custom file extension mappings.
     ///
     /// This method sets the extension map and updates the document tracker
@@ -508,7 +530,7 @@ impl Translator {
     /// Only called during single-owner setup, before the translator is
     /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
-    pub fn with_extensions(mut self, extension_map: HashMap<String, LanguageId>) -> Self {
+    pub fn with_extensions(mut self, extension_map: HashMap<FileExtension, LanguageId>) -> Self {
         self.extension_map = Arc::new(extension_map);
         self.rebuild_document_tracker();
         self
@@ -591,7 +613,7 @@ impl Translator {
     /// }
     /// ```
     pub fn register_server_complete(&self, server: LspServer) {
-        let id = server.init_config().server_config.id();
+        let id = server.init_config().server_config().id();
         let registered = lock_std(&self.servers).register(id, Backend::Process(server));
         drop(registered.displaced);
     }
@@ -761,7 +783,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::state::detect_language;
-    use crate::config::{ServerId, ToolKind, ToolRouter};
+    use crate::config::{DocumentLimit, ServerId, SizeLimit, ToolKind, ToolRouter, ToolSet};
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
 
@@ -841,9 +863,9 @@ mod tests {
         handles: Option<Vec<ToolKind>>,
     ) -> crate::config::LspServerConfig {
         let mut config = crate::config::LspServerConfig::rust_analyzer();
-        config.name = Some(name.to_string());
+        config.name = Some(ServerId::from(name));
         config.language_id = LanguageId::new(language).unwrap();
-        config.handles = handles;
+        config.handles = handles.map(|tools| ToolSet::new(tools).unwrap());
         config
     }
 
@@ -851,7 +873,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.clone(),
+            command: config.command.to_string(),
             reason: StartupFailure::InitTaskPanicked,
         }
     }
@@ -1336,15 +1358,18 @@ mod tests {
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
             .unwrap_err();
-        assert_matches!(err, Error::NoServerForLanguage(_));
+        assert_matches!(err, Error::NoServerForLanguage { .. });
     }
 
     #[test]
     fn test_translator_with_custom_extensions() {
         let mut extension_map = HashMap::new();
-        extension_map.insert("nu".to_string(), LanguageId::from_static("nushell"));
         extension_map.insert(
-            "customext".to_string(),
+            FileExtension::from_static("nu"),
+            LanguageId::from_static("nushell"),
+        );
+        extension_map.insert(
+            FileExtension::from_static("customext"),
             LanguageId::from_static("customlang"),
         );
 
@@ -1371,8 +1396,8 @@ mod tests {
     #[tokio::test]
     async fn test_with_resource_limits_applies_before_with_extensions() {
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let translator = Translator::new()
             .with_resource_limits(limits)
@@ -1417,12 +1442,12 @@ mod tests {
     #[tokio::test]
     async fn test_with_resource_limits_applies_after_with_extensions() {
         let limits = ResourceLimits {
-            max_documents: 1,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(1),
+            max_file_size: SizeLimit::UNLIMITED,
         };
         let translator = Translator::new()
             .with_extensions(HashMap::from([(
-                "rs".to_string(),
+                FileExtension::from_static("rs"),
                 LanguageId::from_static("rust"),
             )]))
             .with_resource_limits(limits);

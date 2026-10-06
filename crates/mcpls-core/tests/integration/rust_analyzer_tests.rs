@@ -16,11 +16,12 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    ClientPath, IndexingState, NotificationCache, Position, TabSize, Translator, WorkspaceRoots,
-    apply_lifecycle_notification,
+    ClientPath, IndexingState, KindFilterInput, NotificationCache, Position, SymbolKindFilter,
+    TabSize, Translator, WorkspaceRoots, apply_lifecycle_notification,
 };
 use mcpls_core::config::{
-    LanguageId, LspServerConfig, PositionEncodings, ServerId, TimeoutSecs, ToolRouter,
+    FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
+    ServerId, TimeoutSecs, ToolRouter,
 };
 use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
@@ -30,6 +31,12 @@ use crate::common::test_utils::rust_workspace_path;
 use crate::skip_if_no_rust_analyzer;
 
 static INIT_TRACING: Once = Once::new();
+
+fn symbol_kind_filter(name: &str) -> SymbolKindFilter {
+    KindFilterInput::<SymbolKindFilter>::from(name.to_owned())
+        .into_known()
+        .unwrap()
+}
 
 fn client_path(path: impl AsRef<Path>) -> ClientPath {
     ClientPath::try_from(path.as_ref().to_path_buf()).unwrap()
@@ -82,8 +89,10 @@ async fn setup_rust_analyzer_with_lifecycle_cache()
 
 fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
     let workspace_path = rust_workspace_path();
-    let extension_map =
-        std::collections::HashMap::from([("rs".to_string(), LanguageId::from_static("rust"))]);
+    let extension_map = std::collections::HashMap::from([(
+        FileExtension::from_static("rs"),
+        LanguageId::from_static("rust"),
+    )]);
     let mut translator = Translator::new()
         .with_extensions(extension_map)
         .with_router(ToolRouter::catch_all([(
@@ -102,10 +111,10 @@ async fn spawn_rust_analyzer() -> LspServer {
 
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: "rust-analyzer".to_string(),
+        command: ServerCommand::from_static("rust-analyzer"),
         args: vec![],
         env: std::collections::HashMap::new(),
-        file_patterns: vec!["**/*.rs".to_string()],
+        file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -117,13 +126,12 @@ async fn spawn_rust_analyzer() -> LspServer {
         selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
-    let server_init_config = ServerInitConfig {
-        server_config: lsp_config,
-        workspace_roots: vec![workspace_path.clone()],
-        initialization_options: None,
-        position_encodings: PositionEncodings::DEFAULT,
-        redactions: std::sync::Arc::default(),
-    };
+    let server_init_config = ServerInitConfig::new(
+        lsp_config,
+        WorkspaceRoots::from_configured(std::slice::from_ref(&workspace_path)).unwrap(),
+        PositionEncodings::DEFAULT,
+        std::sync::Arc::default(),
+    );
 
     LspServer::spawn(server_init_config)
         .await
@@ -961,7 +969,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
             String::new(), // Empty query to get all symbols
-            Some("Struct".to_string()),
+            Some(symbol_kind_filter("Struct")),
             100,
         ),
     )
@@ -1029,7 +1037,7 @@ async fn test_workspace_symbol_search_function() {
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
             "create".to_string(),
-            Some("Function".to_string()),
+            Some(symbol_kind_filter("Function")),
             100,
         ),
     )
@@ -1079,10 +1087,10 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
     let workspace_path = rust_workspace_path();
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: "rust-analyzer".to_string(),
+        command: ServerCommand::from_static("rust-analyzer"),
         args: vec![],
         env: std::collections::HashMap::new(),
-        file_patterns: vec!["**/*.rs".to_string()],
+        file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -1094,13 +1102,12 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
-    let server_init_config = ServerInitConfig {
-        server_config: lsp_config,
-        workspace_roots: vec![workspace_path],
-        initialization_options: None,
-        position_encodings: PositionEncodings::DEFAULT,
-        redactions: std::sync::Arc::default(),
-    };
+    let server_init_config = ServerInitConfig::new(
+        lsp_config,
+        WorkspaceRoots::from_configured(&[workspace_path]).unwrap(),
+        PositionEncodings::DEFAULT,
+        std::sync::Arc::default(),
+    );
 
     let mut server = LspServer::spawn(server_init_config)
         .await

@@ -7,12 +7,10 @@
 //! 4. Active request handling
 //! 5. Graceful shutdown sequence
 
-use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use futures::FutureExt as _;
 use lsp_types::{
     ClientCapabilities, ClientInfo, DidChangeConfigurationNotification,
     DidChangeConfigurationParams, ExitNotification, GeneralClientCapabilities, InitializeParams,
@@ -25,10 +23,11 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::bridge::try_path_to_uri;
+use crate::bridge::{WorkspaceRoots, try_path_to_uri};
 use crate::config::{LspServerConfig, LspSettings, PositionEncodings};
 use crate::error::{
-    BackgroundTask, Error, InitFailureHint, Result, ServerSpawnFailure, StartupFailure, StdioStream,
+    BackgroundTask, Error, InitFailureHint, InitPhase, Result, ServerSpawnFailure, StartupFailure,
+    StdioStream, UntrustedRefusal,
 };
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
@@ -37,7 +36,9 @@ use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
-use crate::lsp::{CONTENT_MODIFIED_RETRY_METHODS, tsserver_pin};
+use crate::lsp::{
+    CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, ParentEnv, process_env, tsserver_pin,
+};
 use crate::redaction::Redactions;
 
 /// Environment variables passed through to a spawned LSP server even though
@@ -52,7 +53,14 @@ use crate::redaction::Redactions;
 /// `SSH_AUTH_SOCK`, which changes every login session) have no way through
 /// today. See [`LspServerConfig::env`] for the config-level override/addition
 /// mechanism this list feeds into.
-const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"];
+const ENV_PASSTHROUGH: &[&str] = &[
+    ManagedEnvVar::Path.name(),
+    ManagedEnvVar::Home.name(),
+    ManagedEnvVar::UserProfile.name(),
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+];
 
 /// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
 /// its own after sending the LSP `exit` notification, before falling back to
@@ -142,8 +150,12 @@ pub const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
 /// loader itself; `APPDATA`/`LOCALAPPDATA` are read by the Node-based default
 /// servers (pyright, typescript-language-server) for global config and
 /// cache; the rest are conventionally expected by Windows child processes.
+/// `NoDefaultCurrentDirectoryInExePath` passes through so a user who set it to
+/// keep the current directory out of executable lookups is not overridden by
+/// the environment clearing.
 #[cfg(windows)]
 const ENV_PASSTHROUGH_WINDOWS: &[&str] = &[
+    ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.name(),
     "SystemRoot",
     "SystemDrive",
     "windir",
@@ -186,28 +198,248 @@ impl ServerState {
     }
 }
 
+/// Where a spawned server's working directory is.
+///
+/// A closed type so a spawn never silently depends on the working directory
+/// mcpls itself happens to have.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use mcpls_core::lsp::ChildWorkingDir;
+///
+/// assert_eq!(ChildWorkingDir::default(), ChildWorkingDir::Inherit);
+/// let fixed = ChildWorkingDir::Fixed(PathBuf::from("project"));
+/// assert_ne!(fixed, ChildWorkingDir::Inherit);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ChildWorkingDir {
+    /// The server inherits mcpls's working directory.
+    #[default]
+    Inherit,
+    /// The server starts in this directory.
+    Fixed(PathBuf),
+}
+
+/// A tsserver pin mcpls chose, as opposed to one the user configured.
+///
+/// Remembered so a respawn can tell a pin that went stale (the install moved)
+/// from the user's own `tsserver.path`, which is never second-guessed.
+#[derive(Debug, Clone)]
+struct AutoPin {
+    tsserver: PathBuf,
+    /// The untrusted-mode boundary the pin was vetted against, if any.
+    untrusted_boundary: Option<WorkspaceRoots>,
+}
+
 /// Configuration for LSP server initialization.
+///
+/// Built by [`Self::new`]; the fields are private so the effective
+/// `initialization_options` live in exactly one place, the
+/// [`LspServerConfig`] this was built from.
 #[derive(Debug, Clone)]
 pub struct ServerInitConfig {
-    /// LSP server configuration.
-    pub server_config: LspServerConfig,
-    /// Workspace root paths.
-    pub workspace_roots: Vec<PathBuf>,
-    /// Initialization options (server-specific JSON).
-    pub initialization_options: Option<serde_json::Value>,
-    /// Position encoding preference order from
-    /// [`crate::config::WorkspaceConfig::position_encodings`].
+    server_config: LspServerConfig,
+    workspace_roots: WorkspaceRoots,
+    position_encodings: PositionEncodings,
+    redactions: Arc<Redactions>,
+    child_working_dir: ChildWorkingDir,
+    auto_pin: Option<AutoPin>,
+}
+
+impl ServerInitConfig {
+    /// Builds the config a server is spawned from.
     ///
-    /// Sent as `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
-    /// `initialize` handshake, in the configured order.
-    pub position_encodings: PositionEncodings,
-    /// Secrets of every configured server, hidden in this server's output.
+    /// `server_config` must already carry the *effective* initialization
+    /// options (for example with the tsserver pin applied): they are sent as
+    /// they are and are the only copy.
     ///
+    /// `position_encodings` is the preference order from
+    /// [`crate::config::WorkspaceConfig::position_encodings`], sent as
+    /// `capabilities.general.positionEncodings` during [`LspServer::spawn`]'s
+    /// `initialize` handshake. `redactions` holds the secrets of every
+    /// configured server, hidden in this server's output;
     /// [`LspServer::spawn`] adds the secrets of this server's own
     /// configuration and current environment, so an empty set still hides
-    /// them; `serve` fills it with the secrets of every configured server, so
-    /// a server that echoes another's secret has it hidden too.
-    pub redactions: Arc<Redactions>,
+    /// them, and `serve` fills it with the secrets of every configured server
+    /// so a server that echoes another's secret has it hidden too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::WorkspaceRoots;
+    /// use mcpls_core::config::{LspServerConfig, PositionEncodings};
+    /// use mcpls_core::lsp::{ChildWorkingDir, ServerInitConfig};
+    ///
+    /// let config = ServerInitConfig::new(
+    ///     LspServerConfig::rust_analyzer(),
+    ///     WorkspaceRoots::default(),
+    ///     PositionEncodings::DEFAULT,
+    ///     Arc::default(),
+    /// );
+    /// assert_eq!(config.child_working_dir(), &ChildWorkingDir::Inherit);
+    /// ```
+    #[must_use]
+    pub const fn new(
+        server_config: LspServerConfig,
+        workspace_roots: WorkspaceRoots,
+        position_encodings: PositionEncodings,
+        redactions: Arc<Redactions>,
+    ) -> Self {
+        Self {
+            server_config,
+            workspace_roots,
+            position_encodings,
+            redactions,
+            child_working_dir: ChildWorkingDir::Inherit,
+            auto_pin: None,
+        }
+    }
+
+    /// This config with `tsserver` recorded as the pin mcpls chose, vetted
+    /// against `untrusted_boundary` in untrusted-workspace mode.
+    #[must_use]
+    pub(crate) fn with_auto_pin(
+        mut self,
+        tsserver: PathBuf,
+        untrusted_boundary: Option<WorkspaceRoots>,
+    ) -> Self {
+        self.auto_pin = Some(AutoPin {
+            tsserver,
+            untrusted_boundary,
+        });
+        self
+    }
+
+    /// This config with the child started in `dir`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::WorkspaceRoots;
+    /// use mcpls_core::config::{LspServerConfig, PositionEncodings};
+    /// use mcpls_core::lsp::{ChildWorkingDir, ServerInitConfig};
+    ///
+    /// let dir = ChildWorkingDir::Fixed(PathBuf::from("project"));
+    /// let config = ServerInitConfig::new(
+    ///     LspServerConfig::rust_analyzer(),
+    ///     WorkspaceRoots::default(),
+    ///     PositionEncodings::DEFAULT,
+    ///     Arc::default(),
+    /// )
+    /// .with_child_working_dir(dir.clone());
+    /// assert_eq!(config.child_working_dir(), &dir);
+    /// ```
+    #[must_use]
+    pub fn with_child_working_dir(mut self, dir: ChildWorkingDir) -> Self {
+        self.child_working_dir = dir;
+        self
+    }
+
+    /// The server's configuration, carrying the effective initialization options.
+    #[must_use]
+    pub const fn server_config(&self) -> &LspServerConfig {
+        &self.server_config
+    }
+
+    /// The workspace roots sent as `workspaceFolders`.
+    #[must_use]
+    pub const fn workspace_roots(&self) -> &WorkspaceRoots {
+        &self.workspace_roots
+    }
+
+    /// The position encoding preference order offered to the server.
+    #[must_use]
+    pub const fn position_encodings(&self) -> &PositionEncodings {
+        &self.position_encodings
+    }
+
+    /// The secrets hidden in this server's output.
+    #[must_use]
+    pub const fn redactions(&self) -> &Arc<Redactions> {
+        &self.redactions
+    }
+
+    /// Where the child process starts.
+    #[must_use]
+    pub const fn child_working_dir(&self) -> &ChildWorkingDir {
+        &self.child_working_dir
+    }
+
+    /// Mutable access to the server config, for tests that adjust a fixture.
+    #[cfg(all(test, unix))]
+    pub(crate) const fn server_config_mut(&mut self) -> &mut LspServerConfig {
+        &mut self.server_config
+    }
+
+    /// The tsserver this config pins through `initialization_options.tsserver.path`.
+    #[must_use]
+    pub fn pinned_tsserver(&self) -> Option<PathBuf> {
+        tsserver_pin::configured_tsserver_path(self.server_config.initialization_options.as_ref())
+    }
+
+    /// The config a respawn of this server spawns from.
+    ///
+    /// Called by every respawn right before it spawns. A tsserver pin mcpls
+    /// chose whose canonical path changed (the install was upgraded, moved or
+    /// retargeted through a symlink) is resolved again and, in untrusted mode,
+    /// checked against the boundary it was first vetted against. A pin the
+    /// user configured is kept as is.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ServerFailedToStart`] with an untrusted-mode refusal when the
+    /// tsserver now resolves inside the workspace, or the server is now
+    /// launched in a way no tsserver can be pinned for (the same two checks
+    /// startup makes).
+    pub(crate) fn for_respawn(&self) -> Result<Self> {
+        let Some(pin) = self
+            .auto_pin
+            .as_ref()
+            .filter(|pin| dunce::canonicalize(&pin.tsserver).ok().as_ref() != Some(&pin.tsserver))
+        else {
+            return Ok(self.clone());
+        };
+        let mut unpinned = self.server_config.clone();
+        unpinned.initialization_options = None;
+        let plan = tsserver_pin::plan_typescript(unpinned, process_env);
+        if let Some(boundary) = &pin.untrusted_boundary {
+            if let Some(tsserver) = plan.pin_inside(boundary) {
+                return Err(self.refusal(UntrustedRefusal::WorkspaceTsserver { tsserver }));
+            }
+            if plan.has_unpinnable_launcher() {
+                return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
+                    command: self.server_config.command.to_string(),
+                }));
+            }
+        }
+        let (server_config, tsserver) = plan.apply(&self.workspace_roots);
+        let auto_pin = tsserver.map(|tsserver| AutoPin {
+            tsserver,
+            untrusted_boundary: pin.untrusted_boundary.clone(),
+        });
+        Ok(Self {
+            server_config,
+            auto_pin,
+            ..self.clone()
+        })
+    }
+
+    fn refusal(&self, refusal: UntrustedRefusal) -> Error {
+        Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
+            server_id: self.server_config.id(),
+            language_id: self.server_config.language_id.clone(),
+            command: self.server_config.command.to_string(),
+            reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
+        }))
+    }
 }
 
 /// The terminal outcome of starting one configured server.
@@ -280,7 +512,7 @@ impl std::fmt::Debug for LspServer {
 pub fn child_env_var(
     config: &LspServerConfig,
     key: &str,
-    parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    parent_env: impl ParentEnv,
 ) -> Option<std::ffi::OsString> {
     config
         .env
@@ -342,11 +574,15 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
-        let own = Redactions::for_server(&config.server_config, current_environment());
-        let redactions = Arc::new(Redactions::union([config.redactions.as_ref(), &own]));
-        Self::log_spawn(&config.server_config, &redactions);
+        let own = Redactions::for_server(config.server_config(), current_environment());
+        let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));
+        Self::log_spawn(config.server_config(), &redactions);
 
-        let command = Self::build_command(&config.server_config, |key| std::env::var_os(key));
+        let command = Self::build_command(
+            config.server_config(),
+            config.child_working_dir(),
+            process_env,
+        );
 
         // Log allowlist presence and an override count only — never the
         // configured keys themselves, since `config.server_config.env` may
@@ -373,7 +609,7 @@ impl LspServer {
         );
 
         let mut child = ServerProcess::spawn(command)
-            .map_err(|e| spawn_error(config.server_config.command.clone(), e))?;
+            .map_err(|e| spawn_error(config.server_config.command.to_string(), e))?;
 
         let stdin = child
             .take_stdin()
@@ -410,24 +646,24 @@ impl LspServer {
                         &mut child,
                         stderr_capture,
                         &redactions,
-                        &init_error,
+                        init_error,
                     )
                     .await);
                 }
-                Err(Error::LspInitFailed { message, .. }) => {
+                Err(Error::LspInitFailed { phase, cause, .. }) => {
                     // The server may be about to exit after printing its reason,
                     // so wait the (bounded) end-of-file grace whether or not it
                     // has exited yet.
                     let stderr = stderr_capture.finish(EofWait::Grace, &redactions).await;
-                    let message = redactions.apply(&message).into_owned();
                     let hint = Self::init_failure_hint(&config);
                     return Err(Error::LspInitFailed {
-                        message,
+                        phase,
+                        cause: Box::new(redactions.sanitize_error(*cause)),
                         hint,
                         stderr,
                     });
                 }
-                Err(init_error) => return Err(init_error),
+                Err(init_error) => return Err(redactions.sanitize_error(init_error)),
             };
 
         info!("LSP server initialized successfully");
@@ -450,7 +686,7 @@ impl LspServer {
         child: &mut ServerProcess,
         stderr_capture: StderrCapture,
         redactions: &Redactions,
-        init_error: &Error,
+        init_error: Error,
     ) -> Error {
         let exit_status = early_exit_status(child).await;
         let eof_wait = if exit_status.is_some() {
@@ -462,15 +698,14 @@ impl LspServer {
         let hint = Self::init_failure_hint(config);
         match exit_status {
             Some(status) => Error::ServerExitedDuringInit {
-                command: config.server_config.command.clone(),
+                command: config.server_config.command.to_string(),
                 exit_code: status.code(),
                 hint,
                 stderr,
             },
             None => Error::LspInitFailed {
-                message: redactions
-                    .apply(&format!("Initialize request failed: {init_error}"))
-                    .into_owned(),
+                phase: InitPhase::Initialize,
+                cause: Box::new(redactions.sanitize_error(init_error)),
                 hint,
                 stderr,
             },
@@ -482,10 +717,9 @@ impl LspServer {
     /// Runs on the failure path only and reads nothing but package manifests.
     fn init_failure_hint(config: &ServerInitConfig) -> Option<InitFailureHint> {
         tsserver_pin::init_failure_hint(
-            &config.server_config,
-            config.initialization_options.as_ref(),
-            &config.workspace_roots,
-            |key| std::env::var_os(key),
+            config.server_config(),
+            config.workspace_roots(),
+            process_env,
         )
     }
 
@@ -518,10 +752,14 @@ impl LspServer {
     /// racing on real process-global state.
     fn build_command(
         config: &LspServerConfig,
-        parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+        working_dir: &ChildWorkingDir,
+        parent_env: impl ParentEnv,
     ) -> Command {
         let mut command = Command::new(&config.command);
         command.args(&config.args).env_clear();
+        if let ChildWorkingDir::Fixed(dir) = working_dir {
+            command.current_dir(dir);
+        }
 
         for key in ENV_PASSTHROUGH {
             if let Some(value) = child_env_var(config, key, &parent_env) {
@@ -640,6 +878,12 @@ impl LspServer {
                     ..Default::default()
                 }),
                 folding_range: Some(Self::folding_range_capabilities()),
+                // typescript-language-server publishes nothing unless this object is present;
+                // only `versionSupport`, the one field the diagnostics cache retains.
+                publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                    version_support: Some(true),
+                    ..Default::default()
+                }),
                 selection_range: Some(lsp_types::SelectionRangeClientCapabilities {
                     dynamic_registration: Some(false),
                 }),
@@ -715,7 +959,9 @@ impl LspServer {
         process_id: Option<i32>,
     ) -> Result<(ServerCapabilities, PositionEncodingKind)> {
         debug!("Sending initialize request");
-        if config.initialization_options.is_some() && config.server_config.settings.is_some() {
+        if config.server_config().initialization_options.is_some()
+            && config.server_config().settings.is_some()
+        {
             warn!(
                 "server `{}` has both initialization_options and settings: servers that pull \
                  workspace/configuration (rust-analyzer, jdtls) may replace the options with \
@@ -725,7 +971,8 @@ impl LspServer {
         }
 
         let workspace_folders: Vec<WorkspaceFolder> = config
-            .workspace_roots
+            .workspace_roots()
+            .canonical()
             .iter()
             .map(|root| workspace_folder(root))
             .collect::<Result<Vec<_>>>()?;
@@ -737,7 +984,7 @@ impl LspServer {
                 reason = "`root_uri` is deprecated but the struct literal must still set it"
             )]
             root_uri: None,
-            initialization_options: config.initialization_options.clone(),
+            initialization_options: config.server_config().initialization_options.clone(),
             capabilities: Self::client_capabilities(
                 &config.position_encodings,
                 config.server_config.settings.as_ref(),
@@ -768,7 +1015,8 @@ impl LspServer {
                     e
                 } else {
                     Error::LspInitFailed {
-                        message: format!("Initialize request failed: {e}"),
+                        phase: InitPhase::Initialize,
+                        cause: Box::new(e),
                         hint: None,
                         stderr: None,
                     }
@@ -786,9 +1034,15 @@ impl LspServer {
             position_encoding
         );
 
-        notify_handshake::<InitializedNotification>(client, InitializedParams {}).await?;
+        notify_handshake::<InitializedNotification>(
+            client,
+            InitPhase::Initialized,
+            InitializedParams {},
+        )
+        .await?;
         notify_handshake::<DidChangeConfigurationNotification>(
             client,
+            InitPhase::DidChangeConfiguration,
             DidChangeConfigurationParams {
                 settings: config
                     .server_config
@@ -1002,7 +1256,7 @@ async fn contain(
     let command = config.server_config.command.clone();
     let started = Instant::now();
 
-    let reason = match AssertUnwindSafe(start).catch_unwind().await {
+    let reason = match crate::util::catch_panic(start).await {
         Ok(Ok(server)) => {
             info!(
                 "Successfully spawned LSP server: {} ({}) in {:?}",
@@ -1022,13 +1276,13 @@ async fn contain(
             );
             StartupFailure::Spawn(Arc::new(e))
         }
-        Err(payload) => {
+        Err(panicked) => {
             tracing::error!(
                 "Starting LSP server {} ({}) panicked after {:?}: {}",
                 server_id,
                 command,
                 started.elapsed(),
-                crate::util::panic_message(payload.as_ref())
+                panicked.message()
             );
             StartupFailure::InitTaskPanicked
         }
@@ -1036,7 +1290,7 @@ async fn contain(
     ServerStartOutcome::Failed(ServerSpawnFailure {
         server_id,
         language_id,
-        command,
+        command: command.to_string(),
         reason,
     })
 }
@@ -1057,7 +1311,7 @@ fn initialize_process_id(binding: Binding) -> Option<i32> {
 
 /// Sends one handshake notification, mapping a failed write to
 /// [`Error::LspInitFailed`] naming the notification's method.
-async fn notify_handshake<N>(client: &LspClient, params: N::Params) -> Result<()>
+async fn notify_handshake<N>(client: &LspClient, phase: InitPhase, params: N::Params) -> Result<()>
 where
     N: lsp_types::Notification,
 {
@@ -1065,7 +1319,8 @@ where
         .notify_typed::<N>(params)
         .await
         .map_err(|e| Error::LspInitFailed {
-            message: format!("{} notification failed: {e}", N::METHOD.as_str()),
+            phase,
+            cause: Box::new(e),
             hint: None,
             stderr: None,
         })
@@ -1223,7 +1478,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::PositionEncoding;
-    use crate::config::{LanguageId, TimeoutSecs};
+    use crate::config::{FilePattern, LanguageId, ServerCommand, TimeoutSecs, ToolSet};
 
     #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
@@ -1297,6 +1552,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(capabilities.dynamic_registration, Some(false));
+    }
+
+    #[test]
+    fn test_client_capabilities_advertises_publish_diagnostics_with_version_support_only() {
+        let capabilities = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.publish_diagnostics)
+            .unwrap();
+
+        assert_eq!(
+            capabilities,
+            lsp_types::PublishDiagnosticsClientCapabilities {
+                version_support: Some(true),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_client_capabilities_do_not_advertise_pull_diagnostics() {
+        let text_document = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .unwrap();
+
+        assert!(text_document.diagnostic.is_none());
     }
 
     #[test]
@@ -1398,29 +1678,31 @@ mod tests {
 
     #[test]
     fn test_server_init_config_clone() {
-        let config = ServerInitConfig {
-            server_config: LspServerConfig::rust_analyzer(),
-            workspace_roots: vec![PathBuf::from("/tmp/workspace")],
-            initialization_options: Some(serde_json::json!({"key": "value"})),
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+        let config = ServerInitConfig::new(
+            {
+                let mut c = LspServerConfig::rust_analyzer();
+                c.initialization_options = Some(serde_json::json!({"key": "value"}));
+                c
+            },
+            WorkspaceRoots::for_test(vec![PathBuf::from("/tmp/workspace")], vec![]),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
         #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = config.clone();
-        assert_eq!(cloned.server_config.language_id, "rust");
-        assert_eq!(cloned.workspace_roots.len(), 1);
+        assert_eq!(cloned.server_config().language_id, "rust");
+        assert_eq!(cloned.workspace_roots().canonical().len(), 1);
     }
 
     #[test]
     fn test_server_init_config_debug() {
-        let config = ServerInitConfig {
-            server_config: LspServerConfig::pyright(),
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+        let config = ServerInitConfig::new(
+            LspServerConfig::pyright(),
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
         let debug_str = format!("{config:?}");
         assert!(debug_str.contains("python"));
@@ -1444,14 +1726,14 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
 
-        let config = ServerInitConfig {
-            server_config: LspServerConfig {
+        let config = ServerInitConfig::new(
+            LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: "pyright-langserver".to_string(),
+                command: ServerCommand::from_static("pyright-langserver"),
                 args: vec!["--stdio".to_string()],
                 env,
-                file_patterns: vec!["**/*.py".to_string()],
-                initialization_options: Some(init_opts.clone()),
+                file_patterns: vec![FilePattern::from_static("**/*.py")],
+                initialization_options: Some(init_opts),
                 settings: None,
                 timeout_seconds: TimeoutSecs::new(10).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -1461,44 +1743,44 @@ mod tests {
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
             },
-            workspace_roots: vec![PathBuf::from("/workspace")],
-            initialization_options: Some(init_opts),
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+            WorkspaceRoots::for_test(vec![PathBuf::from("/workspace")], vec![]),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
-        assert!(config.initialization_options.is_some());
-        assert_eq!(config.workspace_roots.len(), 1);
+        assert!(config.server_config().initialization_options.is_some());
+        assert_eq!(config.workspace_roots().canonical().len(), 1);
     }
 
     #[test]
     fn test_server_init_config_empty_workspace() {
-        let config = ServerInitConfig {
-            server_config: LspServerConfig::typescript(),
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+        let config = ServerInitConfig::new(
+            LspServerConfig::typescript(),
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
-        assert_eq!(config.workspace_roots.len(), 0);
+        assert_eq!(config.workspace_roots().canonical().len(), 0);
     }
 
     #[test]
     fn test_server_init_config_multiple_workspaces() {
-        let config = ServerInitConfig {
-            server_config: LspServerConfig::rust_analyzer(),
-            workspace_roots: vec![
-                PathBuf::from("/workspace1"),
-                PathBuf::from("/workspace2"),
-                PathBuf::from("/workspace3"),
-            ],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+        let config = ServerInitConfig::new(
+            LspServerConfig::rust_analyzer(),
+            WorkspaceRoots::for_test(
+                vec![
+                    PathBuf::from("/workspace1"),
+                    PathBuf::from("/workspace2"),
+                    PathBuf::from("/workspace3"),
+                ],
+                vec![],
+            ),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
 
-        assert_eq!(config.workspace_roots.len(), 3);
+        assert_eq!(config.workspace_roots().canonical().len(), 3);
     }
 
     /// #249: `has_exited` must distinguish a live child from one that has
@@ -1644,14 +1926,13 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_nonexistent_command_is_server_not_found() {
         let mut server_config = LspServerConfig::rust_analyzer();
-        server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
-        let config = ServerInitConfig {
+        server_config.command = ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+        let config = ServerInitConfig::new(
             server_config,
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        };
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
         let err = LspServer::spawn(config).await.unwrap_err();
         assert_matches!(err, Error::ServerNotFound { .. }, "got {err:?}");
     }
@@ -1693,9 +1974,13 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
-        assert_matches!(&err, Error::LspInitFailed { message, .. } if message.contains("rejected by server"),
+        assert_matches!(
+            &err,
+            Error::LspInitFailed { phase: InitPhase::Initialize, cause, .. }
+                if matches!(**cause, Error::LspServerError { code: -32603, .. }),
             "got {err:?}"
         );
+        assert!(err.to_string().contains("rejected by server"), "{err}");
     }
 
     /// Connection lost while the child is still running: the error keeps the
@@ -1708,8 +1993,17 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
-        assert_matches!(&err, Error::LspInitFailed { message, .. } if message.contains("Initialize request failed"),
+        assert_matches!(
+            &err,
+            Error::LspInitFailed {
+                phase: InitPhase::Initialize,
+                ..
+            },
             "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Initialize request failed"),
+            "{err}"
         );
     }
 
@@ -2101,17 +2395,13 @@ sleep 5
         async fn test_initialize_sends_configured_position_encodings() {
             let (client, mut server) = fake_lsp_client();
 
-            let config = ServerInitConfig {
-                server_config: LspServerConfig::rust_analyzer(),
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: PositionEncodings::new(vec![
-                    PositionEncoding::Utf32,
-                    PositionEncoding::Utf8,
-                ])
-                .unwrap(),
-                redactions: std::sync::Arc::default(),
-            };
+            let config = ServerInitConfig::new(
+                LspServerConfig::rust_analyzer(),
+                WorkspaceRoots::default(),
+                PositionEncodings::new(vec![PositionEncoding::Utf32, PositionEncoding::Utf8])
+                    .unwrap(),
+                std::sync::Arc::default(),
+            );
 
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
@@ -2240,13 +2530,12 @@ sleep 5
         async fn test_initialize_advertises_stale_request_support() {
             let (client, mut server) = fake_lsp_client();
 
-            let config = ServerInitConfig {
-                server_config: LspServerConfig::rust_analyzer(),
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: PositionEncodings::DEFAULT,
-                redactions: std::sync::Arc::default(),
-            };
+            let config = ServerInitConfig::new(
+                LspServerConfig::rust_analyzer(),
+                WorkspaceRoots::default(),
+                PositionEncodings::DEFAULT,
+                std::sync::Arc::default(),
+            );
 
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
@@ -2291,13 +2580,12 @@ sleep 5
         async fn test_initialize_advertises_server_status_notification_support() {
             let (client, mut server) = fake_lsp_client();
 
-            let config = ServerInitConfig {
-                server_config: LspServerConfig::rust_analyzer(),
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: PositionEncodings::DEFAULT,
-                redactions: std::sync::Arc::default(),
-            };
+            let config = ServerInitConfig::new(
+                LspServerConfig::rust_analyzer(),
+                WorkspaceRoots::default(),
+                PositionEncodings::DEFAULT,
+                std::sync::Arc::default(),
+            );
 
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
@@ -2328,13 +2616,12 @@ sleep 5
         async fn test_initialize_advertises_hierarchical_document_symbols() {
             let (client, mut server) = fake_lsp_client();
 
-            let config = ServerInitConfig {
-                server_config: LspServerConfig::rust_analyzer(),
-                workspace_roots: vec![],
-                initialization_options: None,
-                position_encodings: PositionEncodings::DEFAULT,
-                redactions: std::sync::Arc::default(),
-            };
+            let config = ServerInitConfig::new(
+                LspServerConfig::rust_analyzer(),
+                WorkspaceRoots::default(),
+                PositionEncodings::DEFAULT,
+                std::sync::Arc::default(),
+            );
 
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
@@ -2385,13 +2672,12 @@ sleep 5
             assert_eq!(workspace_roots, vec![base.clone()]);
 
             let (client, mut server) = fake_lsp_client();
-            let config = ServerInitConfig {
-                server_config: LspServerConfig::rust_analyzer(),
-                workspace_roots,
-                initialization_options: None,
-                position_encodings: PositionEncodings::DEFAULT,
-                redactions: std::sync::Arc::default(),
-            };
+            let config = ServerInitConfig::new(
+                LspServerConfig::rust_analyzer(),
+                WorkspaceRoots::for_test(workspace_roots, vec![]),
+                PositionEncodings::DEFAULT,
+                std::sync::Arc::default(),
+            );
 
             let init_task =
                 tokio::spawn(async move { LspServer::initialize(&client, &config).await });
@@ -2420,7 +2706,7 @@ sleep 5
     fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
-            command: "irrelevant-for-build-command".to_string(),
+            command: ServerCommand::from_static("irrelevant-for-build-command"),
             args: vec![],
             env,
             file_patterns: vec![],
@@ -2460,11 +2746,12 @@ sleep 5
     #[test]
     fn test_build_command_excludes_non_allowlisted_parent_env_vars() {
         let config = bare_server_config(HashMap::new());
-        let command = LspServer::build_command(&config, |key| match key {
-            "PATH" => Some("/parent/bin".into()),
-            "MCPLS_TEST_LEAK_CANARY" => Some("should-not-reach-child".into()),
-            _ => None,
-        });
+        let command =
+            LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| match key {
+                "PATH" => Some("/parent/bin".into()),
+                "MCPLS_TEST_LEAK_CANARY" => Some("should-not-reach-child".into()),
+                _ => None,
+            });
 
         let envs = effective_envs(&command);
 
@@ -2495,12 +2782,65 @@ sleep 5
     #[test]
     fn test_build_command_passes_through_allowlisted_env_vars() {
         let config = bare_server_config(HashMap::new());
-        let command =
-            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+        let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| {
+            (key == "PATH").then(|| "/parent/bin".into())
+        });
 
         let envs = effective_envs(&command);
 
         assert_eq!(envs.get("PATH"), Some(&"/parent/bin".to_string()));
+    }
+
+    #[test]
+    fn test_build_command_inherits_working_dir_unless_fixed() {
+        let config = bare_server_config(HashMap::new());
+        let inherited = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |_| None);
+        assert_eq!(inherited.as_std().get_current_dir(), None);
+
+        let dir = PathBuf::from("/fixed/dir");
+        let fixed =
+            LspServer::build_command(&config, &ChildWorkingDir::Fixed(dir.clone()), |_| None);
+        assert_eq!(fixed.as_std().get_current_dir(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn test_server_init_config_defaults_to_inherited_working_dir() {
+        let config = ServerInitConfig::new(
+            LspServerConfig::rust_analyzer(),
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
+        assert_eq!(config.child_working_dir(), &ChildWorkingDir::Inherit);
+        let fixed = config.with_child_working_dir(ChildWorkingDir::Fixed(PathBuf::from("/x")));
+        assert_eq!(
+            fixed.child_working_dir(),
+            &ChildWorkingDir::Fixed(PathBuf::from("/x"))
+        );
+    }
+
+    #[test]
+    fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
+        let mut server_config = LspServerConfig::typescript();
+        server_config.initialization_options =
+            Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
+        let config = ServerInitConfig::new(
+            server_config,
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
+        assert_eq!(
+            config.pinned_tsserver(),
+            Some(PathBuf::from("/pin/tsserver.js"))
+        );
+
+        let respawn = config.for_respawn().unwrap();
+        assert_eq!(
+            respawn.server_config().initialization_options,
+            config.server_config().initialization_options
+        );
+        assert_eq!(respawn.pinned_tsserver(), config.pinned_tsserver());
     }
 
     /// Regression test for #247: `LspServerConfig::env` entries must reach
@@ -2513,7 +2853,7 @@ sleep 5
             "from-server-config".to_string(),
         );
         let config = bare_server_config(env);
-        let command = LspServer::build_command(&config, |_| None);
+        let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |_| None);
 
         let envs = effective_envs(&command);
 
@@ -2531,8 +2871,9 @@ sleep 5
         let mut env = HashMap::new();
         env.insert("PATH".to_string(), "/configured/override/path".to_string());
         let config = bare_server_config(env);
-        let command =
-            LspServer::build_command(&config, |key| (key == "PATH").then(|| "/parent/bin".into()));
+        let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| {
+            (key == "PATH").then(|| "/parent/bin".into())
+        });
 
         let envs = effective_envs(&command);
 
@@ -2557,7 +2898,7 @@ sleep 5
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: "pyright-langserver".to_string(),
+                command: ServerCommand::from_static("pyright-langserver"),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2566,14 +2907,14 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some("pyright-diag".to_string()),
-                handles: Some(vec![ToolKind::Diagnostics]),
+                name: Some(ServerId::from("pyright-diag")),
+                handles: Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap()),
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: "pylsp".to_string(),
+                command: ServerCommand::from_static("pylsp"),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2582,7 +2923,7 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some("pylsp".to_string()),
+                name: Some(ServerId::from("pylsp")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,

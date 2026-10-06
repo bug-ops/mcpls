@@ -9,7 +9,7 @@ tags:
   - config
   - diagnosability
 created: 2026-10-06
-status: draft
+status: approved
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]]"
@@ -148,25 +148,25 @@ THEN they list the supported form, say how to cover several extensions, and agre
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place: a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of ASCII letters, digits, `_` and `-`, optionally preceded by any directory part such as `**/` | must |
+| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place (`FilePattern::parse`): a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of letters, digits, `_`, `-` and `+` (a valid `FileExtension`), optionally preceded by any directory part such as `**/`; the directory part is ignored for routing | must |
 | FR-002 | WHEN a configured `file_patterns` entry is not a supported form THE SYSTEM SHALL NOT drop it silently | must |
-| FR-003 | WHEN a configured entry is not a supported form THE SYSTEM SHALL reject the config at load with `Error::InvalidConfig` naming the server entry (its id), the pattern and the supported forms, unless the decision in section 9 selects a warning | must |
-| FR-004 | WHERE the decision is a warning THE SYSTEM SHALL log it at `WARN` once per entry and pattern at load, naming the entry, the pattern and the supported forms | must |
-| FR-005 | THE check SHALL run in `ServerConfig::validate`, so every load path (file, default, programmatic construction) is covered by it | must |
-| FR-006 | WHEN `NoServerForLanguage` is returned for a file whose language fell back to `plaintext` THE SYSTEM SHALL include in the error the file extension and the configured `file_patterns` | must |
+| FR-003 | WHEN a configured entry is not a supported form THE SYSTEM SHALL reject the config at load with `ConfigError::UnsupportedFilePattern` naming the server entry (its id), the pattern and the supported forms; loading a TOML file surfaces it inside `Error::TomlDe` (the entry is deserialized through `serde(try_from)`, and the message carries the line), while a value built in code reports it as `Error::Config` | must |
+| FR-004 | ~~Warning instead of rejection~~ superseded: the decision is rejection (section 9) | n/a |
+| FR-005 | THE check SHALL run when an `lsp_servers` entry is deserialized (`FilePattern` is the only representation of a pattern), so every load path (file, default, programmatic construction) is covered by it | must |
+| FR-006 | WHEN `NoServerForLanguage` is returned for a file whose language fell back to `plaintext` THE SYSTEM SHALL include in the error text the file extension (or that the file has none) and the `file_patterns` configured across servers (or that none are configured) | must |
 | FR-007 | WHEN the fallback language is not `plaintext` THE existing error text SHALL be unchanged | should |
 | FR-008 | THE SYSTEM SHALL NOT change routing for supported patterns, including the default config and every pattern in the user guides | must |
 | FR-009 | THE configuration guide SHALL state the supported forms, remove the claim of full glob syntax, and show how to cover several extensions with several patterns (for example `["**/*.cpp", "**/*.h"]`) | must |
 | FR-010 | THE getting-started, installation and configuration guides SHALL agree on the supported forms | must |
-| FR-011 | THE SYSTEM SHALL decide how a pattern that names a single file (`src/main.rs`, `Cargo.toml`) is treated: kept as an extension pattern with a documented caveat, or rejected as an unsupported form | should |
-| FR-012 | THE SYSTEM MAY support brace expansion (`**/*.{cpp,h}`) as an extension of FR-001; it is an option to evaluate, not a requirement of this spec | may |
+| FR-011 | THE SYSTEM SHALL reject a pattern that names a single file (`src/main.rs`, `Cargo.toml`) as an unsupported form, because it would register the whole extension | must |
+| FR-012 | ~~Brace expansion~~ superseded: not supported; a pattern per extension covers several extensions | n/a |
 | FR-013 | THE `.local/testing/` playbooks SHALL gain a case for each unsupported form and for the no-server error, and the coverage status for config SHALL be reset | must |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Diagnosability | Every message names the specific field and value that failed, as [[config/001-config-discovery-and-heuristics/spec\|config/001]] NFR-005 already requires of `Error::InvalidConfig` |
+| NFR-001 | Diagnosability | Every message names the specific field and value that failed, as [[config/001-config-discovery-and-heuristics/spec\|config/001]] NFR-005 already requires of invalid configuration |
 | NFR-002 | Type safety | A supported pattern is parsed once into a typed value (an extension newtype), and the extractor, the validator and the error text use that one parse, per [[constitution]] |
 | NFR-003 | Consistency | The validator and the extension-map builder cannot disagree: a pattern accepted by one is accepted by the other, with no second copy of the rule |
 | NFR-004 | Compatibility | Pre-1.0 compatibility is not a constraint; if load-time rejection is chosen, a config that loaded before and is now rejected is recorded in `CHANGELOG.md` as a breaking change |
@@ -187,20 +187,20 @@ THEN they list the supported form, say how to cover several extensions, and agre
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| `**/*.{cpp,h}` | Reported at load (FR-002, FR-003 or FR-004); with brace expansion adopted (FR-012) it maps both `cpp` and `h` |
-| `Makefile` | Reported: no extension, so no mapping; the message points to `workspace.language_extensions` as the way to map extensionless files, if that mechanism supports it (`[NEEDS CLARIFICATION: confirm]`) |
+| `**/*.{cpp,h}` | Rejected at load (FR-002, FR-003); list `**/*.cpp` and `**/*.h` instead |
+| `Makefile` | Reported: no extension, so no mapping; `workspace.language_extensions` is keyed by extension, so an extensionless file cannot be mapped today (section 9) |
 | `src/**` or `**/*` | Reported: no extension |
 | `**/*.[ch]` | Reported: character class |
 | `**/*.ts?` | Reported: single-character wildcard |
 | `.eslintrc` or other dotfile | Reported |
 | `**/*.` (empty extension) | Reported |
-| `foo.tar.gz` | Supported as extension `gz` today; stays, with the documented rule that the last segment after the final dot is the extension |
-| `src/main.rs` (names one file) | Decided under FR-011; today it registers `rs` for the whole server |
+| `foo.tar.gz`, `**/*.tar.gz` | Reported: the extension token may not contain a dot; use `**/*.gz` |
+| `src/main.rs` (names one file) | Reported (FR-011) |
 | A server entry with an empty `file_patterns` | Valid and unchanged: the entry relies on the built-in or `workspace.language_extensions` mappings |
-| Unsupported pattern on an entry whose extension is also mapped through `workspace.language_extensions` | Still reported, because the pattern has no effect; severity follows the decision (a warning is enough here, `[NEEDS CLARIFICATION: confirm]`) |
+| Unsupported pattern on an entry whose extension is also mapped through `workspace.language_extensions` | Still rejected, because the pattern has no effect (section 9: rejection, not a warning) |
 | Two entries claim the same extension | Unchanged: the existing duplicate-claim rule and map overlay order stand |
 | File with an unmapped extension and no patterns configured at all | `NoServerForLanguage` names the extension and says no patterns are configured |
-| Windows path separators in a pattern (`**\\*.rs`) | Out of scope; `[NEEDS CLARIFICATION: is the split on `/` only a defect on Windows?]` |
+| Windows path separators in a pattern (`**\\*.rs`) | Out of scope: the directory part is split on `/` only, so such a pattern is rejected as an unsupported form |
 
 ## 7. Success Criteria
 
@@ -224,7 +224,7 @@ THEN they list the supported form, say how to cover several extensions, and agre
 
 ### Ask First
 - Choosing rejection over a warning (section 9), since it changes which configs load.
-- Adding brace expansion or any glob matching (FR-012).
+- Adding brace expansion or any glob matching (superseded FR-012).
 - Adding a dependency for glob parsing (constitution VII).
 - Rejecting single-file patterns (FR-011).
 
@@ -234,21 +234,21 @@ THEN they list the supported form, say how to cover several extensions, and agre
 - Include server-supplied text in the new messages.
 - Change routing for supported patterns.
 
-## 9. Open Questions
+## 9. Decisions
 
-- [NEEDS CLARIFICATION: reject at load, or warn? Rejection matches the rule that invalid config fails with a diagnosable `Error::InvalidConfig` ([[config/001-config-discovery-and-heuristics/spec|config/001]] FR-006) and is correct pre-1.0, but it blocks startup for a config where the pattern is merely redundant (the extension is also mapped elsewhere). Recommended default: reject, with the message naming the fix; revisit if redundant patterns turn out to be common.]
-- [NEEDS CLARIFICATION: brace expansion. Supporting `{a,b}` removes the most likely mistake and needs only a bounded expansion of one brace group; character classes and `?` have no sensible extension mapping and should stay unsupported. Recommended default: not in this change; list several patterns instead, and revisit on demand.]
-- [NEEDS CLARIFICATION: single-file patterns (`src/main.rs`) currently over-match the whole extension (FR-011). Reject, or keep with a documented caveat? Recommended default: keep and document, since rejecting could break working configs for no routing benefit.]
-- [NEEDS CLARIFICATION: can an extensionless file (`Makefile`, `Dockerfile`) be mapped at all today? `workspace.language_extensions` is keyed by extension; if there is no filename mapping, the message cannot offer a fix and the gap is a separate enhancement.]
-- [NEEDS CLARIFICATION: `get_tool_support` reports coverage `all` for a language whose extension has no mapping. Should coverage take the extension map into account, or is that a separate issue? Recommended default: separate issue, referenced from this spec.]
-- [NEEDS CLARIFICATION: is splitting on `/` only a defect for Windows-style patterns?]
+- Reject at load, not warn: matches the rule that invalid config fails with a diagnosable error ([[config/001-config-discovery-and-heuristics/spec|config/001]] FR-006); the message names the fix.
+- No brace expansion and no glob matching: several `**/*.ext` patterns cover several extensions.
+- Single-file patterns are rejected, not kept with a caveat: they over-match the whole extension.
+- Extensionless files (`Makefile`, `Dockerfile`) cannot be mapped today, because `workspace.language_extensions` is keyed by extension; the guides say so. Mapping by file name is a separate enhancement.
+- `get_tool_support` coverage ignoring the extension map is a separate issue.
+- Windows-style separators in a pattern (`**\\*.rs`) are out of scope: the directory part is ignored, and the final segment is taken after the last `/`, so a backslash pattern is rejected rather than mis-parsed.
 
 ## 10. See Also
 
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
-- [[config/001-config-discovery-and-heuristics/spec|config/001]] — config loading, validation and the `Error::InvalidConfig` rules this extends
+- [[config/001-config-discovery-and-heuristics/spec|config/001]] — config loading, validation and the invalid-configuration rules this extends
 - [[config/002-typescript-7-native-server-support/spec|config/002]] — another config path where an opaque failure needed a typed explanation
 - [[mcp/005-tool-capability-discoverability/spec|mcp/005]] — `get_tool_support` coverage semantics
-- Code: `crates/mcpls-core/src/config/mod.rs` (`extract_extension_from_pattern`, `build_effective_extension_map`, `ServerConfig::validate`), `crates/mcpls-core/src/bridge/state.rs` (`detect_language`, `PLAINTEXT_LANGUAGE`), `crates/mcpls-core/src/error.rs` (`Error::NoServerForLanguage`)
+- Code: `crates/mcpls-core/src/config/patterns.rs` (`FilePattern`), `crates/mcpls-core/src/config/mod.rs` (`build_effective_extension_map`), `crates/mcpls-core/src/bridge/state.rs` (`detect_language`), `crates/mcpls-core/src/error.rs` (`ConfigError::UnsupportedFilePattern`, `Error::NoServerForLanguage`)
 - Docs: `docs/user-guide/configuration.md` (`file_patterns`), `docs/user-guide/getting-started.md`, `docs/user-guide/installation.md`

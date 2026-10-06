@@ -12,6 +12,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
+use super::pull_support::PullProbe;
 use super::respawn::RespawnBackoff;
 use super::restart::RestartGeneration;
 use crate::config::ServerId;
@@ -134,6 +135,9 @@ pub(super) struct ServerSlot {
     pub(super) restart: RestartState,
     /// The task consuming this server's notification lanes.
     pub(super) notification_task: Option<AbortHandle>,
+    /// What a pull request showed about the running process; fresh for every
+    /// replacement.
+    pull_probe: PullProbe,
 }
 
 impl ServerStatus {
@@ -151,6 +155,7 @@ impl ServerSlot {
             backoff: None,
             restart: RestartState::default(),
             notification_task: None,
+            pull_probe: PullProbe::default(),
         }
     }
 }
@@ -166,6 +171,18 @@ impl Servers {
 
     pub(super) fn get_mut(&mut self, id: &ServerId) -> Option<&mut ServerSlot> {
         self.0.get_mut(id)
+    }
+
+    /// What a pull request showed about `id`'s running process.
+    pub(super) fn pull_probe(&self, id: &ServerId) -> PullProbe {
+        self.0.get(id).map_or_default(|slot| slot.pull_probe)
+    }
+
+    /// Records what a pull request showed about `id`'s running process.
+    pub(super) fn set_pull_probe(&mut self, id: &ServerId, probe: PullProbe) {
+        if let Some(slot) = self.0.get_mut(id) {
+            slot.pull_probe = probe;
+        }
     }
 
     /// Every slot id, in no order.
@@ -387,6 +404,7 @@ impl Servers {
     /// displaced, so the caller drops it after releasing the guard.
     pub(super) fn register(&mut self, id: ServerId, backend: Backend) -> Registered {
         if let Some(slot) = self.0.get_mut(&id) {
+            slot.pull_probe = PullProbe::default();
             let was_expected = matches!(slot.status, ServerStatus::Expected { .. });
             let displaced =
                 match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
@@ -479,9 +497,13 @@ impl Servers {
     /// Stops every running server that has one, for shutdown, returning them.
     pub(super) fn drain_servers(&mut self) -> Vec<(ServerId, LspServer)> {
         let ids: Vec<ServerId> = self.0.keys().cloned().collect();
-        ids.into_iter()
-            .filter_map(|id| self.remove_server(&id).map(|server| (id, server)))
-            .collect()
+        let mut drained = Vec::new();
+        for id in ids {
+            if let Some(server) = self.remove_server(&id) {
+                drained.push((id, server));
+            }
+        }
+        drained
     }
 
     /// The settlement of every slot, for re-deriving the routing table.
@@ -531,6 +553,7 @@ impl Servers {
             if matches!(slot.status, ServerStatus::Stopped(_)) {
                 return Err(Box::new(backend));
             }
+            slot.pull_probe = PullProbe::default();
             return Ok(
                 match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
                     ServerStatus::Running(old) => Some(old),
@@ -745,6 +768,28 @@ mod tests {
             std::ptr::from_ref(server.client())
         ));
         assert!(servers.client(&id).is_some());
+    }
+
+    /// #666: what a pull showed belongs to one process; a swap or a
+    /// registration starts the probe over, a restore keeps it.
+    #[tokio::test]
+    async fn test_pull_probe_is_fresh_for_every_replacement_process() {
+        let mut servers = Servers::default();
+        let id = ServerId::from("rust");
+        servers.register(id.clone(), running_backend());
+        assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
+
+        servers.set_pull_probe(&id, PullProbe::Refused);
+        let held = servers.take_for_restart(&id).unwrap();
+        assert!(servers.restore(&id, held).is_none());
+        assert_eq!(servers.pull_probe(&id), PullProbe::Refused);
+
+        drop(servers.slot_for_swap(&id, running_backend()).unwrap());
+        assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
+
+        servers.set_pull_probe(&id, PullProbe::Answered);
+        drop(servers.register(id.clone(), running_backend()));
+        assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
     }
 
     #[tokio::test]

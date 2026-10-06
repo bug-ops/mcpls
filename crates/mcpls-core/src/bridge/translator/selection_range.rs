@@ -15,17 +15,30 @@ use crate::error::Result;
 ///
 /// Walks the `parent` links iteratively, so the cost is bounded by the cap
 /// whatever the nesting.
-fn chain(first: lsp_types::SelectionRange) -> (Vec<lsp_types::Range>, bool) {
+fn chain(first: lsp_types::SelectionRange) -> Chain {
     let mut ranges = Vec::with_capacity(MAX_SELECTION_CHAIN);
     let mut current = Some(first);
     while let Some(node) = current {
         if ranges.len() == MAX_SELECTION_CHAIN {
-            return (ranges, true);
+            return Chain {
+                ranges,
+                truncated: true,
+            };
         }
         ranges.push(node.range);
         current = node.parent.map(|parent| *parent);
     }
-    (ranges, false)
+    Chain {
+        ranges,
+        truncated: false,
+    }
+}
+
+/// A selection chain cut to [`MAX_SELECTION_CHAIN`] ranges.
+#[derive(Debug, Default)]
+struct Chain {
+    ranges: Vec<lsp_types::Range>,
+    truncated: bool,
 }
 
 impl Translator {
@@ -49,10 +62,11 @@ impl Translator {
         position: Position,
     ) -> Result<SelectionRangesResult> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::SelectionRange,
                 IndexingGate::NotRequired,
+                &[position],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -71,9 +85,12 @@ impl Translator {
             .request_typed::<lsp_types::SelectionRangeRequest>(params, client.request_timeout())
             .await?;
 
-        let (lsp_ranges, truncated) = response
+        let Chain {
+            ranges: lsp_ranges,
+            truncated,
+        } = response
             .and_then(|chains| chains.into_iter().next())
-            .map_or((Vec::new(), false), chain);
+            .map_or_default(chain);
         let mut ranges = Vec::with_capacity(lsp_ranges.len());
         for range in lsp_ranges {
             ranges.push(ctx.normalize_range(&response_uri, range).await);
@@ -303,8 +320,8 @@ mod tests {
                 parent: Some(Box::new(node)),
             };
         }
-        let (ranges, truncated) = chain(node);
-        assert_eq!(ranges.len(), MAX_SELECTION_CHAIN);
-        assert!(truncated);
+        let chain = chain(node);
+        assert_eq!(chain.ranges.len(), MAX_SELECTION_CHAIN);
+        assert!(chain.truncated);
     }
 }

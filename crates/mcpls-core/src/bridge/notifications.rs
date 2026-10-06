@@ -3,6 +3,7 @@
 //! Stores diagnostics, log messages, and server messages received from LSP servers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
@@ -10,8 +11,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
+use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, IndexingTracker};
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
+use crate::bridge::{DiagnosticsAvailability, DocumentTracker, uri_to_path};
 use crate::config::ServerId;
 use crate::util::truncate_string;
 
@@ -51,7 +53,7 @@ const MAX_LOG_ENTRIES: usize = 100;
 /// of it they actually use. Which single entry within the chosen server (or
 /// another over-share one) is actually removed is further refined by
 /// emptiness -- see the private `entry_to_evict` (#284).
-const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
+pub const MAX_DIAGNOSTIC_ENTRIES: usize = 1000;
 
 /// A `file:` URI normalized for cache lookup; only built by [`Self::of`], so a
 /// raw URI string can never be mistaken for a key.
@@ -128,6 +130,15 @@ struct PullTicket(u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ClearEpoch(u64);
 
+/// What the cache remembers of the pull behind a file's pulled slot.
+#[derive(Debug, Clone, Copy)]
+struct PullRecord {
+    ticket: PullTicket,
+    /// The tracked opening of the document when the report was stored, or
+    /// `None` without a tracker or an open document.
+    opening: Option<u64>,
+}
+
 /// A pull request's claim on the cache, issued by [`NotificationCache::begin_pull`]
 /// before the request is sent and redeemed by
 /// [`NotificationCache::store_pulled_diagnostics`].
@@ -196,6 +207,14 @@ pub enum PullWrite {
     },
 }
 
+/// Result of [`NotificationCache::write_published_diagnostics`].
+#[derive(Debug)]
+#[must_use]
+pub struct PushWrite {
+    /// Files whose slots were evicted to make room for the published one.
+    pub evicted: Vec<DiagnosticsKey>,
+}
+
 /// Whether the merged diagnostics of a file differ before and after a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeOutcome {
@@ -237,6 +256,39 @@ impl ChangeOutcome {
             },
             _ => Self::Changed,
         }
+    }
+}
+
+/// What the document tracker says about the document a push is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentSync {
+    /// The server was last told this version of the document.
+    Synced(i32),
+    /// The document is not open for the server.
+    NotOpen,
+    /// No tracker is attached, so there is nothing to compare with.
+    Unattached,
+}
+
+/// Whether a push supersedes the pulled slot of its file.
+///
+/// A push carrying a newer document version than the pull answered does. Any
+/// push does when the tracked document is no longer at the pulled version
+/// (it moved on, or a closed or evicted document restarted its version) or is
+/// not open. While the document still is at the pulled version the pull
+/// stays, whether the push carries an equal, a lower or no version: servers
+/// that push and pull one version keep both slots, and a versionless flycheck
+/// push must not erase the pulled native diagnostics (bridge/004). A document
+/// closed and reopened since the pull is handled by [`NotificationCache`]
+/// itself, since its version can coincide with the pulled one again.
+///
+/// Without a tracker ([`DocumentSync::Unattached`]) only a newer version counts.
+const fn pull_is_superseded(pulled: i32, pushed: Option<i32>, sync: DocumentSync) -> bool {
+    match (pushed, sync) {
+        (Some(pushed), _) if pushed > pulled => true,
+        (_, DocumentSync::Unattached) => false,
+        (_, DocumentSync::NotOpen) => true,
+        (_, DocumentSync::Synced(current)) => current != pulled,
     }
 }
 
@@ -290,6 +342,9 @@ const MAX_SERVER_MESSAGES: usize = 50;
 /// as many as the cache can hold entries, so a full cache cleared at once
 /// (e.g. a server restart) loses no replayable clear.
 const MAX_RECENT_EVICTIONS: usize = MAX_DIAGNOSTIC_ENTRIES;
+
+/// Most evicted files remembered for `NotificationCache::availability`.
+const MAX_EVICTION_MARKS: usize = MAX_DIAGNOSTIC_ENTRIES;
 
 /// How long an empty-entry removal stays replayable.
 const EVICTION_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_mins(2);
@@ -382,6 +437,87 @@ impl EvictionRecord {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.at.is_empty()
+    }
+}
+
+/// What was cached for a file when capacity eviction removed its last entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvictedContent {
+    /// Only empty lists: the file was clean.
+    Clean,
+    /// A non-empty list: what the server said is no longer known.
+    Lost,
+}
+
+#[derive(Debug)]
+struct EvictionMark {
+    owner: ServerId,
+    content: EvictedContent,
+    seq: u64,
+}
+
+/// Files whose entries capacity eviction removed, so a read can tell a clean
+/// file or lost diagnostics from a file nothing was ever published for.
+///
+/// Bounded to `MAX_EVICTION_MARKS`; once the oldest mark of a server is
+/// forgotten the server is `overflowed`, and a file without entry or mark is
+/// then reported as possibly evicted rather than as pending. A server's marks
+/// and overflow are dropped with its diagnostics (respawn), and a file's mark
+/// with its next entry.
+#[derive(Debug, Default)]
+struct EvictionMarks {
+    by_file: HashMap<DiagnosticsKey, EvictionMark>,
+    order: BTreeMap<u64, DiagnosticsKey>,
+    next_seq: u64,
+    overflowed: HashSet<ServerId>,
+}
+
+impl EvictionMarks {
+    fn record(&mut self, file: DiagnosticsKey, owner: ServerId, content: EvictedContent) {
+        let content = match self.by_file.get(&file) {
+            Some(previous) if previous.content == EvictedContent::Lost => EvictedContent::Lost,
+            _ => content,
+        };
+        self.forget_file(&file);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.order.insert(seq, file.clone());
+        self.by_file.insert(
+            file,
+            EvictionMark {
+                owner,
+                content,
+                seq,
+            },
+        );
+        while self.by_file.len() > MAX_EVICTION_MARKS {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some(mark) = self.by_file.remove(&oldest) {
+                self.overflowed.insert(mark.owner);
+            }
+        }
+    }
+
+    fn forget_file(&mut self, file: &DiagnosticsKey) {
+        if let Some(mark) = self.by_file.remove(file) {
+            self.order.remove(&mark.seq);
+        }
+    }
+
+    fn forget_server(&mut self, server: &ServerId) {
+        self.by_file.retain(|_, mark| &mark.owner != server);
+        self.order.retain(|_, file| self.by_file.contains_key(file));
+        self.overflowed.remove(server);
+    }
+
+    fn content(&self, file: &DiagnosticsKey) -> Option<EvictedContent> {
+        self.by_file.get(file).map(|mark| mark.content)
+    }
+
+    fn has_overflowed(&self, server: &ServerId) -> bool {
+        self.overflowed.contains(server)
     }
 }
 
@@ -664,7 +800,7 @@ pub struct NotificationCache {
     /// Ticket of the pull behind each file's pulled slot. Written with the
     /// slot by `store_pulled_diagnostics` and dropped with it by `take_entry`,
     /// so a ticket exists exactly while a `Pulled` slot does.
-    pull_tickets: HashMap<DiagnosticsKey, PullTicket>,
+    pull_tickets: HashMap<DiagnosticsKey, PullRecord>,
     /// Per-server count of [`Self::clear_server_diagnostics`] calls; absent
     /// means epoch zero.
     clear_epochs: HashMap<ServerId, ClearEpoch>,
@@ -701,6 +837,13 @@ pub struct NotificationCache {
     /// drop valid errors, so a non-empty entry evicted by capacity is never
     /// replayed. Written only by `evict_entry`, never by publishers.
     recent_evictions: EvictionRecord,
+    /// Files whose last entry capacity eviction removed; see
+    /// [`Self::availability`]. Unlike `recent_evictions` it is written by
+    /// capacity evictions only, never by a server clear.
+    eviction_marks: EvictionMarks,
+    /// Tracker whose synced versions tell whether a push supersedes a pulled
+    /// slot; see [`Self::attach_documents`].
+    documents: Option<Arc<DocumentTracker>>,
     /// Recent log entries (FIFO queue with max size).
     logs: VecDeque<LogEntry>,
     /// Recent server messages (FIFO queue with max size).
@@ -745,6 +888,8 @@ impl NotificationCache {
             diagnostics_route_count: None,
             empty_diagnostics_count: 0,
             recent_evictions: EvictionRecord::default(),
+            eviction_marks: EvictionMarks::default(),
+            documents: None,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             messages: VecDeque::with_capacity(MAX_SERVER_MESSAGES),
             push_degraded: HashSet::new(),
@@ -1017,13 +1162,16 @@ impl NotificationCache {
     /// dropped before anything is stored, but the canonical spelling is always
     /// admitted, evicting the oldest alias, so a server fanning one file out
     /// cannot suppress the canonical publishes.
-    pub(crate) fn store_published_diagnostics(
+    ///
+    /// The files whose entries were evicted to make room are returned so the
+    /// caller can tell their subscribers (#649).
+    pub(crate) fn write_published_diagnostics(
         &mut self,
         server_id: &ServerId,
         published: &PublishedDiagnosticsUri,
         version: Option<i32>,
         diagnostics: Vec<LspDiagnostic>,
-    ) {
+    ) -> PushWrite {
         let source_key = SlotKey::pushed(DiagnosticsKey::of(published.source()));
         let canonical_key = DiagnosticsKey::of(published.canonical());
 
@@ -1033,17 +1181,19 @@ impl NotificationCache {
             .is_some_and(|entry| entry.file(&source_key) == &canonical_key);
         let at_capacity = self.pushed_slot_count(&canonical_key) >= MAX_SOURCES_PER_FILE;
         if !already_indexed && at_capacity {
-            let evicted = published
+            let alias_to_evict = published
                 .is_canonical()
                 .then(|| self.oldest_alias_source(&canonical_key))
                 .flatten();
-            let Some(oldest_alias) = evicted else {
+            let Some(oldest_alias) = alias_to_evict else {
                 debug!(
                     "dropping diagnostics for {}: {MAX_SOURCES_PER_FILE} published URIs already cached for {}",
                     published.source().as_ref(),
                     published.canonical().as_ref()
                 );
-                return;
+                return PushWrite {
+                    evicted: Vec::new(),
+                };
             };
             self.evict_entry(&oldest_alias);
         }
@@ -1054,19 +1204,18 @@ impl NotificationCache {
             diagnostics: BoundedDiagnostics::new(published.source(), diagnostics).0,
         };
 
-        self.drop_superseded_pull(&canonical_key, version);
+        self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
         // never needs room; only a genuinely new URI can trigger eviction.
+        let mut evicted = Vec::new();
         let is_new_entry = self.take_entry(&source_key).is_none();
         if is_new_entry {
-            // TODO(#649): an eviction caused by a push is not announced to
-            // the evicted file's subscribers (FR-013 covers pull writes only).
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES
                 && let Some((_, _, evict_key)) = self.entry_to_evict(server_id, Protect::Nothing)
             {
-                self.evict_entry(&evict_key);
+                evicted.extend(self.evict_for_capacity(&evict_key));
             }
         }
 
@@ -1085,6 +1234,20 @@ impl NotificationCache {
                 spelling,
             },
         );
+        PushWrite { evicted }
+    }
+
+    /// [`Self::write_published_diagnostics`] for tests that do not look at
+    /// what the write evicted.
+    #[cfg(test)]
+    pub(crate) fn store_published_diagnostics(
+        &mut self,
+        server_id: &ServerId,
+        published: &PublishedDiagnosticsUri,
+        version: Option<i32>,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        drop(self.write_published_diagnostics(server_id, published, version, diagnostics));
     }
 
     const fn next_seq(&mut self) -> u64 {
@@ -1103,28 +1266,65 @@ impl NotificationCache {
         })
     }
 
-    /// Removes `file`'s pulled slot when a push carries a document version
-    /// newer than the one the pull answered, since the pulled content is then
-    /// older than what the server last said.
+    /// Removes `file`'s pulled slot when a push shows that its content is
+    /// older than the file, by [`pull_is_superseded`]'s rule.
     ///
-    /// A push without a version, or with an equal one, keeps the pulled slot:
-    /// servers that both push and pull report the same version twice, and a
-    /// versionless flycheck push must not erase the pulled native diagnostics.
-    // TODO(#670): a slot can outlive a versionless or lower-versioned push
-    // (an LRU reopen restarts the tracker at version 1) until the next pull.
-    fn drop_superseded_pull(&mut self, file: &DiagnosticsKey, pushed_version: Option<i32>) {
-        let Some(pushed) = pushed_version else {
-            return;
-        };
+    /// The document's synced version is read from the attached tracker for
+    /// the server that owns the pulled slot; a push that carries a document
+    /// version newer than the pulled one supersedes it without the tracker.
+    fn drop_superseded_pull(
+        &mut self,
+        file: &DiagnosticsKey,
+        canonical: &Uri,
+        pushed_version: Option<i32>,
+    ) {
         let slot = SlotKey::pulled(file.clone());
-        let superseded = self
+        let Some((pulled, owner)) = self
             .entries
             .get(&slot)
-            .and_then(|entry| entry.info.version)
-            .is_some_and(|pulled| pushed > pulled);
-        if superseded {
+            .and_then(|entry| Some((entry.info.version?, entry.owner.clone())))
+        else {
+            return;
+        };
+        let sync = self.document_sync(&owner, canonical);
+        let reopened = self.documents.is_some()
+            && self
+                .pull_tickets
+                .get(file)
+                .is_some_and(|record| record.opening != self.document_opening(canonical));
+        if reopened || pull_is_superseded(pulled, pushed_version, sync) {
+            debug!(
+                "dropping the pulled diagnostics of {}: superseded by a push \
+                 (pulled v{pulled}, pushed {pushed_version:?}, {sync:?})",
+                canonical.as_ref()
+            );
             self.take_entry(&slot);
         }
+    }
+
+    /// Attaches the document tracker whose synced versions decide whether a
+    /// push supersedes a pulled slot. Without one, only a push carrying a
+    /// newer document version does.
+    pub(crate) fn attach_documents(&mut self, documents: Arc<DocumentTracker>) {
+        self.documents = Some(documents);
+    }
+
+    /// What the attached tracker says about the document `canonical` names,
+    /// for `owner`.
+    fn document_sync(&self, owner: &ServerId, canonical: &Uri) -> DocumentSync {
+        let Some(documents) = &self.documents else {
+            return DocumentSync::Unattached;
+        };
+        uri_to_path(canonical)
+            .and_then(|path| documents.synced_version(&path, owner))
+            .map_or(DocumentSync::NotOpen, DocumentSync::Synced)
+    }
+
+    /// Which opening of the document `canonical` names the attached tracker
+    /// holds, `None` when none is attached or it is not open.
+    fn document_opening(&self, canonical: &Uri) -> Option<u64> {
+        let path = uri_to_path(canonical)?;
+        self.documents.as_ref()?.opening(&path)
     }
 
     /// Issues the claim a pull of `server`'s diagnostics for a document at
@@ -1183,7 +1383,7 @@ impl NotificationCache {
         if self
             .pull_tickets
             .get(&file_key)
-            .is_some_and(|stored| *stored >= stamp.ticket)
+            .is_some_and(|stored| stored.ticket >= stamp.ticket)
         {
             return discard(Discard::OlderTicket, items);
         }
@@ -1212,15 +1412,19 @@ impl NotificationCache {
                         items,
                     };
                 };
-                if let Some(entry) = self.entries.get(&victim) {
-                    evicted.push(entry.file(&victim).clone());
-                }
-                self.evict_entry(&victim);
+                evicted.extend(self.evict_for_capacity(&victim));
             }
         }
 
         let seq = self.next_seq();
-        self.pull_tickets.insert(file_key, stamp.ticket);
+        let opening = self.document_opening(file);
+        self.pull_tickets.insert(
+            file_key,
+            PullRecord {
+                ticket: stamp.ticket,
+                opening,
+            },
+        );
         self.insert_entry(
             slot_key,
             CachedEntry {
@@ -1274,6 +1478,7 @@ impl NotificationCache {
     /// `order`, `files` and `empty_diagnostics_count`.
     fn insert_entry(&mut self, key: SlotKey, entry: CachedEntry) {
         debug_assert!(!self.entries.contains_key(&key));
+        self.eviction_marks.forget_file(entry.file(&key));
         self.order
             .entry(entry.owner.clone())
             .or_default()
@@ -1320,6 +1525,27 @@ impl NotificationCache {
         if entry.info.diagnostics.is_empty() {
             self.record_empty_eviction(entry.file(key).clone(), std::time::Instant::now());
         }
+    }
+
+    /// Evicts the entry under `key` to make room and returns its file, after
+    /// remembering what was lost for [`Self::availability`].
+    ///
+    /// A clean entry is remembered only when it was the file's last one: while
+    /// other slots of the file remain, they answer reads.
+    fn evict_for_capacity(&mut self, key: &SlotKey) -> Option<DiagnosticsKey> {
+        let entry = self.entries.get(key)?;
+        let file = entry.file(key).clone();
+        let owner = entry.owner.clone();
+        let content = if entry.info.diagnostics.is_empty() {
+            EvictedContent::Clean
+        } else {
+            EvictedContent::Lost
+        };
+        self.evict_entry(key);
+        if content == EvictedContent::Lost || !self.files.contains_key(&file) {
+            self.eviction_marks.record(file.clone(), owner, content);
+        }
+        Some(file)
     }
 
     fn record_empty_eviction(&mut self, file: DiagnosticsKey, now: std::time::Instant) {
@@ -1389,6 +1615,12 @@ impl NotificationCache {
             .filter(|entry| entry.info.diagnostics.is_empty())
             .count();
         assert_eq!(empty, self.empty_diagnostics_count);
+
+        let marks = &self.eviction_marks;
+        assert_eq!(marks.by_file.len(), marks.order.len(), "marks diverge");
+        for (seq, file) in &marks.order {
+            assert_eq!(marks.by_file.get(file).map(|mark| mark.seq), Some(*seq));
+        }
     }
 
     /// The least recently written non-canonical source indexed under
@@ -1516,8 +1748,10 @@ impl NotificationCache {
         self.indexing.state(server_id)
     }
 
-    /// Forget `server_id`'s tracked [`IndexingState`], reverting it to
-    /// [`IndexingState::Unknown`].
+    /// Reset `server_id`'s tracked [`IndexingState`] as `reset` says;
+    /// [`IndexingReset::Forget`] reverts it to [`IndexingState::Unknown`],
+    /// [`IndexingReset::AwaitReplacement`] to [`IndexingState::Loading`] until
+    /// the replacement's first signal when the server has reported one before.
     ///
     /// `Translator::respawn_if_dead` calls this after replacing a crashed
     /// server's process, since the new process starts indexing from
@@ -1526,8 +1760,8 @@ impl NotificationCache {
     /// leak into requests routed to its replacement. This is the only
     /// production caller: a timed-out [`Self::indexing_state`] read does
     /// *not* call this, so one caller's wait can never affect another's.
-    pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId) {
-        self.indexing.reset(server_id);
+    pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId, reset: IndexingReset) {
+        self.indexing.reset(server_id, reset);
     }
 
     /// Get diagnostics for a document URI.
@@ -1608,6 +1842,41 @@ impl NotificationCache {
         self.entries.contains_key(&SlotKey::pushed(key.clone())) || self.files.contains_key(&key)
     }
 
+    /// Whether the cache has an answer for the file `uri` names, read for the
+    /// diagnostics server `route`.
+    ///
+    /// An entry, or the memory that capacity eviction removed only clean
+    /// entries of the file, is [`DiagnosticsAvailability::Published`]. Lost
+    /// diagnostics, or no trace of the file although eviction forgot some of
+    /// `route`'s files, is [`DiagnosticsAvailability::Evicted`]. Anything else
+    /// is [`DiagnosticsAvailability::Pending`]: nothing was published since
+    /// the server started.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsp_types::Uri;
+    /// use mcpls_core::bridge::{DiagnosticsAvailability, NotificationCache};
+    ///
+    /// let cache = NotificationCache::new();
+    /// let uri = Uri::from("file:///workspace/main.rs".to_owned());
+    /// assert_eq!(cache.availability(&uri, None), DiagnosticsAvailability::Pending);
+    /// ```
+    #[must_use]
+    pub fn availability(&self, uri: &Uri, route: Option<&ServerId>) -> DiagnosticsAvailability {
+        if self.has_diagnostics(uri) {
+            return DiagnosticsAvailability::Published;
+        }
+        match self.eviction_marks.content(&DiagnosticsKey::of(uri)) {
+            Some(EvictedContent::Clean) => DiagnosticsAvailability::Published,
+            Some(EvictedContent::Lost) => DiagnosticsAvailability::Evicted,
+            None if route.is_some_and(|server| self.eviction_marks.has_overflowed(server)) => {
+                DiagnosticsAvailability::Evicted
+            }
+            None => DiagnosticsAvailability::Pending,
+        }
+    }
+
     /// Server that published the currently cached diagnostics for `uri`, if
     /// any. Used to look up that server's negotiated position encoding for a
     /// cache-only read that has no live LSP round trip of its own to resolve
@@ -1655,6 +1924,7 @@ impl NotificationCache {
     pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<DiagnosticsKey> {
         let epoch = self.clear_epochs.entry(server_id.clone()).or_default();
         epoch.0 = epoch.0.saturating_add(1);
+        self.eviction_marks.forget_server(server_id);
         let Some(order) = self.order.remove(server_id) else {
             return Vec::new();
         };
@@ -1773,6 +2043,23 @@ pub fn apply_lifecycle_notification(
     }
 }
 
+/// Handles one lifecycle-lane notification of `server_id`: warns when a pinned
+/// `tsserver` was ignored, then applies it to `cache` when there is one.
+///
+/// Every consumer of the lifecycle lane goes through here, so no consumer can
+/// skip a step (#658).
+pub async fn on_lifecycle(
+    cache: Option<&tokio::sync::Mutex<NotificationCache>>,
+    server_id: &ServerId,
+    pinned_tsserver: Option<&std::path::Path>,
+    notif: crate::lsp::LspNotification,
+) {
+    crate::lsp::tsserver_pin::warn_if_pin_ignored(pinned_tsserver, &notif, server_id);
+    if let Some(cache) = cache {
+        apply_lifecycle_notification(&mut *cache.lock().await, server_id, notif);
+    }
+}
+
 #[cfg(test)]
 mod pull_tests;
 
@@ -1782,6 +2069,7 @@ mod tests {
 
     use super::bounds::*;
     use super::*;
+    use crate::bridge::indexing::IndexingReset;
     use crate::test_lsp::CapturedLogs;
 
     /// Every test in this module that doesn't exercise multi-server
@@ -3194,7 +3482,7 @@ mod tests {
             "experimental/serverStatus",
             Some(&serde_json::json!({"quiescent": false})),
         );
-        cache.reset_indexing_state(&server);
+        cache.reset_indexing_state(&server, IndexingReset::Forget);
         assert_eq!(cache.indexing_state(&server), IndexingState::Unknown);
     }
 
@@ -3676,6 +3964,161 @@ mod tests {
         assert!(!cache.has_diagnostics(&first_uri()));
         assert!(cache.is_listen_replayable(&first_uri()));
         assert!(!cache.is_listen_replayable(&Uri::from("file:///unrelated.rs")));
+    }
+
+    fn write_error(cache: &mut NotificationCache, file: &str) -> PushWrite {
+        let uri = Uri::from(file);
+        cache.write_published_diagnostics(
+            &test_server(),
+            &PublishedDiagnosticsUri::for_test(uri.clone(), uri),
+            None,
+            vec![error_diagnostic()],
+        )
+    }
+
+    /// #649: a push that needs room names the file whose entry it evicted.
+    #[test]
+    fn test_a_push_reports_the_file_it_evicts() {
+        let mut cache = full_cache(false);
+        let write = write_error(&mut cache, "file:///overflow.rs");
+        assert_eq!(write.evicted, vec![DiagnosticsKey::of(&first_uri())]);
+        assert!(!cache.has_diagnostics(&first_uri()));
+    }
+
+    /// #649: replacing a cached entry, or writing below capacity, evicts nothing.
+    #[test]
+    fn test_a_push_that_needs_no_room_reports_no_eviction() {
+        let mut cache = full_cache(false);
+        assert!(
+            write_error(&mut cache, "file:///first.rs")
+                .evicted
+                .is_empty()
+        );
+        let mut roomy = NotificationCache::new();
+        assert!(write_error(&mut roomy, "file:///a.rs").evicted.is_empty());
+    }
+
+    fn route() -> ServerId {
+        test_server()
+    }
+
+    /// #666: a clean file whose entry was evicted still reads as published
+    /// and clean, not as pending.
+    #[test]
+    fn test_evicted_clean_entry_reads_as_published() {
+        let mut cache = full_cache(true);
+        assert!(cache.has_diagnostics(&first_uri()));
+        evict_one(&mut cache);
+        assert!(!cache.has_diagnostics(&first_uri()));
+        assert_eq!(
+            cache.availability(&first_uri(), Some(&route())),
+            DiagnosticsAvailability::Published
+        );
+    }
+
+    /// #666: a file whose diagnostics were evicted reads as evicted: what the
+    /// server said is unknown, which is not the same as nothing published.
+    #[test]
+    fn test_evicted_non_empty_entry_reads_as_evicted() {
+        let mut cache = full_cache(false);
+        evict_one(&mut cache);
+        assert_eq!(
+            cache.availability(&first_uri(), Some(&route())),
+            DiagnosticsAvailability::Evicted
+        );
+    }
+
+    #[test]
+    fn test_unpublished_file_reads_as_pending_even_next_to_evictions() {
+        let mut cache = full_cache(false);
+        evict_one(&mut cache);
+        let unseen = Uri::from("file:///never-published.rs");
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Pending
+        );
+        assert_eq!(
+            cache.availability(&unseen, None),
+            DiagnosticsAvailability::Pending
+        );
+    }
+
+    /// #666: a respawn forgets what was evicted along with the diagnostics, so
+    /// the file reads as pending again until the replacement publishes.
+    #[test]
+    fn test_clearing_a_server_forgets_its_eviction_marks() {
+        let mut cache = full_cache(false);
+        evict_one(&mut cache);
+        drop(cache.clear_server_diagnostics(&route()));
+        assert_eq!(
+            cache.availability(&first_uri(), Some(&route())),
+            DiagnosticsAvailability::Pending
+        );
+    }
+
+    #[test]
+    fn test_a_new_publish_replaces_the_mark_of_its_file() {
+        let mut cache = full_cache(true);
+        evict_one(&mut cache);
+        let first: Uri = Uri::from("file:///first.rs");
+        cache.store_diagnostics(&test_server(), &first, None, vec![error_diagnostic()]);
+        assert_eq!(
+            cache.availability(&first_uri(), None),
+            DiagnosticsAvailability::Published
+        );
+        assert!(
+            cache
+                .eviction_marks
+                .content(&DiagnosticsKey::of(&first))
+                .is_none()
+        );
+    }
+
+    /// Lost content is never downgraded to clean by a later clean eviction of
+    /// the same file.
+    #[test]
+    fn test_lost_content_survives_a_later_clean_eviction_of_the_file() {
+        let mut marks = EvictionMarks::default();
+        let file = DiagnosticsKey::of(&first_uri());
+        marks.record(file.clone(), route(), EvictedContent::Lost);
+        marks.record(file.clone(), route(), EvictedContent::Clean);
+        assert_eq!(marks.content(&file), Some(EvictedContent::Lost));
+    }
+
+    /// #666 eviction pressure: once more files were evicted than the marks
+    /// remember, a file without a mark is reported as possibly evicted for the
+    /// server that lost marks, and still as pending for any other route.
+    #[test]
+    fn test_overflowing_the_marks_makes_unmarked_files_read_as_evicted_for_that_server() {
+        let mut cache = full_cache(false);
+        for i in 0..=MAX_EVICTION_MARKS {
+            drop(write_error(&mut cache, &format!("file:///churn{i}.rs")));
+        }
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+        assert!(cache.eviction_marks.by_file.len() <= MAX_EVICTION_MARKS);
+        assert!(cache.eviction_marks.order.len() <= MAX_EVICTION_MARKS);
+        cache.assert_consistent();
+
+        assert_eq!(
+            cache.availability(&first_uri(), Some(&route())),
+            DiagnosticsAvailability::Evicted,
+            "its mark was the oldest, forgotten"
+        );
+        let unseen = Uri::from("file:///never-published.rs");
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Evicted
+        );
+        assert_eq!(
+            cache.availability(&unseen, Some(&ServerId::from("other"))),
+            DiagnosticsAvailability::Pending
+        );
+
+        drop(cache.clear_server_diagnostics(&route()));
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Pending
+        );
     }
 
     #[test]

@@ -93,6 +93,41 @@ pub enum InboundMessage {
         /// Identifier of the request the response answers.
         id: RequestId,
     },
+    /// A server request whose body could not be decoded but whose framing
+    /// and `id` were intact: it is answered with an error and the connection
+    /// stays up.
+    UndecodableRequest {
+        /// Identifier of the request to answer.
+        id: RequestId,
+    },
+    /// A server notification that could not be decoded; it is dropped.
+    UndecodableNotification,
+    /// A framed message that is not JSON, or that carries nothing to tell what
+    /// it was or whom it addresses; it is dropped.
+    UndecodableFrame,
+}
+
+impl InboundMessage {
+    /// Whether this message stands for a frame that could not be decoded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::lsp::{InboundMessage, RequestId};
+    ///
+    /// assert!(InboundMessage::UndecodableResponse { id: RequestId::Number(1) }.is_undecodable());
+    /// assert!(InboundMessage::UndecodableNotification.is_undecodable());
+    /// ```
+    #[must_use]
+    pub const fn is_undecodable(&self) -> bool {
+        matches!(
+            self,
+            Self::UndecodableResponse { .. }
+                | Self::UndecodableRequest { .. }
+                | Self::UndecodableNotification
+                | Self::UndecodableFrame
+        )
+    }
 }
 
 /// Typed LSP notification variants.

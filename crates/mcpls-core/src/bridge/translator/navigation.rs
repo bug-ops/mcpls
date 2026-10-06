@@ -476,7 +476,12 @@ impl Translator {
         position: Position,
     ) -> Result<HoverResult> {
         let doc = self
-            .prepare_gated_document(&file_path, Capability::Hover, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::Hover,
+                IndexingGate::Required,
+                &[position],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -552,7 +557,7 @@ impl Translator {
         T: GotoResponse,
     {
         let doc = self
-            .prepare_gated_document(file_path, capability, IndexingGate::Required)
+            .prepare_positioned_document(file_path, capability, IndexingGate::Required, &[position])
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -622,7 +627,12 @@ impl Translator {
         context: ResultContext,
     ) -> Result<ReferencesResult> {
         let doc = self
-            .prepare_gated_document(&file_path, Capability::References, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::References,
+                IndexingGate::Required,
+                &[position],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -794,9 +804,10 @@ mod tests {
     use super::*;
     use crate::bridge::encoding::PositionEncoding;
     use crate::bridge::translator::testing::*;
-    use crate::bridge::{NotificationCache, lock_std, path_to_uri};
+    use crate::bridge::{NotificationCache, path_to_uri};
     use crate::config::{IndexingReadyTimeoutSecs, ServerId};
     use crate::test_lsp::client_path;
+    use crate::util::lock_std;
 
     // -----------------------------------------------------------------
     // Indexing readiness gate (`Translator::wait_for_indexing_ready`)

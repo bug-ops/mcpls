@@ -232,7 +232,9 @@ impl ToolCoverage {
         for route in routes {
             total = total.saturating_add(1);
             match route {
-                RouteSupport::Supported { .. } => supported = supported.saturating_add(1),
+                RouteSupport::Supported { .. } | RouteSupport::PushOnly { .. } => {
+                    supported = supported.saturating_add(1);
+                }
                 RouteSupport::Initializing => initializing = true,
                 RouteSupport::CapabilityNotAdvertised { .. } | RouteSupport::NoServer => {}
             }
@@ -254,7 +256,7 @@ impl ToolCoverage {
 /// The languages of one tool that share an identical [`RouteSupport`].
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LanguageGroup {
-    languages: Vec<String>,
+    languages: Vec<LanguageId>,
     #[serde(flatten)]
     support: RouteSupport,
 }
@@ -276,7 +278,7 @@ pub(super) enum ToolRoutes {
 impl ToolRoutes {
     /// Group `routes` (one per language) by identical support, keeping the
     /// order in which each distinct support is first seen.
-    fn grouped(routes: Vec<(String, RouteSupport)>) -> Self {
+    fn grouped(routes: Vec<(LanguageId, RouteSupport)>) -> Self {
         let mut groups: Vec<LanguageGroup> = Vec::new();
         for (language, support) in routes {
             match groups.iter_mut().find(|group| group.support == support) {
@@ -299,7 +301,7 @@ impl ToolRoutes {
     reason = "describes the wire shape for schema generation only"
 )]
 struct RouteShape {
-    languages: Option<Vec<String>>,
+    languages: Option<Vec<LanguageId>>,
     #[serde(flatten)]
     support: RouteSupport,
 }
@@ -335,7 +337,7 @@ pub(super) struct ToolEntry {
 /// The `get_tool_support` response.
 #[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct ToolSupportReport {
-    languages: Vec<String>,
+    languages: Vec<LanguageId>,
     tools: Vec<ToolEntry>,
 }
 
@@ -358,7 +360,7 @@ impl ToolSupportReport {
                             .iter()
                             .map(|language| {
                                 (
-                                    language.to_string(),
+                                    language.clone(),
                                     snapshot.document_support_gated(
                                         language,
                                         kind,
@@ -368,9 +370,13 @@ impl ToolSupportReport {
                             })
                             .collect();
                         let coverage = ToolCoverage::from_routes(routes.iter().map(|(_, s)| s));
+                        let push_only = routes
+                            .iter()
+                            .any(|(_, s)| matches!(s, RouteSupport::PushOnly { .. }));
                         (
                             coverage,
-                            (coverage != ToolCoverage::All).then(|| ToolRoutes::grouped(routes)),
+                            (coverage != ToolCoverage::All || push_only)
+                                .then(|| ToolRoutes::grouped(routes)),
                         )
                     }
                     ToolBackend::Workspace(kind) => {
@@ -391,7 +397,7 @@ impl ToolSupportReport {
             })
             .collect();
         Self {
-            languages: languages.iter().map(ToString::to_string).collect(),
+            languages: languages.to_vec(),
             tools,
         }
     }
@@ -487,10 +493,10 @@ mod tests {
     fn document_routes_group_identical_support_in_first_seen_order() {
         let none = RouteSupport::NoServer;
         let routes = ToolRoutes::grouped(vec![
-            ("c".to_string(), none.clone()),
-            ("go".to_string(), supported()),
-            ("java".to_string(), none),
-            ("rust".to_string(), supported()),
+            (LanguageId::from_static("c"), none.clone()),
+            (LanguageId::from_static("go"), supported()),
+            (LanguageId::from_static("java"), none),
+            (LanguageId::from_static("rust"), supported()),
         ]);
         assert_eq!(
             serde_json::to_value(&routes).unwrap(),
@@ -498,6 +504,21 @@ mod tests {
                 {"languages": ["c", "java"], "status": "no_server"},
                 {"languages": ["go", "rust"], "status": "supported", "server": "s"},
             ])
+        );
+    }
+
+    #[test]
+    fn push_only_route_serializes_as_push_only_with_its_server() {
+        let push_only = RouteSupport::PushOnly {
+            server: "ts".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&push_only).unwrap(),
+            serde_json::json!({"status": "push_only", "server": "ts"})
+        );
+        assert_eq!(
+            ToolCoverage::from_routes([&push_only].into_iter()),
+            ToolCoverage::All
         );
     }
 

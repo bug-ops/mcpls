@@ -12,7 +12,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
 use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::ClientPath;
+use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
 /// Which way a type hierarchy walk goes from the queried item.
@@ -52,12 +52,13 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
-    ) -> Result<TypeHierarchyResult> {
+    ) -> Result<Indexed<TypeHierarchyResult>> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::TypeHierarchy,
                 IndexingGate::NotRequired,
+                &[position],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -72,14 +73,17 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
 
-        let response = client
-            .request_typed::<lsp_types::TypeHierarchyPrepareRequest>(
-                params,
-                client.request_timeout(),
+        let (response, indexing) = self
+            .sampled_indexing(
+                server_id,
+                client.request_typed::<lsp_types::TypeHierarchyPrepareRequest>(
+                    params,
+                    client.request_timeout(),
+                ),
             )
             .await?;
 
-        Ok(convert_items(response, &ctx).await)
+        Ok(Indexed::new(convert_items(response, &ctx).await, indexing))
     }
 
     /// Handle a supertypes request for an item from a previous prepare or walk.
@@ -262,7 +266,8 @@ mod tests {
             .await
             .expect("handler call should not hang")
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .result;
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].name, "Base");
         assert_eq!(result.items[0].kind, 5);
@@ -302,7 +307,8 @@ mod tests {
             .await
             .expect("handler call should not hang")
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .result;
         assert!(result.items.is_empty());
     }
 

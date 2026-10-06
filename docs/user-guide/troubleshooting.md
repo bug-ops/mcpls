@@ -604,6 +604,18 @@ file_patterns = ["**/*.go"]
 - `ServerFailedToStart`: the message names the command and the reason; install the server or fix its `command`/`args` in the config, then restart mcpls
 - `resources/subscribe` on such a file fails the same way, except during startup, where it succeeds and you receive one `resources/updated` if startup then fails; re-read the resource to get the error
 
+### `get_diagnostics` returns an empty list with `availability: "pending"` or `"evicted"`
+
+**Cause**: the empty list is not a clean file. `pending` means the language server has not published diagnostics for the file yet (a server that advertises no `diagnosticProvider`, such as typescript-language-server, only pushes them, and `get_diagnostics` then answers from that cache with `origin: "push_cache"`). `evicted` means a publish was dropped to keep the cache bounded.
+
+**Fix**: call `get_diagnostics` again after a moment; `pending` clears with the server's first publish for the file, and a restart of the server returns every file to `pending`. For `evicted`, the server's next publish for the file restores the answer.
+
+### The first query after `restart_server` waits or returns a retryable indexing error
+
+**Cause**: a server that reported readiness signals before is treated as loading again from the moment it is replaced, until its replacement reports ready or the indexing-ready timeout (`workspace.indexing_ready_timeout_seconds`) elapses. This is intended: answering at once would return results from an empty index.
+
+**Fix**: retry after the `-32050`/`-32051` error, or wait; no action is needed.
+
 ### "was not started: the workspace is untrusted"
 
 **Cause**: mcpls runs with `--workspace-trust untrusted`, which starts only the servers named with `--allow-server`. The error names the server, the kind of workspace code it may run, and the flag that starts it.

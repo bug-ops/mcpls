@@ -135,6 +135,7 @@ marked clarification below — because this is a research/parity spec, not an im
 | FR-002 | WHEN a tool is not supported by *any* currently configured LSP server THE SYSTEM SHALL surface that distinctly from "supported by some but not all configured servers" (per US-002's three-way distinction) | should |
 | FR-003 | WHEN LSP servers are added, removed, or respawned during a session (see `lsp/001-lsp-server-lifecycle-and-respawn`) THE SYSTEM SHALL keep any exposed capability-discovery information consistent with the currently connected servers' actual `initialize` responses | should |
 | FR-004 | IF a chosen mechanism changes the shape or contents of the standard MCP `tools/list` response THEN THE SYSTEM SHALL verify the change stays within valid MCP protocol schema (tool `name`, `description`, `inputSchema`, and optional fields only) — no invention of non-standard top-level fields the MCP spec does not define | must |
+| FR-005 | WHEN the routed server of `get_diagnostics` advertises no `diagnosticProvider` and has not answered a pull, THE SYSTEM SHALL report that route as `push_only` (with its `server`), which counts as supported for coverage but is always listed in `routes`, so a push-derived answer is never reported as plain `supported` ([[bridge/011-push-only-server-diagnostics/spec\|bridge/011]], #666) | must |
 
 ## 4. Non-Functional Requirements
 
