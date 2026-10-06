@@ -1242,6 +1242,7 @@ mod launch_tests {
         };
         let (command, args) = native.launch_parts();
         assert_eq!(command, prefix.join("node.exe").to_str().unwrap());
+        let tsc = dunce::canonicalize(tsc).unwrap();
         assert_eq!(args, [tsc.to_str().unwrap(), "--lsp", "--stdio"]);
     }
 
