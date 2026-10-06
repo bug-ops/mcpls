@@ -165,7 +165,8 @@ struct Fixture {
 
 fn fixture(caps: lsp_types::ServerCapabilities, limits: Option<ResourceLimits>) -> Fixture {
     let dir = TempDir::new().unwrap();
-    let (translator, server) = translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+    let (translator, server) =
+        translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps);
     let translator = match limits {
         Some(limits) => translator.with_resource_limits(limits),
         None => translator,

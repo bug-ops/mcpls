@@ -557,8 +557,8 @@ impl Translator {
     /// Test-only: register a bare LSP client under its routing identity, next
     /// to the server already registered for it, if any.
     #[cfg(test)]
-    pub(crate) fn register_client(&self, id: impl Into<ServerId>, client: crate::lsp::LspClient) {
-        lock_std(&self.servers).register_test_client(id.into(), client);
+    pub(crate) fn register_client(&self, id: ServerId, client: crate::lsp::LspClient) {
+        lock_std(&self.servers).register_test_client(id, client);
     }
 
     /// The secrets of every live server's client, for hiding them in tool
@@ -592,8 +592,8 @@ impl Translator {
     /// Test-only: register a bare LSP server under its routing identity, next
     /// to the client already registered for it, if any.
     #[cfg(test)]
-    pub(crate) fn register_server(&self, id: impl Into<ServerId>, server: LspServer) {
-        lock_std(&self.servers).register_test_server(id.into(), server);
+    pub(crate) fn register_server(&self, id: ServerId, server: LspServer) {
+        lock_std(&self.servers).register_test_server(id, server);
     }
 
     /// Register a spawned server under its routing identity, in one step.
@@ -798,8 +798,8 @@ mod tests {
         let (b, _fake_b, _lanes_b) = crate::test_lsp::fake_lsp_client_with_redactions(
             Redactions::new([("B_TOKEN".to_owned(), "bravo-secret-222".to_owned())]),
         );
-        translator.register_client(ServerId::from("a"), a);
-        translator.register_client(ServerId::from("b"), b);
+        translator.register_client(ServerId::from_static("a"), a);
+        translator.register_client(ServerId::from_static("b"), b);
         let both = translator.server_text_redactions();
         assert_eq!(both.apply("alpha-secret-111"), "[redacted:A_TOKEN]");
         assert_eq!(both.apply("bravo-secret-222"), "[redacted:B_TOKEN]");
@@ -807,7 +807,7 @@ mod tests {
         let (respawned, _fake_c, _lanes_c) = crate::test_lsp::fake_lsp_client_with_redactions(
             Redactions::new([("C_TOKEN".to_owned(), "charlie-secret-333".to_owned())]),
         );
-        translator.register_client(ServerId::from("a"), respawned);
+        translator.register_client(ServerId::from_static("a"), respawned);
         let after = translator.server_text_redactions();
         assert_eq!(after.apply("alpha-secret-111"), "alpha-secret-111");
         assert_eq!(after.apply("charlie-secret-333"), "[redacted:C_TOKEN]");
@@ -825,8 +825,8 @@ mod tests {
         let (b, _fake_b, _lanes_b) = crate::test_lsp::fake_lsp_client_with_redactions(
             Redactions::new([("B_TOKEN".to_owned(), "A_TOKEN]".to_owned())]),
         );
-        translator.register_client(ServerId::from("a"), a);
-        translator.register_client(ServerId::from("b"), b);
+        translator.register_client(ServerId::from_static("a"), a);
+        translator.register_client(ServerId::from_static("b"), b);
 
         let logs = crate::test_lsp::CapturedLogs::default();
         let subscriber = tracing_subscriber::registry()
@@ -863,7 +863,7 @@ mod tests {
         handles: Option<Vec<ToolKind>>,
     ) -> crate::config::LspServerConfig {
         let mut config = crate::config::LspServerConfig::rust_analyzer();
-        config.name = Some(ServerId::from(name));
+        config.name = Some(ServerId::new(name).unwrap());
         config.language_id = LanguageId::new(language).unwrap();
         config.handles = handles.map(|tools| ToolSet::new(tools).unwrap());
         config
@@ -1228,7 +1228,7 @@ mod tests {
     fn test_record_startup_failures_orders_listing_by_server_id() {
         let translator = Translator::new();
         let failure = |id: &str| ServerSpawnFailure {
-            server_id: ServerId::from(id),
+            server_id: ServerId::new(id).unwrap(),
             language_id: LanguageId::new(id).unwrap(),
             command: id.to_string(),
             reason: StartupFailure::InitTaskPanicked,
@@ -1249,7 +1249,7 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         let handle = tasks.spawn(async { panic!("shutdown task boom") });
         let mut ids = HashMap::new();
-        ids.insert(handle.id(), ServerId::from("rust"));
+        ids.insert(handle.id(), ServerId::from_static("rust"));
         tasks.spawn(async {});
 
         join_shutdown_tasks(tasks, &ids).await;
@@ -1312,8 +1312,14 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_servers_drains_registered_servers() {
         let translator = Translator::new();
-        translator.register_server("server-a", crate::lsp::fake_lsp_server());
-        translator.register_server("server-b", crate::lsp::fake_lsp_server());
+        translator.register_server(
+            ServerId::from_static("server-a"),
+            crate::lsp::fake_lsp_server(),
+        );
+        translator.register_server(
+            ServerId::from_static("server-b"),
+            crate::lsp::fake_lsp_server(),
+        );
         assert_eq!(translator.registered_server_count(), 2);
 
         // Bounded well above `lsp::SHUTDOWN_TIMEOUT` (10s) so a genuine
@@ -1410,7 +1416,7 @@ mod tests {
         std::fs::write(&path_b, "b").unwrap();
 
         let (client, _server) = fake_lsp_client();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .document_tracker
@@ -1459,7 +1465,7 @@ mod tests {
         std::fs::write(&path_b, "b").unwrap();
 
         let (client, _server) = fake_lsp_client();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .document_tracker

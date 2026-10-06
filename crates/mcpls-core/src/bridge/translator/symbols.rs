@@ -508,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_initializing_when_expected_but_not_registered() {
         let translator = Translator::new();
-        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+        translator.set_expected_servers(HashSet::from([ServerId::from_static("pyright")]));
 
         let result = translator
             .handle_workspace_symbol("test".to_string(), None, 100)
@@ -522,7 +522,7 @@ mod tests {
     async fn test_handle_workspace_symbol_reports_startup_failures() {
         let translator = Translator::new();
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
-            server_id: ServerId::from("pyright"),
+            server_id: ServerId::from_static("pyright"),
             language_id: LanguageId::from_static("python"),
             command: "pyright-langserver".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
@@ -536,7 +536,7 @@ mod tests {
             panic!("expected AllServersFailedToInit, got {result:?}");
         };
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].server_id, ServerId::from("pyright"));
+        assert_eq!(failures[0].server_id, ServerId::from_static("pyright"));
     }
 
     /// A failed server that would have claimed workspace search is reported
@@ -544,13 +544,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_failed_claimant() {
         let mut live = crate::config::LspServerConfig::pyright();
-        live.name = Some(ServerId::from("live"));
+        live.name = Some(ServerId::from_static("live"));
         live.handles = Some(ToolSet::new(vec![ToolKind::Hover]).unwrap());
         let mut failing = crate::config::LspServerConfig::rust_analyzer();
-        failing.name = Some(ServerId::from("failing"));
+        failing.name = Some(ServerId::from_static("failing"));
         failing.handles = Some(ToolSet::new(vec![ToolKind::WorkspaceSymbols]).unwrap());
         let router = ToolRouter::from_configs([&live, &failing]).unwrap();
-        let failing_id = ServerId::from("failing");
+        let failing_id = ServerId::from_static("failing");
 
         let translator = Translator::new().with_router(router);
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
@@ -559,7 +559,7 @@ mod tests {
             command: "rust-analyzer".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
         }]);
-        translator.rebind_router(&HashSet::from([ServerId::from("live")]));
+        translator.rebind_router(&HashSet::from([ServerId::from_static("live")]));
         translator.clear_expected_servers();
 
         let result = translator
@@ -575,9 +575,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_initializing_wins_over_recorded_failure() {
         let translator = Translator::new();
-        translator.set_expected_servers(HashSet::from([ServerId::from("pyright")]));
+        translator.set_expected_servers(HashSet::from([ServerId::from_static("pyright")]));
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
-            server_id: ServerId::from("other"),
+            server_id: ServerId::from_static("other"),
             language_id: LanguageId::from_static("go"),
             command: "gopls".to_string(),
             reason: crate::error::StartupFailure::InitTaskPanicked,
@@ -608,7 +608,7 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: Some(ServerId::from("pyright")),
+            name: Some(ServerId::from_static("pyright")),
             handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
@@ -635,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_document_symbols_flat_response_selection_range_matches_range() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -706,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_document_symbols_flat_response_normalizes_against_response_uri() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = translator_with_capabilities_and_encoding(
             &dir,
             &server_id,
@@ -779,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_document_symbols_sets_positions_degraded_for_unresolvable_line() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = translator_with_capabilities_and_encoding(
             &dir,
             &server_id,
@@ -852,7 +852,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_drops_location_uri_only_entries() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
             ..Default::default()
@@ -931,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_does_not_filter_out_of_workspace_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
             ..Default::default()
@@ -1028,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_clamps_limit_to_max_normalized_locations() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
             ..Default::default()
@@ -1101,7 +1101,7 @@ mod tests {
         use crate::bridge::NotificationCache;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             document_symbol_provider: Some(lsp_types::DocumentSymbolProvider::Bool(true)),
             ..Default::default()

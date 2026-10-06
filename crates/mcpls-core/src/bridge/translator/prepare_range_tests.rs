@@ -61,7 +61,7 @@ async fn prepare_rename_redacting(
 ) -> Result<PrepareRenameResult> {
     let dir = TempDir::new().unwrap();
     let (translator, mut server) =
-        translator_with_capabilities(&dir, &ServerId::from("rust"), prepare_caps());
+        translator_with_capabilities(&dir, &ServerId::from_static("rust"), prepare_caps());
     let translator = translator.with_startup_redactions(Arc::new(redactions));
     let path = dir.path().join("a.rs");
     fs::write(&path, "fn old_name() {}").unwrap();
@@ -302,7 +302,8 @@ fn tracked_translator(
     caps: lsp_types::ServerCapabilities,
     source: &str,
 ) -> (Translator, std::path::PathBuf, impl Sized) {
-    let (translator, server) = translator_with_capabilities(dir, &ServerId::from("rust"), caps);
+    let (translator, server) =
+        translator_with_capabilities(dir, &ServerId::from_static("rust"), caps);
     let path = dir.path().join("a.rs");
     fs::write(&path, source).unwrap();
     (translator, path, server)
@@ -524,7 +525,7 @@ async fn an_untracked_document_passes_the_line_check() {
 async fn prepare_rename_character_past_the_line_end_is_forwarded() {
     let dir = TempDir::new().unwrap();
     let (translator, mut server) =
-        translator_with_capabilities(&dir, &ServerId::from("rust"), prepare_caps());
+        translator_with_capabilities(&dir, &ServerId::from_static("rust"), prepare_caps());
     let path = dir.path().join("a.rs");
     fs::write(&path, "fn a() {}").unwrap();
     let translator = Arc::new(translator);
@@ -573,7 +574,8 @@ async fn prepare_rename_requires_prepare_provider_not_just_rename() {
         rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
         ..Default::default()
     };
-    let (translator, _server) = translator_with_capabilities(&dir, &ServerId::from("rust"), caps);
+    let (translator, _server) =
+        translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps);
     let path = dir.path().join("a.rs");
     fs::write(&path, "fn old_name() {}").unwrap();
 
@@ -596,7 +598,7 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
         request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
         heuristics: None,
-        name: Some(ServerId::from(name)),
+        name: Some(ServerId::new(name).unwrap()),
         handles: Some(ToolSet::new(handles).unwrap()),
         indexing: IndexingPolicy::Auto,
         selection: crate::config::ServerSelection::Explicit,
@@ -625,8 +627,11 @@ async fn prepare_rename_routes_with_rename() {
     let (renamer_client, mut renamer) = fake_lsp_client();
     let (hoverer_client, _hoverer) = fake_lsp_client();
     for (id, client) in [("renamer", renamer_client), ("hoverer", hoverer_client)] {
-        translator.register_client(ServerId::from(id), client);
-        translator.register_server(ServerId::from(id), LspServer::new_for_test(prepare_caps()));
+        translator.register_client(ServerId::new(id).unwrap(), client);
+        translator.register_server(
+            ServerId::new(id).unwrap(),
+            LspServer::new_for_test(prepare_caps()),
+        );
     }
     let path = dir.path().join("a.rs");
     fs::write(&path, "fn old_name() {}").unwrap();
@@ -679,7 +684,7 @@ async fn format_range_with(
     response: serde_json::Value,
 ) -> (serde_json::Value, FormatDocumentResult) {
     let dir = TempDir::new().unwrap();
-    let id = ServerId::from("rust");
+    let id = ServerId::from_static("rust");
     let (translator, mut server) = encoding.map_or_else(
         || translator_with_capabilities(&dir, &id, range_caps()),
         |encoding| translator_with_capabilities_and_encoding(&dir, &id, range_caps(), encoding),
@@ -806,7 +811,7 @@ async fn format_range_with_a_line_beyond_the_document_is_rejected_before_the_req
 async fn format_range_end_character_past_the_line_end_is_forwarded() {
     let dir = TempDir::new().unwrap();
     let (translator, mut server) =
-        translator_with_capabilities(&dir, &ServerId::from("rust"), range_caps());
+        translator_with_capabilities(&dir, &ServerId::from_static("rust"), range_caps());
     let path = dir.path().join("a.rs");
     fs::write(&path, "a\nb\nc").unwrap();
     let translator = Arc::new(translator);
@@ -853,7 +858,7 @@ async fn format_range_without_capability_is_rejected() {
     let dir = TempDir::new().unwrap();
     let (translator, _server) = translator_with_capabilities(
         &dir,
-        &ServerId::from("rust"),
+        &ServerId::from_static("rust"),
         lsp_types::ServerCapabilities::default(),
     );
     let path = dir.path().join("a.rs");

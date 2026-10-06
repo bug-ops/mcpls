@@ -1666,7 +1666,7 @@ pub const SERVER_RESTARTED_ERROR_CODE: i32 = -32054;
 /// use mcpls_core::error::{RetryableErrorData, WORKSPACE_INDEXING_ERROR_CODE};
 ///
 /// let data = RetryableErrorData::WorkspaceIndexing {
-///     server_id: ServerId::from("rust"),
+///     server_id: ServerId::from_static("rust"),
 ///     elapsed_secs: 30,
 /// };
 /// assert_eq!(data.code(), WORKSPACE_INDEXING_ERROR_CODE);
@@ -1775,7 +1775,7 @@ impl Error {
     /// use mcpls_core::error::{Error, McpErrorKind};
     ///
     /// let err = Error::WorkspaceIndexing {
-    ///     server_id: ServerId::from("rust"),
+    ///     server_id: ServerId::from_static("rust"),
     ///     elapsed_secs: 30,
     /// };
     /// let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
@@ -1981,13 +1981,13 @@ mod tests {
     fn test_all_servers_failed_to_init_error() {
         let failures = vec![
             ServerSpawnFailure {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
             },
             ServerSpawnFailure {
-                server_id: ServerId::from("python"),
+                server_id: ServerId::from_static("python"),
                 language_id: LanguageId::from_static("python"),
                 command: "pyright".to_string(),
                 reason: StartupFailure::InitTaskPanicked,
@@ -2011,7 +2011,7 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_display_names_init_panic() {
         let failure = ServerSpawnFailure {
-            server_id: ServerId::from("typescript"),
+            server_id: ServerId::from_static("typescript"),
             language_id: LanguageId::from_static("typescript"),
             command: "tsserver".to_string(),
             reason: StartupFailure::InitTaskPanicked,
@@ -2496,7 +2496,7 @@ mod tests {
 
     fn spawn_failure(id: &str, command: &str, error: Error) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from(id),
+            server_id: ServerId::new(id).unwrap(),
             language_id: LanguageId::new(id).unwrap(),
             command: command.to_string(),
             reason: StartupFailure::Spawn(Arc::new(error)),
@@ -2549,7 +2549,7 @@ mod tests {
     #[test]
     fn test_server_failed_to_start_init_task_panicked_display() {
         let err = Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             language_id: LanguageId::from_static("rust"),
             command: "rust-analyzer".to_string(),
             reason: StartupFailure::InitTaskPanicked,
@@ -2572,7 +2572,7 @@ mod tests {
                 stderr: None,
             },
             Error::ServerUnavailable {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 retry_in: Duration::from_secs(1),
             },
         ] {
@@ -2637,7 +2637,7 @@ mod tests {
     #[test]
     fn test_server_unavailable_display_names_retry_delay() {
         let err = Error::ServerUnavailable {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             retry_in: Duration::from_secs(2),
         };
         assert_eq!(
@@ -2761,7 +2761,7 @@ mod tests {
     #[test]
     fn test_error_display_capability_not_supported() {
         let err = Error::CapabilityNotSupported {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             capability: Capability::Rename,
         };
         assert_eq!(
@@ -2773,7 +2773,7 @@ mod tests {
     #[test]
     fn test_error_display_workspace_indexing() {
         let err = Error::WorkspaceIndexing {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             elapsed_secs: 30,
         };
         assert_eq!(
@@ -2846,7 +2846,7 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_workspace_indexing_is_retryable_with_dedicated_code() {
         let err = Error::WorkspaceIndexing {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             elapsed_secs: 30,
         };
         let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
@@ -2862,7 +2862,7 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_server_initializing_is_retryable_with_dedicated_code() {
         let err = Error::ServerInitializing {
-            server_id: ServerId::from("python"),
+            server_id: ServerId::from_static("python"),
         };
         let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
             panic!("expected ServerInitializing to classify as Retryable");
@@ -2903,7 +2903,7 @@ mod tests {
         let cases = [
             (
                 RetryableErrorData::WorkspaceIndexing {
-                    server_id: ServerId::from("rust"),
+                    server_id: ServerId::from_static("rust"),
                     elapsed_secs: 7,
                 },
                 WORKSPACE_INDEXING_ERROR_CODE,
@@ -2911,7 +2911,7 @@ mod tests {
             ),
             (
                 RetryableErrorData::ServerInitializing {
-                    server_id: ServerId::from("python"),
+                    server_id: ServerId::from_static("python"),
                 },
                 SERVER_INITIALIZING_ERROR_CODE,
                 serde_json::json!({"server_id": "python"}),
@@ -2959,7 +2959,7 @@ mod tests {
                 tool: crate::config::ToolKind::Hover,
             },
             Error::CapabilityNotSupported {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 capability: Capability::Rename,
             },
             Error::NoWorkspaceRoots(PathBuf::from("/tmp")),
@@ -3117,7 +3117,7 @@ mod tests {
 
     fn refusal_failure(refusal: UntrustedRefusal) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             language_id: LanguageId::new("rust").unwrap(),
             command: "rust-analyzer".to_string(),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),

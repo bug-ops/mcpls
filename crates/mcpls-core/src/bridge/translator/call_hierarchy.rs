@@ -336,7 +336,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_incoming_calls_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -371,7 +371,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_outgoing_calls_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -552,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_calls_round_trips_non_function_kind() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -642,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_calls_from_ranges_convert_against_callers_own_uri() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_outgoing_calls_from_ranges_convert_against_queried_uri() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -874,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_calls_does_not_filter_out_of_workspace_caller() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -982,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_outgoing_calls_does_not_filter_out_of_workspace_callee() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -1092,7 +1092,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_then_incoming_calls_round_trip_percent_encoded_path() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -1220,7 +1220,7 @@ mod tests {
         response: impl FnOnce(&str) -> serde_json::Value,
     ) -> serde_json::Value {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
             ..Default::default()
@@ -1392,7 +1392,7 @@ mod tests {
             (MAX_NORMALIZED_LOCATIONS, false),
         ] {
             let dir = TempDir::new().unwrap();
-            let server_id = ServerId::from("rust");
+            let server_id = ServerId::from_static("rust");
             let caps = lsp_types::ServerCapabilities {
                 call_hierarchy_provider: Some(lsp_types::CallHierarchyProvider::Bool(true)),
                 ..Default::default()

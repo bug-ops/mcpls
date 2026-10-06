@@ -414,10 +414,10 @@ mod settler_tests {
 
     fn explicit_and_catch_all_translator() -> (Translator, LspServerConfig, LspServerConfig) {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some(ServerId::from("explicit"));
+        explicit.name = Some(ServerId::from_static("explicit"));
         explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some(ServerId::from("catch-all"));
+        catch_all.name = Some(ServerId::from_static("catch-all"));
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
@@ -551,10 +551,10 @@ mod settler_tests {
     #[tokio::test]
     async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some(ServerId::from("explicit"));
+        explicit.name = Some(ServerId::from_static("explicit"));
         explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some(ServerId::from("catch-all"));
+        catch_all.name = Some(ServerId::from_static("catch-all"));
         let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
         let translator = Translator::new().with_router(router);
         translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
@@ -744,7 +744,7 @@ mod startup_tests {
         );
         let failure = startup
             .translator
-            .startup_failure(&ServerId::from("broken"))
+            .startup_failure(&ServerId::from_static("broken"))
             .unwrap();
         std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
 

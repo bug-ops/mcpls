@@ -2033,7 +2033,7 @@ mod tests {
     #[test]
     fn test_server_restarted_error_is_retryable_with_its_own_code() {
         let err = map_bridge_error(crate::error::Error::ServerRestarted {
-            server_id: crate::config::ServerId::from("rust"),
+            server_id: crate::config::ServerId::from_static("rust"),
         });
 
         assert_eq!(
@@ -2046,8 +2046,8 @@ mod tests {
     #[test]
     fn test_unknown_server_error_is_invalid_params_listing_configured_ids() {
         let err = map_bridge_error(crate::error::Error::UnknownServers {
-            unknown: vec![crate::config::ServerId::from("nope")],
-            configured: vec![crate::config::ServerId::from("rust")],
+            unknown: vec![crate::config::ServerId::from_static("nope")],
+            configured: vec![crate::config::ServerId::from_static("rust")],
         });
 
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -2144,7 +2144,7 @@ mod tests {
     #[test]
     fn test_map_bridge_error_workspace_indexing_uses_dedicated_error_code() {
         let err = crate::error::Error::WorkspaceIndexing {
-            server_id: crate::config::ServerId::from("rust"),
+            server_id: crate::config::ServerId::from_static("rust"),
             elapsed_secs: 30,
         };
         let mcp_err = map_bridge_error(err);
@@ -2164,7 +2164,7 @@ mod tests {
     #[test]
     fn test_map_bridge_error_server_initializing_uses_dedicated_error_code() {
         let err = crate::error::Error::ServerInitializing {
-            server_id: crate::config::ServerId::from("python"),
+            server_id: crate::config::ServerId::from_static("python"),
         };
         let mcp_err = map_bridge_error(err);
 
@@ -2341,10 +2341,10 @@ mod tests {
         server
             .context
             .translator
-            .register_client(crate::config::ServerId::from("a"), client);
+            .register_client(crate::config::ServerId::from_static("a"), client);
         let failure =
             crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
-                server_id: crate::config::ServerId::from("b"),
+                server_id: crate::config::ServerId::from_static("b"),
                 language_id: crate::config::LanguageId::from_static("python"),
                 command: "pyright".to_owned(),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
@@ -2745,7 +2745,7 @@ mod tests {
     fn test_map_bridge_error_startup_failure_carries_guidance() {
         let error =
             crate::error::Error::ServerFailedToStart(Box::new(crate::error::ServerSpawnFailure {
-                server_id: crate::config::ServerId::from("rust"),
+                server_id: crate::config::ServerId::from_static("rust"),
                 language_id: LanguageId::from_static("rust"),
                 command: "rust-analyzer".to_string(),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
@@ -3034,7 +3034,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let dir = TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
@@ -3110,7 +3110,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let dir = TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
@@ -3184,7 +3184,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let dir = TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
@@ -3274,7 +3274,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
         use crate::test_lsp::fake_lsp_client;
 
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let dir = tempfile::TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
@@ -3555,11 +3555,11 @@ mod tests {
 
         for data in [
             RetryableErrorData::WorkspaceIndexing {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 elapsed_secs: 1,
             },
             RetryableErrorData::ServerInitializing {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
             },
             RetryableErrorData::WorkspaceServersInitializing {},
         ] {
@@ -3588,7 +3588,7 @@ mod tests {
         use crate::config::{ServerId, ToolRouter};
         use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
 
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let dir = TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
@@ -3881,7 +3881,7 @@ mod tests {
         {
             let mut cache = server.context.notification_cache.lock().await;
             cache.store_diagnostics(
-                &crate::config::ServerId::from("rust"),
+                &crate::config::ServerId::from_static("rust"),
                 &uri,
                 Some(1),
                 vec![diagnostic],
@@ -3970,7 +3970,7 @@ mod tests {
             McpConfig::default(),
             WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
-        let owner = crate::config::ServerId::from("rust");
+        let owner = crate::config::ServerId::from_static("rust");
         server.context.translator.register_server(
             owner.clone(),
             crate::lsp::LspServer::new_for_test_with_encoding(
@@ -4037,7 +4037,7 @@ mod tests {
         server
             .context
             .translator
-            .register_client(crate::config::ServerId::from("rust"), client);
+            .register_client(crate::config::ServerId::from_static("rust"), client);
 
         let hover = server
             .structured_result(Ok(HoverResult {
@@ -4126,7 +4126,7 @@ mod tests {
         {
             let mut cache = server.context.notification_cache.lock().await;
             cache.store_diagnostics(
-                &crate::config::ServerId::from("rust"),
+                &crate::config::ServerId::from_static("rust"),
                 &params.uri,
                 None,
                 params.diagnostics,
@@ -4175,7 +4175,7 @@ mod tests {
             WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         // Deliberately not registered with `translator.register_server`.
-        let owner = crate::config::ServerId::from("rust");
+        let owner = crate::config::ServerId::from_static("rust");
 
         let canonical_path = test_file.canonicalize().unwrap();
         let uri: lsp_types::Uri =
@@ -4242,7 +4242,7 @@ mod tests {
         // is a fast unit test of that wiring alone; the slower
         // `..._after_real_respawn` test below covers the full path through
         // an actual crash + respawn.
-        let owner = ServerId::from("rust");
+        let owner = ServerId::from_static("rust");
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
             Translator::new()
@@ -4302,7 +4302,7 @@ mod tests {
 
         use crate::config::{ServerId, ToolRouter};
 
-        let owner = ServerId::from("rust");
+        let owner = ServerId::from_static("rust");
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         notification_cache.lock().await.observe_indexing_signal(
             &owner,
@@ -4361,7 +4361,7 @@ mod tests {
 
         use crate::config::{ServerId, ToolRouter};
 
-        let owner = ServerId::from("rust");
+        let owner = ServerId::from_static("rust");
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         notification_cache.lock().await.observe_indexing_signal(
             &owner,
@@ -4454,7 +4454,7 @@ sleep 0.3
         )
         .unwrap();
 
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let config = ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
@@ -4467,7 +4467,7 @@ sleep 0.3
                 timeout_seconds: TimeoutSecs::new(5).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from("rust")),
+                name: Some(ServerId::from_static("rust")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
@@ -4601,7 +4601,7 @@ sleep 0.3
         let file = root.join("main.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
 
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
@@ -5847,7 +5847,7 @@ sleep 0.3
         std::fs::write(&rust_file, "fn main() {}").unwrap();
         std::fs::write(&python_file, "pass").unwrap();
 
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let mut translator = Translator::new()
             .with_extensions(HashMap::from([
                 (
@@ -6224,7 +6224,12 @@ sleep 0.3
         std::fs::write(&file, "fn main() {}").unwrap();
         let mut translator = Translator::new()
             .with_router(ToolRouter::catch_all(servers.iter().map(
-                |(id, language, _)| (ServerId::from(*id), LanguageId::new(*language).unwrap()),
+                |(id, language, _)| {
+                    (
+                        ServerId::new(*id).unwrap(),
+                        LanguageId::new(*language).unwrap(),
+                    )
+                },
             )))
             .with_extensions(std::collections::HashMap::from([
                 (
@@ -6242,8 +6247,8 @@ sleep 0.3
         let mut fake_servers = Vec::new();
         for (id, _, caps) in servers {
             let (client, fake) = fake_lsp_client();
-            translator.register_client(id, client);
-            translator.register_server(id, LspServer::new_for_test(caps));
+            translator.register_client(ServerId::new(id).unwrap(), client);
+            translator.register_server(ServerId::new(id).unwrap(), LspServer::new_for_test(caps));
             fake_servers.push(fake);
         }
         let server = McplsServer::new(
@@ -6692,7 +6697,7 @@ sleep 0.3
             .server
             .context
             .translator
-            .rebind_router(&HashSet::from([ServerId::from("rust")]));
+            .rebind_router(&HashSet::from([ServerId::from_static("rust")]));
         let report = report_json(&fixture.server, None).await;
         assert_eq!(report["languages"], serde_json::json!(["python", "rust"]));
         assert_eq!(
@@ -6785,7 +6790,7 @@ sleep 0.3
                     ToolBackend::Workspace(_) => assert_eq!(
                         reported,
                         RouteSupport::CapabilityNotAdvertised {
-                            server: "a-srv".into(),
+                            server: crate::config::ServerId::from_static("a-srv"),
                             capability: Capability::WorkspaceSymbols,
                         }
                     ),
@@ -6804,10 +6809,10 @@ sleep 0.3
         use crate::config::{ServerId, ToolRouter};
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             LanguageId::from_static("rust"),
         )]));
-        translator.set_expected_servers(HashSet::from([ServerId::from("rust")]));
+        translator.set_expected_servers(HashSet::from([ServerId::from_static("rust")]));
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),

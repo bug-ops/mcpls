@@ -268,7 +268,7 @@ mod sh_servers {
                 timeout_seconds: TimeoutSecs::new(20).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(20).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from(id)),
+                name: Some(ServerId::new(id).unwrap()),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,

@@ -495,7 +495,7 @@ mod tests {
     fn test_respawn_backoff_remaining_returns_none_once_delay_elapsed() {
         let clock = Arc::new(FakeClock::new());
         let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
 
         translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
         translator.record_respawn_failure(&id);
@@ -516,7 +516,7 @@ mod tests {
     fn test_reconcile_respawn_stability_clears_backoff_after_proven_stable() {
         let clock = Arc::new(FakeClock::new());
         let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
 
         translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
         translator.record_respawn_failure(&id);
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn test_respawn_lock_is_shared_across_lookups_for_same_id() {
         let translator = Translator::new();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         translator.set_expected_servers(std::collections::HashSet::from([id.clone()]));
 
         let first = translator.respawn_lock(&id);
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn test_unknown_id_has_a_detached_lock_and_no_backoff() {
         let translator = Translator::new();
-        let id = ServerId::from("ghost");
+        let id = ServerId::from_static("ghost");
 
         assert!(!Arc::ptr_eq(
             &translator.respawn_lock(&id),
@@ -575,8 +575,8 @@ mod tests {
     fn test_respawn_lock_differs_across_ids() {
         let translator = Translator::new();
 
-        let rust_lock = translator.respawn_lock(&ServerId::from("rust"));
-        let python_lock = translator.respawn_lock(&ServerId::from("python"));
+        let rust_lock = translator.respawn_lock(&ServerId::from_static("rust"));
+        let python_lock = translator.respawn_lock(&ServerId::from_static("python"));
 
         assert!(!Arc::ptr_eq(&rust_lock, &python_lock));
     }
@@ -586,7 +586,7 @@ mod tests {
         let translator = Translator::new();
         assert!(
             translator
-                .dead_server_config(&ServerId::from("rust"))
+                .dead_server_config(&ServerId::from_static("rust"))
                 .is_none()
         );
     }
@@ -657,7 +657,7 @@ sleep 0.3
                 pid_file.display()
             ));
             fs::write(&crashing, body).unwrap();
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
 
             let server = LspServer::spawn(stub_server_config("rust", &crashing))
                 .await
@@ -690,7 +690,7 @@ sleep 0.3
         async fn test_respawn_if_dead_noop_when_server_alive() {
             let dir = TempDir::new().unwrap();
             let script = write_responder_script(dir.path(), 1);
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script);
 
             let server = LspServer::spawn(config).await.unwrap();
@@ -708,7 +708,7 @@ sleep 0.3
         async fn test_respawn_if_dead_replaces_server_with_stopped_message_loop() {
             let dir = TempDir::new().unwrap();
             let script = write_responder_script(dir.path(), 5);
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
 
             let seed = crate::lsp::fake_lsp_server_with_dead_loop_and_live_child();
             let translator = Translator::new();
@@ -728,7 +728,7 @@ sleep 0.3
         async fn test_respawn_if_dead_uses_config_of_registered_server() {
             let dir = TempDir::new().unwrap();
             let script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script);
 
             let server = LspServer::spawn(config.clone()).await.unwrap();
@@ -753,7 +753,7 @@ sleep 0.3
 
             let dir = TempDir::new().unwrap();
             let crash = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let server = LspServer::spawn(stub_server_config("rust", &crash))
                 .await
                 .unwrap();
@@ -803,7 +803,7 @@ sleep 5
         async fn test_respawn_if_dead_propagates_spawn_failure() {
             let dir = TempDir::new().unwrap();
             let script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &script);
 
             let server = LspServer::spawn(seed_config).await.unwrap();
@@ -859,7 +859,7 @@ fi
                 .replace("__MARKER__", &marker.display().to_string());
             fs::write(&script_path, script_body).unwrap();
 
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script_path);
 
             let seed = LspServer::spawn(config.clone()).await.unwrap();
@@ -899,7 +899,7 @@ fi
         async fn test_respawn_if_dead_backs_off_after_repeated_failure() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -939,7 +939,7 @@ fi
         async fn test_respawn_if_dead_reattempts_once_backoff_window_elapses() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -997,7 +997,7 @@ fi
         async fn test_respawn_if_dead_backs_off_after_quick_recrash_following_success() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -1050,7 +1050,7 @@ fi
         async fn test_respawn_if_dead_clears_diagnostics_cache_when_diagnostics_route() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -1079,7 +1079,7 @@ fi
                 .await
                 .store_diagnostics(&id, &never_opened_uri, None, vec![]);
             cache.lock().await.store_diagnostics(
-                &ServerId::from("python"),
+                &ServerId::from_static("python"),
                 &other_language_uri,
                 None,
                 vec![],
@@ -1118,7 +1118,7 @@ fi
                  push-degraded, since its replacement's notifications are discarded"
             );
             assert!(
-                !guard.is_push_degraded(&ServerId::from("python")),
+                !guard.is_push_degraded(&ServerId::from_static("python")),
                 "an unrelated, never-respawned server must not be marked degraded"
             );
             drop(guard);
@@ -1137,7 +1137,7 @@ fi
         async fn test_respawn_if_dead_awaits_replacement_indexing_signal() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -1187,7 +1187,7 @@ fi
         async fn test_respawn_if_dead_without_signal_history_stays_unknown() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed = LspServer::spawn(stub_server_config("rust", &seed_script))
                 .await
                 .unwrap();
@@ -1239,7 +1239,7 @@ fi
         async fn test_respawn_if_dead_reacquires_indexing_state_from_replacement() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -1303,7 +1303,7 @@ sleep 1
         async fn test_respawn_if_dead_aborts_previous_forwarder_handle() {
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();
@@ -1358,7 +1358,7 @@ sleep 1
 
             let dir = TempDir::new().unwrap();
             let seed_script = write_crash_after_init_script(dir.path());
-            let hover_id = ServerId::from("hover-only");
+            let hover_id = ServerId::from_static("hover-only");
             let hover_seed_config = stub_server_config("hover-only", &seed_script);
 
             let seed = LspServer::spawn(hover_seed_config).await.unwrap();
@@ -1378,7 +1378,7 @@ sleep 1
                     timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
-                    name: Some(ServerId::from("hover-only")),
+                    name: Some(ServerId::from_static("hover-only")),
                     handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
                     indexing: crate::bridge::IndexingPolicy::Auto,
                     selection: crate::config::ServerSelection::Explicit,
@@ -1394,7 +1394,7 @@ sleep 1
                     timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
-                    name: Some(ServerId::from("diag-catchall")),
+                    name: Some(ServerId::from_static("diag-catchall")),
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                     selection: crate::config::ServerSelection::Explicit,
@@ -1460,7 +1460,7 @@ sleep 1
             fs::write(&file_path, "fn main() {}").unwrap();
 
             let seed_script = write_crash_after_init_script(dir.path());
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
             let seed = LspServer::spawn(seed_config).await.unwrap();

@@ -911,7 +911,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
@@ -1018,7 +1018,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
@@ -2355,7 +2355,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
             ..Default::default()
@@ -2402,7 +2402,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
             ..Default::default()
@@ -2471,7 +2471,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
                 lsp_types::CodeActionOptions {
@@ -2582,7 +2582,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::Bool(true)),
             ..Default::default()
@@ -2660,7 +2660,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
                 lsp_types::CodeActionOptions {
@@ -2752,7 +2752,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
                 lsp_types::CodeActionOptions {
@@ -2854,7 +2854,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             code_action_provider: Some(lsp_types::CodeActionProvider::CodeActionOptions(
                 lsp_types::CodeActionOptions {
@@ -2935,7 +2935,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
@@ -2982,7 +2982,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()

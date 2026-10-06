@@ -79,14 +79,14 @@ impl Fixture {
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
             WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
         );
         let (client, server, _lanes) = fake_lsp_client_with_redactions(redactions);
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
         let wiring = Arc::new(RecordingWiring {
             subscribed: std::sync::atomic::AtomicBool::new(true),
             ..RecordingWiring::default()
@@ -134,7 +134,7 @@ impl Fixture {
     }
 
     fn rust() -> ServerId {
-        ServerId::from("rust")
+        ServerId::from_static("rust")
     }
 }
 

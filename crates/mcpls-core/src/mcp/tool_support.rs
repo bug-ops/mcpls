@@ -416,9 +416,12 @@ impl ServerText for ToolSupportReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerId;
 
     fn supported() -> RouteSupport {
-        RouteSupport::Supported { server: "s".into() }
+        RouteSupport::Supported {
+            server: ServerId::from_static("s"),
+        }
     }
 
     #[test]
@@ -510,7 +513,7 @@ mod tests {
     #[test]
     fn push_only_route_serializes_as_push_only_with_its_server() {
         let push_only = RouteSupport::PushOnly {
-            server: "ts".into(),
+            server: ServerId::from_static("ts"),
         };
         assert_eq!(
             serde_json::to_value(&push_only).unwrap(),

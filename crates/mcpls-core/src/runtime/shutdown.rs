@@ -155,6 +155,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::bridge::Translator;
+    use crate::config::ServerId;
 
     /// #241: `serve_with`'s post-transport shutdown sequence must drain
     /// registered LSP servers rather than orphaning them. Exercises
@@ -167,7 +168,10 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_drains_registered_lsp_server() {
         let translator = Translator::new();
-        translator.register_server("fake-server", crate::lsp::fake_lsp_server());
+        translator.register_server(
+            ServerId::from_static("fake-server"),
+            crate::lsp::fake_lsp_server(),
+        );
         assert_eq!(translator.registered_server_count(), 1);
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);

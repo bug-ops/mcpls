@@ -560,7 +560,7 @@ mod plan_tests {
         let plan = plan(&config, &roots);
 
         assert!(plan.admitted.is_empty());
-        assert_eq!(refused_ids(&plan), [ServerId::from("rust")]);
+        assert_eq!(refused_ids(&plan), [ServerId::from_static("rust")]);
         std::assert_matches!(
             &plan.refused[0].failure.reason,
             StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal::NotAllowed {
@@ -587,13 +587,13 @@ mod plan_tests {
         go.command = ServerCommand::new(gopls.to_string_lossy().into_owned()).unwrap();
         let config = config_with(
             vec![LspServerConfig::rust_analyzer(), go],
-            WorkspaceTrust::untrusted([ServerId::from("go")]),
+            WorkspaceTrust::untrusted([ServerId::from_static("go")]),
         );
 
         let plan = plan(&config, &roots);
 
-        assert_eq!(admitted_ids(&plan), [ServerId::from("go")]);
-        assert_eq!(refused_ids(&plan), [ServerId::from("rust")]);
+        assert_eq!(admitted_ids(&plan), [ServerId::from_static("go")]);
+        assert_eq!(refused_ids(&plan), [ServerId::from_static("rust")]);
     }
 
     #[test]
@@ -706,7 +706,7 @@ mod plan_tests {
         }
 
         fn untrusted_allowing_rust() -> WorkspaceTrust {
-            WorkspaceTrust::untrusted([ServerId::from("rust")])
+            WorkspaceTrust::untrusted([ServerId::from_static("rust")])
         }
 
         fn refused_executable(plan: &StartPlan) -> Option<PathBuf> {
@@ -771,7 +771,7 @@ mod plan_tests {
 
             let plan = plan_allowing_rust(rust_with_path(&fx.workspace.join("bin")), &fx);
 
-            assert_eq!(admitted_ids(&plan), [ServerId::from("rust")]);
+            assert_eq!(admitted_ids(&plan), [ServerId::from_static("rust")]);
         }
 
         #[test]
@@ -781,7 +781,7 @@ mod plan_tests {
 
             let plan = plan_allowing_rust(rust_with_path(&fx.outside), &fx);
 
-            assert_eq!(admitted_ids(&plan), [ServerId::from("rust")]);
+            assert_eq!(admitted_ids(&plan), [ServerId::from_static("rust")]);
             assert!(plan.refused.is_empty());
         }
 
@@ -798,7 +798,7 @@ mod plan_tests {
             );
 
             assert_eq!(refused_executable(&plan), None);
-            assert_eq!(refused_ids(&plan), [ServerId::from("rust")]);
+            assert_eq!(refused_ids(&plan), [ServerId::from_static("rust")]);
         }
 
         #[test]
@@ -813,7 +813,7 @@ mod plan_tests {
                 &fx.roots,
             );
 
-            assert_eq!(admitted_ids(&plan), [ServerId::from("rust")]);
+            assert_eq!(admitted_ids(&plan), [ServerId::from_static("rust")]);
         }
 
         #[test]
@@ -1121,7 +1121,7 @@ mod plan_tests {
         }
 
         fn untrusted_allowing_typescript() -> WorkspaceTrust {
-            WorkspaceTrust::untrusted([ServerId::from("typescript")])
+            WorkspaceTrust::untrusted([ServerId::from_static("typescript")])
         }
 
         fn plan_logging(config: &ServerConfig, roots: &WorkspaceRoots) -> (StartPlan, Vec<String>) {
@@ -1497,7 +1497,7 @@ mod plan_tests {
                 &fx.roots,
             );
 
-            assert_eq!(admitted_ids(&plan), [ServerId::from("rust")]);
+            assert_eq!(admitted_ids(&plan), [ServerId::from_static("rust")]);
         }
 
         #[test]
@@ -1509,7 +1509,11 @@ mod plan_tests {
 
                 let plan = plan_allowing_rust(rust_launched_by(exe.to_str().unwrap(), args), &fx);
 
-                assert_eq!(admitted_ids(&plan), [ServerId::from("rust")], "{name}");
+                assert_eq!(
+                    admitted_ids(&plan),
+                    [ServerId::from_static("rust")],
+                    "{name}"
+                );
             }
         }
 
@@ -1558,7 +1562,7 @@ mod plan_tests {
                 &fx.roots,
             );
 
-            assert_eq!(admitted_ids(&plan), [ServerId::from("typescript")]);
+            assert_eq!(admitted_ids(&plan), [ServerId::from_static("typescript")]);
             assert_eq!(plan.admitted[0].pinned_tsserver(), None);
         }
 
@@ -1770,7 +1774,7 @@ mod plan_tests {
             let fx = fixture();
             let config = config_with(
                 vec![LspServerConfig::rust_analyzer(), LspServerConfig::gopls()],
-                WorkspaceTrust::untrusted([ServerId::from("rust")]),
+                WorkspaceTrust::untrusted([ServerId::from_static("rust")]),
             );
             let exe = fx.outside.join("rust-analyzer");
             executable(&exe);
@@ -1784,10 +1788,10 @@ mod plan_tests {
             assert_eq!(admitted.len(), 1);
             assert_eq!(
                 refused.iter().map(LspServerConfig::id).collect::<Vec<_>>(),
-                [ServerId::from("go")]
+                [ServerId::from_static("go")]
             );
             assert_eq!(failures.len(), 1);
-            assert_eq!(failures[0].server_id, ServerId::from("go"));
+            assert_eq!(failures[0].server_id, ServerId::from_static("go"));
         }
     }
 }
@@ -1993,7 +1997,7 @@ mod refusal_spawn_tests {
     #[tokio::test]
     async fn untrusted_workspace_never_runs_a_path_interpreter_from_the_workspace() {
         let (case, interpreter_marker) =
-            env_shebang_case(WorkspaceTrust::untrusted([ServerId::from("rust")]));
+            env_shebang_case(WorkspaceTrust::untrusted([ServerId::from_static("rust")]));
 
         let running = run_plan(&case);
         assert_eq!((running.admitted, running.refused), (1, 0));
@@ -2038,7 +2042,7 @@ mod windows_spawn_tests {
         server.command = ServerCommand::new(script.to_string_lossy().into_owned()).unwrap();
         let config = ServerConfig {
             lsp_servers: vec![server],
-            workspace_trust: WorkspaceTrust::untrusted([ServerId::from("rust")]),
+            workspace_trust: WorkspaceTrust::untrusted([ServerId::from_static("rust")]),
             ..ServerConfig::default()
         };
         let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();

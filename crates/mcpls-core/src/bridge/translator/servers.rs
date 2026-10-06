@@ -685,7 +685,7 @@ mod tests {
 
     fn failure(id: &str) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from(id),
+            server_id: ServerId::new(id).unwrap(),
             language_id: crate::config::LanguageId::from_static("rust"),
             command: "x".to_string(),
             reason: StartupFailure::InitTaskPanicked,
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn test_failed_then_expected_then_cleared_keeps_the_failure() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.record_failure(&failure("rust"));
         servers.set_expected(&HashSet::from([id.clone()]));
         assert!(servers.is_expected(&id));
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn test_failure_of_an_expected_server_settles_it_as_failed() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.set_expected(&HashSet::from([id.clone()]));
         assert!(servers.record_failure(&failure("rust")));
         assert!(servers.failure(&id).is_some());
@@ -727,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn test_failure_on_a_running_or_stopped_slot_is_ignored() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         assert!(!servers.record_failure(&failure("rust")));
@@ -743,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopped_slot_keeps_the_dead_client_and_is_never_revived_by_a_swap() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
         drop(servers.remove_server(&id));
 
@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn test_swap_replaces_the_backend_in_one_assignment_and_returns_the_old_one() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         let old = servers.slot_for_swap(&id, running_backend()).unwrap();
@@ -775,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn test_pull_probe_is_fresh_for_every_replacement_process() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
         assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
 
@@ -795,7 +795,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_and_restore_round_trip_and_refuse_a_settled_slot() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         let held = servers.take_for_restart(&id).unwrap();
@@ -811,7 +811,10 @@ mod tests {
     #[test]
     fn test_clear_expected_keeps_failed_and_drops_plain_expected() {
         let mut servers = Servers::default();
-        let (failed, plain) = (ServerId::from("failed"), ServerId::from("plain"));
+        let (failed, plain) = (
+            ServerId::from_static("failed"),
+            ServerId::from_static("plain"),
+        );
         servers.record_failure(&failure("failed"));
         servers.set_expected(&HashSet::from([failed.clone(), plain.clone()]));
 
@@ -824,7 +827,7 @@ mod tests {
     #[test]
     fn test_set_expected_drops_expectation_of_servers_outside_the_set() {
         let mut servers = Servers::default();
-        let (a, b) = (ServerId::from("a"), ServerId::from("b"));
+        let (a, b) = (ServerId::from_static("a"), ServerId::from_static("b"));
         servers.set_expected(&HashSet::from([a.clone(), b.clone()]));
         servers.set_expected(&HashSet::from([a.clone()]));
         assert!(servers.is_expected(&a));

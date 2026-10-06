@@ -230,7 +230,7 @@ mod tests {
     async fn prepare_returns_one_based_items() {
         let dir = TempDir::new().unwrap();
         let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         let path = dir.path().join("a.rs");
         fs::write(&path, "struct Base;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();
@@ -279,7 +279,7 @@ mod tests {
     async fn prepare_null_response_is_empty_not_an_error() {
         let dir = TempDir::new().unwrap();
         let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         let path = dir.path().join("a.rs");
         fs::write(&path, "let x = 1;").unwrap();
 
@@ -317,7 +317,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (translator, _server) = translator_with_capabilities(
             &dir,
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             lsp_types::ServerCapabilities::default(),
         );
         let path = dir.path().join("a.rs");
@@ -335,7 +335,7 @@ mod tests {
     async fn walk_request_method(direction: WalkDirection) -> (String, serde_json::Value) {
         let dir = TempDir::new().unwrap();
         let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         let path = dir.path().join("a.rs");
         fs::write(&path, "struct Derived;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();
@@ -395,7 +395,7 @@ mod tests {
     async fn walk_rejects_item_outside_the_workspace_without_a_request() {
         let dir = TempDir::new().unwrap();
         let (translator, _server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         let outside = TempDir::new().unwrap();
         let path = outside.path().join("a.rs");
         fs::write(&path, "struct Derived;").unwrap();
@@ -412,7 +412,7 @@ mod tests {
     async fn walk_forwards_the_canonical_document_uri_not_the_raw_item_uri() {
         let dir = TempDir::new().unwrap();
         let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("a.rs"), "struct Derived;").unwrap();
         let root = canonical_dir(&dir);
@@ -456,7 +456,7 @@ mod tests {
     async fn walk_caps_items_and_reports_truncation() {
         let dir = TempDir::new().unwrap();
         let (translator, mut server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps());
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps());
         let path = dir.path().join("a.rs");
         fs::write(&path, "struct Derived;").unwrap();
         let uri = Url::from_file_path(&path).unwrap().to_string();

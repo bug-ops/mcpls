@@ -119,7 +119,7 @@ mod tests {
     fn test_unknown_route_samples_no_signal() {
         let cache = NotificationCache::new();
         assert_eq!(RouteSignals::sample(&cache, None), RouteSignals::default());
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         assert_eq!(
             RouteSignals::sample(&cache, Some(&id)),
             RouteSignals::default()

@@ -42,12 +42,12 @@ pub fn login_home_dir() -> Option<PathBuf> {
 /// ```
 /// use mcpls_core::config::{ServerId, WorkspaceTrust};
 ///
-/// let rust = ServerId::from("rust");
+/// let rust = ServerId::from_static("rust");
 /// assert!(WorkspaceTrust::default().allows(&rust));
 ///
 /// let untrusted = WorkspaceTrust::untrusted([rust.clone()]);
 /// assert!(untrusted.allows(&rust));
-/// assert!(!untrusted.allows(&ServerId::from("python")));
+/// assert!(!untrusted.allows(&ServerId::from_static("python")));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum WorkspaceTrust {
@@ -85,10 +85,10 @@ impl WorkspaceTrust {
 /// ```
 /// use mcpls_core::config::{ServerAllowlist, ServerId};
 ///
-/// let list = ServerAllowlist::new(["rust", "rust", "go"].map(ServerId::from));
+/// let list = ServerAllowlist::new(["rust", "rust", "go"].map(ServerId::from_static));
 /// assert_eq!(list.as_slice().len(), 2);
-/// assert!(list.contains(&ServerId::from("go")));
-/// assert!(!ServerAllowlist::default().contains(&ServerId::from("go")));
+/// assert!(list.contains(&ServerId::from_static("go")));
+/// assert!(!ServerAllowlist::default().contains(&ServerId::from_static("go")));
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerAllowlist(Vec<ServerId>);
@@ -126,20 +126,20 @@ mod tests {
     #[test]
     fn test_default_is_trusted_and_allows_everything() {
         assert_eq!(WorkspaceTrust::default(), WorkspaceTrust::Trusted);
-        assert!(WorkspaceTrust::Trusted.allows(&ServerId::from("anything")));
+        assert!(WorkspaceTrust::Trusted.allows(&ServerId::from_static("anything")));
     }
 
     #[test]
     fn test_untrusted_allows_only_listed_ids() {
-        let trust = WorkspaceTrust::untrusted([ServerId::from("rust")]);
-        assert!(trust.allows(&ServerId::from("rust")));
-        assert!(!trust.allows(&ServerId::from("python")));
-        assert!(!WorkspaceTrust::untrusted([]).allows(&ServerId::from("rust")));
+        let trust = WorkspaceTrust::untrusted([ServerId::from_static("rust")]);
+        assert!(trust.allows(&ServerId::from_static("rust")));
+        assert!(!trust.allows(&ServerId::from_static("python")));
+        assert!(!WorkspaceTrust::untrusted([]).allows(&ServerId::from_static("rust")));
     }
 
     #[test]
     fn test_allowlist_deduplicates_keeping_first_occurrence() {
-        let list = ServerAllowlist::new(["b", "a", "b", "a"].map(ServerId::from));
-        assert_eq!(list.as_slice(), ["b", "a"].map(ServerId::from));
+        let list = ServerAllowlist::new(["b", "a", "b", "a"].map(ServerId::from_static));
+        assert_eq!(list.as_slice(), ["b", "a"].map(ServerId::from_static));
     }
 }

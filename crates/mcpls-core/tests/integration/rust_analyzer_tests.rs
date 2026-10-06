@@ -77,7 +77,7 @@ async fn setup_rust_analyzer_with_lifecycle_cache()
     let mut lifecycle_rx = server.take_lifecycle_rx();
     let cache = Arc::new(Mutex::new(NotificationCache::new()));
     let forwarder_cache = Arc::clone(&cache);
-    let server_id = ServerId::from("rust");
+    let server_id = ServerId::from_static("rust");
     tokio::spawn(async move {
         while let Some(notification) = lifecycle_rx.recv().await {
             let mut cache = forwarder_cache.lock().await;
@@ -96,7 +96,7 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
     let mut translator = Translator::new()
         .with_extensions(extension_map)
         .with_router(ToolRouter::catch_all([(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             LanguageId::from_static("rust"),
         )]));
     translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_path]).unwrap());
@@ -621,7 +621,7 @@ async fn test_diagnostics_with_error() {
         let indexing_state = notification_cache
             .lock()
             .await
-            .indexing_state(&ServerId::from("rust"));
+            .indexing_state(&ServerId::from_static("rust"));
         let (deadline, reason) = match indexing_state {
             IndexingState::Ready => panic!(
                 "Diagnostics lack the intentional error although indexing is Ready; \

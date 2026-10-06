@@ -817,7 +817,7 @@ mod tests {
     async fn test_wait_for_indexing_ready_without_cache_is_noop() {
         // No wired cache (most fixtures) must never block -- see `Translator::notification_cache`'s field doc.
         let translator = Translator::new();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .wait_for_indexing_ready(&server_id)
@@ -829,7 +829,7 @@ mod tests {
     async fn test_wait_for_indexing_ready_unknown_state_is_noop() {
         let translator = Translator::new()
             .with_notification_cache(Arc::new(Mutex::new(NotificationCache::new())));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .wait_for_indexing_ready(&server_id)
@@ -840,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_ready_state_is_noop() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -862,7 +862,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_wait_for_indexing_ready_uses_configured_timeout_override() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -885,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_loading_times_out() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -904,14 +904,14 @@ mod tests {
 
         assert_matches!(
             err,
-            Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from("rust")
+            Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from_static("rust")
         );
     }
 
     #[tokio::test]
     async fn test_wait_for_indexing_ready_returns_ok_once_signaled_ready() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -954,7 +954,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_hover_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -988,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_hover_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -1037,7 +1037,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_hover_timeout_keeps_document_open_for_next_request() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -1096,7 +1096,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_definition_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1134,7 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1185,7 +1185,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_references_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1224,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1276,7 +1276,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_implementation_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
             ..Default::default()
@@ -1313,7 +1313,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_type_definition_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1357,7 +1357,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_timeout_does_not_mutate_shared_state() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -1391,7 +1391,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_one_callers_timeout_does_not_release_another() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -1482,7 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_flattens_single_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1549,7 +1549,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_does_not_filter_out_of_workspace_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1615,7 +1615,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_does_not_filter_out_of_workspace_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1709,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_sets_truncated_flag_past_cap() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1774,7 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_implementation_flattens_location_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
             ..Default::default()
@@ -1849,7 +1849,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_flattens_location_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -1906,7 +1906,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_flattens_link_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -1966,7 +1966,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_null_response_is_empty() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -2009,7 +2009,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_declaration_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -2046,7 +2046,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_type_definition_flattens_definition_link_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
             ..Default::default()

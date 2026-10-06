@@ -89,12 +89,12 @@ fn test_two_server_routing_fixture_loads_and_routes() {
 
     assert_eq!(
         router.resolve("python", ToolKind::Diagnostics),
-        Some(&ServerId::from("pylsp")),
+        Some(&ServerId::from_static("pylsp")),
         "pylsp explicitly claims diagnostics"
     );
     assert_eq!(
         router.resolve("python", ToolKind::Hover),
-        Some(&ServerId::from("pyright")),
+        Some(&ServerId::from_static("pyright")),
         "pyright is the catch-all for everything else"
     );
 }

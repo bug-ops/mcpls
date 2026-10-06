@@ -13,6 +13,7 @@
 //! would create a `config -> mcp -> bridge -> config` cycle. When a new
 //! routable MCP tool is added, extend [`ToolKind::ALL`] here.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use schemars::JsonSchema;
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::language_id::LanguageId;
 use super::server::LspServerConfig;
+use super::text_newtype::impl_text_newtype;
 use crate::error::{ConfigError, Result};
 
 /// A server id was empty or whitespace-only.
@@ -46,13 +48,38 @@ pub struct InvalidServerId;
 /// assert_eq!(ServerId::new("pyright").unwrap().as_str(), "pyright");
 /// assert!(ServerId::new("  ").is_err());
 /// ```
-// TODO(#673): `From<&str>`/`From<String>` below can still build a blank id; replace them with
-// `from_static` and migrate the fixtures (follow-up issue "ServerId still has infallible
-// From<&str>/From<String> constructors").
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
-pub struct ServerId(String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(try_from = "String", into = "String")]
+#[schemars(with = "String")]
+pub struct ServerId(Cow<'static, str>);
 
 impl ServerId {
+    /// Builds an id from a literal, checked at compile time when evaluated in
+    /// a `const` context.
+    ///
+    /// Accepts exactly the literals [`Self::new`] accepts: ASCII and not blank.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is blank or not ASCII.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::ServerId;
+    ///
+    /// const RUST: ServerId = ServerId::from_static("rust");
+    /// assert_eq!(RUST.as_str(), "rust");
+    /// ```
+    #[must_use]
+    pub const fn from_static(id: &'static str) -> Self {
+        assert!(
+            id.is_ascii() && !id.trim_ascii().is_empty(),
+            "server id cannot be blank"
+        );
+        Self(Cow::Borrowed(id))
+    }
+
     /// Builds an id from any string.
     ///
     /// # Errors
@@ -63,56 +90,15 @@ impl ServerId {
         if id.trim().is_empty() {
             return Err(InvalidServerId);
         }
-        Ok(Self(id))
-    }
-
-    /// Borrow the identity as a plain string, e.g. for log messages or map
-    /// lookups against external APIs that expect `&str`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+        Ok(Self(Cow::Owned(id)))
     }
 }
 
-impl std::fmt::Display for ServerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::str::FromStr for ServerId {
-    type Err = InvalidServerId;
-
-    fn from_str(id: &str) -> std::result::Result<Self, Self::Err> {
-        Self::new(id)
-    }
-}
-
-impl<'de> Deserialize<'de> for ServerId {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let id = String::deserialize(deserializer)?;
-        Self::new(id).map_err(serde::de::Error::custom)
-    }
-}
-
-impl From<String> for ServerId {
-    fn from(id: String) -> Self {
-        Self(id)
-    }
-}
+impl_text_newtype!(ServerId, InvalidServerId);
 
 impl From<LanguageId> for ServerId {
     fn from(id: LanguageId) -> Self {
-        Self(id.into())
-    }
-}
-
-impl From<&str> for ServerId {
-    fn from(id: &str) -> Self {
-        Self(id.to_string())
+        Self(Cow::Owned(id.into()))
     }
 }
 
@@ -397,7 +383,7 @@ pub enum NoServerReason {
 /// ```
 /// use mcpls_core::config::{LanguageId, ServerId, ServerSettlement, ToolKind, ToolRouter};
 ///
-/// let mut router = ToolRouter::catch_all([(ServerId::from("pyright"), LanguageId::from_static("python"))]);
+/// let mut router = ToolRouter::catch_all([(ServerId::from_static("pyright"), LanguageId::from_static("python"))]);
 /// router.rebind(|_| ServerSettlement::Failed);
 /// assert!(router.resolve("python", ToolKind::Hover).is_none());
 /// ```
@@ -712,8 +698,8 @@ impl ToolRouter {
     /// use mcpls_core::config::{LanguageId, ServerId, ToolRouter};
     ///
     /// let router = ToolRouter::catch_all([
-    ///     (ServerId::from("pyright"), LanguageId::from_static("python")),
-    ///     (ServerId::from("rust-analyzer"), LanguageId::from_static("rust")),
+    ///     (ServerId::from_static("pyright"), LanguageId::from_static("python")),
+    ///     (ServerId::from_static("rust-analyzer"), LanguageId::from_static("rust")),
     /// ]);
     /// assert_eq!(router.configured_languages(), ["python", "rust"]);
     /// ```
@@ -741,8 +727,23 @@ mod tests {
         assert!(serde_json::from_str::<ServerId>("\" \"").is_err());
         assert_eq!(
             serde_json::from_str::<ServerId>("\"pylsp\"").unwrap(),
-            ServerId::from("pylsp")
+            ServerId::from_static("pylsp")
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "server id cannot be blank")]
+    fn test_server_id_from_static_panics_on_blank() {
+        let _ = ServerId::from_static(" ");
+    }
+
+    #[test]
+    fn test_server_id_static_and_owned_compare_and_serialize_alike() {
+        let owned = ServerId::new("rust".to_owned()).unwrap();
+        assert_eq!(owned, ServerId::from_static("rust"));
+        assert_eq!(owned, "rust");
+        assert_eq!(serde_json::to_string(&owned).unwrap(), "\"rust\"");
+        assert_eq!(String::from(owned), "rust");
     }
 
     #[test]
@@ -785,7 +786,7 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: name.map(ServerId::from),
+            name: name.map(|id| ServerId::new(id).unwrap()),
             handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
@@ -801,11 +802,11 @@ mod tests {
         let router = ToolRouter::from_configs(&configs).unwrap();
         assert_eq!(
             router.resolve("python", ToolKind::Hover),
-            Some(&ServerId::from("pyright"))
+            Some(&ServerId::from_static("pyright"))
         );
         assert_eq!(
             router.resolve("python", ToolKind::Diagnostics),
-            Some(&ServerId::from("pylsp"))
+            Some(&ServerId::from_static("pylsp"))
         );
     }
 
@@ -828,7 +829,7 @@ mod tests {
         // though python was declared first.
         assert_eq!(
             router.resolve_any(ToolKind::WorkspaceSymbols),
-            Ok(&ServerId::from("rust-catch-all"))
+            Ok(&ServerId::from_static("rust-catch-all"))
         );
     }
 
@@ -845,7 +846,7 @@ mod tests {
         let router = ToolRouter::from_configs(&configs).unwrap();
         assert_eq!(
             router.resolve_any(ToolKind::WorkspaceSymbols),
-            Ok(&ServerId::from("python-explicit"))
+            Ok(&ServerId::from_static("python-explicit"))
         );
     }
 
@@ -962,12 +963,12 @@ mod tests {
             cfg("python", Some("pylsp"), None),
         ];
         let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("pylsp")]);
+        let registered: HashSet<ServerId> = HashSet::from([ServerId::from_static("pylsp")]);
         router.rebind_to_registered(&registered);
 
         assert_eq!(
             router.resolve("python", ToolKind::Hover),
-            Some(&ServerId::from("pylsp"))
+            Some(&ServerId::from_static("pylsp"))
         );
     }
 
@@ -978,7 +979,7 @@ mod tests {
             cfg("python", Some("pylsp"), Some(vec![ToolKind::Diagnostics])),
         ];
         let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("pylsp")]);
+        let registered: HashSet<ServerId> = HashSet::from([ServerId::from_static("pylsp")]);
         router.rebind_to_registered(&registered);
 
         // pyright died, no catch-all exists, and pylsp never claimed Hover:
@@ -986,7 +987,7 @@ mod tests {
         assert_eq!(router.resolve("python", ToolKind::Hover), None);
         assert_eq!(
             router.resolve("python", ToolKind::Diagnostics),
-            Some(&ServerId::from("pylsp"))
+            Some(&ServerId::from_static("pylsp"))
         );
     }
 
@@ -1032,11 +1033,11 @@ mod tests {
 
         assert_eq!(
             router.resolve("rust", ToolKind::Hover),
-            Some(&ServerId::from("slow"))
+            Some(&ServerId::from_static("slow"))
         );
         assert_eq!(
             router.resolve_any(ToolKind::Hover),
-            Ok(&ServerId::from("slow"))
+            Ok(&ServerId::from_static("slow"))
         );
     }
 
@@ -1055,9 +1056,9 @@ mod tests {
         };
 
         let pending_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Pending);
-        assert_eq!(pending_catch_all, Some(ServerId::from("pyright")));
+        assert_eq!(pending_catch_all, Some(ServerId::from_static("pyright")));
         let registered_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Registered);
-        assert_eq!(registered_catch_all, Some(ServerId::from("pylsp")));
+        assert_eq!(registered_catch_all, Some(ServerId::from_static("pylsp")));
         let failed_catch_all = settle(ServerSettlement::Failed, ServerSettlement::Failed);
         assert_eq!(failed_catch_all, None);
     }
@@ -1069,7 +1070,7 @@ mod tests {
                 let registered: HashSet<ServerId> = [("pyright", pyright_up), ("pylsp", pylsp_up)]
                     .into_iter()
                     .filter(|(_, up)| *up)
-                    .map(|(id, _)| ServerId::from(id))
+                    .map(|(id, _)| ServerId::new(id).unwrap())
                     .collect();
                 let mut router = explicit_and_catch_all_router();
                 router.rebind_to_registered(&registered);
@@ -1102,11 +1103,11 @@ mod tests {
     fn test_rebind_prunes_order_for_resolve_any() {
         let configs = vec![cfg("rust", Some("a"), None), cfg("python", Some("b"), None)];
         let mut router = ToolRouter::from_configs(&configs).unwrap();
-        let registered: HashSet<ServerId> = HashSet::from([ServerId::from("b")]);
+        let registered: HashSet<ServerId> = HashSet::from([ServerId::from_static("b")]);
         router.rebind_to_registered(&registered);
         assert_eq!(
             router.resolve_any(ToolKind::Hover),
-            Ok(&ServerId::from("b"))
+            Ok(&ServerId::from_static("b"))
         );
     }
 
@@ -1134,19 +1135,22 @@ mod tests {
     #[test]
     fn test_catch_all_helper_registers_two_entries() {
         let router = ToolRouter::catch_all([
-            (ServerId::from("ts"), LanguageId::from_static("typescript")),
             (
-                ServerId::from("tsx"),
+                ServerId::from_static("ts"),
+                LanguageId::from_static("typescript"),
+            ),
+            (
+                ServerId::from_static("tsx"),
                 LanguageId::from_static("typescriptreact"),
             ),
         ]);
         assert_eq!(
             router.resolve("typescript", ToolKind::Hover),
-            Some(&ServerId::from("ts"))
+            Some(&ServerId::from_static("ts"))
         );
         assert_eq!(
             router.resolve("typescriptreact", ToolKind::Hover),
-            Some(&ServerId::from("tsx"))
+            Some(&ServerId::from_static("tsx"))
         );
     }
 
@@ -1166,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_server_id_display_and_as_str() {
-        let id = ServerId::from("pyright");
+        let id = ServerId::from_static("pyright");
         assert_eq!(id.as_str(), "pyright");
         assert_eq!(id.to_string(), "pyright");
     }

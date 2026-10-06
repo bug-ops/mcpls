@@ -649,7 +649,7 @@ mod tests {
     use super::*;
 
     fn test_server() -> ServerId {
-        ServerId::from("test-server")
+        ServerId::from_static("test-server")
     }
 
     fn progress(kind: &str, token: i32) -> ProgressParams {
@@ -740,8 +740,8 @@ mod tests {
     #[test]
     fn test_observe_server_status_tracks_servers_independently() {
         let mut tracker = IndexingTracker::new();
-        let rust = ServerId::from("rust");
-        let python = ServerId::from("python");
+        let rust = ServerId::from_static("rust");
+        let python = ServerId::from_static("python");
         tracker.observe_server_status(
             &rust,
             "experimental/serverStatus",
@@ -929,8 +929,8 @@ mod tests {
     #[test]
     fn test_observe_progress_tracks_servers_independently() {
         let mut tracker = IndexingTracker::new();
-        let rust = ServerId::from("rust");
-        let go = ServerId::from("go");
+        let rust = ServerId::from_static("rust");
+        let go = ServerId::from_static("go");
 
         tracker.observe_progress(&rust, &progress("begin", 1));
 
@@ -1281,8 +1281,8 @@ mod tests {
     #[test]
     fn test_await_replacement_tracks_servers_independently() {
         let mut tracker = IndexingTracker::new();
-        let rust = ServerId::from("rust");
-        let python = ServerId::from("python");
+        let rust = ServerId::from_static("rust");
+        let python = ServerId::from_static("python");
         server_status(&mut tracker, &rust, true);
         server_status(&mut tracker, &python, true);
         await_replacement(&mut tracker, &rust);
@@ -1378,7 +1378,7 @@ mod tests {
             let (_client, mut server, lanes) = fake_lsp_client_with_lanes();
             assert_create_request_is_acknowledged(&mut server).await;
             let (cache, _cancel) = spawn_test_pump_over_lanes(lanes);
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             tokio::time::pause();
 
             send_progress(&mut server, "begin").await;

@@ -1686,7 +1686,7 @@ file_patterns = ["**/*.ts", "**/*.tsx"]"#;
     #[test]
     fn test_named_native_entry_appended_to_default_is_rejected() {
         let mut named = native_entries("");
-        named[0].name = Some(ServerId::from("native-ts"));
+        named[0].name = Some(ServerId::from_static("native-ts"));
         let mut configs = vec![LspServerConfig::typescript()];
         configs.extend(named);
         let err = ToolRouter::from_configs(&configs).unwrap_err().to_string();

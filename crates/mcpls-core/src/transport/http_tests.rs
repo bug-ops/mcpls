@@ -1816,7 +1816,7 @@ async fn test_http_listen_replays_cached_diagnostics() {
         crate::bridge::NotificationCache::new(),
     ));
     cache.lock().await.store_diagnostics(
-        &crate::config::ServerId::from("rust"),
+        &crate::config::ServerId::from_static("rust"),
         &crate::bridge::path_to_uri(&file).unwrap(),
         None,
         vec![],
@@ -1976,7 +1976,7 @@ async fn test_http_listen_lease_with_real_client_replays_cache_and_evictions() {
 
     const REQUESTED: usize = 200;
     const CACHED: usize = 10;
-    let server_id = crate::config::ServerId::from("rust");
+    let server_id = crate::config::ServerId::from_static("rust");
     let workspace = tempfile::TempDir::new().unwrap();
     let root = dunce::canonicalize(workspace.path()).unwrap();
     let make = |name: &str| {
@@ -2218,12 +2218,12 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     let mut translator = Translator::new()
         .with_extensions(crate::test_lsp::test_extensions())
         .with_router(ToolRouter::catch_all([(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             LanguageId::from_static("rust"),
         )]));
     translator.set_workspace_roots(roots.clone());
     let (client, mut fake) = fake_lsp_client();
-    translator.register_client("rust".to_string(), client);
+    translator.register_client(ServerId::from_static("rust"), client);
     let (_cancel, cancel_rx) = watch::channel(false);
     translator.install_wiring(Arc::new(PumpWiring::new(
         PumpShared {
@@ -2316,7 +2316,7 @@ async fn test_pull_only_file_is_replayed_once_on_subscribe_and_listen() {
         crate::bridge::NotificationCache::new(),
     ));
     cache.lock().await.store_pulled_for_test(
-        &crate::config::ServerId::from("rust"),
+        &crate::config::ServerId::from_static("rust"),
         &crate::bridge::path_to_uri(&file).unwrap(),
         vec![lsp_types::Diagnostic::default()],
     );

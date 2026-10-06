@@ -3714,7 +3714,7 @@ mod tests {
             });
             let _ = read_framed_message(&mut reader).await;
 
-            client.mark_restarted(ServerId::from("rust"));
+            client.mark_restarted(ServerId::from_static("rust"));
             client
                 .shutdown_until(Instant::now() + Duration::from_millis(200))
                 .await

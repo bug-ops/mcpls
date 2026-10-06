@@ -175,7 +175,7 @@ mod tests {
         encoding: Option<lsp_types::PositionEncodingKind>,
     ) -> FoldingRangesResult {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = encoding.map_or_else(
             || translator_with_capabilities(&dir, &server_id, caps()),
             |encoding| {
@@ -375,7 +375,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (translator, _server) = translator_with_capabilities(
             &dir,
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             lsp_types::ServerCapabilities::default(),
         );
         let path = dir.path().join("a.rs");

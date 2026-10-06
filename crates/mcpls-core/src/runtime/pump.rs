@@ -536,7 +536,7 @@ mod pump_tests {
 
         let c = Arc::clone(&cache);
         tokio::spawn(diagnostics_pump(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -609,7 +609,7 @@ mod pump_tests {
         let workspace_roots = WorkspaceRoots::for_test(vec![workspace_root], vec![]);
 
         tokio::spawn(diagnostics_pump(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -679,7 +679,7 @@ mod pump_tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         let handle = tokio::spawn(diagnostics_pump(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -710,7 +710,7 @@ mod pump_tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         let handle = tokio::spawn(diagnostics_pump(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -756,7 +756,7 @@ mod pump_tests {
         lock_acquired.notified().await;
 
         tokio::spawn(diagnostics_pump(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -814,7 +814,7 @@ mod pump_tests {
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         tokio::spawn(diagnostics_pump(
             server_id.clone(),
@@ -872,7 +872,7 @@ mod pump_tests {
         let (_tx, rx) = mpsc::channel::<LspNotification>(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let server_id = ServerId::from("gopls");
+        let server_id = ServerId::from_static("gopls");
 
         tokio::spawn(diagnostics_pump(
             server_id.clone(),
@@ -926,7 +926,7 @@ mod pump_tests {
         let (tx, rx) = mpsc::channel(2);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let server_id = ServerId::from("gopls");
+        let server_id = ServerId::from_static("gopls");
 
         // Fill the notification lane to capacity before the pump drains it, forcing a backlog.
         for _ in 0..2 {
@@ -1061,7 +1061,7 @@ mod pump_tests {
         }
 
         let cache = make_cache();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
         let published = bridge::resolve_one(&bridge::path_to_uri(&cleared_file).unwrap(), &roots)
             .await
@@ -1130,7 +1130,7 @@ mod pump_tests {
             .unwrap();
         let cache = make_cache();
         cache.lock().await.store_pulled_for_test(
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             &test_uri("x.rs"),
             vec![lsp_types::Diagnostic::default()],
         );
@@ -1174,7 +1174,7 @@ mod pump_tests {
         let cache = make_cache();
         let error = lsp_types::Diagnostic::default();
         let mut guard = cache.lock().await;
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         guard.store_diagnostics(&server, &test_uri("first.rs"), None, vec![error.clone()]);
         for i in 1..bridge::MAX_DIAGNOSTIC_ENTRIES {
             guard.store_diagnostics(
@@ -1361,7 +1361,7 @@ mod pump_tests {
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         tokio::spawn(diagnostics_pump_with_resolver(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -1411,7 +1411,7 @@ mod pump_tests {
         let (tx, rx) = mpsc::channel(8);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         tokio::spawn(diagnostics_pump_with_resolver(
             server_id.clone(),
             rx,
@@ -1479,7 +1479,7 @@ mod pump_tests {
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         tokio::spawn(diagnostics_pump_with_resolver(
-            ServerId::from("tsls"),
+            ServerId::from_static("tsls"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -1531,7 +1531,7 @@ mod pump_tests {
     #[tokio::test]
     async fn test_contain_pump_panic_degrades_only_after_a_panic() {
         let cache = Mutex::new(NotificationCache::new());
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &id,
             "experimental/serverStatus",
@@ -1573,7 +1573,7 @@ mod pump_tests {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let (role_tx, role_rx) = watch::channel(DiagnosticsRole::Authoritative);
         tokio::spawn(diagnostics_pump_with_resolver(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -1638,7 +1638,7 @@ mod pump_tests {
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let pump = tokio::spawn(diagnostics_pump_with_resolver(
-            ServerId::from("rust"),
+            ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,
@@ -2016,7 +2016,7 @@ mod pump_tests {
             std::fs::write(&file, "fn main() {}").unwrap();
             let uri = bridge::resources::make_uri(&file).unwrap();
 
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let mut translator = Translator::new()
                 .with_extensions(crate::test_lsp::test_extensions())
                 .with_router(config::ToolRouter::catch_all([(
@@ -2086,7 +2086,7 @@ mod pump_tests {
         fn settle_failed(&self) {
             self.translator
                 .record_startup_failures(&[crate::error::ServerSpawnFailure {
-                    server_id: ServerId::from("rust"),
+                    server_id: ServerId::from_static("rust"),
                     language_id: LanguageId::from_static("rust"),
                     command: "rust-analyzer".to_string(),
                     reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {

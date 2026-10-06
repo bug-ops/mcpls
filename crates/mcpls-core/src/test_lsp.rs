@@ -386,7 +386,7 @@ pub fn named_sh_init_config(
     let sub = dir.join(name);
     std::fs::create_dir_all(&sub).unwrap();
     let mut config = sh_script_init_config(&sub, script_body);
-    config.server_config_mut().name = Some(ServerId::from(name));
+    config.server_config_mut().name = Some(ServerId::new(name).unwrap());
     config.server_config_mut().language_id = LanguageId::new(language).unwrap();
     config.server_config_mut().timeout_seconds = TimeoutSecs::new(10).unwrap();
     config
@@ -520,7 +520,7 @@ fn spawn_pump<K: Send + 'static>(
     tokio::spawn(async move {
         let _keep_alive = keep_alive;
         crate::runtime::pump::diagnostics_pump(
-            crate::config::ServerId::from("rust"),
+            crate::config::ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
             cancel_rx,

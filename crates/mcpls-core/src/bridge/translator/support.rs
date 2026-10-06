@@ -269,16 +269,16 @@ mod tests {
         expected: &[&str],
         caps: &[(&str, ServerCapabilities)],
     ) -> ToolSupportSnapshot {
-        let ids = |names: &[&str]| names.iter().map(|n| ServerId::from(*n)).collect();
+        let ids = |names: &[&str]| names.iter().map(|n| ServerId::new(*n).unwrap()).collect();
         ToolSupportSnapshot {
             router: Arc::new(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )])),
             expected: ids(expected),
             capabilities: caps
                 .iter()
-                .map(|(id, caps)| (ServerId::from(*id), CapabilitySet::of(caps)))
+                .map(|(id, caps)| (ServerId::new(*id).unwrap(), CapabilitySet::of(caps)))
                 .collect(),
             pull_support: HashMap::new(),
             registered: ids(registered),
@@ -329,7 +329,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         let snap = snapshot(&["rust"], &[], &[("rust", rename_only)]);
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Rename),
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::Supported {
-                server: ServerId::from("rust")
+                server: ServerId::from_static("rust")
             }
         );
     }
@@ -388,21 +388,21 @@ mod tests {
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
             RouteSupport::CapabilityNotAdvertised {
-                server: ServerId::from("rust"),
+                server: ServerId::from_static("rust"),
                 capability: Capability::Hover,
             }
         );
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Diagnostics),
             RouteSupport::Supported {
-                server: ServerId::from("rust")
+                server: ServerId::from_static("rust")
             }
         );
     }
 
     fn snapshot_with_pull(pull: PullSupport) -> ToolSupportSnapshot {
         ToolSupportSnapshot {
-            pull_support: HashMap::from([(ServerId::from("rust"), pull)]),
+            pull_support: HashMap::from([(ServerId::from_static("rust"), pull)]),
             ..snapshot(&["rust"], &[], &[("rust", rust_caps(true))])
         }
     }
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn diagnostics_route_is_push_only_unless_pull_is_advertised_or_answered() {
         let language = LanguageId::from_static("rust");
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         for (pull, push_only) in [
             (PullSupport::Advertised, false),
             (PullSupport::Answers, false),
@@ -486,7 +486,7 @@ mod tests {
     async fn server_is_never_misreported_across_registration_and_restart_steps() {
         use crate::lsp::LspServer;
 
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
             id.clone(),
             LanguageId::from_static("rust"),
@@ -526,8 +526,10 @@ mod tests {
 
     #[test]
     fn language_without_live_route_is_listed_as_no_server() {
-        let mut router =
-            ToolRouter::catch_all([(ServerId::from("rust"), LanguageId::from_static("rust"))]);
+        let mut router = ToolRouter::catch_all([(
+            ServerId::from_static("rust"),
+            LanguageId::from_static("rust"),
+        )]);
         router.rebind_to_registered(&HashSet::new());
         let snap = ToolSupportSnapshot {
             router: Arc::new(router),
@@ -562,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn translator_snapshot_reflects_registered_capabilities() {
         let dir = TempDir::new().unwrap();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let (translator, _fake) = translator_with_capabilities(&dir, &id, rust_caps(true));
         let snap = translator.tool_support_snapshot();
         assert_eq!(
@@ -583,7 +585,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (translator, _fake) = translator_with_capabilities(
             &dir,
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             ServerCapabilities::default(),
         );
         let file = dir.path().join("a.rs");

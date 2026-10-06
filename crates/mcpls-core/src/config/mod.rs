@@ -1974,7 +1974,7 @@ mod tests {
     fn test_load_rejects_empty_language_id() {
         assert_toml_rejected(
             "[[lsp_servers]]\nlanguage_id = \"\"\ncommand = \"x\"\n",
-            &["language_id cannot be empty"],
+            &["language_id cannot be blank"],
         );
     }
 
@@ -3552,13 +3552,15 @@ mod tests {
 
         #[test]
         fn test_validate_accepts_allowed_ids_of_configured_servers() {
-            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rust")]));
+            let config =
+                config_with_servers(WorkspaceTrust::untrusted([ServerId::from_static("rust")]));
             assert!(config.validate().is_ok());
         }
 
         #[test]
         fn test_validate_rejects_an_allowed_id_that_names_no_configured_server() {
-            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rsut")]));
+            let config =
+                config_with_servers(WorkspaceTrust::untrusted([ServerId::from_static("rsut")]));
             let err = config.validate().unwrap_err();
             let text = err.to_string();
             assert_matches!(

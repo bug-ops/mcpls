@@ -726,7 +726,12 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(
+            &ServerId::from_static("rust"),
+            &uri,
+            Some(1),
+            vec![diagnostic],
+        );
 
         let cache_key = Translator::cached_diagnostics_uri(
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
@@ -846,7 +851,7 @@ mod tests {
             },
         ];
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
+        cache.store_diagnostics(&ServerId::from_static("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
@@ -902,7 +907,12 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(
+            &ServerId::from_static("rust"),
+            &uri,
+            Some(1),
+            vec![diagnostic],
+        );
 
         let cache_key = Translator::cached_diagnostics_uri(
             &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
@@ -1113,7 +1123,7 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(
@@ -1125,7 +1135,7 @@ mod tests {
         )]);
         let (client, mut server, _lanes) =
             crate::test_lsp::fake_lsp_client_with_redactions(redactions);
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1133,7 +1143,7 @@ mod tests {
         let uri = path_to_uri(&path.canonicalize().unwrap()).unwrap();
         let notification_cache = Mutex::new(NotificationCache::new());
         notification_cache.lock().await.store_diagnostics(
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             &uri,
             Some(1),
             vec![lsp_diag(
@@ -1215,7 +1225,7 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
@@ -1223,7 +1233,7 @@ mod tests {
         );
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1238,7 +1248,7 @@ mod tests {
         {
             let mut cache = notification_cache.lock().await;
             cache.store_diagnostics(
-                &ServerId::from("rust"),
+                &ServerId::from_static("rust"),
                 &uri,
                 Some(1),
                 vec![lsp_diag(
@@ -1312,7 +1322,7 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
@@ -1320,7 +1330,7 @@ mod tests {
         );
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1385,7 +1395,7 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
         translator.set_workspace_roots(
@@ -1393,7 +1403,7 @@ mod tests {
         );
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();

@@ -2894,7 +2894,7 @@ sleep 5
         use crate::bridge::Translator;
         use crate::config::{ServerId, ToolKind, ToolRouter};
 
-        let pylsp_id = ServerId::from("pylsp");
+        let pylsp_id = ServerId::from_static("pylsp");
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
@@ -2907,7 +2907,7 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from("pyright-diag")),
+                name: Some(ServerId::from_static("pyright-diag")),
                 handles: Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap()),
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
@@ -2923,7 +2923,7 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from("pylsp")),
+                name: Some(ServerId::from_static("pylsp")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
@@ -2932,13 +2932,13 @@ sleep 5
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);
         translator.set_expected_servers(
-            [ServerId::from("pyright-diag"), pylsp_id.clone()]
+            [ServerId::from_static("pyright-diag"), pylsp_id.clone()]
                 .into_iter()
                 .collect(),
         );
 
         translator.settle_failed(&ServerSpawnFailure {
-            server_id: ServerId::from("pyright-diag"),
+            server_id: ServerId::from_static("pyright-diag"),
             language_id: LanguageId::from_static("python"),
             command: "pyright-langserver".to_string(),
             reason: StartupFailure::InitTaskPanicked,
