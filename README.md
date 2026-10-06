@@ -185,7 +185,7 @@ Position-based tools (`get_hover`, `get_definition`, `get_references`, `go_to_im
 | Tool | What it does |
 |------|--------------|
 | `get_diagnostics` | Real compiler errors and warnings, not guesses |
-| `get_cached_diagnostics` | Fast access to push-based diagnostics from LSP server |
+| `get_cached_diagnostics` | Fast access to cached diagnostics: pushed by the server and stored by `get_diagnostics` pulls |
 | `get_code_actions` | Quick fixes, refactorings, and source actions at a position |
 
 </details>

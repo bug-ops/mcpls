@@ -132,7 +132,7 @@ array, `selectionRange` on call hierarchy items (so they round-trip into `get_in
 | Tool | LSP Method | Description |
 |------|------------|-------------|
 | [get_diagnostics](#get_diagnostics) | `textDocument/diagnostic` + push notifications | Compiler errors, warnings, and hints (merged from pull and push) |
-| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications | Diagnostics from server push notifications only |
+| [get_cached_diagnostics](#get_cached_diagnostics) | Cached notifications and pulls | Diagnostics pushed by the server plus the last report `get_diagnostics` stored |
 | [format_document](#format_document) | `textDocument/formatting` | Document formatting |
 | [format_range](#format_range) | `textDocument/rangeFormatting` | Formatting of a range |
 | [get_selection_ranges](#get_selection_ranges) | `textDocument/selectionRange` | Ranges enclosing a position, innermost first |
@@ -463,9 +463,10 @@ Claude: [Uses get_diagnostics] Found 1 warning:
 
 - Returns diagnostics from both LSP pull requests and push notifications from background analysis tools
 - Includes diagnostics from tools like clippy (Rust), pylint (Python), and other linters configured in your LSP server
-- Diagnostics are automatically deduplicated by severity, code, and proximity to avoid duplicates across sources
+- Diagnostics are automatically deduplicated by severity, code, and proximity to avoid duplicates across sources; the message is not compared, so two distinct errors with the same code that start within 3 lines are shown once, with the pulled message
 - Empty array if no issues found
-- If the LSP server is unavailable but diagnostics have been cached from previous push notifications, those cached diagnostics are returned
+- A full pull report is stored as the file's cached diagnostics next to the pushed ones, so `get_cached_diagnostics` and the `lsp-diagnostics://` resource return the same diagnostics right after; `unchanged` and partial reports, failed pulls, and reports raced by a later pull or an edit are returned but not stored
+- If the pull fails but diagnostics have been cached from previous pushes or pulls, those cached diagnostics are returned
 
 ---
 
@@ -966,7 +967,7 @@ Claude: [Uses get_outgoing_calls] The function calls:
 
 ## get_cached_diagnostics
 
-Get diagnostics from LSP server push notifications (cached), without making a new pull request.
+Get cached diagnostics: what the LSP server pushed via `textDocument/publishDiagnostics` together with the last full report a `get_diagnostics` pull stored for the file, without making a new pull request.
 
 ### Parameters
 
@@ -1000,13 +1001,14 @@ Get diagnostics from LSP server push notifications (cached), without making a ne
 
 ### Notes
 
-- Returns only diagnostics pushed by the LSP server via `textDocument/publishDiagnostics`, without making a new pull request
+- Returns the diagnostics pushed by the LSP server via `textDocument/publishDiagnostics` together with the last full `textDocument/diagnostic` report a `get_diagnostics` call stored for the file, without making a new pull request; a pushed diagnostic that duplicates a pulled one is dropped, so the result matches what `get_diagnostics` returned. The cache refreshes on the next pull: a stored pulled report is replaced only by a later pull or dropped by a push with a newer document version, so a file edited since the last pull can show older pulled diagnostics (a push without a version does not replace them). Like pushed ones, stored pulled diagnostics keep the server's `relatedInformation` locations (which can point outside the workspace) and redacted `data` in the `lsp-diagnostics://` resource read
 - Filtered by the same routing rules as `get_diagnostics`, so both tools use the same server when routed explicitly
 - Returns an empty array if the file hasn't been analyzed yet or no push notifications have been received, but only once the file's server is running (or no server is configured for its language)
 - If the server for the file's language failed to start, returns that startup error (`... failed to start: ...`, including the server's stderr when it printed any) instead of an empty array; the `lsp-diagnostics://` resource read behaves the same. Startup failures are not retried: fix the server and restart mcpls
 - A server may publish diagnostics for one file under several spellings (a symlink and its target, for example). mcpls keys them by the file's canonical path and returns the union, with exact duplicates removed and entries ordered by range, so errors published under a symlink path are visible when you ask for the real path. A symlink pointing outside the workspace roots is ignored
 - While the file's server is still starting, returns the retryable `ServerInitializing` error (code `-32051`) instead of an empty array; retry after a short wait
 - The diagnostics resource read, `resources/subscribe` and `subscriptions/listen` follow the same rules: subscribing while the server is still starting succeeds, and a subscriber is sent one `resources/updated` when startup fails, after which a re-read returns the error
+- A `get_diagnostics` call that changes a file's diagnostics also sends `resources/updated` to every session subscribed to its `lsp-diagnostics://` resource before the call returns; an identical pull sends nothing. A file edited on disk that no tool call pulls notifies nobody
 - Useful when you want fast, cached-only results without waiting for a fresh pull request
 
 ---

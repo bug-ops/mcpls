@@ -61,7 +61,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
 | 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | implemented | #565 |
 | 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
-| 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | draft | #574 |
+| 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648, #649 (follow-ups) |
 | 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
 
 ## runtime
