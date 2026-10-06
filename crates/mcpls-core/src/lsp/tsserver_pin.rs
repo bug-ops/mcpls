@@ -544,6 +544,16 @@ fn native_package_of(canonical: &Path) -> Option<&Path> {
         .then_some(package)
 }
 
+/// Whether the canonical `canonical` of `path`, or the directory `path` was
+/// found in, lies inside a root of `roots`.
+fn lies_inside_workspace(path: &Path, canonical: &Path, roots: &WorkspaceRoots) -> bool {
+    let parent_inside = path
+        .parent()
+        .and_then(|parent| dunce::canonicalize(parent).ok())
+        .is_some_and(|parent| roots.contains_canonical(&parent));
+    roots.contains_canonical(canonical) || parent_inside
+}
+
 impl NativeTsc {
     /// Accepts `path` only when it canonicalizes to the `bin/tsc` of a native
     /// `typescript` package, as an executable regular file with a UTF-8 path.
@@ -564,11 +574,7 @@ impl NativeTsc {
         if native_package_of(&canonical).is_none() {
             return Err(CandidateRejected::NotNativeTsc);
         }
-        let parent_inside = path
-            .parent()
-            .and_then(|parent| dunce::canonicalize(parent).ok())
-            .is_some_and(|parent| roots.contains_canonical(&parent));
-        if roots.contains_canonical(&canonical) || parent_inside {
+        if lies_inside_workspace(path, &canonical, roots) {
             return Err(CandidateRejected::InsideWorkspace);
         }
         if !host.is_executable_file(&canonical) {
@@ -624,6 +630,9 @@ pub enum TsserverKept {
     /// The native `tsc` is a `node` script and `node` is not on the effective
     /// `PATH`.
     NodeNotOnPath,
+    /// On Windows, the `node` that would run the native `tsc` lies inside a
+    /// workspace root and is never run without the user's own configuration.
+    NodeInsideWorkspace,
     /// The server is started through an unsupported shim, wrapper or package
     /// runner.
     UnsupportedLauncher,
@@ -645,6 +654,9 @@ impl fmt::Display for TsserverKept {
             Self::NotExecutable => "the TypeScript 7 `tsc` is not an executable file",
             Self::NonUtf8Path => "the TypeScript 7 `tsc` path is not valid UTF-8",
             Self::NodeNotOnPath => "the TypeScript 7 `tsc` needs `node`, which is not on PATH",
+            Self::NodeInsideWorkspace => {
+                "the `node` for the TypeScript 7 `tsc` is inside the workspace"
+            }
             Self::UnsupportedLauncher => {
                 "typescript-language-server is started through an unsupported launcher or shim"
             }
@@ -690,17 +702,26 @@ fn native_tsc_on_path(
 }
 
 /// How `tsc` is started on `host`, or why it cannot be.
+///
+/// On Windows `node` comes from the child's `PATH` and must pass the check the
+/// `tsc` passed: canonical, and neither it nor the directory it was found in
+/// inside a root of `roots`.
 fn native_launch(
     host: HostOs,
     tsc: &Path,
+    roots: &WorkspaceRoots,
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
 ) -> Result<NativeLaunch, TsserverKept> {
     let node = || find_on_child_path(host, config, &parent_env, NODE_NAME);
     match host {
         HostOs::Windows => {
-            let node = node().ok_or(TsserverKept::NodeNotOnPath)?;
-            let node = node.to_str().ok_or(TsserverKept::NonUtf8Path)?;
+            let found = node().ok_or(TsserverKept::NodeNotOnPath)?;
+            let canonical = dunce::canonicalize(&found).map_err(|_| TsserverKept::NodeNotOnPath)?;
+            if lies_inside_workspace(&found, &canonical, roots) {
+                return Err(TsserverKept::NodeInsideWorkspace);
+            }
+            let node = canonical.to_str().ok_or(TsserverKept::NonUtf8Path)?;
             let node = ServerCommand::new(node).map_err(|_| TsserverKept::NodeNotOnPath)?;
             Ok(NativeLaunch::ThroughNode(node))
         }
@@ -757,7 +778,7 @@ fn select_typescript_server_on(
         return kept(TsserverKept::NoNativeOutsideWorkspace);
     };
     Some(match NativeTsc::from_candidate(&candidate, roots, host) {
-        Ok(mut tsc) => match native_launch(host, tsc.path(), config, &parent_env) {
+        Ok(mut tsc) => match native_launch(host, tsc.path(), roots, config, &parent_env) {
             Ok(launch) => {
                 tsc.launch = launch;
                 TypescriptServerChoice::Native(tsc)
@@ -1260,6 +1281,26 @@ mod launch_tests {
             windows_select(&prefix, &roots, HostOs::Windows),
             Some(TypescriptServerChoice::Tsserver(
                 TsserverKept::NativeInsideWorkspace
+            ))
+        );
+    }
+
+    #[test]
+    fn test_windows_never_runs_a_node_from_inside_the_workspace() {
+        let (install, prefix, _tsc) = windows_npm_prefix(false);
+        let workspace = install.base.join("ws");
+        write(&workspace.join("node.exe"), "");
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
+        let path = std::env::join_paths([&prefix, &workspace]).unwrap();
+        let env = move |key: &str| (key == "PATH").then(|| path.clone());
+
+        let choice =
+            select_typescript_server_on(&config(SERVER_STEM, &[]), &roots, env, HostOs::Windows);
+
+        assert_eq!(
+            choice,
+            Some(TypescriptServerChoice::Tsserver(
+                TsserverKept::NodeInsideWorkspace
             ))
         );
     }
