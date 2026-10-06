@@ -84,6 +84,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
 | 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md, untrusted-workspace mode, launcher refusals, untrusted working directory) | #566; #652, #653, #657 |
 | 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599 |
+| 005 | [[runtime/005-untrusted-unlisted-wrapper-workspace-program/spec\|untrusted-unlisted-wrapper-workspace-program]] | enhancement | P3 | draft | #724 |
 
 ## testing
 
