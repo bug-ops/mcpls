@@ -68,11 +68,20 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   - no valid `typescript` package is found next to the server;
   - you set `initialization_options` for the server without `tsserver.path`.
 
+  Version-manager shims are not resolved because their install directory can
+  only be found through the manager's own layout, and asdf, mise and Volta pick
+  the version from workspace files; set `initialization_options.tsserver.path`
+  to pin them. In untrusted-workspace mode the first two cases are refused
+  instead of started with a warning (see below).
+
   A server installed inside the workspace is pinned, but that pins the
   workspace's own `typescript` and the server itself is workspace code, so
   nothing is narrowed. A `tsserver.path` you set yourself always wins; set it
   to a workspace path to opt back in to the workspace's TypeScript. The pin is
-  resolved once at startup. The pin narrows one vector. It does not make an
+  resolved once per start, and the path that is checked against the workspace
+  is the canonical path that is sent. A respawn resolves it again when the
+  pinned path no longer resolves to the same file, with the same check in
+  untrusted mode. The pin narrows one vector. It does not make an
   untrusted workspace safe.
 
 - **Automatic native `tsc` selection.** An entry with `selection = "auto"` (the
@@ -145,7 +154,34 @@ enforces the following, and nothing more:
   servers see the account home, so toolchains installed under the overridden
   `$HOME` are not found: set `HOME` in that server's `env` to opt in.
 - **tsserver pin.** A TypeScript server whose pinned tsserver lies inside the
-  workspace is refused instead of started.
+  workspace is refused instead of started, and so is one started through a
+  launcher no tsserver can be pinned for: a package runner, a version-manager
+  shim, or a wrapper that only names the server in its arguments (also when you
+  set `tsserver.path`, since the launcher still picks the server).
+- **Launcher.** A `command` that lets the workspace choose the program is
+  refused: package runners (`npm`, `npx`, `bunx`, `pnpm`, `pnpx`, `yarn`, `uvx`,
+  `corepack`, `deno npm:`), task runners (`make`, `just`, `task`, `rake`, `mvn`,
+  `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`,
+  `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
+  `./node_modules/.bin/<name>` from the working directory before anything else
+  and reads a workspace `.npmrc`, so the planted package would run. `env` is
+  unwrapped; `env -S` and a shell started with `-c` cannot be analyzed and are
+  refused. `deno lsp` is allowed. The list matches the command's file stem and
+  arguments and is best-effort: the trusted configuration is the boundary, so
+  install the server globally and give its absolute path as `command`.
+- **Working directory.** The server starts in your login home directory (else
+  the system temporary directory), never in the checkout, and is refused when
+  neither lies outside the workspace. Servers get the workspace from
+  `workspaceFolders`, so a server that treats its working directory as the
+  workspace root, or a relative path in `args`, no longer resolves into the
+  checkout; give such a server absolute paths and `workspace.roots`.
+- **Windows executable lookups.** `NoDefaultCurrentDirectoryInExePath=1` is
+  always set in the server's environment (a value you set is overridden), and
+  the working directory above is outside the workspace, so `cmd.exe` running an
+  npm `.cmd` shim, and a Node server starting `python` or `git` by name, do
+  not find a `node.exe`, `node.cmd` or `node.bat` in the checkout. Verified on
+  Windows only by the CI test that starts a `.cmd` server and records its
+  working directory.
 
 What the mode does not cover:
 
@@ -170,20 +206,22 @@ What the mode does not cover:
   unknown, a `HOME` set to the parent of a configured root (roots
   `[<ws>/pkg]`, `HOME=<ws>`) is not refused: it falls under the directories
   above a configured root listed below.
-- Launchers that choose the real server from files in the workspace: rustup
-  honors a workspace `rust-toolchain.toml` whose `path` names a toolchain
-  inside it, so the `rust-analyzer` proxy outside the workspace can run a
-  binary from the workspace; asdf, mise and Volta pick versions from workspace
-  files; Go switches toolchains from `go.mod`. The executable check sees only
-  the launcher.
+- Launchers that choose the real server from files in the workspace and are not
+  on the launcher list: rustup honors a workspace `rust-toolchain.toml` whose
+  `path` names a toolchain inside it, so the `rust-analyzer` proxy outside the
+  workspace can run a binary from the workspace; asdf, mise and Volta shims
+  (refused only for the TypeScript server) pick versions from workspace files;
+  Go switches toolchains from `go.mod`. The executable check sees only the
+  launcher, and the launcher list is best-effort.
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not
   every link of a chain.
-- TypeScript pin: a pin that resolves inside the workspace is refused, an
-  unresolved one (package runner, unknown wrapper) is not. mcpls starts the
-  server without a `rootUri`, so it does not look up a workspace tsserver on
-  its own, which is why this is not treated as a bypass.
+- TypeScript pin: a pin that resolves inside the workspace is refused, as is a
+  launcher that cannot be pinned. A server that is pinnable but has no valid
+  `typescript` next to it is admitted without a pin. mcpls starts the server
+  without a `rootUri`, so it does not look up a workspace tsserver on its own,
+  which is why this is not treated as a bypass.
 - Code the allowed servers run on their own (build scripts, procedural macros,
   tsconfig plugins) is outside every check above.
 

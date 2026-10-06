@@ -35,6 +35,15 @@ related:
 > history, most recently including the untrusted-project-config model (#345/#348) and the bounded
 > config-file read (#309).
 
+> [!note] Marker detection at startup (#659)
+> Startup collects the project markers of every configured server with `MarkerScan::collect`
+> (`config/server.rs`): the workspace roots first, then at most one walk per root while a marker is
+> still missing, stopping as soon as every marker is found, so a monorepo no longer pays one walk per
+> configured server. `plan_server_starts` runs on the blocking pool (`serve_with`), which keeps the
+> async workers free; `initialize` still waits for the plan, since the router the MCP server answers
+> from is built from it. `LspServerConfig::should_spawn` remains the single-server form with the same
+> result.
+
 ## 1. Overview
 
 ### Problem Statement
@@ -152,7 +161,7 @@ THEN node_modules is excluded from the search and this nested package.json does 
 | FR-007 | THE SYSTEM SHALL resolve relative `workspace.roots` entries against the config file's own directory for an explicitly-named config (`load_from`'s default), but against the process's current working directory for the auto-discovered global/user config tier (since that tier is not tied to any particular project) | must |
 | FR-008 | THE SYSTEM SHALL provide 6 built-in `LspServerConfig`s (rust-analyzer, pyright, typescript-language-server, gopls, clangd, zls), each gated by `ServerHeuristics::project_markers` naming the files/directories that indicate that language's project type | must |
 | FR-009 | THE SYSTEM SHALL provide ~30 built-in file-extension → language-ID mappings (`default_language_extensions`), user-overridable/-extensible via `workspace.language_extensions` | must |
-| FR-010 | WHEN `ServerHeuristics::is_applicable_recursive` searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10; `ServerConfig::validate` rejects values above `MAX_HEURISTICS_DEPTH` = 64), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`) | must |
+| FR-010 | WHEN `ServerHeuristics::is_applicable_recursive` searches a workspace tree for project markers THE SYSTEM SHALL search recursively up to `heuristics_max_depth` (default 10; `ServerConfig::validate` rejects values above `MAX_HEURISTICS_DEPTH` = 64), excluding well-known noise directories (`node_modules`, `target`, `.git`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `.cargo`, `.rustup`, `vendor`, `coverage`, `.next`, `.nuxt`); at startup THE SYSTEM SHALL do so with one walk per workspace root for all servers together, on the blocking pool (`MarkerScan`) | must |
 | FR-011 | WHEN `ServerHeuristics::project_markers` is empty THE SYSTEM SHALL treat the server as always applicable (no heuristic gating) | must |
 | FR-012 | THE SYSTEM SHALL reject (`Error::InvalidConfig`) an empty `workspace.position_encodings` list, an unrecognized encoding string, an empty `workspace.roots` entry, an empty/duplicate-claiming server config (`language_id`, `command`, `handles`), a `timeout_seconds`/`request_timeout_seconds` of `0` or above `MAX_TIMEOUT_SECONDS` (900s), and a `workspace.heuristics_max_depth` above `MAX_HEURISTICS_DEPTH` (64) | must |
 

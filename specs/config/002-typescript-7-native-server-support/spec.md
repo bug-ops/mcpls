@@ -37,6 +37,16 @@ related:
 > optionally selecting the native TypeScript server automatically under the workspace-code-execution
 > trust model.
 
+> [!note] Shared resolution and user `tsserver.path` (#657, #645)
+> Selection, the pin and the untrusted-mode check read `initialization_options.tsserver.path` through one
+> `UserTsserverPath { Absent, Path, Invalid }`: a non-string value counts as user-set and keeps
+> `typescript-language-server` (`TsserverKept::UserTsserverPath`), where it used to skip the pin yet allow
+> native selection. The server, `tsc` and `node` are found by the single `PATH` walker in
+> `lsp/command_path.rs` (on Windows a name without extension is looked up as `.exe`, as a spawn does).
+> The pin is resolved once per server start (`TypescriptPlan`). Version-manager shims stay unresolved;
+> the documented way to pin them is `initialization_options.tsserver.path`, and untrusted mode refuses
+> them ([[runtime/003-workspace-supplied-code-execution/spec|runtime/003]], #652).
+
 ## 1. Overview
 
 ### Problem Statement
