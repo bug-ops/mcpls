@@ -456,8 +456,12 @@ impl ResourceDiagnosticsResponse {
             tracked,
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
-            // TODO(#666): derive from the cache entry and its eviction history.
-            availability: DiagnosticsAvailability::Published,
+            // Refined from the cache's eviction history by `resource_diagnostics_response`.
+            availability: if entry.is_some() {
+                DiagnosticsAvailability::Published
+            } else {
+                DiagnosticsAvailability::Pending
+            },
             signals,
         }
     }
@@ -802,11 +806,10 @@ impl McplsServer {
         };
         let signals = before.union(after);
 
-        self.structured_result(result.map(|result| DiagnosticsResponse {
-            result,
-            // TODO(#666): derive from the cache entry and the route's pull support.
-            availability: DiagnosticsAvailability::Published,
-            origin: DiagnosticsOrigin::Pull,
+        self.structured_result(result.map(|answer| DiagnosticsResponse {
+            result: answer.result,
+            availability: answer.availability,
+            origin: answer.origin,
             signals,
         }))
     }
@@ -1217,11 +1220,12 @@ impl McplsServer {
                 // Lock only long enough for the map lookup + clone: no
                 // canonicalize() or Vec mapping while `notification_cache`
                 // is held, since `diagnostics_pump` needs the same lock.
-                let (sources, owner, signals) = {
+                let (sources, owner, availability, signals) = {
                     let cache = self.context.notification_cache.lock().await;
                     let owner = cache.diagnostics_owner(&uri).cloned();
+                    let availability = cache.availability(&uri, route_id.as_ref());
                     let signals = RouteSignals::sample(&cache, route_id.as_ref());
-                    (cache.diagnostic_sources(&uri), owner, signals)
+                    (cache.diagnostic_sources(&uri), owner, availability, signals)
                 };
                 let diag_info = sources.merge();
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
@@ -1235,8 +1239,7 @@ impl McplsServer {
                 .await;
                 Ok(CachedDiagnosticsResponse {
                     result,
-                    // TODO(#666): derive from the cache entry and its eviction history.
-                    availability: DiagnosticsAvailability::Published,
+                    availability,
                     signals,
                 })
             }
@@ -1504,21 +1507,24 @@ impl McplsServer {
         // Only the snapshot is taken under the cache lock: merging the sources
         // (dedupe, sort, size cap) runs after it is released, since
         // `diagnostics_pump` needs the same lock.
-        let (sources, signals) = {
+        let (sources, availability, signals) = {
             let cache = self.context.notification_cache.lock().await;
             (
                 cache.diagnostic_sources(&lsp_uri),
+                cache.availability(&lsp_uri, route_id.as_ref()),
                 RouteSignals::sample(&cache, route_id.as_ref()),
             )
         };
         let diag_info = sources.merge();
-        Ok(build_resource_diagnostics_response(
+        let mut response = build_resource_diagnostics_response(
             self.context
                 .translator
                 .is_document_open(validated_path.as_path()),
             diag_info.as_ref(),
             signals,
-        ))
+        );
+        response.availability = availability;
+        Ok(response)
     }
 
     /// Body of `read_resource`, kept separate so it can run under
@@ -2609,7 +2615,7 @@ mod tests {
             RouteSignals::default(),
         ))
         .unwrap();
-        assert_eq!(resource["availability"], "published");
+        assert_eq!(resource["availability"], "pending");
     }
 
     /// #636: an inverted `range` or `selectionRange` is `-32602`, while a
@@ -6599,7 +6605,14 @@ sleep 0.3
 
         let diagnostics = tool_entry(&report, "get_diagnostics");
         assert_eq!(diagnostics["coverage"], "all");
-        assert!(diagnostics.get("routes").is_none());
+        assert_eq!(
+            diagnostics["routes"],
+            serde_json::json!([
+                {"languages": ["python"], "status": "push_only", "server": "py-srv"},
+                {"languages": ["rust"], "status": "push_only", "server": "rust-srv"},
+            ]),
+            "servers advertising no diagnosticProvider answer from the push cache"
+        );
 
         let workspace = tool_entry(&report, "workspace_symbol_search");
         assert_eq!(workspace["coverage"], "none");

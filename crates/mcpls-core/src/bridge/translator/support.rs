@@ -16,6 +16,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::Translator;
+use super::pull_support::PullSupport;
 use super::routing::{
     Capability, LanguageCandidates, RouteLookup, WorkspaceRouteLookup, lookup_route,
     lookup_workspace_route,
@@ -91,6 +92,7 @@ pub struct ToolSupportSnapshot {
     router: Arc<ToolRouter>,
     expected: HashSet<ServerId>,
     capabilities: HashMap<ServerId, CapabilitySet>,
+    pull_support: HashMap<ServerId, PullSupport>,
     registered: HashSet<ServerId>,
 }
 
@@ -131,7 +133,16 @@ impl ToolSupportSnapshot {
             |_| None,
         );
         match lookup {
-            RouteLookup::Registered(server, ()) => self.registered_support(server, capability),
+            RouteLookup::Registered(server, ()) => {
+                match (tool, self.registered_support(server, capability)) {
+                    (ToolKind::Diagnostics, RouteSupport::Supported { server })
+                        if self.answers_from_push_cache(&server) =>
+                    {
+                        RouteSupport::PushOnly { server }
+                    }
+                    (_, support) => support,
+                }
+            }
             RouteLookup::Initializing(_) => RouteSupport::Initializing,
             RouteLookup::Failed(_) | RouteLookup::Dangling { .. } | RouteLookup::Unrouted => {
                 RouteSupport::NoServer
@@ -160,6 +171,15 @@ impl ToolSupportSnapshot {
         }
     }
 
+    /// Whether `get_diagnostics` reads `server`'s push cache because it
+    /// advertises no pull provider and has not shown that it answers pulls.
+    fn answers_from_push_cache(&self, server: &ServerId) -> bool {
+        matches!(
+            self.pull_support.get(server),
+            Some(PullSupport::Probing | PullSupport::Unsupported)
+        )
+    }
+
     fn registered_support(&self, server: ServerId, capability: Option<Capability>) -> RouteSupport {
         let Some(caps) = self.capabilities.get(&server) else {
             return RouteSupport::Initializing;
@@ -186,6 +206,16 @@ impl Translator {
             .running_servers()
             .map(|(id, server)| (id.clone(), CapabilitySet::of(server.capabilities())))
             .collect();
+        let pull_support = servers
+            .running_servers()
+            .map(|(id, server)| {
+                let advertised = server.capabilities().diagnostic_provider.is_some();
+                (
+                    id.clone(),
+                    PullSupport::of(advertised, servers.pull_probe(id)),
+                )
+            })
+            .collect();
         let registered = servers
             .ids()
             .filter(|id| servers.client(id).is_some())
@@ -200,6 +230,7 @@ impl Translator {
             router,
             expected,
             capabilities,
+            pull_support,
             registered,
         }
     }
@@ -249,6 +280,7 @@ mod tests {
                 .iter()
                 .map(|(id, caps)| (ServerId::from(*id), CapabilitySet::of(caps)))
                 .collect(),
+            pull_support: HashMap::new(),
             registered: ids(registered),
         }
     }
@@ -368,6 +400,47 @@ mod tests {
         );
     }
 
+    fn snapshot_with_pull(pull: PullSupport) -> ToolSupportSnapshot {
+        ToolSupportSnapshot {
+            pull_support: HashMap::from([(ServerId::from("rust"), pull)]),
+            ..snapshot(&["rust"], &[], &[("rust", rust_caps(true))])
+        }
+    }
+
+    /// #666: a server that advertises no pull provider, and has not shown it
+    /// answers pulls, is reported as answering `get_diagnostics` from the push
+    /// cache; one that advertises or answers is plain supported.
+    #[test]
+    fn diagnostics_route_is_push_only_unless_pull_is_advertised_or_answered() {
+        let language = LanguageId::from_static("rust");
+        let server = ServerId::from("rust");
+        for (pull, push_only) in [
+            (PullSupport::Advertised, false),
+            (PullSupport::Answers, false),
+            (PullSupport::Probing, true),
+            (PullSupport::Unsupported, true),
+        ] {
+            let support =
+                snapshot_with_pull(pull).document_support(&language, ToolKind::Diagnostics);
+            let expected = if push_only {
+                RouteSupport::PushOnly {
+                    server: server.clone(),
+                }
+            } else {
+                RouteSupport::Supported {
+                    server: server.clone(),
+                }
+            };
+            assert_eq!(support, expected, "{pull:?}");
+        }
+        assert_eq!(
+            snapshot_with_pull(PullSupport::Unsupported)
+                .document_support(&language, ToolKind::Hover),
+            RouteSupport::Supported { server },
+            "only the diagnostics route is affected"
+        );
+    }
+
     #[test]
     fn client_without_server_capabilities_is_initializing() {
         let snap = snapshot(&["rust"], &[], &[]);
@@ -460,6 +533,7 @@ mod tests {
             router: Arc::new(router),
             expected: HashSet::new(),
             capabilities: HashMap::new(),
+            pull_support: HashMap::new(),
             registered: HashSet::new(),
         };
         assert_eq!(snap.languages(), ["rust"]);
@@ -475,6 +549,7 @@ mod tests {
             router: Arc::new(ToolRouter::default()),
             expected: HashSet::new(),
             capabilities: HashMap::new(),
+            pull_support: HashMap::new(),
             registered: HashSet::new(),
         };
         assert!(snap.languages().is_empty());

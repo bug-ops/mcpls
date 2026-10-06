@@ -11,12 +11,14 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use super::Translator;
+use super::availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 use super::dto::{
     Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, ServerLogsResult,
     ServerMessagesResult,
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
+use super::pull_support::{PullProbe, PullSupport};
 use super::routing::PreparedDocument;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::{
@@ -27,8 +29,9 @@ use crate::bridge::{
     ClientPath, DiagnosticInfo, DiagnosticSources, DiagnosticsKey, DocumentTracker,
     NotificationCache, WorkspacePath, WorkspaceRoots, path_to_uri,
 };
-use crate::config::ToolKind;
-use crate::error::Result;
+use crate::config::{ServerId, ToolKind};
+use crate::error::{Error, Result};
+use crate::util::lock_std;
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
 /// shapes.
@@ -41,7 +44,7 @@ use crate::error::Result;
 /// a deserialization error where today it degrades to an empty diagnostics
 /// list. This preserves the union gluon's `DocumentDiagnosticReportResult`
 /// used to provide, via the untyped `LspClient::request`.
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum DocumentDiagnosticReportResult {
     Report(lsp_types::DocumentDiagnosticReport),
@@ -56,6 +59,31 @@ enum DocumentDiagnosticReportResult {
         )]
         lsp_types::DocumentDiagnosticReportPartialResult,
     ),
+}
+
+/// `textDocument/diagnostic` with [`DocumentDiagnosticReportResult`] as its
+/// result, so it can go through `LspClient::request_typed_classified` and the
+/// caller decides how an error response is logged.
+enum PullDiagnosticRequest {}
+
+impl lsp_types::Request for PullDiagnosticRequest {
+    type Params = DocumentDiagnosticParams;
+    type Result = DocumentDiagnosticReportResult;
+    const METHOD: lsp_types::LspRequestMethod<'static> =
+        <lsp_types::DocumentDiagnosticRequest as lsp_types::Request>::METHOD;
+    const MESSAGE_DIRECTION: lsp_types::MessageDirection =
+        <lsp_types::DocumentDiagnosticRequest as lsp_types::Request>::MESSAGE_DIRECTION;
+}
+
+/// How a pull request ended.
+enum PullAttempt {
+    /// The server answered; holds the items of a full report.
+    Answered(Option<BoundedDiagnostics>),
+    /// No pull answered and none is expected to: the request was not sent, or a
+    /// server advertising no provider refused it with `-32601`.
+    PushOnly,
+    /// The request failed.
+    Failed(Error),
 }
 
 /// What a `textDocument/diagnostic` answer says about the file.
@@ -96,6 +124,18 @@ struct PullSettlement {
     storage: PullStorage,
     /// Files whose entries were evicted to make room for the report.
     evicted: Vec<DiagnosticsKey>,
+    /// Whether the cache has an answer for the file, read in the same
+    /// critical section as `sources`.
+    availability: DiagnosticsAvailability,
+}
+
+/// Whether a server answered a request with JSON-RPC "method not found".
+fn is_method_not_found(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LspServerError { code, .. }
+            if lsp_types::ErrorCodes::from(*code) == lsp_types::ErrorCodes::MethodNotFound
+    )
 }
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
@@ -187,10 +227,15 @@ impl Translator {
     /// first, or when the document was resynced to another version while the
     /// request was in flight; the result then still contains the report, but
     /// the cache and the subscribers are left alone. If the pull request itself
-    /// fails (e.g. a push-only server answering `-32601`, or a timeout), a
-    /// non-empty cache entry is returned as a cache-only result instead of
-    /// propagating the error, since the cache is not required to be fresher
-    /// than the pull response to be useful here.
+    /// fails (e.g. a timeout), a non-empty cache entry is returned as a
+    /// cache-only result instead of propagating the error, since the cache is
+    /// not required to be fresher than the pull response to be useful here.
+    ///
+    /// A server that advertises no `diagnosticProvider` is probed with its
+    /// first pull: `-32601` is not an error but the learned fact that it is
+    /// push-only, so this and every later call answers from the push cache
+    /// without a request (#666); the [`DiagnosticsAnswer`] says so in its
+    /// `origin` and says in its `availability` whether the cache knows the file.
     ///
     /// The cache is locked once, after the pull request settles (success or
     /// failure), for the store and the snapshot -- never across the LSP
@@ -223,10 +268,12 @@ impl Translator {
         let path = self.validate_path(&file_path).await?;
         self.handle_validated_diagnostics(&path, context, notification_cache)
             .await
+            .map(|answer| answer.result)
     }
 
     /// As [`Self::handle_diagnostics`], for a path the caller already
-    /// validated, so it is not canonicalized a second time.
+    /// validated, so it is not canonicalized a second time, returning the
+    /// result with the file's availability and the origin of the answer.
     ///
     /// # Errors
     ///
@@ -236,55 +283,35 @@ impl Translator {
         path: &WorkspacePath,
         context: ResultContext,
         notification_cache: &Mutex<NotificationCache>,
-    ) -> Result<DocumentDiagnosticsResult> {
+    ) -> Result<DiagnosticsAnswer> {
         let doc = self
             .prepare_document_for_path(path, ToolKind::Diagnostics)
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let (server_id, uri) = (doc.server_id(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
+        let support = self.pull_support(server_id);
 
         let stamp = match self.document_tracker.synced_version(doc.path(), server_id) {
-            Some(version) => Some(
+            Some(version) if support.sends_pull() => Some(
                 notification_cache
                     .lock()
                     .await
                     .begin_pull(server_id, version),
             ),
-            None => None,
+            _ => None,
         };
 
-        let params = DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let pull_response: Result<DocumentDiagnosticReportResult> = client
-            .request("textDocument/diagnostic", params, client.request_timeout())
-            .await;
-        let report = pull_response.map(|response| match PullReport::from(response) {
-            PullReport::Full(mut items) => {
-                let redactions = client.redactions();
-                if !redactions.is_empty() {
-                    for d in &mut items {
-                        redactions.redact_diagnostic(d);
-                    }
-                }
-                Some(BoundedDiagnostics::new(uri, items))
-            }
-            PullReport::NotStored => None,
-        });
-        let (pulled, failure) = match report {
-            Ok(pulled) => (pulled, None),
-            Err(e) => (None, Some(e)),
+        let (pulled, failure, origin) = match self.request_pull(&doc, support).await {
+            PullAttempt::Answered(pulled) => (pulled, None, DiagnosticsOrigin::Pull),
+            PullAttempt::PushOnly => (None, None, DiagnosticsOrigin::PushCache),
+            PullAttempt::Failed(e) => (None, Some(e), DiagnosticsOrigin::Pull),
         };
 
         let PullSettlement {
             sources,
             storage,
             evicted,
+            availability,
         } = {
             let mut cache = notification_cache.lock().await;
             self.settle_pull(&mut cache, &doc, stamp, pulled)
@@ -335,11 +362,81 @@ impl Translator {
                 merged.positions_degraded,
             )
             .await;
-        Ok(DocumentDiagnosticsResult {
-            diagnostics,
-            positions_degraded,
-            enrichment,
+        Ok(DiagnosticsAnswer {
+            result: DocumentDiagnosticsResult {
+                diagnostics,
+                positions_degraded,
+                enrichment,
+            },
+            availability,
+            origin,
         })
+    }
+
+    /// Sends the pull request `support` calls for, and learns from how it
+    /// ends: a server advertising no provider that answers is pulled from now
+    /// on, one that refuses with `-32601` is not pulled again (until it is
+    /// replaced) and its refusal is logged at DEBUG, not ERROR.
+    async fn request_pull(&self, doc: &PreparedDocument, support: PullSupport) -> PullAttempt {
+        if !support.sends_pull() {
+            return PullAttempt::PushOnly;
+        }
+        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let response = client
+            .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
+            .await;
+        match response {
+            Ok(response) => {
+                if support == PullSupport::Probing {
+                    self.record_pull_probe(server_id, PullProbe::Answered);
+                }
+                PullAttempt::Answered(match PullReport::from(response) {
+                    PullReport::Full(mut items) => {
+                        let redactions = client.redactions();
+                        if !redactions.is_empty() {
+                            for d in &mut items {
+                                redactions.redact_diagnostic(d);
+                            }
+                        }
+                        Some(BoundedDiagnostics::new(uri, items))
+                    }
+                    PullReport::NotStored => None,
+                })
+            }
+            Err(unclassified)
+                if support == PullSupport::Probing && is_method_not_found(unclassified.error()) =>
+            {
+                debug!(
+                    %server_id,
+                    error = %unclassified.handled(),
+                    "server advertises no diagnostic provider and refused a pull; \
+                     answering from the push cache"
+                );
+                self.record_pull_probe(server_id, PullProbe::Refused);
+                PullAttempt::PushOnly
+            }
+            Err(unclassified) => PullAttempt::Failed(unclassified.surface()),
+        }
+    }
+
+    /// What is known about `id` answering `textDocument/diagnostic`.
+    pub(super) fn pull_support(&self, id: &ServerId) -> PullSupport {
+        let servers = lock_std(&self.servers);
+        let advertised = servers
+            .server(id)
+            .is_some_and(|server| server.capabilities().diagnostic_provider.is_some());
+        PullSupport::of(advertised, servers.pull_probe(id))
+    }
+
+    fn record_pull_probe(&self, id: &ServerId, probe: PullProbe) {
+        lock_std(&self.servers).set_pull_probe(id, probe);
     }
 
     /// Meets a settled pull with the cache, under the caller's lock: stores
@@ -359,12 +456,14 @@ impl Translator {
                 .with_pulled(uri, version, items),
             storage: PullStorage::NotStored,
             evicted: Vec::new(),
+            availability: DiagnosticsAvailability::Published,
         };
         let Some(items) = pulled else {
             return PullSettlement {
                 sources: cache.diagnostic_sources(uri),
                 storage: PullStorage::NotStored,
                 evicted: Vec::new(),
+                availability: cache.availability(uri, Some(server_id)),
             };
         };
         let Some(stamp) = stamp else {
@@ -382,6 +481,7 @@ impl Translator {
                 sources: cache.diagnostic_sources(uri),
                 storage: PullStorage::Stored(slot),
                 evicted,
+                availability: DiagnosticsAvailability::Published,
             },
             PullWrite::Discarded {
                 reason,
@@ -1323,8 +1423,8 @@ mod tests {
         write_error_response(
             &mut server.read_half_stdin,
             &diag_request["id"],
-            -32601,
-            "method not found",
+            -32603,
+            "internal error",
         )
         .await;
 

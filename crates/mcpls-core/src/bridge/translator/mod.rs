@@ -49,6 +49,7 @@ mod kind_filter;
 mod navigation;
 #[cfg(test)]
 mod prepare_range_tests;
+mod pull_support;
 mod respawn;
 mod restart;
 mod routing;
@@ -64,7 +65,7 @@ pub use addressing::{
     AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
     ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
 };
-pub use availability::{DiagnosticsAvailability, DiagnosticsOrigin};
+pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,

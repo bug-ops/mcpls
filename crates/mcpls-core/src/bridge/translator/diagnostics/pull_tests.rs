@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::*;
+use crate::bridge::resources::PublishedDiagnosticsUri;
 use crate::bridge::translator::testing::*;
 use crate::bridge::{DiagnosticsRole, NotificationReceivers, NotificationWiring};
 use crate::config::{LanguageId, ServerId, ToolRouter};
@@ -297,11 +298,169 @@ async fn test_failed_pull_of_an_unseen_file_is_still_an_error() {
 
     let pull = fx.spawn_pull();
     let request = next_pull_request(&mut wire).await;
-    write_error_response(&mut server.read_half_stdin, &request["id"], -32601, "no").await;
+    write_error_response(&mut server.read_half_stdin, &request["id"], -32603, "no").await;
 
     assert!(Fixture::finish(pull).await.is_err());
     assert!(fx.sources().await.is_none());
     assert!(fx.wiring.changed().is_empty());
+}
+
+impl Fixture {
+    fn spawn_answer(&self) -> JoinHandle<Result<DiagnosticsAnswer>> {
+        let (translator, cache) = (Arc::clone(&self.translator), Arc::clone(&self.cache));
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            let path = translator.validate_path(&client_path(path)).await?;
+            translator
+                .handle_validated_diagnostics(&path, ResultContext::None, &cache)
+                .await
+        })
+    }
+
+    async fn finish_answer(answer: JoinHandle<Result<DiagnosticsAnswer>>) -> DiagnosticsAnswer {
+        timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the answer did not finish")
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn publish(&self, items: Vec<lsp_types::Diagnostic>) {
+        let published = PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone());
+        self.cache
+            .lock()
+            .await
+            .store_published_diagnostics(&Self::rust(), &published, None, items);
+    }
+}
+
+fn lsp_error(message: &str) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        message: message.to_owned().into(),
+        severity: Some(lsp_types::DiagnosticSeverity::Error),
+        ..lsp_types::Diagnostic::default()
+    }
+}
+
+/// #666: a server that advertises no pull provider and answers `-32601` is
+/// answered from the push cache -- no error, nothing logged at ERROR -- and is
+/// not asked again.
+#[tokio::test]
+async fn test_refused_pull_answers_from_the_push_cache_and_is_not_repeated() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let captured = crate::test_lsp::CapturedLogs::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let mut wire = BufReader::new(&mut server.write_stdout);
+
+    let first = fx.spawn_answer();
+    let request = next_pull_request(&mut wire).await;
+    write_error_response(&mut server.read_half_stdin, &request["id"], -32601, "no").await;
+    let first = Fixture::finish_answer(first).await;
+
+    assert_eq!(first.origin, DiagnosticsOrigin::PushCache);
+    assert_eq!(first.availability, DiagnosticsAvailability::Pending);
+    assert!(first.result.diagnostics.is_empty());
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Unsupported
+    );
+
+    fx.publish(vec![lsp_error("published")]).await;
+    let second = Fixture::finish_answer(fx.spawn_answer()).await;
+    assert_eq!(shown(&second.result), ["published"]);
+    assert_eq!(second.origin, DiagnosticsOrigin::PushCache);
+    assert_eq!(second.availability, DiagnosticsAvailability::Published);
+    assert!(
+        !captured
+            .entries()
+            .iter()
+            .any(|(level, _)| *level == tracing::Level::ERROR),
+        "{:?}",
+        captured.entries()
+    );
+}
+
+/// #666: a published empty list is a clean answer, not a pending one.
+#[tokio::test]
+async fn test_published_empty_list_of_a_push_only_server_is_clean() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let first = fx.spawn_answer();
+    let request = next_pull_request(&mut wire).await;
+    write_error_response(&mut server.read_half_stdin, &request["id"], -32601, "no").await;
+    drop(Fixture::finish_answer(first).await);
+
+    fx.publish(Vec::new()).await;
+    let answer = Fixture::finish_answer(fx.spawn_answer()).await;
+
+    assert!(answer.result.diagnostics.is_empty());
+    assert_eq!(answer.availability, DiagnosticsAvailability::Published);
+    assert_eq!(answer.origin, DiagnosticsOrigin::PushCache);
+}
+
+/// #666: pyright advertises no provider yet answers pulls; once one is
+/// answered, pulls continue and the origin is `pull`.
+#[tokio::test]
+async fn test_unadvertised_but_answering_server_keeps_being_pulled() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    for _ in 0..2 {
+        let pull = fx.spawn_answer();
+        answer(
+            &mut wire,
+            &mut server.read_half_stdin,
+            full_report(json!([error_item(0, "E0308")])),
+        )
+        .await;
+        let answered = Fixture::finish_answer(pull).await;
+        assert_eq!(answered.origin, DiagnosticsOrigin::Pull);
+        assert_eq!(answered.availability, DiagnosticsAvailability::Published);
+    }
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Answers
+    );
+}
+
+/// #666: only a server that advertises nothing is allowed to refuse; one that
+/// advertises a provider and answers `-32601` keeps today's error.
+#[tokio::test]
+async fn test_advertising_server_refusing_a_pull_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let caps = lsp_types::ServerCapabilities {
+        diagnostic_provider: Some(lsp_types::DiagnosticProvider::DiagnosticOptions(
+            lsp_types::DiagnosticOptions::new(
+                None,
+                false,
+                false,
+                lsp_types::WorkDoneProgressOptions::default(),
+            ),
+        )),
+        ..lsp_types::ServerCapabilities::default()
+    };
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, caps);
+    let path = dir.path().join("lib.rs");
+    fs::write(&path, "fn main() {}").unwrap();
+    let translator = Arc::new(translator);
+    let cache = Arc::new(Mutex::new(NotificationCache::new()));
+    let pull = {
+        let (translator, cache) = (Arc::clone(&translator), Arc::clone(&cache));
+        tokio::spawn(async move {
+            translator
+                .handle_diagnostics(client_path(path), ResultContext::None, &cache)
+                .await
+        })
+    };
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let request = next_pull_request(&mut wire).await;
+    write_error_response(&mut server.read_half_stdin, &request["id"], -32601, "no").await;
+
+    assert!(Fixture::finish(pull).await.is_err());
+    assert_eq!(translator.pull_support(&id), PullSupport::Advertised);
 }
 
 /// SC-006 without disk timing: the tracker's synced version moves while the

@@ -6,6 +6,8 @@
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use super::dto::DocumentDiagnosticsResult;
+
 /// Whether the diagnostics cache has an answer for a file.
 ///
 /// An empty list under [`Self::Published`] is a real answer: the server said
@@ -31,6 +33,21 @@ pub enum DiagnosticsOrigin {
     Pull,
     /// The push cache alone, because the server advertises no pull provider.
     PushCache,
+}
+
+/// A `get_diagnostics` answer together with the state the cache was in when
+/// it was read.
+///
+/// The state is taken under the same cache lock as the snapshot the result
+/// was merged from, so the two cannot disagree.
+#[derive(Debug)]
+pub struct DiagnosticsAnswer {
+    /// The diagnostics of the file.
+    pub result: DocumentDiagnosticsResult,
+    /// Whether the cache has an answer for the file.
+    pub availability: DiagnosticsAvailability,
+    /// Where the answer came from.
+    pub origin: DiagnosticsOrigin,
 }
 
 #[cfg(test)]

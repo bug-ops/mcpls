@@ -155,13 +155,13 @@ THEN the output says the answer is push-derived
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | WHEN the routed server does not advertise `diagnosticProvider` THE SYSTEM SHALL NOT send `textDocument/diagnostic` for `get_diagnostics` | must |
-| FR-002 | WHEN the routed server does not advertise `diagnosticProvider` THE SYSTEM SHALL answer `get_diagnostics` from the push cache | must |
+| FR-001 | WHEN the routed server does not pull-answer, THE SYSTEM SHALL NOT send `textDocument/diagnostic` for `get_diagnostics`. Pull support is learned per server process, because `diagnosticProvider` is only the advertisement (pyright advertises `null` and answers pulls): a server that advertises a provider is pulled; one that does not is probed with its first pull, `-32601` marks it unsupported (no further pull until the process is replaced), an answered pull marks it as answering and it keeps being pulled | must |
+| FR-002 | WHEN the routed server is unsupported (FR-001) THE SYSTEM SHALL answer `get_diagnostics` from the push cache | must |
 | FR-003 | THE SYSTEM SHALL record whether a publish has ever been received for a file, so a published empty list (clean) is distinct from no publish yet | must |
 | FR-004 | WHEN a publish with an empty list has been received for the file THE SYSTEM SHALL answer with a successful empty result | must |
 | FR-005 | WHEN no publish has been received for the file THE SYSTEM SHALL report diagnostics as pending or unknown through a distinct, structured state, not as an error and not as an unqualified empty list | must |
 | FR-006 | WHEN `get_diagnostics` is answered from the push cache because the server has no pull provider THE SYSTEM SHALL say so in the result, or in `get_tool_support` for that server, or in both | must |
-| FR-007 | WHEN the pull request is not sent (FR-001) THE SYSTEM SHALL NOT log an `ERROR` for it | must |
+| FR-007 | WHEN the pull request is not sent (FR-001), or the probing pull is refused with `-32601`, THE SYSTEM SHALL NOT log an `ERROR` for it (the refusal is logged at DEBUG); a server that advertises a provider and fails a pull keeps the ERROR log | must |
 | FR-008 | WHEN the routed server advertises `diagnosticProvider` THE SYSTEM SHALL keep the current pull plus push merge, unchanged | must |
 | FR-009 | WHEN the routed server advertises `diagnosticProvider` and the pull request fails THE SYSTEM SHALL keep the current error behavior unless the plan decides otherwise; this spec does not change it | should |
 | FR-010 | THE existing `indexing_in_progress` and `push_notifications_degraded` flags SHALL keep their meaning and SHALL be reported alongside the new state | must |
@@ -235,13 +235,13 @@ THEN the output says the answer is push-derived
 - Change merge or dedup behavior for servers that have a pull provider.
 - Special-case a server by name.
 
-## 9. Open Questions
+## 9. Resolutions
 
-- [NEEDS CLARIFICATION: response shape for "pending or unknown": a distinct field on the diagnostics response (as `indexing_in_progress` is), a retryable error, or a status value. Proposed default: a structured field, so the call succeeds and the caller can branch without error handling.]
-- [NEEDS CLARIFICATION: should `get_diagnostics` wait a bounded time for the first publish on a push-only server (the server often publishes within a second of `didOpen`), or return pending at once? Proposed default: return pending at once; waiting is a follow-up.]
-- [NEEDS CLARIFICATION: how does the cache record "published empty" today? `get_cached_diagnostics` returns the same `{"diagnostics": []}` for both states, so the cache probably stores an entry for a published empty list but returns an empty result for a missing entry. Confirm, and decide whether the same availability type serves all three surfaces.]
-- [NEEDS CLARIFICATION: which capability predicate counts as "has a pull provider": `diagnosticProvider` present (any form), or present with document pull support? Proposed default: present.]
-- [NEEDS CLARIFICATION: does the pending state clear on server respawn, and should a respawn publish a notification to subscribers? Interacts with [[bridge/009-diagnostics-subscription-staleness/spec|bridge/009]].]
+- **Response shape.** A structured `availability` field (`published`, `pending`, `evicted`) on `get_diagnostics`, `get_cached_diagnostics` and the resource read, and `origin` (`pull`, `push_cache`) on `get_diagnostics`; the call succeeds and the caller branches on the field. `pending` and `evicted` carry no answer, so an empty list next to them is not clean.
+- **No wait.** `get_diagnostics` returns `pending` at once; a bounded wait is a follow-up.
+- **How the cache records a clean file.** A published empty list is an ordinary entry (`published`). Capacity eviction of the last entry of a file leaves a mark: only clean entries evicted reads `published` (clean), a lost non-empty entry reads `evicted`. The marks are bounded; once a server lost the oldest of them, a file without entry or mark reads `evicted` for that server rather than `pending`. A server's marks are dropped with its diagnostics.
+- **Capability predicate.** `diagnosticProvider` present (any form) is the advertisement; FR-001 adds what a probe learned. `get_tool_support` reports `push_only` for a server that advertises nothing and has not answered a pull, so a push-only route is never reported as plain `supported`.
+- **Respawn.** The learned pull support, the eviction marks and the cached diagnostics of the replaced process are dropped; the file reads `pending` until the replacement publishes. Subscribers are notified through the existing respawn invalidation.
 
 ## 10. See Also
 

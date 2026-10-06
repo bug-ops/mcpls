@@ -370,9 +370,13 @@ impl ToolSupportReport {
                             })
                             .collect();
                         let coverage = ToolCoverage::from_routes(routes.iter().map(|(_, s)| s));
+                        let push_only = routes
+                            .iter()
+                            .any(|(_, s)| matches!(s, RouteSupport::PushOnly { .. }));
                         (
                             coverage,
-                            (coverage != ToolCoverage::All).then(|| ToolRoutes::grouped(routes)),
+                            (coverage != ToolCoverage::All || push_only)
+                                .then(|| ToolRoutes::grouped(routes)),
                         )
                     }
                     ToolBackend::Workspace(kind) => {
