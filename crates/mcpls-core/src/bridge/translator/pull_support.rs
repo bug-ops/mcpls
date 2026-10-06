@@ -18,8 +18,8 @@ pub(super) enum PullProbe {
     /// The process answered a pull request with `-32601`, or timed out on two
     /// in a row.
     Refused,
-    /// The last pull request timed out and the one before it did not: a second
-    /// timeout in a row refuses the process.
+    /// A pull request timed out: a second one that was sent after that
+    /// timeout, and times out too, refuses the process.
     ///
     /// One timeout is not enough, since a large workspace's first pull can
     /// outlast the request timeout on a server that answers pulls.
@@ -27,12 +27,20 @@ pub(super) enum PullProbe {
 }
 
 impl PullProbe {
-    /// The probe after one more pull request timed out.
-    pub(super) const fn after_timeout(self) -> Self {
+    /// The probe after a pull request that was sent while the probe was
+    /// `sent_with` timed out.
+    ///
+    /// Only a request sent after an earlier timeout can be the second one: two
+    /// requests in flight together that both time out are one failure to
+    /// answer in time, not two. An answer ends the count, and a transient
+    /// reply (`-32800`, `-32801`, `-32802`) neither adds to it nor ends it.
+    pub(super) const fn after_timeout(self, sent_with: Self) -> Self {
         match self {
-            Self::Untried => Self::TimedOutOnce,
-            Self::TimedOutOnce | Self::Refused => Self::Refused,
-            Self::Answered => Self::Answered,
+            Self::Answered | Self::Refused => self,
+            Self::Untried | Self::TimedOutOnce => match sent_with {
+                Self::TimedOutOnce | Self::Refused => Self::Refused,
+                Self::Untried | Self::Answered => Self::TimedOutOnce,
+            },
         }
     }
 }
@@ -101,17 +109,34 @@ mod tests {
     }
 
     #[test]
-    fn test_one_timeout_keeps_probing_and_a_second_refuses() {
-        let once = PullProbe::Untried.after_timeout();
+    fn test_one_timeout_keeps_probing_and_a_later_sent_second_refuses() {
+        let once = PullProbe::Untried.after_timeout(PullProbe::Untried);
         assert_eq!(once, PullProbe::TimedOutOnce);
         assert_eq!(PullSupport::of(false, once), PullSupport::Probing);
-        assert_eq!(once.after_timeout(), PullProbe::Refused);
+        assert_eq!(once.after_timeout(once), PullProbe::Refused);
+    }
+
+    #[test]
+    fn test_overlapping_timeouts_count_once() {
+        let once = PullProbe::Untried.after_timeout(PullProbe::Untried);
+        assert_eq!(
+            once.after_timeout(PullProbe::Untried),
+            PullProbe::TimedOutOnce
+        );
     }
 
     #[test]
     fn test_a_timeout_never_undoes_an_answer_or_a_refusal() {
-        assert_eq!(PullProbe::Answered.after_timeout(), PullProbe::Answered);
-        assert_eq!(PullProbe::Refused.after_timeout(), PullProbe::Refused);
+        for sent_with in [PullProbe::Untried, PullProbe::TimedOutOnce] {
+            assert_eq!(
+                PullProbe::Answered.after_timeout(sent_with),
+                PullProbe::Answered
+            );
+            assert_eq!(
+                PullProbe::Refused.after_timeout(sent_with),
+                PullProbe::Refused
+            );
+        }
     }
 
     #[test]

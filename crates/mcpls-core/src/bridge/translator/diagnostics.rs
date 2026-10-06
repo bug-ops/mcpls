@@ -432,6 +432,7 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
+        let sent_with = self.pull_probe_of(server_id);
         let response = client
             .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
             .await;
@@ -456,20 +457,23 @@ impl Translator {
                 })
             }
             Err(unclassified) if support == PullSupport::Probing => {
-                self.conclude_probe(server_id, client.connection_id(), unclassified)
+                self.conclude_probe(server_id, client.connection_id(), sent_with, unclassified)
             }
             Err(unclassified) => PullAttempt::Failed(unclassified.surface()),
         }
     }
 
     /// Learns from a pull request that failed while the server was still being
-    /// probed. A server that refuses or repeatedly times out is answered from
-    /// the push cache from now on, and so is this call when the failure says
-    /// nothing about the server; any other failure surfaces.
+    /// probed. A server that refuses, or times out on a pull sent after an
+    /// earlier timeout, is answered from the push cache from now on, and so is
+    /// this call when the failure says nothing about the server; any other
+    /// failure surfaces. `sent_with` is the probe when the failed request was
+    /// sent.
     fn conclude_probe(
         &self,
         server_id: &ServerId,
         conn: ConnectionId,
+        sent_with: PullProbe,
         unclassified: UnclassifiedError,
     ) -> PullAttempt {
         let Some(outcome) = ProbeOutcome::of(unclassified.error()) else {
@@ -487,7 +491,8 @@ impl Translator {
                 self.record_pull_probe(server_id, conn, |_| PullProbe::Refused);
             }
             ProbeOutcome::TimedOut => {
-                let probe = self.record_pull_probe(server_id, conn, PullProbe::after_timeout);
+                let probe =
+                    self.record_pull_probe(server_id, conn, |now| now.after_timeout(sent_with));
                 if probe == Some(PullProbe::Refused) {
                     info!(
                         %server_id,
@@ -516,6 +521,10 @@ impl Translator {
             .server(id)
             .is_some_and(|server| server.capabilities().diagnostic_provider.is_some());
         PullSupport::of(advertised, servers.pull_probe(id))
+    }
+
+    fn pull_probe_of(&self, id: &ServerId) -> PullProbe {
+        lock_std(&self.servers).pull_probe(id)
     }
 
     fn record_pull_probe(
