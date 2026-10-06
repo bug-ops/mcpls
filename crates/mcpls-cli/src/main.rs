@@ -45,7 +45,7 @@ fn main() {
 
     // Initialize logging. No subscriber is installed yet, so failures here
     // must go straight to stderr.
-    if let Err(err) = logging::init(&args.log_level, args.log_json) {
+    if let Err(err) = logging::init(&args.log_level, args.log_format()) {
         eprintln!("failed to initialize logging: {err:?}");
         std::process::exit(1);
     }
@@ -110,15 +110,8 @@ async fn run(args: Args, trust: WorkspaceTrust, config_origin: ConfigOrigin) -> 
     // Load configuration. In untrusted mode the file that was actually loaded
     // must lie outside the workspace, whichever way it was found.
     let config = if let Some(config_path) = &args.config {
-        let mut config = mcpls_core::ServerConfig::load_from(config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?;
-        if matches!(trust, WorkspaceTrust::Untrusted(_)) {
-            config
-                .ensure_outside_workspace(config_path, config_origin)
-                .context("untrusted workspace mode refused the config file")?;
-        }
-        config.workspace_trust = trust;
-        config
+        mcpls_core::ServerConfig::load_explicit(config_path, config_origin, &trust)
+            .with_context(|| format!("failed to load config from {}", config_path.display()))?
     } else {
         let project_trust = if args.trust_project_config {
             ProjectConfigTrust::Trusted

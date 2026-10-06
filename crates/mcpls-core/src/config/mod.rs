@@ -247,10 +247,12 @@ impl std::fmt::Display for ToolPrefix {
 }
 
 impl std::str::FromStr for ToolPrefix {
-    type Err = String;
+    type Err = InvalidToolPrefix;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        validate_tool_prefix(s)?;
+        if let Some(reason) = InvalidToolPrefix::check(s) {
+            return Err(reason);
+        }
         Ok(Self(s.to_string()))
     }
 }
@@ -265,58 +267,69 @@ impl<'de> Deserialize<'de> for ToolPrefix {
     }
 }
 
-/// Shared validator behind [`ToolPrefix::from_str`] and its `Deserialize`
-/// impl, so a prefix constructed programmatically is held to the same rules
-/// as one loaded from TOML.
-fn validate_tool_prefix(value: &str) -> std::result::Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(
-            "mcp.tool_prefix cannot be empty (omit `tool_prefix` from the `[mcp]` section to \
-             use unprefixed tool names)"
-                .to_string(),
-        );
+/// Why a string is not a valid [`ToolPrefix`].
+///
+/// Characters are shown with `Debug`, which quotes and escapes control
+/// characters, so a TOML value smuggling a raw ANSI escape byte cannot be
+/// echoed verbatim into a terminal through a log line.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidToolPrefix {
+    /// The prefix was empty or whitespace only.
+    #[error(
+        "mcp.tool_prefix cannot be empty (omit `tool_prefix` from the `[mcp]` section to use \
+         unprefixed tool names)"
+    )]
+    Empty,
+    /// The prefix was longer than [`MAX_MCP_TOOL_PREFIX_BYTES`].
+    #[error(
+        "mcp.tool_prefix exceeds the maximum of {MAX_MCP_TOOL_PREFIX_BYTES} bytes ({len} given)"
+    )]
+    TooLong {
+        /// Byte length of the rejected prefix.
+        len: usize,
+    },
+    /// The prefix contained a character outside ASCII letters, digits, `_` and `-`.
+    #[error(
+        "mcp.tool_prefix contains an invalid character {0:?} (allowed: ASCII letters, digits, \
+         '_', and '-')"
+    )]
+    InvalidChar(char),
+    /// The first character was not an ASCII letter or digit.
+    #[error("mcp.tool_prefix cannot start with {0:?} (must start with an ASCII letter or digit)")]
+    LeadingSeparator(char),
+    /// The last character was not an ASCII letter or digit.
+    #[error(
+        "mcp.tool_prefix cannot end with {0:?} (the '_' separator between the prefix and each \
+         tool name is inserted automatically by mcpls -- remove the trailing separator character)"
+    )]
+    TrailingSeparator(char),
+}
+
+impl InvalidToolPrefix {
+    fn check(value: &str) -> Option<Self> {
+        let (Some(first), Some(last)) = (value.chars().next(), value.chars().next_back()) else {
+            return Some(Self::Empty);
+        };
+        if value.trim().is_empty() {
+            return Some(Self::Empty);
+        }
+        if value.len() > MAX_MCP_TOOL_PREFIX_BYTES {
+            return Some(Self::TooLong { len: value.len() });
+        }
+        if let Some(bad) = value
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+        {
+            return Some(Self::InvalidChar(bad));
+        }
+        if !first.is_ascii_alphanumeric() {
+            return Some(Self::LeadingSeparator(first));
+        }
+        if !last.is_ascii_alphanumeric() {
+            return Some(Self::TrailingSeparator(last));
+        }
+        None
     }
-    let len = value.len();
-    if len > MAX_MCP_TOOL_PREFIX_BYTES {
-        return Err(format!(
-            "mcp.tool_prefix exceeds the maximum of {MAX_MCP_TOOL_PREFIX_BYTES} bytes ({len} \
-             given)"
-        ));
-    }
-    if let Some(bad) = value
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
-    {
-        return Err(format!(
-            // `{bad:?}` (not `'{bad}'`): `char`'s `Debug` quotes and escapes
-            // control characters (e.g. ESC becomes `'\u{1b}'`), so a TOML
-            // value smuggling a raw control/ANSI-escape byte can't be
-            // echoed verbatim into this message and onward into a
-            // terminal via `tracing`.
-            "mcp.tool_prefix contains an invalid character {bad:?} (allowed: ASCII letters, \
-             digits, '_', and '-')"
-        ));
-    }
-    // `value.trim().is_empty()` above already rejected the empty string, so
-    // `next()`/`next_back()` never actually fall back here -- kept as a
-    // defensive default rather than an `unwrap()`, since `clippy::unwrap_used`
-    // is a workspace-wide warn-as-error.
-    let first = value.chars().next().unwrap_or_default();
-    let last = value.chars().next_back().unwrap_or_default();
-    if !first.is_ascii_alphanumeric() {
-        return Err(format!(
-            "mcp.tool_prefix cannot start with '{first}' (must start with an ASCII letter or \
-             digit)"
-        ));
-    }
-    if !last.is_ascii_alphanumeric() {
-        return Err(format!(
-            "mcp.tool_prefix cannot end with '{last}' (the '_' separator between the prefix \
-             and each tool name is inserted automatically by mcpls -- remove the trailing \
-             separator character)"
-        ));
-    }
-    Ok(())
 }
 
 /// Workspace-level configuration.
@@ -963,11 +976,60 @@ impl ServerConfig {
             WorkspaceTrust::Untrusted(_) => CreateDefault::No,
         };
         let (mut config, source) = Self::discover(trust, create)?;
-        config.workspace_trust = workspace.clone();
-        if let (WorkspaceTrust::Untrusted(_), Some(source)) = (workspace, source) {
-            config.ensure_outside_workspace(&source, ConfigOrigin::Environment)?;
-        }
+        let source = source
+            .as_deref()
+            .map(|path| (path, ConfigOrigin::Environment));
+        config.apply_workspace_trust(workspace, source)?;
         Ok(config)
+    }
+
+    /// Loads the config file the user named (`--config` or `$MCPLS_CONFIG`) for
+    /// a workspace trusted as `workspace`, applying that trust to the result.
+    ///
+    /// Naming a path is consent to load it, so no project-config trust applies.
+    /// With [`WorkspaceTrust::Untrusted`] the file must lie outside the
+    /// workspace, as [`ensure_outside_workspace`](Self::ensure_outside_workspace)
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// As [`load_from`](Self::load_from), plus [`Error::ConfigInsideWorkspace`]
+    /// when the file is inside an untrusted workspace.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// use mcpls_core::config::ConfigOrigin;
+    /// use mcpls_core::{ServerConfig, WorkspaceTrust};
+    ///
+    /// let missing = Path::new("/nonexistent/mcpls.toml");
+    /// assert!(
+    ///     ServerConfig::load_explicit(missing, ConfigOrigin::Argument, &WorkspaceTrust::Trusted)
+    ///         .is_err()
+    /// );
+    /// ```
+    pub fn load_explicit(
+        path: &Path,
+        origin: ConfigOrigin,
+        workspace: &WorkspaceTrust,
+    ) -> Result<Self> {
+        let mut config = Self::load_from(path)?;
+        config.apply_workspace_trust(workspace, Some((path, origin)))?;
+        Ok(config)
+    }
+
+    fn apply_workspace_trust(
+        &mut self,
+        workspace: &WorkspaceTrust,
+        source: Option<(&Path, ConfigOrigin)>,
+    ) -> Result<()> {
+        if let (WorkspaceTrust::Untrusted(_), Some((source, origin))) = (workspace, source) {
+            self.ensure_outside_workspace(source, origin)?;
+        }
+        self.workspace_trust = workspace.clone();
+        Ok(())
     }
 
     /// The discovery behind [`load_with_trust`](Self::load_with_trust): the
@@ -3380,8 +3442,9 @@ mod tests {
     #[test]
     fn test_tool_prefix_rejects_empty() {
         let err = "".parse::<ToolPrefix>().unwrap_err();
+        assert_eq!(err, InvalidToolPrefix::Empty);
         assert_eq!(
-            err,
+            err.to_string(),
             "mcp.tool_prefix cannot be empty (omit `tool_prefix` from the `[mcp]` section to \
              use unprefixed tool names)"
         );
@@ -3390,13 +3453,13 @@ mod tests {
     #[test]
     fn test_tool_prefix_rejects_whitespace_only() {
         let err = "   ".parse::<ToolPrefix>().unwrap_err();
-        assert!(err.contains("cannot be empty"));
+        assert_eq!(err, InvalidToolPrefix::Empty);
     }
 
     #[test]
     fn test_tool_prefix_rejects_leading_separator() {
         for bad in ["_optics", "-optics"] {
-            let err = bad.parse::<ToolPrefix>().unwrap_err();
+            let err = bad.parse::<ToolPrefix>().unwrap_err().to_string();
             assert!(
                 err.contains("cannot start with"),
                 "for input {bad:?}: {err}"
@@ -3407,7 +3470,7 @@ mod tests {
     #[test]
     fn test_tool_prefix_rejects_trailing_separator() {
         for bad in ["optics_", "optics-"] {
-            let err = bad.parse::<ToolPrefix>().unwrap_err();
+            let err = bad.parse::<ToolPrefix>().unwrap_err().to_string();
             assert!(err.contains("cannot end with"), "for input {bad:?}: {err}");
             assert!(err.contains("inserted automatically"));
         }
@@ -3415,19 +3478,19 @@ mod tests {
 
     #[test]
     fn test_tool_prefix_rejects_dot() {
-        let err = "op.tics".parse::<ToolPrefix>().unwrap_err();
+        let err = "op.tics".parse::<ToolPrefix>().unwrap_err().to_string();
         assert!(err.contains("invalid character '.'"));
     }
 
     #[test]
     fn test_tool_prefix_rejects_space() {
-        let err = "op tics".parse::<ToolPrefix>().unwrap_err();
+        let err = "op tics".parse::<ToolPrefix>().unwrap_err().to_string();
         assert!(err.contains("invalid character ' '"));
     }
 
     #[test]
     fn test_tool_prefix_rejects_non_ascii_and_names_the_character() {
-        let err = "optiсs".parse::<ToolPrefix>().unwrap_err();
+        let err = "optiсs".parse::<ToolPrefix>().unwrap_err().to_string();
         assert!(err.contains("invalid character 'с'"), "{err}");
     }
 
@@ -3435,9 +3498,12 @@ mod tests {
     fn test_tool_prefix_rejects_over_length() {
         let prefix = "a".repeat(MAX_MCP_TOOL_PREFIX_BYTES + 1);
         let err = prefix.parse::<ToolPrefix>().unwrap_err();
-        assert!(err.contains(&format!(
-            "exceeds the maximum of {MAX_MCP_TOOL_PREFIX_BYTES} bytes"
-        )));
+        assert_eq!(
+            err,
+            InvalidToolPrefix::TooLong {
+                len: MAX_MCP_TOOL_PREFIX_BYTES + 1
+            }
+        );
     }
 
     #[test]
