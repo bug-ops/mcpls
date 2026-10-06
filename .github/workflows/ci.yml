@@ -36,8 +36,13 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'fuzz/**'
+              - 'README.md'
+              - 'book/src/getting-started/installation.md'
+              - 'book/src/guide/language-servers.md'
+              - 'book/src/advanced/typescript.md'
             workflows:
               - '.github/workflows/**'
+              - '!.github/workflows/book.yml'
               - '.cargo/**'
             scripts:
               - 'scripts/**'
