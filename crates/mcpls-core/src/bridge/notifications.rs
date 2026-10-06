@@ -13,48 +13,18 @@ use tracing::{debug, warn};
 use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::config::ServerId;
-use crate::util::{truncate_str, truncate_string};
+use crate::util::truncate_string;
+
+mod bounds;
+mod pulled_index;
+
+pub use bounds::BoundedDiagnostics;
+use bounds::{MAX_ENTRY_TEXT_BYTES, cap_diagnostics_entry_size};
+use pulled_index::{PulledIndex, point};
+pub use pulled_index::{ReportedSeverity, reported_code};
 
 /// Maximum number of log entries to store.
 const MAX_LOG_ENTRIES: usize = 100;
-
-/// Maximum size, in bytes, of a single cached log message, server message,
-/// or a single diagnostic's free-form `message` text.
-///
-/// `MAX_LOG_ENTRIES`/`MAX_SERVER_MESSAGES`/`MAX_DIAGNOSTIC_ENTRIES` bound
-/// the *number* of cached entries, but not the size of any one entry -- a
-/// spawned LSP server could publish a single pathologically large message
-/// and still fit under those caps while consuming unbounded memory (#311).
-/// This is independent of the transport-level `MAX_CONTENT_LENGTH` cap in
-/// `lsp::transport`, which bounds a whole JSON-RPC frame, not one field
-/// within it. 256 KiB comfortably fits any realistic diagnostic or log
-/// message while still capping the worst case.
-///
-/// This alone does not bound a whole diagnostics *entry* (a
-/// `Vec<LspDiagnostic>`), only one diagnostic's `message` field -- see
-/// `MAX_DIAGNOSTICS_ENTRY_BYTES` for the entry-level cap.
-const MAX_ENTRY_TEXT_BYTES: usize = 256 * 1024;
-
-/// Maximum serialized size, in bytes, of a single document's *whole*
-/// diagnostics list (`Vec<LspDiagnostic>`), enforced by
-/// [`cap_diagnostics_entry_size`].
-///
-/// `MAX_ENTRY_TEXT_BYTES` alone does not bound this: it only truncates one
-/// diagnostic's `message` field, but the list's *length* is uncapped, and
-/// `LspDiagnostic` carries several more free-form or arbitrary-JSON fields
-/// besides `message` (`source`, `code`, `code_description`,
-/// `related_information`, `data`). A hostile server can stay under
-/// `MAX_ENTRY_TEXT_BYTES` on every individual message while still
-/// publishing e.g. 100k diagnostics for one URI, or a single diagnostic
-/// with a multi-MiB `data` blob -- both still fit under the transport-level
-/// `lsp::transport::MAX_CONTENT_LENGTH` (10 MiB) per notification, and
-/// `MAX_DIAGNOSTIC_ENTRIES` bounds only the *number* of distinct cached
-/// URIs, not their individual size, so up to 1000 such entries could
-/// otherwise accumulate to gigabytes. 1 MiB is far larger than any
-/// realistic diagnostics list for one file, and combined with
-/// `MAX_DIAGNOSTIC_ENTRIES` bounds the cache's total diagnostics footprint
-/// to roughly 1 GiB in the worst case.
-const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 
 /// Global budget for distinct-URI diagnostic entries, shared work-conservingly
 /// across every registered diagnostics-route server rather than claimed by
@@ -114,6 +84,169 @@ enum Spelling {
     Alias(DiagnosticsKey),
 }
 
+/// Where a cached diagnostics list came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Provenance {
+    /// Delivered by `textDocument/publishDiagnostics`.
+    Pushed,
+    /// Answered to a `textDocument/diagnostic` request.
+    Pulled,
+}
+
+/// Identifies one cache slot: a published URI and the way its diagnostics arrived.
+///
+/// A file has at most one `Pulled` slot, always under its canonical URI, next
+/// to its `Pushed` slots, so neither source erases the other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SlotKey {
+    uri: DiagnosticsKey,
+    provenance: Provenance,
+}
+
+impl SlotKey {
+    const fn pushed(uri: DiagnosticsKey) -> Self {
+        Self {
+            uri,
+            provenance: Provenance::Pushed,
+        }
+    }
+
+    const fn pulled(uri: DiagnosticsKey) -> Self {
+        Self {
+            uri,
+            provenance: Provenance::Pulled,
+        }
+    }
+}
+
+/// Orders the pulls of one server: a later request gets a greater ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PullTicket(u64);
+
+/// Counts how often a server's diagnostics were cleared, so a pull answered by
+/// a process that has since been replaced can be recognized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClearEpoch(u64);
+
+/// A pull request's claim on the cache, issued by [`NotificationCache::begin_pull`]
+/// before the request is sent and redeemed by
+/// [`NotificationCache::store_pulled_diagnostics`].
+#[derive(Debug, Clone, Copy)]
+pub struct PullStamp {
+    ticket: PullTicket,
+    epoch: ClearEpoch,
+    version: i32,
+}
+
+impl PullStamp {
+    /// Document version the pull was requested at.
+    pub(crate) const fn version(self) -> i32 {
+        self.version
+    }
+}
+
+/// Whether the tracker still holds the document version a pull was requested at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionCheck {
+    /// The tracked version still equals the stamped one.
+    Current,
+    /// The document was resynced to another version while the pull was in flight.
+    Moved,
+}
+
+/// Why a pull report was not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discard {
+    /// A pull issued later already stored its report.
+    OlderTicket,
+    /// The server's diagnostics were cleared after the pull was issued.
+    ServerCleared,
+    /// The document moved to another version while the pull was in flight.
+    VersionMoved,
+    /// No entry could be evicted to make room.
+    NoRoom,
+}
+
+/// What a stored pull report did to the file's pulled slot.
+#[derive(Debug)]
+pub enum SlotChange {
+    /// The slot already held exactly this list.
+    Identical,
+    /// The slot was replaced; `before` is the file's snapshot taken just
+    /// before, so the merged views can be compared.
+    Replaced { before: DiagnosticSources },
+}
+
+/// Result of [`NotificationCache::store_pulled_diagnostics`].
+#[derive(Debug)]
+#[must_use]
+pub enum PullWrite {
+    /// The report is now the file's pulled slot.
+    Stored {
+        slot: SlotChange,
+        /// Files whose slots were evicted to make room.
+        evicted: Vec<DiagnosticsKey>,
+    },
+    /// The report was dropped and is handed back.
+    Discarded {
+        reason: Discard,
+        /// Files whose slots were evicted before the pull was dropped.
+        evicted: Vec<DiagnosticsKey>,
+        items: BoundedDiagnostics,
+    },
+}
+
+/// Whether the merged diagnostics of a file differ before and after a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeOutcome {
+    /// A read would now return something else.
+    Changed,
+    /// A read would return the same diagnostics.
+    Unchanged,
+}
+
+impl ChangeOutcome {
+    /// Compares two merged views as multisets of serialized diagnostics; an
+    /// absent view differs from a present but empty one.
+    pub(crate) fn of(before: Option<&DiagnosticInfo>, after: Option<&DiagnosticInfo>) -> Self {
+        Self::compare(before, after, |d| serde_json::to_vec(d).ok())
+    }
+
+    /// [`Self::of`] over a caller-chosen serializer. A diagnostic that cannot
+    /// be serialized makes its view incomparable, which reads as a change:
+    /// the conservative side is to notify.
+    fn compare(
+        before: Option<&DiagnosticInfo>,
+        after: Option<&DiagnosticInfo>,
+        serialize: impl Fn(&LspDiagnostic) -> Option<Vec<u8>>,
+    ) -> Self {
+        let fingerprint = |info: &DiagnosticInfo| -> Option<Vec<Vec<u8>>> {
+            let mut items = info
+                .diagnostics
+                .iter()
+                .map(&serialize)
+                .collect::<Option<Vec<_>>>()?;
+            items.sort_unstable();
+            Some(items)
+        };
+        match (before, after) {
+            (None, None) => Self::Unchanged,
+            (Some(before), Some(after)) => match (fingerprint(before), fingerprint(after)) {
+                (Some(before), Some(after)) if before == after => Self::Unchanged,
+                _ => Self::Changed,
+            },
+            _ => Self::Changed,
+        }
+    }
+}
+
+/// Which file's slots a capacity eviction must leave alone.
+#[derive(Debug, Clone, Copy)]
+enum Protect<'a> {
+    Nothing,
+    File(&'a DiagnosticsKey),
+}
+
 /// One cached diagnostics entry with all of its bookkeeping, so the indices
 /// derived from it are only ever touched by `insert_entry`/`take_entry`.
 #[derive(Debug)]
@@ -128,9 +261,9 @@ struct CachedEntry {
 
 impl CachedEntry {
     /// Key of the file this entry belongs to, given the entry's own `key`.
-    const fn file<'a>(&'a self, key: &'a DiagnosticsKey) -> &'a DiagnosticsKey {
+    const fn file<'a>(&'a self, key: &'a SlotKey) -> &'a DiagnosticsKey {
         match &self.spelling {
-            Spelling::Canonical => key,
+            Spelling::Canonical => &key.uri,
             Spelling::Alias(canonical) => canonical,
         }
     }
@@ -252,88 +385,6 @@ impl EvictionRecord {
     }
 }
 
-/// Conservative fixed-field/JSON-structure overhead assumed per diagnostic
-/// (`range`, `severity`, and object/field-name punctuation) by
-/// [`cap_diagnostics_entry_size`]'s cheap size estimate. Deliberately
-/// generous relative to the true overhead (`range` alone serializes to
-/// roughly 70 bytes) so the estimate can only ever *overcount*, never
-/// undercount, actual serialized size.
-const DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES: usize = 256;
-
-/// Worst-case JSON string-escaping expansion factor, applied to each raw
-/// string field's byte length in [`cap_diagnostics_entry_size`]'s cheap
-/// size estimate.
-///
-/// A raw byte's serialized JSON form is at most 6 bytes: `"` and `\` and
-/// the five control characters with a short escape (`\b \f \n \r \t`) cost
-/// 2 bytes, but every other control character (`U+0000`..=`U+001F`, e.g.
-/// NUL) has no short escape and is emitted as `\u00XX` -- 6 bytes for 1 raw
-/// byte. The original estimate summed raw string lengths directly and
-/// could *undercount* an escape-heavy string (e.g. all-NUL) by up to this
-/// factor, letting an oversized entry skip the real `fits` check
-/// entirely -- multiplying by it keeps the estimate a true upper bound on
-/// serialized size rather than merely a typical-case guess.
-const JSON_ESCAPE_WORST_CASE_FACTOR: usize = 6;
-
-/// Last-resort message length used by [`cap_diagnostics_entry_size`]'s
-/// terminal-enforcement fallback -- small enough that a single diagnostic
-/// (fixed-size `range`/`severity` plus this one short string, every other
-/// field cleared) can never approach [`MAX_DIAGNOSTICS_ENTRY_BYTES`]
-/// regardless of JSON encoding overhead.
-const DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES: usize = 1024;
-
-/// Ordinal rank used to sort diagnostics by severity before
-/// [`cap_diagnostics_entry_size`] truncates an oversized list -- lower rank
-/// sorts first, so it is kept preferentially (#311 S6).
-///
-/// `DiagnosticSeverity`'s inner value is private, so its natural numeric
-/// ordering (`ERROR` < `WARNING` < `INFORMATION` < `HINT`) can't be read
-/// directly; `Option<DiagnosticSeverity>`'s *derived* `Ord` would also rank
-/// `None` before every `Some` value, the opposite of what's wanted here
-/// (no reported severity is treated as least important, same as `HINT`).
-/// This maps explicitly instead of relying on either.
-const fn diagnostic_severity_rank(diagnostic: &LspDiagnostic) -> u8 {
-    match diagnostic.severity {
-        Some(lsp_types::DiagnosticSeverity::Error) => 0,
-        Some(lsp_types::DiagnosticSeverity::Warning) => 1,
-        Some(lsp_types::DiagnosticSeverity::Information) => 2,
-        // An unrecognized (future) severity value is treated the same as
-        // no severity at all: least important, not most.
-        Some(_) | None => 3,
-    }
-}
-
-/// Largest `k` such that `fits(&diagnostics[..k])`, found via binary search
-/// rather than a linear scan or a flat halve (#311 S6).
-///
-/// Correct because a JSON array's serialized length is monotonically
-/// non-decreasing in its element count -- appending a diagnostic can only
-/// add bytes, never remove them -- so `fits(&diagnostics[..k])` is `true`
-/// for a contiguous run of small `k` and `false` for every larger `k`,
-/// exactly the shape a boundary binary search requires. `fits(&[])` is
-/// always `true`, so the search is well-defined even if no diagnostic at
-/// all fits individually.
-fn largest_fitting_prefix(
-    diagnostics: &[LspDiagnostic],
-    fits: impl Fn(&[LspDiagnostic]) -> bool,
-) -> usize {
-    let (mut lo, mut hi) = (0usize, diagnostics.len());
-    #[allow(
-        clippy::arithmetic_side_effects,
-        clippy::indexing_slicing,
-        reason = "binary search over 0..=len: lo < hi gives mid in 1..=hi"
-    )]
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if fits(&diagnostics[..mid]) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    lo
-}
-
 /// Borrows a diagnostic's free-form `message` as plain text, regardless of
 /// whether the server sent it as a plain string or (per LSP 3.18)
 /// `MarkupContent`.
@@ -341,190 +392,6 @@ pub fn message_as_str(message: &lsp_types::Message) -> &str {
     match message {
         lsp_types::Message::String(s) => s,
         lsp_types::Message::MarkupContent(m) => &m.value,
-    }
-}
-
-/// Truncates a diagnostic's free-form `message` to at most `max_bytes`,
-/// regardless of whether it is a plain string or `MarkupContent`.
-fn truncate_message(message: lsp_types::Message, max_bytes: usize) -> lsp_types::Message {
-    match message {
-        lsp_types::Message::String(s) => lsp_types::Message::String(truncate_string(s, max_bytes)),
-        lsp_types::Message::MarkupContent(mut m) => {
-            m.value = truncate_string(m.value, max_bytes);
-            lsp_types::Message::MarkupContent(m)
-        }
-    }
-}
-
-/// Bounds `diagnostics`' serialized size to at most
-/// `MAX_DIAGNOSTICS_ENTRY_BYTES` (#311 C1 fix).
-///
-/// Measures the list's *actual* serialized size via `serde_json::to_vec`
-/// rather than bounding each field individually -- that covers every
-/// field on `LspDiagnostic` (`source`, `code`, `code_description`,
-/// `related_information`, `data`, `tags`) at once, not just `message`.
-///
-/// # Guarantee
-///
-/// The postcondition -- the returned list's serialized size is at most
-/// `MAX_DIAGNOSTICS_ENTRY_BYTES` -- is enforced directly by a final,
-/// unconditional check at the end of this function, not merely assumed to
-/// follow from the field-specific mitigations below it. Those mitigations
-/// are best-effort (preserve as much real content as fits) and only cover
-/// the fields known today; the terminal step is what actually guarantees
-/// the bound holds even if a mitigation is incomplete or `LspDiagnostic`
-/// gains a new unbounded field in a future `lsp-types` upgrade.
-///
-/// # Cost (#311 S5)
-///
-/// `publishDiagnostics` is a hot path (rust-analyzer republishes
-/// whole-workspace diagnostics on every save), so this avoids a full
-/// `serde_json` serialization pass whenever every diagnostic's size is
-/// cheaply accountable from `message`/`source`/`code` alone (i.e. none
-/// carry `data`, `code_description`, `related_information`, or `tags`,
-/// each of which needs real serialization to size safely) and a
-/// conservative *upper bound* on their sum already fits. The estimate is
-/// not their raw byte length: JSON string escaping can expand a byte up to
-/// [`JSON_ESCAPE_WORST_CASE_FACTOR`]-fold (a NUL-heavy string previously
-/// let this fast path undercount actual serialized size by that much and
-/// skip the real `fits` check below entirely), so raw lengths are
-/// multiplied by that factor before comparing against the cap.
-///
-/// # Visibility (#311 S7)
-///
-/// Every mitigation that drops or truncates real content -- discarding
-/// diagnostics entirely, or clearing a survivor's `data` (which the LSP
-/// spec says is preserved through to a later `textDocument/codeAction`
-/// request, so losing it can silently break that diagnostic's quick fix)
-/// -- logs a `tracing::warn!` so the degradation is visible rather than a
-/// silent, hard-to-diagnose gap in what a caller sees.
-fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
-    let fits = |ds: &[LspDiagnostic]| {
-        // A serialization error is conservatively treated as "does not
-        // fit" (triggers the mitigations below) rather than as success.
-        // `LspDiagnostic`'s fields can't actually produce one in practice
-        // (no floats, no non-string map keys anywhere in `Diagnostic` or
-        // `serde_json::Value`'s own object representation), but failing
-        // safe costs nothing here.
-        serde_json::to_vec(ds).is_ok_and(|bytes| bytes.len() <= MAX_DIAGNOSTICS_ENTRY_BYTES)
-    };
-
-    let cheaply_estimable = diagnostics.iter().all(|d| {
-        d.data.is_none()
-            && d.code_description.is_none()
-            && d.related_information.is_none()
-            && d.tags.is_none()
-    });
-    if cheaply_estimable {
-        let estimated: usize = diagnostics
-            .iter()
-            .map(|d| {
-                let raw_string_bytes = message_as_str(&d.message)
-                    .len()
-                    .saturating_add(d.source.as_deref().map_or(0, str::len))
-                    .saturating_add(match &d.code {
-                        Some(lsp_types::Code::String(s)) => s.len(),
-                        _ => 0,
-                    });
-                raw_string_bytes
-                    .saturating_mul(JSON_ESCAPE_WORST_CASE_FACTOR)
-                    .saturating_add(DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES)
-            })
-            .sum();
-        if estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES {
-            return;
-        }
-    }
-
-    if fits(diagnostics) {
-        return;
-    }
-
-    let original_count = diagnostics.len();
-
-    // Prefer dropping lower-severity diagnostics first (a stable sort, so
-    // same-severity diagnostics keep their original -- typically
-    // file-position -- relative order), then keep the largest prefix that
-    // actually fits rather than a flat halve, which both overshoots (a
-    // list one byte over the cap would otherwise lose half its
-    // diagnostics) and was severity-blind (would keep hundreds of leading
-    // HINT-level noise over a later ERROR). At least one diagnostic is
-    // always kept here so the mitigations below have a survivor to act on.
-    diagnostics.sort_by_key(diagnostic_severity_rank);
-    let keep = largest_fitting_prefix(diagnostics, fits).max(1);
-    diagnostics.truncate(keep);
-    if diagnostics.len() < original_count {
-        warn!(
-            "diagnostics for {} exceeded the {MAX_DIAGNOSTICS_ENTRY_BYTES}-byte cache cap; kept \
-             the {} highest-severity of {original_count} diagnostics",
-            uri.as_ref(),
-            diagnostics.len(),
-        );
-    }
-
-    // Drop opaque/structured fields first -- cheap, and often enough on
-    // its own (e.g. the single-huge-`data`-blob shape).
-    if diagnostics.len() == 1 && !fits(diagnostics) {
-        #[allow(clippy::indexing_slicing, reason = "len == 1 checked above")]
-        let diagnostic = &mut diagnostics[0];
-        let had_data = diagnostic.data.is_some();
-        diagnostic.data = None;
-        diagnostic.code_description = None;
-        diagnostic.related_information = None;
-        diagnostic.tags = None;
-        warn!(
-            "diagnostic for {} exceeded the cache cap; dropped its data/code_description/\
-             related_information/tags fields{}",
-            uri.as_ref(),
-            if had_data {
-                " (a later code-action request for this diagnostic may not resolve its quick fix)"
-            } else {
-                ""
-            },
-        );
-    }
-
-    // Still oversized: `source`/`code` (plain strings, unlike the opaque
-    // fields above) are truncated rather than dropped, to preserve some
-    // content.
-    if diagnostics.len() == 1 && !fits(diagnostics) {
-        #[allow(clippy::indexing_slicing, reason = "len == 1 checked above")]
-        let diagnostic = &mut diagnostics[0];
-        if let Some(source) = &diagnostic.source {
-            diagnostic.source = Some(truncate_str(source, MAX_ENTRY_TEXT_BYTES));
-        }
-        if let Some(lsp_types::Code::String(code)) = &diagnostic.code {
-            diagnostic.code = Some(lsp_types::Code::String(truncate_str(
-                code,
-                MAX_ENTRY_TEXT_BYTES,
-            )));
-        }
-    }
-
-    // Terminal enforcement: guarantee the postcondition directly rather
-    // than trusting the mitigations above to have covered every case --
-    // see this function's doc.
-    if !fits(diagnostics) {
-        diagnostics.truncate(1);
-        if let Some(diagnostic) = diagnostics.first_mut() {
-            let placeholder = lsp_types::Message::String(String::new());
-            diagnostic.message = truncate_message(
-                std::mem::replace(&mut diagnostic.message, placeholder),
-                DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES,
-            );
-            diagnostic.source = None;
-            diagnostic.code = None;
-            diagnostic.code_description = None;
-            diagnostic.related_information = None;
-            diagnostic.tags = None;
-            diagnostic.data = None;
-        }
-        warn!(
-            "diagnostic for {} still exceeded the cache cap after every other mitigation; \
-             truncated its message to {DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES} bytes and \
-             cleared all other fields",
-            uri.as_ref(),
-        );
     }
 }
 
@@ -545,10 +412,12 @@ struct SourceEntry {
     info: DiagnosticInfo,
     /// Whether the server published under the canonical spelling of the path.
     spelling: Spelling,
+    provenance: Provenance,
 }
 
 /// Owned snapshot of the diagnostics cached for one file, possibly spread
-/// over several published URIs (a canonical path plus symlink aliases).
+/// over several published URIs (a canonical path plus symlink aliases) and
+/// over a pushed and a pulled source.
 ///
 /// Taken under the cache lock by [`NotificationCache::diagnostic_sources`];
 /// the clone/dedupe/sort/cap work in [`Self::merge`] then runs after the
@@ -560,17 +429,41 @@ pub struct DiagnosticSources {
 }
 
 impl DiagnosticSources {
+    /// Replaces the snapshot's pulled entry with `diagnostics`, for a pull
+    /// report that was answered but not stored.
+    pub(crate) fn with_pulled(
+        mut self,
+        file: &Uri,
+        version: Option<i32>,
+        diagnostics: BoundedDiagnostics,
+    ) -> Self {
+        self.entries
+            .retain(|entry| entry.provenance != Provenance::Pulled);
+        self.entries.push(SourceEntry {
+            info: DiagnosticInfo {
+                uri: file.clone(),
+                version,
+                diagnostics: diagnostics.0,
+            },
+            spelling: Spelling::Canonical,
+            provenance: Provenance::Pulled,
+        });
+        self
+    }
+
     /// Collapses the sources into one entry for the requested file.
     ///
     /// - No source: `None`.
-    /// - One source: returned unchanged, with its own `uri` and `version`,
-    ///   even when it is a symlink alias.
-    /// - Several sources: diagnostics are concatenated in source-URI order,
-    ///   exact duplicates (equal in every field) are removed, the result is
-    ///   ordered by range and re-capped to the per-entry size bound. The
-    ///   entry's `uri` is the requested one and its `version` is that of the
-    ///   source published under the canonical spelling, or `None` when only
-    ///   aliases published.
+    /// - One pushed source: returned unchanged, with its own `uri` and
+    ///   `version`, even when it is a symlink alias.
+    /// - Otherwise: pulled diagnostics come first and are never collapsed
+    ///   among themselves; a pushed diagnostic is dropped when it duplicates a
+    ///   pulled one (same problem, see `PulledIndex::contains_same_problem`) or an earlier
+    ///   pushed one (equal in every field). The result is ordered by range
+    ///   (stable) and re-capped to the per-entry size bound. The entry's `uri`
+    ///   is the requested one and its `version` is that of the pushed source
+    ///   published under the canonical spelling, else the pulled one's, else
+    ///   `None`.
     ///
     /// # Examples
     ///
@@ -586,32 +479,49 @@ impl DiagnosticSources {
     #[must_use]
     pub fn merge(self) -> Option<DiagnosticInfo> {
         let Self { requested, entries } = self;
-        if entries.len() <= 1 {
+        let has_pulled = entries
+            .iter()
+            .any(|entry| entry.provenance == Provenance::Pulled);
+        if entries.len() <= 1 && !has_pulled {
             return entries.into_iter().next().map(|entry| entry.info);
         }
         let version = entries
             .iter()
-            .find(|entry| entry.spelling == Spelling::Canonical)
-            .and_then(|entry| entry.info.version);
+            .find(|entry| {
+                entry.provenance == Provenance::Pushed && entry.spelling == Spelling::Canonical
+            })
+            .and_then(|entry| entry.info.version)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.provenance == Provenance::Pulled)
+                    .and_then(|entry| entry.info.version)
+            });
 
+        let (pulled, pushed): (Vec<SourceEntry>, Vec<SourceEntry>) = entries
+            .into_iter()
+            .partition(|entry| entry.provenance == Provenance::Pulled);
+        let pulled: Vec<LspDiagnostic> = pulled
+            .into_iter()
+            .flat_map(|entry| entry.info.diagnostics)
+            .collect();
+        let index = PulledIndex::new(&pulled);
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let mut merged: Vec<LspDiagnostic> = Vec::new();
-        for diagnostic in entries.into_iter().flat_map(|entry| entry.info.diagnostics) {
+        let mut kept_pushed = Vec::new();
+        for diagnostic in pushed.into_iter().flat_map(|entry| entry.info.diagnostics) {
+            if index.contains_same_problem(&diagnostic) {
+                continue;
+            }
             // A serialization error cannot happen for a `Diagnostic`; keeping
             // the item is the safe fallback.
-            let unique = serde_json::to_vec(&diagnostic).map_or(true, |bytes| seen.insert(bytes));
-            if unique {
-                merged.push(diagnostic);
+            if serde_json::to_vec(&diagnostic).map_or(true, |bytes| seen.insert(bytes)) {
+                kept_pushed.push(diagnostic);
             }
         }
-        merged.sort_by_key(|d| {
-            (
-                d.range.start.line,
-                d.range.start.character,
-                d.range.end.line,
-                d.range.end.character,
-            )
-        });
+        drop(index);
+        let mut merged = pulled;
+        merged.extend(kept_pushed);
+        merged.sort_by_key(|d| (point(d.range.start), point(d.range.end)));
         cap_diagnostics_entry_size(&requested, &mut merged);
 
         Some(DiagnosticInfo {
@@ -728,7 +638,7 @@ impl From<lsp_types::MessageType> for MessageType {
 #[derive(Debug)]
 pub struct NotificationCache {
     /// Diagnostics entries by published URI.
-    entries: HashMap<DiagnosticsKey, CachedEntry>,
+    entries: HashMap<SlotKey, CachedEntry>,
     /// Per-server entry keys ordered oldest-write-first, keyed by a
     /// monotonic sequence number rather than position: a re-publish removes
     /// its old entry by key in `O(log n)` instead of scanning for it, which a
@@ -740,15 +650,24 @@ pub struct NotificationCache {
     /// loses an entry once the aggregate is full, so one server's write
     /// volume can never evict another's entries while it still has room
     /// left in the global budget (#266, #276).
-    order: HashMap<ServerId, BTreeMap<u64, DiagnosticsKey>>,
+    order: HashMap<ServerId, BTreeMap<u64, SlotKey>>,
     /// Canonical file key -> keys of the entries (the canonical path and its
     /// symlink aliases) whose diagnostics are unioned on read.
-    files: HashMap<DiagnosticsKey, BTreeSet<DiagnosticsKey>>,
+    files: HashMap<DiagnosticsKey, BTreeSet<SlotKey>>,
     /// Next sequence number to assign in `order`. Shared across every
     /// server's order map and monotonically increasing for the cache's
     /// lifetime; never reused, so it never collides with an older entry
     /// still pending eviction.
     next_diagnostic_seq: u64,
+    /// Next ticket handed to a pull by [`Self::begin_pull`].
+    next_pull_ticket: u64,
+    /// Ticket of the pull behind each file's pulled slot. Written with the
+    /// slot by `store_pulled_diagnostics` and dropped with it by `take_entry`,
+    /// so a ticket exists exactly while a `Pulled` slot does.
+    pull_tickets: HashMap<DiagnosticsKey, PullTicket>,
+    /// Per-server count of [`Self::clear_server_diagnostics`] calls; absent
+    /// means epoch zero.
+    clear_epochs: HashMap<ServerId, ClearEpoch>,
     /// Number of registered diagnostics-route servers currently sharing the
     /// `MAX_DIAGNOSTIC_ENTRIES` budget, explicitly configured via
     /// [`NotificationCache::set_diagnostics_route_count`].
@@ -820,6 +739,9 @@ impl NotificationCache {
             order: HashMap::new(),
             files: HashMap::new(),
             next_diagnostic_seq: 0,
+            next_pull_ticket: 0,
+            pull_tickets: HashMap::new(),
+            clear_epochs: HashMap::new(),
             diagnostics_route_count: None,
             empty_diagnostics_count: 0,
             recent_evictions: EvictionRecord::default(),
@@ -942,19 +864,43 @@ impl NotificationCache {
     /// file as now clean. Derived directly from `entries` rather than
     /// from a separately maintained key set, so there is nothing else to
     /// keep in sync (#284).
-    fn is_empty_entry(&self, key: &DiagnosticsKey) -> bool {
+    fn is_empty_entry(&self, key: &SlotKey) -> bool {
         self.entries
             .get(key)
             .is_some_and(|entry| entry.info.diagnostics.is_empty())
     }
 
-    /// Oldest entry in `server`'s own order map whose diagnostics list is
-    /// empty, if it has one.
-    fn oldest_empty_entry_in(&self, server: &ServerId) -> Option<(u64, DiagnosticsKey)> {
+    /// Whether `key` is a slot of the file `protect` names.
+    fn is_protected(&self, key: &SlotKey, protect: Protect<'_>) -> bool {
+        match protect {
+            Protect::Nothing => false,
+            Protect::File(file) => self
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.file(key) == file),
+        }
+    }
+
+    /// Oldest unprotected entry in `server`'s own order map whose diagnostics
+    /// list is empty, if it has one.
+    fn oldest_empty_entry_in(
+        &self,
+        server: &ServerId,
+        protect: Protect<'_>,
+    ) -> Option<(u64, SlotKey)> {
         let order = self.order.get(server)?;
         order
             .iter()
-            .find(|(_, key)| self.is_empty_entry(key))
+            .find(|(_, key)| self.is_empty_entry(key) && !self.is_protected(key, protect))
+            .map(|(&seq, key)| (seq, key.clone()))
+    }
+
+    /// Oldest unprotected entry in `server`'s own order map.
+    fn oldest_entry_in(&self, server: &ServerId, protect: Protect<'_>) -> Option<(u64, SlotKey)> {
+        self.order
+            .get(server)?
+            .iter()
+            .find(|(_, key)| !self.is_protected(key, protect))
             .map(|(&seq, key)| (seq, key.clone()))
     }
 
@@ -988,11 +934,20 @@ impl NotificationCache {
     /// is `0`, so the common steady state (a codebase full of real
     /// diagnostics, no clean-file churn) pays no extra cost over a plain
     /// oldest-first lookup (#284).
-    fn entry_to_evict(&self, writer: &ServerId) -> Option<(ServerId, u64, DiagnosticsKey)> {
+    ///
+    /// Entries of the file `protect` names are never picked: a pull write
+    /// must not evict the same file's pushed slot it is merged with. When the
+    /// chosen server has nothing else, the largest other server's oldest
+    /// unprotected entry is taken instead.
+    fn entry_to_evict(
+        &self,
+        writer: &ServerId,
+        protect: Protect<'_>,
+    ) -> Option<(ServerId, u64, SlotKey)> {
         let evict_from = self.server_to_evict_from(writer)?;
 
         if self.empty_diagnostics_count > 0 {
-            if let Some((seq, key)) = self.oldest_empty_entry_in(&evict_from) {
+            if let Some((seq, key)) = self.oldest_empty_entry_in(&evict_from, protect) {
                 return Some((evict_from, seq, key));
             }
 
@@ -1002,7 +957,7 @@ impl NotificationCache {
                 .iter()
                 .filter(|(id, order)| order.len() > budget && *id != &evict_from)
                 .filter_map(|(id, order)| {
-                    self.oldest_empty_entry_in(id)
+                    self.oldest_empty_entry_in(id, protect)
                         .map(|(seq, key)| (id, order.len(), seq, key))
                 })
                 .max_by_key(|(id, len, ..)| (*len, id.as_str()));
@@ -1012,9 +967,18 @@ impl NotificationCache {
             }
         }
 
-        let order = self.order.get(&evict_from)?;
-        let (&seq, key) = order.iter().next()?;
-        Some((evict_from, seq, key.clone()))
+        if let Some((seq, key)) = self.oldest_entry_in(&evict_from, protect) {
+            return Some((evict_from, seq, key));
+        }
+        self.order
+            .iter()
+            .filter(|(id, _)| *id != &evict_from)
+            .filter_map(|(id, order)| {
+                self.oldest_entry_in(id, protect)
+                    .map(|(seq, key)| (id, order.len(), seq, key))
+            })
+            .max_by_key(|(id, len, ..)| (*len, id.as_str()))
+            .map(|(id, _, seq, key)| (id.clone(), seq, key))
     }
 
     /// Store diagnostics for a document published by `server_id`, indexed
@@ -1058,19 +1022,16 @@ impl NotificationCache {
         server_id: &ServerId,
         published: &PublishedDiagnosticsUri,
         version: Option<i32>,
-        mut diagnostics: Vec<LspDiagnostic>,
+        diagnostics: Vec<LspDiagnostic>,
     ) {
-        let source_key = DiagnosticsKey::of(published.source());
+        let source_key = SlotKey::pushed(DiagnosticsKey::of(published.source()));
         let canonical_key = DiagnosticsKey::of(published.canonical());
 
         let already_indexed = self
             .entries
             .get(&source_key)
             .is_some_and(|entry| entry.file(&source_key) == &canonical_key);
-        let at_capacity = self
-            .files
-            .get(&canonical_key)
-            .is_some_and(|sources| sources.len() >= MAX_SOURCES_PER_FILE);
+        let at_capacity = self.pushed_slot_count(&canonical_key) >= MAX_SOURCES_PER_FILE;
         if !already_indexed && at_capacity {
             let evicted = published
                 .is_canonical()
@@ -1087,41 +1048,29 @@ impl NotificationCache {
             self.evict_entry(&oldest_alias);
         }
 
-        // Bound each diagnostic's free-form message text (#311); see
-        // `MAX_ENTRY_TEXT_BYTES`. `mem::take` + `truncate_string` avoids an
-        // extra clone on the common (already-under-limit) path, since
-        // `message` is already an owned `String` here.
-        for diagnostic in &mut diagnostics {
-            let placeholder = lsp_types::Message::String(String::new());
-            diagnostic.message = truncate_message(
-                std::mem::replace(&mut diagnostic.message, placeholder),
-                MAX_ENTRY_TEXT_BYTES,
-            );
-        }
-        // Bound the whole list's serialized size (#311 C1); see
-        // `MAX_DIAGNOSTICS_ENTRY_BYTES`.
-        cap_diagnostics_entry_size(published.source(), &mut diagnostics);
-
         let info = DiagnosticInfo {
             uri: published.source().clone(),
             version,
-            diagnostics,
+            diagnostics: BoundedDiagnostics::new(published.source(), diagnostics).0,
         };
+
+        self.drop_superseded_pull(&canonical_key, version);
 
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
         // never needs room; only a genuinely new URI can trigger eviction.
         let is_new_entry = self.take_entry(&source_key).is_none();
         if is_new_entry {
+            // TODO(#649): an eviction caused by a push is not announced to
+            // the evicted file's subscribers (FR-013 covers pull writes only).
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES
-                && let Some((_, _, evict_key)) = self.entry_to_evict(server_id)
+                && let Some((_, _, evict_key)) = self.entry_to_evict(server_id, Protect::Nothing)
             {
                 self.evict_entry(&evict_key);
             }
         }
 
-        let seq = self.next_diagnostic_seq;
-        self.next_diagnostic_seq = self.next_diagnostic_seq.saturating_add(1);
+        let seq = self.next_seq();
         let spelling = if published.is_canonical() {
             Spelling::Canonical
         } else {
@@ -1136,6 +1085,175 @@ impl NotificationCache {
                 spelling,
             },
         );
+    }
+
+    const fn next_seq(&mut self) -> u64 {
+        let seq = self.next_diagnostic_seq;
+        self.next_diagnostic_seq = self.next_diagnostic_seq.saturating_add(1);
+        seq
+    }
+
+    /// Number of pushed slots (canonical and aliases) indexed under `file`.
+    fn pushed_slot_count(&self, file: &DiagnosticsKey) -> usize {
+        self.files.get(file).map_or(0, |slots| {
+            slots
+                .iter()
+                .filter(|slot| slot.provenance == Provenance::Pushed)
+                .count()
+        })
+    }
+
+    /// Removes `file`'s pulled slot when a push carries a document version
+    /// newer than the one the pull answered, since the pulled content is then
+    /// older than what the server last said.
+    ///
+    /// A push without a version, or with an equal one, keeps the pulled slot:
+    /// servers that both push and pull report the same version twice, and a
+    /// versionless flycheck push must not erase the pulled native diagnostics.
+    // TODO(#670): a slot can outlive a versionless or lower-versioned push
+    // (an LRU reopen restarts the tracker at version 1) until the next pull.
+    fn drop_superseded_pull(&mut self, file: &DiagnosticsKey, pushed_version: Option<i32>) {
+        let Some(pushed) = pushed_version else {
+            return;
+        };
+        let slot = SlotKey::pulled(file.clone());
+        let superseded = self
+            .entries
+            .get(&slot)
+            .and_then(|entry| entry.info.version)
+            .is_some_and(|pulled| pushed > pulled);
+        if superseded {
+            self.take_entry(&slot);
+        }
+    }
+
+    /// Issues the claim a pull of `server`'s diagnostics for a document at
+    /// `version` needs to redeem in [`Self::store_pulled_diagnostics`].
+    ///
+    /// Taken before the request is sent: the ticket orders concurrent pulls
+    /// of one file and the epoch exposes a clear that happened meanwhile.
+    pub(crate) fn begin_pull(&mut self, server: &ServerId, version: i32) -> PullStamp {
+        let ticket = PullTicket(self.next_pull_ticket);
+        self.next_pull_ticket = self.next_pull_ticket.saturating_add(1);
+        PullStamp {
+            ticket,
+            epoch: self.clear_epochs.get(server).copied().unwrap_or_default(),
+            version,
+        }
+    }
+
+    /// Stores a `textDocument/diagnostic` report as `file`'s pulled slot,
+    /// next to whatever the server pushed for it.
+    ///
+    /// The report is discarded unless `stamp`'s ticket is newer than the one
+    /// stored, the server's diagnostics were not cleared since the stamp was
+    /// issued, and `check` says the document still has the stamped version.
+    /// Capacity evictions leave the written file's own slots alone and are
+    /// returned so the caller can tell their subscribers.
+    ///
+    /// A slot that was evicted between two pulls no longer carries a ticket,
+    /// so an older pull can then be stored; the next pull replaces it.
+    pub(crate) fn store_pulled_diagnostics(
+        &mut self,
+        server_id: &ServerId,
+        file: &Uri,
+        stamp: PullStamp,
+        check: VersionCheck,
+        items: BoundedDiagnostics,
+    ) -> PullWrite {
+        let discard = |reason, items| PullWrite::Discarded {
+            reason,
+            evicted: Vec::new(),
+            items,
+        };
+        if stamp.epoch
+            != self
+                .clear_epochs
+                .get(server_id)
+                .copied()
+                .unwrap_or_default()
+        {
+            return discard(Discard::ServerCleared, items);
+        }
+        if check == VersionCheck::Moved {
+            return discard(Discard::VersionMoved, items);
+        }
+        let file_key = DiagnosticsKey::of(file);
+        let slot_key = SlotKey::pulled(file_key.clone());
+        if self
+            .pull_tickets
+            .get(&file_key)
+            .is_some_and(|stored| *stored >= stamp.ticket)
+        {
+            return discard(Discard::OlderTicket, items);
+        }
+
+        let identical = self
+            .entries
+            .get(&slot_key)
+            .is_some_and(|entry| entry.info.diagnostics == items.0);
+        let slot = if identical {
+            SlotChange::Identical
+        } else {
+            SlotChange::Replaced {
+                before: self.diagnostic_sources(file),
+            }
+        };
+
+        let mut evicted = Vec::new();
+        let is_new_slot = self.take_entry(&slot_key).is_none();
+        if is_new_slot {
+            while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES {
+                let Some((_, _, victim)) = self.entry_to_evict(server_id, Protect::File(&file_key))
+                else {
+                    return PullWrite::Discarded {
+                        reason: Discard::NoRoom,
+                        evicted,
+                        items,
+                    };
+                };
+                if let Some(entry) = self.entries.get(&victim) {
+                    evicted.push(entry.file(&victim).clone());
+                }
+                self.evict_entry(&victim);
+            }
+        }
+
+        let seq = self.next_seq();
+        self.pull_tickets.insert(file_key, stamp.ticket);
+        self.insert_entry(
+            slot_key,
+            CachedEntry {
+                info: DiagnosticInfo {
+                    uri: file.clone(),
+                    version: Some(stamp.version),
+                    diagnostics: items.0,
+                },
+                owner: server_id.clone(),
+                seq,
+                spelling: Spelling::Canonical,
+            },
+        );
+        PullWrite::Stored { slot, evicted }
+    }
+
+    /// Stores `diagnostics` as `file`'s pulled slot at document version 1, as
+    /// an answered, current pull would.
+    #[cfg(test)]
+    pub(crate) fn store_pulled_for_test(
+        &mut self,
+        server_id: &ServerId,
+        file: &Uri,
+        diagnostics: Vec<LspDiagnostic>,
+    ) {
+        let stamp = self.begin_pull(server_id, 1);
+        drop(self.store_pulled_diagnostics(
+            server_id,
+            file,
+            stamp,
+            VersionCheck::Current,
+            BoundedDiagnostics::new(file, diagnostics),
+        ));
     }
 
     /// Stores `uri`'s diagnostics as the canonical spelling of its own file.
@@ -1154,7 +1272,7 @@ impl NotificationCache {
     /// Adds `entry` under `key`, which must not be cached yet, to every
     /// index. Together with [`Self::take_entry`] the only code that touches
     /// `order`, `files` and `empty_diagnostics_count`.
-    fn insert_entry(&mut self, key: DiagnosticsKey, entry: CachedEntry) {
+    fn insert_entry(&mut self, key: SlotKey, entry: CachedEntry) {
         debug_assert!(!self.entries.contains_key(&key));
         self.order
             .entry(entry.owner.clone())
@@ -1171,8 +1289,11 @@ impl NotificationCache {
     }
 
     /// Removes the entry cached under `key` from every index and returns it.
-    fn take_entry(&mut self, key: &DiagnosticsKey) -> Option<CachedEntry> {
+    fn take_entry(&mut self, key: &SlotKey) -> Option<CachedEntry> {
         let entry = self.entries.remove(key)?;
+        if key.provenance == Provenance::Pulled {
+            self.pull_tickets.remove(&key.uri);
+        }
         if let Some(order) = self.order.get_mut(&entry.owner) {
             order.remove(&entry.seq);
         }
@@ -1192,7 +1313,7 @@ impl NotificationCache {
     /// Removes the entry under `key` for good (eviction, alias replacement,
     /// server clear) and remembers an empty one in the replay ring, so a
     /// clear lost in a listen's lease gap is still replayed.
-    fn evict_entry(&mut self, key: &DiagnosticsKey) {
+    fn evict_entry(&mut self, key: &SlotKey) {
         let Some(entry) = self.take_entry(key) else {
             return;
         };
@@ -1236,6 +1357,17 @@ impl NotificationCache {
             }
         }
         assert_eq!(ordered, self.entries.len(), "order and entries diverge");
+        let pulled: BTreeSet<&DiagnosticsKey> = self
+            .entries
+            .keys()
+            .filter(|key| key.provenance == Provenance::Pulled)
+            .map(|key| &key.uri)
+            .collect();
+        assert_eq!(
+            pulled,
+            self.pull_tickets.keys().collect::<BTreeSet<_>>(),
+            "pull tickets and pulled slots diverge"
+        );
 
         let mut filed = 0;
         for (file, members) in &self.files {
@@ -1261,7 +1393,7 @@ impl NotificationCache {
 
     /// The least recently written non-canonical source indexed under
     /// `canonical_key`.
-    fn oldest_alias_source(&self, canonical_key: &DiagnosticsKey) -> Option<DiagnosticsKey> {
+    fn oldest_alias_source(&self, canonical_key: &DiagnosticsKey) -> Option<SlotKey> {
         self.files
             .get(canonical_key)?
             .iter()
@@ -1274,12 +1406,13 @@ impl NotificationCache {
     }
 
     /// Keys of every entry cached for the file `key` names: its indexed
-    /// published URIs plus an entry stored directly under `key` itself.
-    fn source_keys<'a>(&'a self, key: &'a DiagnosticsKey) -> BTreeSet<&'a DiagnosticsKey> {
-        let mut keys: BTreeSet<&DiagnosticsKey> =
-            self.files.get(key).into_iter().flatten().collect();
-        if self.entries.contains_key(key) {
-            keys.insert(key);
+    /// slots plus a pushed entry stored directly under `key` itself.
+    fn source_keys(&self, key: &DiagnosticsKey) -> BTreeSet<SlotKey> {
+        let mut keys: BTreeSet<SlotKey> =
+            self.files.get(key).into_iter().flatten().cloned().collect();
+        let direct = SlotKey::pushed(key.clone());
+        if self.entries.contains_key(&direct) {
+            keys.insert(direct);
         }
         keys
     }
@@ -1405,22 +1538,23 @@ impl NotificationCache {
     /// order -- callers that assume file-position order should not rely on
     /// it after a cap-triggered truncation.
     ///
-    /// Looks up the entry stored under exactly `uri`. A file reachable
+    /// Looks up the pushed entry stored under exactly `uri`. A file reachable
     /// through symlinks may have its diagnostics spread over several
-    /// published URIs; use [`Self::diagnostic_sources`] to read the union.
+    /// published URIs, and a pull may have stored its own list next to them;
+    /// use [`Self::diagnostic_sources`] to read the union.
     #[inline]
     #[must_use]
     pub fn diagnostics(&self, uri: &Uri) -> Option<&DiagnosticInfo> {
         self.entries
-            .get(&DiagnosticsKey::of(uri))
+            .get(&SlotKey::pushed(DiagnosticsKey::of(uri)))
             .map(|entry| &entry.info)
     }
 
     /// Snapshot of every entry cached for the file `uri` names, to be
     /// [merged](DiagnosticSources::merge) after the cache lock is released.
     ///
-    /// Clones the entries (at most 8, each bounded to 1 MiB) so the merge can
-    /// run without the lock.
+    /// Clones the entries (at most 8 pushed and 1 pulled, each bounded to
+    /// 1 MiB) so the merge can run without the lock.
     ///
     /// # Examples
     ///
@@ -1441,10 +1575,11 @@ impl NotificationCache {
             .source_keys(&key)
             .into_iter()
             .filter_map(|source| {
-                let entry = self.entries.get(source)?;
+                let entry = self.entries.get(&source)?;
                 Some(SourceEntry {
                     info: entry.info.clone(),
                     spelling: entry.spelling.clone(),
+                    provenance: source.provenance,
                 })
             })
             .collect();
@@ -1470,7 +1605,7 @@ impl NotificationCache {
     #[must_use]
     pub fn has_diagnostics(&self, uri: &Uri) -> bool {
         let key = DiagnosticsKey::of(uri);
-        self.entries.contains_key(&key) || self.files.contains_key(&key)
+        self.entries.contains_key(&SlotKey::pushed(key.clone())) || self.files.contains_key(&key)
     }
 
     /// Server that published the currently cached diagnostics for `uri`, if
@@ -1482,11 +1617,13 @@ impl NotificationCache {
     pub fn diagnostics_owner(&self, uri: &Uri) -> Option<&ServerId> {
         let key = DiagnosticsKey::of(uri);
         self.entries
-            .get(&key)
+            .get(&SlotKey::pushed(key.clone()))
             .or_else(|| {
-                self.files
-                    .get(&key)?
+                let slots = self.files.get(&key)?;
+                slots
                     .iter()
+                    .filter(|slot| slot.provenance == Provenance::Pushed)
+                    .chain(slots.iter())
                     .find_map(|source| self.entries.get(source))
             })
             .map(|entry| &entry.owner)
@@ -1510,17 +1647,26 @@ impl NotificationCache {
     ///
     /// Used when a server crashes and respawns: its own stale entries must
     /// be invalidated without disturbing any other server's cache entries
-    /// (#266). Returns the cleared cache keys so a caller can tell
+    /// (#266). Returns the keys of the cleared files so a caller can tell
     /// subscribers which resources changed (see [`diagnostics_cache_key`]).
+    ///
+    /// Also invalidates every pull of this server issued before the call, so
+    /// a report answered by the replaced process is not stored afterwards.
     pub(crate) fn clear_server_diagnostics(&mut self, server_id: &ServerId) -> Vec<DiagnosticsKey> {
+        let epoch = self.clear_epochs.entry(server_id.clone()).or_default();
+        epoch.0 = epoch.0.saturating_add(1);
         let Some(order) = self.order.remove(server_id) else {
             return Vec::new();
         };
         let mut cleared = Vec::with_capacity(order.len());
         for key in order.into_values() {
+            if let Some(entry) = self.entries.get(&key) {
+                cleared.push(entry.file(&key).clone());
+            }
             self.evict_entry(&key);
-            cleared.push(key);
         }
+        cleared.sort_unstable();
+        cleared.dedup();
         cleared
     }
 
@@ -1628,9 +1774,13 @@ pub fn apply_lifecycle_notification(
 }
 
 #[cfg(test)]
+mod pull_tests;
+
+#[cfg(test)]
 mod tests {
     use lsp_types::{Position, Range};
 
+    use super::bounds::*;
     use super::*;
     use crate::test_lsp::CapturedLogs;
 

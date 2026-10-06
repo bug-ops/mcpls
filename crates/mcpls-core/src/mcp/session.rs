@@ -617,6 +617,16 @@ impl SubscriptionRegistry {
         guard.iter().filter_map(Weak::upgrade).collect()
     }
 
+    /// Whether any live session holds a subscription.
+    pub(crate) async fn any_subscription(&self) -> bool {
+        for session in self.live_sessions() {
+            if !session.is_empty().await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Queues, on every live session, each subscribed URI for which `pred`
     /// holds.
     ///

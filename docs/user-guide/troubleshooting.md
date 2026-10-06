@@ -350,7 +350,7 @@ npm update -g pyright
 - A tool that restores a file with an *identical* size and an mtime equal to the last one mcpls observed (e.g. `tar x`, `rsync -a`, `cp -p`) is indistinguishable from "unchanged", no matter how long ago that mtime/size were last recorded — this is not limited to a short window right after the file was read. Detecting this reliably would require hashing file content on every tool call, which mcpls does not do for performance reasons. **Workaround**: touch the file (`touch <file>`) or make a trivial edit to force a size or timestamp change, or restart mcpls.
 - `workspace_symbol_search` is served from the language server's own workspace-wide index rather than from a single tracked document, so it stays unaffected by (and unhelped by) this mechanism for files mcpls has never opened. Re-run the language server's own indexing if its results seem stale.
 
-**Diagnostics semantics**: because a resync never closes and reopens the document, `get_cached_diagnostics` keeps returning the last-known diagnostics for the file until the language server finishes re-analyzing it and publishes fresh ones — there is no transient window where diagnostics appear empty.
+**Diagnostics semantics**: because a resync never closes and reopens the document, `get_cached_diagnostics` keeps returning the last-known diagnostics for the file until the language server publishes fresh ones or the next `get_diagnostics` call pulls and stores them — there is no transient window where diagnostics appear empty. A subscriber to the file's `lsp-diagnostics://` resource is notified when a pull changes them, not when the file changes on disk with no tool call.
 
 ---
 

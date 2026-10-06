@@ -308,7 +308,12 @@ impl DiagnosticsResourceUri {
     /// diagnostics for: the canonical form, so it matches the key
     /// [`Self::resolve`] derives from a client URI for the same file.
     pub(crate) fn for_published(published: &PublishedDiagnosticsUri) -> Option<Self> {
-        make_uri(&uri_to_path(&published.canonical)?).ok().map(Self)
+        Self::for_canonical_file(&published.canonical)
+    }
+
+    /// The key for a file the tracker holds, given its canonical LSP URI.
+    pub(crate) fn for_canonical_file(file: &lsp_types::Uri) -> Option<Self> {
+        make_uri(&uri_to_path(file)?).ok().map(Self)
     }
 
     /// The wire form of the URI.
