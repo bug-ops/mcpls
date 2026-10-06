@@ -170,8 +170,9 @@ enforces the following, and nothing more:
   arguments and is best-effort: the trusted configuration is the boundary, so
   install the server globally and give its absolute path as `command`.
 - **Working directory.** The server starts in your login home directory (else
-  the system temporary directory), never in the checkout, and is refused when
-  neither lies outside the workspace. Servers get the workspace from
+  the system temporary directory when no other user can write to it, which
+  rules out a shared `/tmp`), never in the checkout, and is refused when
+  neither is available outside the workspace. Servers get the workspace from
   `workspaceFolders`, so a server that treats its working directory as the
   workspace root, or a relative path in `args`, no longer resolves into the
   checkout; give such a server absolute paths and `workspace.roots`.

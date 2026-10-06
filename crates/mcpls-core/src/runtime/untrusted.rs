@@ -272,13 +272,44 @@ fn untrusted_working_dir(
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
 ) -> Result<ChildWorkingDir, UntrustedRefusal> {
+    working_dir_in(boundary, login_home, &std::env::temp_dir())
+}
+
+/// [`untrusted_working_dir`] with the temporary directory given.
+///
+/// The temporary directory is used only when no other user can write to it: a
+/// shared one (`/tmp`) would let another user plant the files rustup, asdf and
+/// similar look up from the working directory.
+fn working_dir_in(
+    boundary: &WorkspaceRoots,
+    login_home: Option<&Path>,
+    temp_dir: &Path,
+) -> Result<ChildWorkingDir, UntrustedRefusal> {
+    let private_temp = dunce::canonicalize(temp_dir)
+        .ok()
+        .filter(|dir| is_private_dir(dir));
     login_home
         .map(Path::to_path_buf)
         .into_iter()
-        .chain(dunce::canonicalize(std::env::temp_dir()).ok())
+        .chain(private_temp)
         .find(|dir| !boundary.contains_resolved_prefix(dir))
         .map(ChildWorkingDir::Fixed)
         .ok_or(UntrustedRefusal::NoSafeWorkingDirectory)
+}
+
+/// Whether neither the group nor others can write to `dir`. Every Windows
+/// temporary directory is per-user, so only Unix is checked.
+fn is_private_dir(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o022 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        true
+    }
 }
 
 /// Splits the configured servers into the ones worth starting for this run
@@ -1334,14 +1365,16 @@ mod plan_tests {
             let home = fx.outside.join("home");
             std::fs::create_dir_all(&home).unwrap();
 
-            let with_home = untrusted_working_dir(&fx.roots, Some(&home)).unwrap();
-            let without_home = untrusted_working_dir(&fx.roots, None).unwrap();
+            let temp = private_temp(&fx);
+
+            let with_home = working_dir_in(&fx.roots, Some(&home), &temp).unwrap();
+            let without_home = working_dir_in(&fx.roots, None, &temp).unwrap();
 
             assert_eq!(with_home, ChildWorkingDir::Fixed(home));
-            let ChildWorkingDir::Fixed(temp) = without_home else {
-                panic!("expected a fixed directory");
-            };
-            assert!(!fx.roots.contains_resolved_prefix(&temp), "{temp:?}");
+            assert_eq!(
+                without_home,
+                ChildWorkingDir::Fixed(dunce::canonicalize(&temp).unwrap())
+            );
         }
 
         #[test]
@@ -1350,17 +1383,45 @@ mod plan_tests {
             let home = fx.workspace.join("home");
             std::fs::create_dir_all(&home).unwrap();
 
-            let dir = untrusted_working_dir(&fx.roots, Some(&home)).unwrap();
+            let temp = private_temp(&fx);
+
+            let dir = working_dir_in(&fx.roots, Some(&home), &temp).unwrap();
 
             assert_ne!(dir, ChildWorkingDir::Fixed(home));
         }
 
+        fn temp_with_mode(fx: &Fixture, name: &str, mode: u32) -> PathBuf {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+            let dir = fx.outside.join(name);
+            std::fs::DirBuilder::new().mode(mode).create(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir
+        }
+
+        fn private_temp(fx: &Fixture) -> PathBuf {
+            temp_with_mode(fx, "private-tmp", 0o700)
+        }
+
+        #[test]
+        fn working_dir_is_refused_rather_than_a_directory_other_users_can_write() {
+            let fx = fixture();
+            for (name, mode) in [("shared", 0o1777), ("group", 0o770)] {
+                let temp = temp_with_mode(&fx, name, mode);
+
+                let refused = working_dir_in(&fx.roots, None, &temp).unwrap_err();
+
+                assert_eq!(refused, UntrustedRefusal::NoSafeWorkingDirectory, "{name}");
+            }
+        }
+
         #[test]
         fn working_dir_is_refused_when_nothing_lies_outside_the_boundary() {
-            let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
-            let boundary = WorkspaceRoots::from_configured(&[temp]).unwrap();
+            let fx = fixture();
+            let temp = private_temp(&fx);
+            let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&temp)).unwrap();
 
-            let refused = untrusted_working_dir(&boundary, None).unwrap_err();
+            let refused = working_dir_in(&boundary, None, &temp).unwrap_err();
 
             assert_eq!(refused, UntrustedRefusal::NoSafeWorkingDirectory);
         }

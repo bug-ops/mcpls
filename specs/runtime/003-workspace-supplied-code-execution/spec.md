@@ -106,7 +106,7 @@ related:
   `tsserver.path`. An unresolved pin for another reason (no `typescript` next to the server) stays
   admitted. The list is best-effort; the trusted configuration is the boundary (`SECURITY.md`).
 - **Working directory and Windows lookups (#653).** An untrusted server starts in the login home, else the
-  system temporary directory, whichever lies outside the boundary (`ChildWorkingDir::Fixed`), else the
+  system temporary directory when it is not writable by group or others (a shared `/tmp` is not used), whichever lies outside the boundary (`ChildWorkingDir::Fixed`), else the
   server is refused as `NoSafeWorkingDirectory`; a non-UTF-8 executable or `PATH` is refused as
   `NonUtf8Path`. On Windows `NoDefaultCurrentDirectoryInExePath=1` is set (any spelling of the name is
   normalized, a configured value is overridden) and passes through in trusted mode, so `cmd.exe` running
