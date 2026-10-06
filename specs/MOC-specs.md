@@ -31,6 +31,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve) |
 | 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery) |
 | 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | implemented | #665 |
+| 013 | [[lsp/013-diagnostics-publish-burst-drops/spec\|diagnostics-publish-burst-drops]] | bug | P2 | draft | #704 |
 
 ## mcp
 
@@ -50,6 +51,8 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
 | 013 | [[mcp/013-http-allowed-host-default-port-rejection/spec\|http-allowed-host-default-port-rejection]] | enhancement | P3 | implemented | #629 |
 | 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (135,000 B tools/list budget, #654 kind filter schemas) | #630; #654 |
+| 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | draft | #687 |
+| 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | draft | #705 |
 
 ## bridge
 
@@ -68,6 +71,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | draft (implemented, #666, #670) | #666; #670 |
 | 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | draft (implemented, #667) | #667 |
 | 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | draft (implemented, #668) | #668 |
+| 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | draft | #703 |
 
 ## runtime
 
