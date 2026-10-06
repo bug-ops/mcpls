@@ -149,6 +149,15 @@ impl CodeActionKindFilter {
         Self::SourceOrganizeImports,
     ];
 
+    /// The spellings the schema documents and the rejection message lists:
+    /// the canonical ones in lowercase, which parsing accepts like any case.
+    fn spellings() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .map(|kind| kind.as_str().to_ascii_lowercase())
+            .collect()
+    }
+
     /// The canonical LSP spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -178,16 +187,14 @@ impl KindFilter for CodeActionKindFilter {
     }
 
     fn rejection_message(rejected: &str) -> String {
-        let valid: Vec<&str> = Self::ALL.iter().map(|kind| kind.as_str()).collect();
-        format!("Invalid kind_filter: '{rejected}'. Valid values: {valid:?}")
+        format!(
+            "Invalid kind_filter: '{rejected}'. Valid values: {:?}",
+            Self::spellings()
+        )
     }
 
     fn schema() -> Schema {
-        let values: Vec<String> = Self::ALL
-            .iter()
-            .map(|kind| kind.as_str().to_ascii_lowercase())
-            .collect();
-        schemars::json_schema!({"type": "string", "enum": values})
+        schemars::json_schema!({"type": "string", "enum": Self::spellings()})
     }
 }
 
@@ -201,6 +208,15 @@ impl KindFilter for CodeActionKindFilter {
 pub struct SymbolKindFilter(lsp_types::SymbolKind);
 
 impl SymbolKindFilter {
+    /// The names the schema documents and the rejection message lists: the
+    /// supported kinds in lowercase, which parsing accepts like any case.
+    fn spellings() -> Vec<String> {
+        SUPPORTED_SYMBOL_KINDS
+            .iter()
+            .map(|kind| format!("{kind:?}").to_ascii_lowercase())
+            .collect()
+    }
+
     /// The kind this filter selects.
     #[must_use]
     pub const fn kind(self) -> lsp_types::SymbolKind {
@@ -226,24 +242,17 @@ impl KindFilter for SymbolKindFilter {
     }
 
     fn rejection_message(rejected: &str) -> String {
-        let valid: Vec<String> = SUPPORTED_SYMBOL_KINDS
-            .iter()
-            .map(|kind| format!("{kind:?}"))
-            .collect();
         format!(
-            "Invalid kind_filter: '{rejected}'. Valid values: {valid:?}, or the numeric LSP \
-             SymbolKind value"
+            "Invalid kind_filter: '{rejected}'. Valid values: {:?}, or the numeric LSP \
+             SymbolKind value",
+            Self::spellings()
         )
     }
 
     fn schema() -> Schema {
-        let names: Vec<String> = SUPPORTED_SYMBOL_KINDS
-            .iter()
-            .map(|kind| format!("{kind:?}").to_ascii_lowercase())
-            .collect();
         schemars::json_schema!({
             "type": "string",
-            "anyOf": [{"enum": names}, {"pattern": "^[0-9]+$"}],
+            "anyOf": [{"enum": Self::spellings()}, {"pattern": "^[0-9]+$"}],
         })
     }
 }
@@ -291,7 +300,7 @@ mod tests {
             message.contains("Invalid kind_filter: 'bogus'"),
             "{message}"
         );
-        assert!(message.contains("source.organizeImports"), "{message}");
+        assert!(message.contains("source.organizeimports"), "{message}");
     }
 
     #[test]
@@ -339,6 +348,37 @@ mod tests {
         };
         assert!(message.contains("'NotAKind'"), "{message}");
         assert!(message.contains("numeric LSP SymbolKind"), "{message}");
+    }
+
+    /// A client validating against the schema must accept every spelling the
+    /// rejection message recommends.
+    #[test]
+    fn test_rejection_messages_list_exactly_the_schema_spellings() {
+        let code_actions = CodeActionKindFilter::schema();
+        let listed = code_actions.as_value()["enum"].clone();
+        let message = CodeActionKindFilter::rejection_message("x");
+        assert!(
+            message.ends_with(&format!("Valid values: {}", debug_list(&listed))),
+            "{message}"
+        );
+
+        let symbols = SymbolKindFilter::schema();
+        let listed = symbols.as_value()["anyOf"][0]["enum"].clone();
+        let message = SymbolKindFilter::rejection_message("x");
+        assert!(
+            message.contains(&format!("Valid values: {}", debug_list(&listed))),
+            "{message}"
+        );
+    }
+
+    fn debug_list(values: &serde_json::Value) -> String {
+        let names: Vec<&str> = values
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        format!("{names:?}")
     }
 
     #[test]

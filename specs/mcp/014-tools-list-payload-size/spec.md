@@ -168,7 +168,7 @@ Priorities: `must` / `should` / `may`. Byte counts are UTF-8 bytes of the compac
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 130,000 B (baseline 171,465 B; stretch target 110,000 B) (130,000 B is the enforced figure; the stretch target is not tracked) | must |
+| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 135,000 B (baseline 171,465 B; stretch target 110,000 B) (135,000 B is the enforced figure, raised from 130,000 B for the diagnostics `availability`/`origin` fields, the `indexing_in_progress` flag on four more tools, the `push_only` route status and the inlined kind-filter enums of batch 27; the stretch target is not tracked) | must |
 | FR-002 | EACH serialized `Tool` SHALL NOT exceed the per-tool budget: 9,000 B (baseline maximum 12,458 B, `get_references`) (9,000 B enforced for every tool; no per-tool override) | must |
 | FR-003 | THE sum of all `description` string bytes inside every `inputSchema` and `outputSchema` SHALL NOT exceed 35,000 B (baseline 73,444 B) | should |
 | FR-004 | THE system SHALL NOT emit, in any `inputSchema` or `outputSchema` `description`, a Markdown code fence (a line starting with three backticks), a Markdown heading line (a line starting with `#`), or a rustdoc section such as `# Examples`, `# Errors` or `# Panics` | must |
@@ -232,7 +232,7 @@ Baseline values are those measured at commit `517cb53`.
 
 | ID | Metric | Baseline | Target |
 |----|--------|----------|--------|
-| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 130,000 B (stretch 110,000 B) |
+| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 135,000 B (stretch 110,000 B) |
 | SC-002 | Largest single `Tool` | 12,458 B (`get_references`) | at most 9,000 B |
 | SC-003 | Sum of schema `description` bytes | 73,444 B | at most 35,000 B |
 | SC-004 | Schema descriptions containing a code fence or rustdoc section heading | 10 (about 5.9 KB) | 0 |
@@ -247,7 +247,7 @@ Baseline values are those measured at commit `517cb53`.
 > A throwaway measurement on the golden snapshot (not a design) showed that keeping only the first
 > paragraph of each schema description, capping it at 160 B, and dropping the long descriptions of
 > definitions shared by two or more tools brings the total to about 120 KB, the largest tool to
-> about 7.9 KB, and schema description bytes to about 23 KB. The 130,000 B, 9,000 B and 35,000 B
+> about 7.9 KB, and schema description bytes to about 23 KB. The 135,000 B, 9,000 B and 35,000 B
 > budgets leave roughly 8% to 15% headroom over that figure. Going below about 110 KB needs
 > structural change (inlining small definitions, dropping redundant integer keywords, flattening
 > string enums), not description trimming alone.
@@ -277,7 +277,7 @@ Baseline values are those measured at commit `517cb53`.
 
 > [!success] Resolved
 > - Issue number: #630. The change is not breaking: tools, parameters, result fields and schemas keep their structure; only `description` annotations shrink.
-> - Budgets: 130,000 B total, 9,000 B per tool, 35,000 B schema description bytes, enforced; the 110,000 B stretch target is not tracked.
+> - Budgets: 135,000 B total, 9,000 B per tool, 35,000 B schema description bytes, enforced; the 110,000 B stretch target is not tracked.
 > - Phase 3 (dropping `format` or `minimum`, inlining small definitions) is not applied: `format` and `minimum` are kept, because phases 1 and 2 meet the budgets.
 > - The structural check compares the shaped router with the unshaped router of the same tree.
 > - A definition carried by two or more tools keeps its own description only when it fits in 80 B, and its nested descriptions only when they fit in 24 B; the meaning of `positions_degraded`, `truncated`, `out_of_workspace` and the enrichment statuses lives in the tool descriptions (`out_of_workspace` through a shared sentence added to the 15 tools that carry it).
