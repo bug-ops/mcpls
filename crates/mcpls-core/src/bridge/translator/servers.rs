@@ -497,9 +497,13 @@ impl Servers {
     /// Stops every running server that has one, for shutdown, returning them.
     pub(super) fn drain_servers(&mut self) -> Vec<(ServerId, LspServer)> {
         let ids: Vec<ServerId> = self.0.keys().cloned().collect();
-        ids.into_iter()
-            .filter_map(|id| self.remove_server(&id).map(|server| (id, server)))
-            .collect()
+        let mut drained = Vec::new();
+        for id in ids {
+            if let Some(server) = self.remove_server(&id) {
+                drained.push((id, server));
+            }
+        }
+        drained
     }
 
     /// The settlement of every slot, for re-deriving the routing table.

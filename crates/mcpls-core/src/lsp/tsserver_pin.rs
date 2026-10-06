@@ -964,7 +964,7 @@ fn pin_ignored(params: Option<&serde_json::Value>) -> Option<TypescriptVersionPa
     (parsed.source != TsserverSource::UserSetting).then_some(parsed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn pinned_initialization_options(
     config: &LspServerConfig,
     roots: &WorkspaceRoots,

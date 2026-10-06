@@ -20,11 +20,12 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::Duration;
 
+#[cfg(unix)]
 use crate::ServerId;
 use crate::bridge::WorkspaceRoots;
 #[cfg(unix)]
-use crate::config::{LanguageId, TimeoutSecs};
-use crate::config::{LspServerConfig, PositionEncodings, ServerCommand};
+use crate::config::{LanguageId, ServerCommand, TimeoutSecs};
+use crate::config::{LspServerConfig, PositionEncodings};
 use crate::lsp::{LspClient, LspTransport, LspTransportReader, ServerInitConfig};
 
 /// Duplex buffer capacity for the mock pipes below. Framed JSON-RPC

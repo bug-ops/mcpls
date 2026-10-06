@@ -323,7 +323,7 @@ impl ServerInitConfig {
     }
 
     /// Mutable access to the server config, for tests that adjust a fixture.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) const fn server_config_mut(&mut self) -> &mut LspServerConfig {
         &mut self.server_config
     }

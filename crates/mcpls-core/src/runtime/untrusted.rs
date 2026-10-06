@@ -417,6 +417,7 @@ fn refused(
 mod plan_tests {
     use super::*;
     use crate::config::{ServerCommand, ServerId};
+    #[cfg(unix)]
     use crate::error::Error;
 
     fn rust_workspace() -> (tempfile::TempDir, WorkspaceRoots) {

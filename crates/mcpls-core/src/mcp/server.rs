@@ -2006,9 +2006,9 @@ mod tests {
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::bridge::{Capability, IndexingSignal, LogLevel, ResultContext, RouteSignals};
-    use crate::config::{
-        FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle, ServerCommand,
-    };
+    #[cfg(unix)]
+    use crate::config::ServerCommand;
+    use crate::config::{FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle};
     #[cfg(unix)]
     use crate::config::{PositionEncodings, TimeoutSecs};
     use crate::mcp::tool_support::ToolBackend;
