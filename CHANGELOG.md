@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HttpConfig::write_stall_timeout` and `WriteStallTimeout` (30 s) free the connection permit of a peer that stops reading. (#600, #614)
 - The generated default TypeScript entry (`selection = "auto"`) starts the native `tsc --lsp --stdio` when TypeScript 7 is installed outside the workspace and no JavaScript tsserver can be pinned; new `ServerSelection`, `NativeTsc`, `TypescriptServerChoice` and `TsserverKept`. (#639)
 - `mcpls-bench` reports record the host (`os`, `arch`, `available_parallelism`), and `docs/benchmarks.md` describes how to publish results; no numbers are published. (#639)
+- `get_diagnostics` reports `availability` (`published`, `pending`, `evicted`) and `origin` (`pull`, `push_cache`), and the tool-support `push_only` route status marks servers without a pull provider. (#682)
+- `prepare_rename`, `get_signature_help` and `get_inlay_hints` report `indexing_in_progress` like the other name-resolving tools. (#682)
+- `restart_server` reports `loading` until the replacement server signals indexing. (#682)
+- `lsp::MAX_CONSECUTIVE_UNDECODABLE_FRAMES` and `HttpConfig::with_session_idle_timeout` with the exported `IdleTimeout`. (#682)
+- New typed config values `FilePattern`, `FileExtension`, `ProjectMarker`, `SearchDepth`, `ServerCommand`, `ToolSet`, `BoundedText`, `LogFormat` and `ConfigError`. (#682)
 
 ### Changed
 
@@ -147,6 +152,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** detected and mapped language ids are `LanguageId` (`build_extension_map`, `build_effective_extension_map`, `language_for_extension`, `DocumentTracker::new`, `Translator::with_extensions` and `is_diagnostics_route`, `react_variant_language_id`, `base_language_id`), and `Error::NoServerForLanguage` and `NoServerForTool` carry a `LanguageId`. (#639)
 - **Breaking:** a config file must be a regular file: `--config /dev/null` and `--config <(...)` are rejected as `NotARegularFile`; documents and the config loader share one open-and-verify. (#639)
 - **Breaking:** `LspServerConfig` gains `selection`; generated configs carry `selection = "auto"` on the TypeScript entry, so add it to an existing config to opt in, and older mcpls versions reject the key. (#639)
+- **Breaking:** `file_patterns` accepts only `*.ext`, `**/*.ext` and `dir/*.ext` forms; braces, `**/*`, single files, compound extensions such as `**/*.d.ts` and backslash patterns now fail config loading. (#682)
+- **Breaking:** `extensions` with a leading dot, absolute or multi-component `project_markers`, blank `name`, `command` or `mcp.*` values, and empty or duplicate `handles` are rejected when the config is loaded. (#682)
+- **Breaking:** `LspServerConfig`, `WorkspaceConfig`, `McpConfig` and `LanguageExtensionMapping` fields, `ServerHeuristics`, `ProjectMarker`, `SearchDepth` and `ToolPrefix::from_str` use the typed values and error types. (#682)
+- **Breaking:** `Error::Config(ConfigError)` replaces `Error::InvalidConfig`, and `DocumentTracker::new`, `detect_language`, `ResourceLimits` and `build_effective_extension_map` take or return the typed values. (#682)
+- **Breaking:** `ServerInitConfig` has private fields and a constructor, `Error::LspInitFailed` holds the cause in `cause`, `CapabilityNotSupported` carries a typed capability, and `NoServerForLanguage` and `UntrustedRefusal` change shape. (#682)
+- **Breaking:** symbol kind filters are typed end to end, accepted in any case and forwarded canonically; the tool schemas list the lowercase spellings. (#682)
+- **Breaking:** every positioned tool rejects a line past the end of the document with `-32602`. (#682)
+- **Breaking:** servers without a pull provider answer `get_diagnostics` from the push cache, and `restart_server` gates requests on the replacement server's indexing. (#682)
+- **Breaking:** untrusted-workspace mode refuses package runners, task runners, inline-eval interpreters, unanalyzable shell launches and `env -S`, and starts servers in the login home or a private temporary directory. (#682)
+- **Breaking:** HTTP application errors stay HTTP 200 with an in-band `-32602` for an unknown tool; bump rmcp to 3.5.1. (#682)
+- The default TypeScript server now publishes diagnostics, a server request or notification mcpls cannot decode no longer ends the connection, and project markers are searched in one bounded walk. (#682)
+
+### Removed
+
+- **Breaking:** removed `Error::InvalidConfig`, `Error::InvalidUri`, `language_for_extension`, `validate_kind_filter` and `resolve_kind_filter`. (#682)
 
 ### Fixed
 
@@ -191,6 +211,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A not-renameable `prepare_rename` reply no longer logs at ERROR. (#637)
 - Slow HTTP readers and request bodies are cut instead of holding a connection. (#637)
 - `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#637)
+- A pulled diagnostics result is dropped once the tracked document moved on, and a push that evicts a cache entry notifies its subscribers. (#682)
+- A panicked idle HTTP session reaper is restarted, and a panic in the SSE liveness forwarding task is logged. (#682)
+- `nodemon -e js` and `phpunit -r` are no longer refused as inline-eval launches in untrusted mode. (#682)
+- `LspInitFailed` text is redacted and no longer prints the cause twice. (#682)
+- A numeric symbol kind accepts plain digits only. (#682)
 
 ## [0.6.0] - 2026-09-21
 
