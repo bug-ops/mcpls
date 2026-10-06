@@ -281,17 +281,17 @@ leading dot (`"nu"`, not `".nu"`) and are case-sensitive. Allows you to:
 [workspace]
 
 # Add Nushell support
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
 
 # Override Rust to use custom language ID
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "custom-rust"
 
 # Add multiple extensions for Python
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["py", "pyi", "pyw"]
 language_id = "python"
 ```
@@ -343,11 +343,11 @@ For better performance, configure only the languages you actually use:
 [workspace]
 
 # Only Rust and Python
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["py", "pyi"]
 language_id = "python"
 ```
@@ -1063,15 +1063,19 @@ roots = [
 ]
 
 # Language extensions (optional - defaults will be used if not specified)
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
-[[language_extensions]]
-extensions = ["ts", "tsx"]
+[[workspace.language_extensions]]
+extensions = ["ts"]
 language_id = "typescript"
 
-[[language_extensions]]
+[[workspace.language_extensions]]
+extensions = ["tsx"]
+language_id = "typescriptreact"
+
+[[workspace.language_extensions]]
 extensions = ["py", "pyi"]
 language_id = "python"
 
@@ -1097,6 +1101,11 @@ args = ["--stdio"]
 file_patterns = ["**/*.py"]
 ```
 
+mcpls routes a file by its extension alone, so `file_patterns` cannot limit a server to
+one directory of a monorepo: the directory part (`**/backend/`) is ignored, and two
+servers claiming the same extension both route every file with it. Scope a server by
+project instead (workspace roots and `heuristics.project_markers`).
+
 ### C/C++ Project
 
 ```toml
@@ -1120,17 +1129,17 @@ compilationDatabasePath = "build"
 roots = ["/Users/username/projects/scripts"]
 
 # Add Nushell language support
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
 
 # Keep Rust support for other scripts
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
 # Shell scripts
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["sh", "bash"]
 language_id = "shellscript"
 

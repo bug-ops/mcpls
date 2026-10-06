@@ -324,7 +324,7 @@ async fn prepare_rename_line_beyond_the_document_is_rejected_before_the_request(
     .expect("must fail before any LSP round-trip")
     .unwrap_err();
 
-    assert_matches!(err, Error::PositionBeyondDocument { line } if line.get() == 3);
+    assert_matches!(err, Error::PositionBeyondDocument { line, .. } if line.get() == 3);
     assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
 }
 
@@ -359,7 +359,7 @@ async fn reject_beyond<T>(name: &str, call: Pin<Box<dyn Future<Output = Result<T
         .unwrap_or_else(|| panic!("{name} accepted a line beyond the document"));
     assert_matches!(
         err,
-        Error::PositionBeyondDocument { line } if line.get() == 99,
+        Error::PositionBeyondDocument { line, .. } if line.get() == 99,
         "{name}"
     );
     assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams, "{name}");
@@ -511,7 +511,7 @@ async fn an_untracked_document_passes_the_line_check() {
         .unwrap();
     assert_matches!(
         translator.require_line_in_document(&doc, pos(99, 1)),
-        Err(Error::PositionBeyondDocument { line }) if line.get() == 99
+        Err(Error::PositionBeyondDocument { line, .. }) if line.get() == 99
     );
 
     translator.document_tracker.close(doc.path());
@@ -802,7 +802,7 @@ async fn format_range_with_a_line_beyond_the_document_is_rejected_before_the_req
         .await
         .expect("must fail before any LSP round-trip")
         .unwrap_err();
-        assert_matches!(err, Error::PositionBeyondDocument { line: l } if l.get() == line);
+        assert_matches!(err, Error::PositionBeyondDocument { line: l, .. } if l.get() == line);
     }
 }
 

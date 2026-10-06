@@ -1368,10 +1368,14 @@ pub enum Error {
     /// Only the line is checked: an LSP server clamps a character past the
     /// end of its line to the line length (LSP 3.17, `Position`), so such a
     /// character is forwarded unchanged.
-    #[error("line {line} is beyond the end of the document")]
+    #[error(
+        "line {line} is beyond the end of the document (the document ends at line {last_line})"
+    )]
     PositionBeyondDocument {
         /// The 1-based line the client supplied.
         line: std::num::NonZeroU32,
+        /// The 1-based number of the document's last line.
+        last_line: std::num::NonZeroU32,
     },
 
     /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
@@ -3021,9 +3025,13 @@ mod tests {
     fn test_position_beyond_document_is_invalid_params_naming_the_line() {
         let err = Error::PositionBeyondDocument {
             line: std::num::NonZeroU32::new(7).unwrap(),
+            last_line: std::num::NonZeroU32::new(3).unwrap(),
         };
         assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
-        assert_eq!(err.to_string(), "line 7 is beyond the end of the document");
+        assert_eq!(
+            err.to_string(),
+            "line 7 is beyond the end of the document (the document ends at line 3)"
+        );
     }
 
     /// #575: a malformed client path is caller-fault, whatever IO kind the

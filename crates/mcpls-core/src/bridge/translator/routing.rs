@@ -1018,7 +1018,9 @@ impl Translator {
             .line_presence(doc.path(), line.get().saturating_sub(1))
         {
             LinePresence::Present => Ok(()),
-            LinePresence::Beyond => Err(Error::PositionBeyondDocument { line }),
+            LinePresence::Beyond { last_line } => {
+                Err(Error::PositionBeyondDocument { line, last_line })
+            }
             LinePresence::Untracked => {
                 tracing::debug!(
                     line = line.get(),

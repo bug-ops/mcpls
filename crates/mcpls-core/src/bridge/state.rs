@@ -3,6 +3,7 @@
 //! Tracks open documents and their versions for LSP synchronization.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -99,6 +100,9 @@ pub(super) struct DocumentText {
     stride: usize,
     /// `checkpoints[k]` is the byte offset where line `k * stride` starts.
     checkpoints: Box<[usize]>,
+    /// Number of lines, saturating at `u32::MAX`; at least 1, since empty
+    /// content has line 0.
+    line_count: NonZeroU32,
 }
 
 impl std::fmt::Debug for DocumentText {
@@ -130,10 +134,16 @@ impl DocumentText {
                 checkpoints.push(start);
             }
         }
+        let line_count = u32::try_from(line)
+            .ok()
+            .and_then(|last| last.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .unwrap_or(NonZeroU32::MAX);
         Self {
             content,
             stride,
             checkpoints: checkpoints.into_boxed_slice(),
+            line_count,
         }
     }
 
@@ -151,6 +161,11 @@ impl DocumentText {
     /// The full text.
     pub(super) fn as_str(&self) -> &str {
         &self.content
+    }
+
+    /// The 1-based number of the last line, which is also the line count.
+    pub(super) const fn last_line(&self) -> NonZeroU32 {
+        self.line_count
     }
 
     /// The 0-based `n`'th line without its terminator, or `None` if there is
@@ -514,7 +529,10 @@ pub enum LinePresence {
     /// The document has the line.
     Present,
     /// The document is tracked and ends before the line.
-    Beyond,
+    Beyond {
+        /// The 1-based number of the document's last line.
+        last_line: NonZeroU32,
+    },
 }
 
 /// Tracks document state across the workspace.
@@ -667,7 +685,9 @@ impl DocumentTracker {
         match lock_std(&self.documents).get(path) {
             None => LinePresence::Untracked,
             Some(document) if document.text.line(line).is_some() => LinePresence::Present,
-            Some(_) => LinePresence::Beyond,
+            Some(document) => LinePresence::Beyond {
+                last_line: document.text.last_line(),
+            },
         }
     }
 
@@ -2362,13 +2382,21 @@ mod tests {
         assert_eq!(tracker.line_presence(&path, 0), LinePresence::Present);
         assert_eq!(tracker.line_presence(&path, 1), LinePresence::Present);
         assert_eq!(tracker.line_presence(&path, 2), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&path, 3), LinePresence::Beyond);
-        assert_eq!(tracker.line_presence(&path, u32::MAX), LinePresence::Beyond);
+        let beyond = LinePresence::Beyond {
+            last_line: NonZeroU32::new(3).unwrap(),
+        };
+        assert_eq!(tracker.line_presence(&path, 3), beyond);
+        assert_eq!(tracker.line_presence(&path, u32::MAX), beyond);
 
         let empty = PathBuf::from("/test/empty.rs");
         tracker.open(empty.clone(), String::new()).unwrap();
         assert_eq!(tracker.line_presence(&empty, 0), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&empty, 1), LinePresence::Beyond);
+        assert_eq!(
+            tracker.line_presence(&empty, 1),
+            LinePresence::Beyond {
+                last_line: NonZeroU32::MIN
+            }
+        );
     }
 
     #[test]
