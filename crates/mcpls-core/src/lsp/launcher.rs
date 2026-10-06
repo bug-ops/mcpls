@@ -7,8 +7,10 @@
 //! it refuses these launches ([`launches_from_workspace`]).
 //!
 //! The rules are best-effort. They match the command's file stem and its
-//! arguments, unwrap `env`, and give up on what cannot be analyzed (`env -S`,
-//! a shell with `-c`). The trusted configuration is the boundary, not this list.
+//! arguments, unwrap `env` and `busybox`, and give up on what cannot be
+//! analyzed (an `env` option this list does not know, a `PATH=` assignment, a
+//! shell or interpreter given a command string). The trusted configuration is
+//! the boundary, not this list.
 
 use std::path::Path;
 
@@ -63,13 +65,31 @@ const SHELLS: &[&str] = &[
     "pwsh",
 ];
 
+/// Interpreters that run a program given on the command line, with the short
+/// flag letters and long flags that introduce it. A match is by stem prefix so
+/// `python3.12` counts as `python`.
+const INLINE_EVAL: &[(&str, &[char], &[&str])] = &[
+    ("node", &['e', 'p'], &["--eval", "--print"]),
+    ("nodejs", &['e', 'p'], &["--eval", "--print"]),
+    ("python", &['c'], &[]),
+    ("perl", &['e', 'E'], &[]),
+    ("ruby", &['e'], &[]),
+    ("php", &['r'], &[]),
+];
+
 const NPM_SPECIFIER_PREFIX: &str = "npm:";
 
 /// Most `env` wrappers followed before the launch is treated as unanalyzable.
 const MAX_ENV_DEPTH: usize = 8;
 
-/// `env` options that take a separate value.
-const ENV_OPTIONS_WITH_VALUE: &[&str] = &["-u", "--unset", "-C", "--chdir"];
+/// `env` long options that take no value.
+const ENV_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
+
+/// `env` long options that take a value, attached with `=` or separate.
+const ENV_LONG_OPTIONS_WITH_VALUE: &[&str] = &["--unset", "--chdir"];
+
+/// `env` short flags that take no value and may be clustered.
+const ENV_SHORT_FLAGS: &[char] = &['i', '0', 'v'];
 
 /// Whether starting `command` with `args` lets the workspace choose the
 /// program that runs.
@@ -91,7 +111,20 @@ fn launch_selects_workspace_code(command: &str, args: &[String], env_depth: usiz
     if stem == "env" {
         return env_wraps_workspace_launch(args, env_depth);
     }
-    if SHELLS.contains(&stem.as_str()) && args.iter().any(|arg| is_command_flag(arg)) {
+    if SHELLS.contains(&stem.as_str()) && args.iter().any(|arg| is_command_flag(&stem, arg)) {
+        return true;
+    }
+    if stem == "busybox" {
+        return args.first().is_none_or(|applet| {
+            env_depth >= MAX_ENV_DEPTH
+                || launch_selects_workspace_code(
+                    applet,
+                    args.get(1..).unwrap_or_default(),
+                    env_depth.saturating_add(1),
+                )
+        });
+    }
+    if args.iter().any(|arg| is_inline_eval_flag(&stem, arg)) {
         return true;
     }
     RUNNERS
@@ -105,21 +138,49 @@ fn launch_selects_workspace_code(command: &str, args: &[String], env_depth: usiz
         })
 }
 
-/// Whether a shell argument introduces a command string (`-c`, `-lc`, `/c`,
-/// `-Command`), which cannot be analyzed.
-fn is_command_flag(arg: &str) -> bool {
+/// Whether a shell argument introduces a command string, which cannot be
+/// analyzed: `-c` or a cluster holding it (`-lc`) for POSIX shells, `/c`, `/k`
+/// or `/r` for `cmd` (also glued to the command, `/ccmd`), and the
+/// `-Command`, `-CommandWithArgs` and `-EncodedCommand` parameters of
+/// PowerShell, which accepts any prefix of them and the alias `-ec`.
+fn is_command_flag(shell: &str, arg: &str) -> bool {
     let arg = arg.to_ascii_lowercase();
-    if arg == "/c" || arg == "/k" {
-        return true;
+    match shell {
+        "cmd" => ["/c", "/k", "/r"].iter().any(|flag| arg.starts_with(flag)),
+        "powershell" | "pwsh" => arg.strip_prefix(['-', '/']).is_some_and(|name| {
+            name == "ec"
+                || (!name.is_empty()
+                    && ["command", "commandwithargs", "encodedcommand"]
+                        .iter()
+                        .any(|parameter| parameter.starts_with(name)))
+        }),
+        _ => has_short_flag(&arg, &['c']),
     }
-    arg.strip_prefix('-').is_some_and(|flags| {
-        !flags.starts_with('-') && flags.chars().all(char::is_alphabetic) && flags.contains('c')
+}
+
+/// Whether `arg` is a single-dash cluster of letters holding one of `flags`.
+fn has_short_flag(arg: &str, flags: &[char]) -> bool {
+    arg.strip_prefix('-').is_some_and(|cluster| {
+        !cluster.starts_with('-')
+            && cluster.chars().all(char::is_alphabetic)
+            && cluster.chars().any(|letter| flags.contains(&letter))
     })
 }
 
+/// Whether `arg` makes the interpreter `stem` run a program given inline.
+fn is_inline_eval_flag(stem: &str, arg: &str) -> bool {
+    INLINE_EVAL
+        .iter()
+        .filter(|(name, _, _)| stem.starts_with(name))
+        .any(|(_, letters, long)| has_short_flag(arg, letters) || long.contains(&arg))
+}
+
 /// Whether the command an `env` invocation starts, unwrapped, selects workspace
-/// code. `env -S` splits a string into arguments and is refused as
-/// unanalyzable, as is a chain of more than [`MAX_ENV_DEPTH`] wrappers.
+/// code. Anything that could change which program runs or where it is looked
+/// up is refused as unanalyzable: `-S`, `-P`, an option this list does not
+/// know, a `-u`/`-C` value glued into a cluster, a `PATH=` assignment (it
+/// bypasses the sanitized `PATH`), or a chain of more than [`MAX_ENV_DEPTH`]
+/// wrappers.
 fn env_wraps_workspace_launch(args: &[String], env_depth: usize) -> bool {
     if env_depth >= MAX_ENV_DEPTH {
         return true;
@@ -132,16 +193,31 @@ fn env_wraps_workspace_launch(args: &[String], env_depth: usize) -> bool {
                 launch_selects_workspace_code(command, rest.as_slice(), inner_depth)
             });
         }
-        if arg.starts_with("-S") || arg.starts_with("--split-string") {
-            return true;
-        }
-        if arg.starts_with('-') {
-            if ENV_OPTIONS_WITH_VALUE.contains(&arg.as_str()) {
-                rest.next();
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = format!("--{}", long.split('=').next().unwrap_or_default());
+            if ENV_LONG_OPTIONS_WITH_VALUE.contains(&name.as_str()) {
+                if !long.contains('=') {
+                    rest.next();
+                }
+            } else if !ENV_LONG_FLAGS.contains(&name.as_str()) || long.contains('=') {
+                return true;
             }
             continue;
         }
-        if arg.contains('=') {
+        if let Some(cluster) = arg.strip_prefix('-') {
+            match cluster {
+                "u" | "C" => {
+                    rest.next();
+                }
+                _ if cluster.chars().all(|flag| ENV_SHORT_FLAGS.contains(&flag)) => {}
+                _ => return true,
+            }
+            continue;
+        }
+        if let Some((name, _)) = arg.split_once('=') {
+            if name.eq_ignore_ascii_case("PATH") {
+                return true;
+            }
             continue;
         }
         return launch_selects_workspace_code(arg, rest.as_slice(), inner_depth);
@@ -237,6 +313,98 @@ mod tests {
         let mut chain: Vec<&str> = vec!["env"; MAX_ENV_DEPTH + 1];
         chain.push("rust-analyzer");
         assert!(launches("env", &chain));
+    }
+
+    #[test]
+    fn env_options_that_change_what_runs_are_unanalyzable() {
+        for args in [
+            &["-iS", "npx srv"][..],
+            &["-iC", "/dir", "rust-analyzer"],
+            &["-vu", "X", "rust-analyzer"],
+            &["-uX", "rust-analyzer"],
+            &["-P", "/ws/bin", "rust-analyzer"],
+            &["-Pi", "rust-analyzer"],
+            &["--chdir", "/d", "--bogus", "rust-analyzer"],
+            &["--ignore-environment=x", "rust-analyzer"],
+            &["-z", "rust-analyzer"],
+            &["PATH=/ws/bin", "rust-analyzer"],
+            &["path=/ws/bin", "rust-analyzer"],
+            &["FOO=1", "Path=/ws/bin", "rust-analyzer"],
+        ] {
+            assert!(launches("env", args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn env_options_that_only_edit_the_environment_are_unwrapped() {
+        for args in [
+            &["-i", "rust-analyzer"][..],
+            &["-0", "-v", "rust-analyzer"],
+            &["-iv", "rust-analyzer"],
+            &["-u", "FOO", "rust-analyzer"],
+            &["-C", "/dir", "rust-analyzer"],
+            &["--ignore-environment", "--null", "--debug", "rust-analyzer"],
+            &["--unset", "FOO", "--chdir=/d", "rust-analyzer"],
+            &["--unset=FOO", "rust-analyzer"],
+            &["FOO=1", "PATHEXT=.exe", "rust-analyzer"],
+        ] {
+            assert!(!launches("env", args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn cmd_command_flags_are_recognized_with_and_without_a_space() {
+        for flag in ["/c", "/C", "/k", "/r", "/ccmd", "/Cserver"] {
+            assert!(launches("cmd", &[flag, "server"]), "{flag}");
+        }
+        assert!(!launches("cmd", &["/q", "server.bat"]));
+    }
+
+    #[test]
+    fn powershell_command_parameters_are_refused_but_other_switches_are_not() {
+        for flag in [
+            "-c",
+            "-Command",
+            "-comm",
+            "-CommandWithArgs",
+            "-EncodedCommand",
+            "-e",
+            "-ec",
+            "/command",
+        ] {
+            assert!(launches("pwsh", &[flag, "x"]), "{flag}");
+            assert!(launches("powershell.exe", &[flag, "x"]), "{flag}");
+        }
+        for flag in ["-NonInteractive", "-NoProfile", "-NoLogo", "-Version"] {
+            assert!(!launches("pwsh", &[flag, "server.ps1"]), "{flag}");
+        }
+    }
+
+    #[test]
+    fn busybox_applets_are_unwrapped() {
+        assert!(launches("busybox", &["sh", "-c", "rust-analyzer"]));
+        assert!(launches("busybox", &["env", "npx", "server"]));
+        assert!(launches("busybox", &[]));
+        assert!(!launches("busybox", &["rust-analyzer"]));
+    }
+
+    #[test]
+    fn interpreters_given_an_inline_program_are_refused() {
+        for (command, flag) in [
+            ("node", "-e"),
+            ("node", "--eval"),
+            ("node", "-p"),
+            ("node", "-pe"),
+            ("python", "-c"),
+            ("python3.12", "-c"),
+            ("/usr/bin/perl", "-e"),
+            ("ruby", "-e"),
+            ("php", "-r"),
+        ] {
+            assert!(launches(command, &[flag, "code"]), "{command} {flag}");
+            assert!(!launches(command, &["server.js"]), "{command}");
+        }
+        assert!(!launches("node", &["--version"]));
     }
 
     #[test]
