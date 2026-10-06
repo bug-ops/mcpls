@@ -1,59 +1,51 @@
 //! Small helpers shared across `mcpls-core` modules.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::io::Read as _;
 use std::num::NonZeroU64;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::string::FromUtf8Error;
+use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
 
+use futures::FutureExt as _;
 use tokio::task::JoinHandle;
 
-/// Byte cap for a bounded read against a `max`-byte size limit: `max + 1`
-/// when `max` is a real limit, so a read that reaches the cap is known to
-/// have exceeded it, or unbounded (`u64::MAX`) when `max == 0`, the
-/// documented "unlimited" sentinel used by
-/// [`crate::bridge::state::ResourceLimits::max_file_size`].
-pub const fn bounded_read_cap(max: u64) -> u64 {
-    if max == 0 {
-        u64::MAX
-    } else {
-        max.saturating_add(1)
-    }
-}
+use crate::config::SizeLimit;
 
-/// Outcome of checking a bounded read's raw bytes against `max` and decoding
-/// them as UTF-8.
-#[derive(Debug)]
-pub enum BoundedReadOutcome {
-    /// `buf` was within `max` bytes and valid UTF-8.
-    Ok(String),
-    /// `buf` was longer than `max` bytes; carries the actual byte count.
+/// Why [`check_bounded_utf8`] rejected the bytes of a bounded read.
+#[derive(thiserror::Error, Debug)]
+pub enum BoundedUtf8Error {
+    /// The bytes were longer than the limit; carries the actual byte count.
+    #[error("{size} bytes exceed the limit")]
     TooLarge {
         /// Number of bytes actually read.
         size: u64,
     },
-    /// `buf` was within `max` bytes but not valid UTF-8.
-    InvalidUtf8(FromUtf8Error),
+    /// The bytes were within the limit but not valid UTF-8.
+    #[error(transparent)]
+    InvalidUtf8(#[from] FromUtf8Error),
 }
 
 /// Checks `buf`'s length against `max` *before* UTF-8-validating it, so that
 /// a multibyte character split by a bounded read's cap (see
-/// [`bounded_read_cap`]) is reported as oversized rather than as invalid
-/// UTF-8. `max == 0` means unlimited -- the size check is skipped in that
-/// case, matching [`bounded_read_cap`]'s sentinel.
+/// [`SizeLimit::read_cap`]) is reported as oversized rather than as invalid
+/// UTF-8.
 ///
 /// Callers own the bounded read itself (sync or async filesystem I/O
-/// differs by caller) and map the outcome onto their own error type.
-pub fn check_bounded_utf8(buf: Vec<u8>, max: u64) -> BoundedReadOutcome {
-    if max != 0 && buf.len() as u64 > max {
-        return BoundedReadOutcome::TooLarge {
-            size: buf.len() as u64,
-        };
+/// differs by caller) and map the error onto their own error type.
+///
+/// # Errors
+///
+/// [`BoundedUtf8Error::TooLarge`] past `max`, otherwise
+/// [`BoundedUtf8Error::InvalidUtf8`].
+pub fn check_bounded_utf8(buf: Vec<u8>, max: SizeLimit) -> Result<String, BoundedUtf8Error> {
+    let size = buf.len() as u64;
+    if !max.admits(size) {
+        return Err(BoundedUtf8Error::TooLarge { size });
     }
-    match String::from_utf8(buf) {
-        Ok(s) => BoundedReadOutcome::Ok(s),
-        Err(e) => BoundedReadOutcome::InvalidUtf8(e),
-    }
+    Ok(String::from_utf8(buf)?)
 }
 
 /// Why [`RegularFile::open`] refused a path.
@@ -162,7 +154,7 @@ impl RegularFile {
         }
         let mut buf = Vec::new();
         self.file
-            .take(bounded_read_cap(max))
+            .take(max.saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(ReadBoundedError::Io)?;
         let read = buf.len() as u64;
@@ -326,13 +318,51 @@ impl<T> Drop for AbortOnDrop<'_, T> {
     }
 }
 
-/// Best-effort text of a panic payload, for logging.
-pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
+/// A future that panicked while being driven by [`catch_panic`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("task panicked: {message}")]
+pub struct TaskPanicked {
+    message: String,
+}
+
+impl TaskPanicked {
+    /// Best-effort text of the panic payload.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn from_payload(payload: &(dyn std::any::Any + Send)) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        Self {
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Drives `fut` to completion, turning a panic inside it into
+/// [`TaskPanicked`] so supervised tasks share one containment path.
+pub async fn catch_panic<T>(fut: impl Future<Output = T>) -> Result<T, TaskPanicked> {
+    AssertUnwindSafe(fut)
+        .catch_unwind()
+        .await
+        .map_err(|payload| TaskPanicked::from_payload(payload.as_ref()))
+}
+
+/// Locks a `std::sync::Mutex`, recovering the guard if a previous holder
+/// panicked while holding it.
+///
+/// Every lock guarded this way protects a short, synchronous, panic-free
+/// critical section (a `HashMap`/`HashSet` lookup or insert), so poisoning
+/// can only happen if an unrelated bug already panicked; refusing to unwind
+/// the whole process a second time over stale poisoning is preferable to
+/// deadlocking future calls.
+pub fn lock_std<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -340,6 +370,32 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[tokio::test]
+    async fn catch_panic_passes_value_through() {
+        assert_eq!(catch_panic(async { 7 }).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn catch_panic_reports_str_and_string_payloads() {
+        let from_str = catch_panic(async { panic!("static boom") }).await;
+        assert_eq!(from_str.unwrap_err().message(), "static boom");
+        let detail = 42;
+        let from_string = catch_panic(async { panic!("boom {detail}") }).await;
+        assert_eq!(from_string.unwrap_err().message(), "boom 42");
+    }
+
+    #[test]
+    fn lock_std_recovers_poisoned_mutex() {
+        let mutex = std::sync::Arc::new(StdMutex::new(1));
+        let poisoner = std::sync::Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert_eq!(*lock_std(&mutex), 1);
+    }
 
     #[test]
     fn read_regular_file_bounded_reads_within_limit() {
@@ -502,39 +558,38 @@ mod tests {
         assert_eq!(truncate_string("abc".to_owned(), 0), TRUNCATION_MARKER);
     }
 
-    #[test]
-    fn bounded_read_cap_is_max_plus_one() {
-        assert_eq!(bounded_read_cap(100), 101);
-        assert_eq!(bounded_read_cap(u64::MAX - 1), u64::MAX);
-    }
-
-    #[test]
-    fn bounded_read_cap_zero_means_unlimited() {
-        assert_eq!(bounded_read_cap(0), u64::MAX);
+    fn size(max: u64) -> SizeLimit {
+        SizeLimit::from_static(max)
     }
 
     #[test]
     fn check_bounded_utf8_within_limit() {
-        let outcome = check_bounded_utf8(b"hello".to_vec(), 10);
-        assert_matches!(outcome, BoundedReadOutcome::Ok(s) if s == "hello");
+        assert_eq!(
+            check_bounded_utf8(b"hello".to_vec(), size(10)).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
     fn check_bounded_utf8_too_large() {
-        let outcome = check_bounded_utf8(b"hello".to_vec(), 4);
-        assert_matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 });
+        assert_matches!(
+            check_bounded_utf8(b"hello".to_vec(), size(4)),
+            Err(BoundedUtf8Error::TooLarge { size: 5 })
+        );
     }
 
     #[test]
-    fn check_bounded_utf8_unlimited_when_max_zero() {
-        let outcome = check_bounded_utf8(b"a".repeat(1000), 0);
-        assert_matches!(outcome, BoundedReadOutcome::Ok(s) if s.len() == 1000);
+    fn check_bounded_utf8_unlimited() {
+        let text = check_bounded_utf8(b"a".repeat(1000), SizeLimit::UNLIMITED).unwrap();
+        assert_eq!(text.len(), 1000);
     }
 
     #[test]
     fn check_bounded_utf8_invalid_utf8_within_limit() {
-        let outcome = check_bounded_utf8(vec![0xFF, 0xFE], 10);
-        assert_matches!(outcome, BoundedReadOutcome::InvalidUtf8(_));
+        assert_matches!(
+            check_bounded_utf8(vec![0xFF, 0xFE], size(10)),
+            Err(BoundedUtf8Error::InvalidUtf8(_))
+        );
     }
 
     /// A multibyte character split by the bound must be reported as
@@ -544,8 +599,10 @@ mod tests {
     fn check_bounded_utf8_reports_oversized_before_invalid_utf8() {
         let mut buf = "é".repeat(3).into_bytes();
         buf.truncate(5);
-        let outcome = check_bounded_utf8(buf, 4);
-        assert_matches!(outcome, BoundedReadOutcome::TooLarge { size: 5 });
+        assert_matches!(
+            check_bounded_utf8(buf, size(4)),
+            Err(BoundedUtf8Error::TooLarge { size: 5 })
+        );
     }
 
     #[test]

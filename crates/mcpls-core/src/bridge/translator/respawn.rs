@@ -13,11 +13,13 @@ use tokio::time::Duration;
 use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
 use super::servers::Backend;
-use crate::bridge::{DiagnosticsRole, lock_std};
+use crate::bridge::DiagnosticsRole;
+use crate::bridge::indexing::IndexingReset;
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::tsserver_pin::{configured_tsserver_path, warn_if_pin_ignored};
+use crate::lsp::tsserver_pin::warn_if_pin_ignored;
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::util::lock_std;
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
 /// can back off a crash-looping process instead of retrying it on every
@@ -318,8 +320,15 @@ impl Translator {
             });
         }
 
-        let language_id = config.server_config.language_id.clone();
-        let pinned_tsserver = configured_tsserver_path(config.initialization_options.as_ref());
+        let config = match config.for_respawn() {
+            Ok(config) => config,
+            Err(err) => {
+                self.record_respawn_failure(id);
+                return Err(err);
+            }
+        };
+        let language_id = config.server_config().language_id.clone();
+        let pinned_tsserver = config.pinned_tsserver();
 
         let mut new_server = match LspServer::spawn(config).await {
             Ok(server) => {
@@ -352,7 +361,7 @@ impl Translator {
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
-            cache.reset_indexing_state(id);
+            cache.reset_indexing_state(id, IndexingReset::Forget);
             if diagnostics_route {
                 cleared = cache.clear_server_diagnostics(id);
                 match routing {
@@ -596,7 +605,9 @@ mod tests {
             pid_is_running, stub_server_config, write_crash_after_init_script,
             write_responder_script,
         };
-        use crate::config::{LanguageId, TimeoutSecs, ToolKind, ToolRouter};
+        use crate::config::{
+            FileExtension, LanguageId, ServerCommand, TimeoutSecs, ToolKind, ToolRouter, ToolSet,
+        };
         use crate::lsp::ServerInitConfig;
         use crate::test_lsp::with_read_preamble;
 
@@ -721,7 +732,7 @@ sleep 0.3
             wait_until_dead(&translator, &id).await;
 
             let dead = translator.dead_server_config(&id).unwrap();
-            assert_eq!(dead.server_config.args, config.server_config.args);
+            assert_eq!(dead.server_config().args, config.server_config().args);
 
             translator.respawn_if_dead(&id).await.unwrap();
         }
@@ -760,7 +771,7 @@ sleep 5
             )
             .unwrap();
             let mut pinned = stub_server_config("rust", &reporter);
-            pinned.initialization_options =
+            pinned.server_config_mut().initialization_options =
                 Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
             set_respawn_config(&translator, &id, pinned);
 
@@ -797,7 +808,8 @@ sleep 5
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &script);
-            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
             set_respawn_config(&translator, &id, broken);
 
             let err = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -893,7 +905,8 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &seed_script);
-            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -932,7 +945,8 @@ fi
             wait_until_dead(&translator, &id).await;
 
             let mut broken = stub_server_config("rust", &seed_script);
-            broken.server_config.command = "nonexistent-lsp-cmd-xyz".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
             set_respawn_config(&translator, &id, broken);
 
             let err1 = translator.respawn_if_dead(&id).await.unwrap_err();
@@ -1315,7 +1329,7 @@ sleep 1
             let configs = [
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: "sh".to_string(),
+                    command: ServerCommand::from_static("sh"),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
@@ -1324,14 +1338,14 @@ sleep 1
                     timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
-                    name: Some("hover-only".to_string()),
-                    handles: Some(vec![ToolKind::Hover]),
+                    name: Some(ServerId::from("hover-only")),
+                    handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
                     indexing: crate::bridge::IndexingPolicy::Auto,
                     selection: crate::config::ServerSelection::Explicit,
                 },
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: "sh".to_string(),
+                    command: ServerCommand::from_static("sh"),
                     args: vec![],
                     env: HashMap::new(),
                     file_patterns: vec![],
@@ -1340,7 +1354,7 @@ sleep 1
                     timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
                     heuristics: None,
-                    name: Some("diag-catchall".to_string()),
+                    name: Some(ServerId::from("diag-catchall")),
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
                     selection: crate::config::ServerSelection::Explicit,
@@ -1371,7 +1385,7 @@ sleep 1
             // because of the `handles: Some([Hover])` restriction this test
             // means to exercise, which would pass for the wrong reason.
             let mut respawn_config = stub_server_config("hover-only", &respawn_script);
-            respawn_config.server_config.language_id = LanguageId::from_static("rust");
+            respawn_config.server_config_mut().language_id = LanguageId::from_static("rust");
             set_respawn_config(&translator, &hover_id, respawn_config);
 
             translator.respawn_if_dead(&hover_id).await.unwrap();
@@ -1416,7 +1430,7 @@ sleep 1
                     LanguageId::from_static("rust"),
                 )]))
                 .with_extensions(HashMap::from([(
-                    "rs".to_string(),
+                    FileExtension::from_static("rs"),
                     LanguageId::from_static("rust"),
                 )]));
             translator.set_workspace_roots(

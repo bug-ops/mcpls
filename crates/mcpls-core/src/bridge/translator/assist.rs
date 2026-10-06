@@ -146,7 +146,12 @@ impl Translator {
         validate_completions_params(trigger.as_deref())?;
 
         let doc = self
-            .prepare_gated_document(&file_path, Capability::Completions, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::Completions,
+                IndexingGate::Required,
+                &[position],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -211,10 +216,11 @@ impl Translator {
         position: Position,
     ) -> Result<SignatureHelpResult> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::SignatureHelp,
                 IndexingGate::NotRequired,
+                &[position],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -283,10 +289,11 @@ impl Translator {
     ) -> Result<InlayHintsResult> {
         let (start, end) = (range.start(), range.end());
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::InlayHints,
                 IndexingGate::NotRequired,
+                &[start, end],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -682,16 +689,40 @@ mod tests {
         assert!(wire.get("positions_degraded").is_none());
     }
 
+    /// #641: a line past the end is rejected before any request, so it can no
+    /// longer reach the request-degradation path.
     #[tokio::test]
-    async fn test_handle_completions_line_past_eof_with_column_is_request_degraded() {
-        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/completion").await;
-        assert_eq!(wire["positions_degraded"], "request");
-    }
+    async fn test_handle_completions_and_signature_help_line_past_eof_are_rejected() {
+        use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_handle_signature_help_line_past_eof_with_column_is_request_degraded() {
-        let wire = utf8_degradation("fn main() {}", 5, 3, "textDocument/signatureHelp").await;
-        assert_eq!(wire["positions_degraded"], "request");
+        use crate::config::ServerId;
+
+        let dir = TempDir::new().unwrap();
+        let caps = lsp_types::ServerCapabilities {
+            completion_provider: Some(lsp_types::CompletionOptions::default()),
+            signature_help_provider: Some(lsp_types::SignatureHelpOptions::default()),
+            ..Default::default()
+        };
+        let (translator, _server) = translator_with_capabilities_and_encoding(
+            &dir,
+            &ServerId::from("rust"),
+            caps,
+            lsp_types::PositionEncodingKind::UTF8,
+        );
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let file = || client_path(path.to_string_lossy().into_owned());
+
+        let completions = translator.handle_completions(file(), pos(5, 3), None).await;
+        assert!(matches!(
+            completions,
+            Err(Error::PositionBeyondDocument { .. })
+        ));
+        let signature = translator.handle_signature_help(file(), pos(5, 3)).await;
+        assert!(matches!(
+            signature,
+            Err(Error::PositionBeyondDocument { .. })
+        ));
     }
 
     #[tokio::test]

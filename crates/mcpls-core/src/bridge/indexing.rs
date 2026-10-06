@@ -25,6 +25,14 @@ use tokio::time::Instant;
 use crate::config::ServerId;
 use crate::lsp::types::ProgressKind;
 
+/// How a server's tracked [`IndexingState`] is reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexingReset {
+    /// Forget everything tracked: the state reverts to
+    /// [`IndexingState::Unknown`] until the next signal.
+    Forget,
+}
+
 /// Workspace-indexing readiness of a routed LSP server.
 ///
 /// Tracked separately from the `initialize`/`initialized` handshake

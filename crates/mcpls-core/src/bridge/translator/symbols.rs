@@ -15,10 +15,11 @@ use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::routing::{
     Capability, IndexingGate, PreparedDocument, WorkspaceRouteLookup, lookup_workspace_route,
 };
-use crate::bridge::{ClientPath, lock_std};
+use crate::bridge::ClientPath;
 use crate::config::ToolKind;
 use crate::error::{Error, Result};
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
+use crate::util::lock_std;
 
 /// Validate `query`'s length for `handle_workspace_symbol`.
 fn validate_query_length(query: &str) -> Result<()> {
@@ -473,7 +474,7 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
-    use crate::config::{LanguageId, ServerId, TimeoutSecs, ToolRouter};
+    use crate::config::{LanguageId, ServerCommand, ServerId, TimeoutSecs, ToolRouter, ToolSet};
     use crate::test_lsp::client_path;
 
     /// #355/#467 regression: `resolve_kind_filter`'s name-matching branch
@@ -608,11 +609,11 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_reports_failed_claimant() {
         let mut live = crate::config::LspServerConfig::pyright();
-        live.name = Some("live".to_string());
-        live.handles = Some(vec![ToolKind::Hover]);
+        live.name = Some(ServerId::from("live"));
+        live.handles = Some(ToolSet::new(vec![ToolKind::Hover]).unwrap());
         let mut failing = crate::config::LspServerConfig::rust_analyzer();
-        failing.name = Some("failing".to_string());
-        failing.handles = Some(vec![ToolKind::WorkspaceSymbols]);
+        failing.name = Some(ServerId::from("failing"));
+        failing.handles = Some(ToolSet::new(vec![ToolKind::WorkspaceSymbols]).unwrap());
         let router = ToolRouter::from_configs([&live, &failing]).unwrap();
         let failing_id = ServerId::from("failing");
 
@@ -663,7 +664,7 @@ mod tests {
     async fn test_handle_workspace_symbol_no_claimant_names_tool() {
         let configs = vec![crate::config::LspServerConfig {
             language_id: LanguageId::from_static("python"),
-            command: "pyright-langserver".to_string(),
+            command: ServerCommand::from_static("pyright-langserver"),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -672,8 +673,8 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: Some("pyright".to_string()),
-            handles: Some(vec![ToolKind::Hover]),
+            name: Some(ServerId::from("pyright")),
+            handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
         }];

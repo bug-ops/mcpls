@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use super::config::{ProbeDeadline, ProbeInterval};
 use super::saturating_deadline;
 use super::session_manager::{SessionFingerprint, StreamGuard};
-use crate::bridge::lock_std;
+use crate::util::lock_std;
 
 const PROBE_ID_PREFIX: &str = "mcpls-liveness-";
 const OUTBOUND_CAPACITY: usize = 16;

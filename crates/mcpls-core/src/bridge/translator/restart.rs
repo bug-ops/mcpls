@@ -21,11 +21,13 @@ use tokio::task::AbortHandle;
 use super::Translator;
 use super::respawn::BackoffPolicy;
 use super::servers::{Backend, Phase};
-use crate::bridge::{DiagnosticsKey, IndexingState, lock_std};
+use crate::bridge::indexing::IndexingReset;
+use crate::bridge::{DiagnosticsKey, IndexingState};
 use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
+use crate::util::lock_std;
 
 /// Minimum interval between two manual restart attempts of the same server.
 const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
@@ -184,7 +186,7 @@ impl RestartFailure {
             | Error::InvalidClientPath(_)
             | Error::MalformedPath { .. }
             | Error::DocumentNotFound(_)
-            | Error::NoServerForLanguage(_)
+            | Error::NoServerForLanguage { .. }
             | Error::NoServerForTool { .. }
             | Error::ServerFailedToStart(_)
             | Error::ServerInitializing { .. }
@@ -196,10 +198,10 @@ impl RestartFailure {
             | Error::NoServerForWorkspaceTool { .. }
             | Error::ConfigNotFound(_)
             | Error::ConfigInsideWorkspace { .. }
-            | Error::InvalidConfig(_)
+            | Error::Config(_)
             | Error::TomlDe(_)
             | Error::TomlSer(_)
-            | Error::InvalidUri(_)
+            | Error::NoResolvableListenUris
             | Error::ResourceUri(_)
             | Error::InvalidPositionInput(_)
             | Error::InvalidRangeInput(_)
@@ -680,7 +682,7 @@ impl Translator {
                 message: format!("LSP server '{id}' is not running"),
             };
         };
-        let language_id = config.server_config.language_id.clone();
+        let language_id = config.server_config().language_id.clone();
 
         if self.is_shutting_down() {
             self.invalidate_stopped_server(id, &language_id).await;
@@ -741,7 +743,7 @@ impl Translator {
         let mut cleared = Vec::new();
         if let Some(cache) = &self.notification_cache {
             let mut cache = cache.lock().await;
-            cache.reset_indexing_state(id);
+            cache.reset_indexing_state(id, IndexingReset::Forget);
             if self.is_diagnostics_route(language_id, id) {
                 cleared = cache.clear_server_diagnostics(id);
                 cache.mark_push_degraded(id);
@@ -895,7 +897,7 @@ mod tests {
             write_responder_script, write_slow_exit_server_script,
         };
         use crate::bridge::{NotificationCache, WorkspaceRoots};
-        use crate::config::{LanguageId, ToolRouter};
+        use crate::config::{LanguageId, ServerCommand, ToolRouter};
         use crate::error::{ServerSpawnFailure, StartupFailure};
         use crate::mcp::SubscriptionRegistry;
         use crate::runtime::pump::{PumpShared, PumpWiring};
@@ -1108,7 +1110,7 @@ mod tests {
             translator.record_refusals(&[ServerSpawnFailure {
                 server_id: config.id(),
                 language_id: config.language_id.clone(),
-                command: config.command.clone(),
+                command: config.command.to_string(),
                 reason: StartupFailure::RefusedUntrustedWorkspace(
                     crate::error::UntrustedRefusal::NotAllowed { builtin: None },
                 ),
@@ -1472,7 +1474,8 @@ mod tests {
             let script = write_protocol_server_script(dir.path(), &log, None);
             let fx = fixture(dir, &script, true).await;
             let mut broken = stub_server_config("rust", &script);
-            broken.server_config.command = "mcpls-test-missing-server".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("mcpls-test-missing-server");
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1712,7 +1715,8 @@ mod tests {
             .await
             .expect("the seed server's diagnostics reach the cache");
             let mut broken = stub_server_config("rust", &script);
-            broken.server_config.command = "mcpls-test-missing-server".to_string();
+            broken.server_config_mut().command =
+                ServerCommand::from_static("mcpls-test-missing-server");
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()

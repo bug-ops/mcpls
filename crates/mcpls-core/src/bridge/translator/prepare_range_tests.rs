@@ -1,5 +1,7 @@
 //! Fake-server tests for `handle_prepare_rename` and `handle_format_range`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{assert_matches, fs};
@@ -14,7 +16,10 @@ use super::dto::{
 };
 use super::testing::*;
 use crate::bridge::{IndexingPolicy, WorkspaceRoots};
-use crate::config::{LanguageId, LspServerConfig, ServerId, TimeoutSecs, ToolKind, ToolRouter};
+use crate::config::{
+    FileExtension, LanguageId, LspServerConfig, ServerCommand, ServerId, TimeoutSecs, ToolKind,
+    ToolRouter, ToolSet,
+};
 use crate::error::{Error, McpErrorKind, Result};
 use crate::lsp::LspServer;
 use crate::redaction::Redactions;
@@ -322,6 +327,97 @@ async fn prepare_rename_line_beyond_the_document_is_rejected_before_the_request(
     assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
 }
 
+fn all_positioned_caps() -> lsp_types::ServerCapabilities {
+    serde_json::from_value(serde_json::json!({
+        "hoverProvider": true,
+        "definitionProvider": true,
+        "typeDefinitionProvider": true,
+        "implementationProvider": true,
+        "declarationProvider": true,
+        "referencesProvider": true,
+        "completionProvider": {},
+        "signatureHelpProvider": {},
+        "callHierarchyProvider": true,
+        "typeHierarchyProvider": true,
+        "documentHighlightProvider": true,
+        "selectionRangeProvider": true,
+        "renameProvider": {"prepareProvider": true},
+        "codeActionProvider": true,
+        "inlayHintProvider": true,
+    }))
+    .unwrap()
+}
+
+/// Asserts `call` fails with an out-of-document line, as invalid params,
+/// without a round-trip to the server.
+async fn reject_beyond<T>(name: &str, call: Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>) {
+    let err = timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap_or_else(|_| panic!("{name} must fail before any LSP round-trip"))
+        .err()
+        .unwrap_or_else(|| panic!("{name} accepted a line beyond the document"));
+    assert_matches!(
+        err,
+        Error::PositionBeyondDocument { line } if line.get() == 99,
+        "{name}"
+    );
+    assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams, "{name}");
+}
+
+macro_rules! reject {
+    ($name:literal, $call:expr) => {
+        reject_beyond($name, Box::pin($call)).await
+    };
+}
+
+/// #641: every tool that takes a position or range rejects a line past the
+/// end of the tracked document as invalid params, before any LSP request.
+#[tokio::test]
+async fn every_positioned_tool_rejects_a_line_beyond_the_document() {
+    use crate::bridge::ResultContext;
+
+    let dir = TempDir::new().unwrap();
+    let (translator, path, _server) = tracked_translator(&dir, all_positioned_caps(), "a\nb\n");
+    let file = || client_path(path.to_string_lossy().into_owned());
+    let (beyond, ctx) = (pos(99, 1), ResultContext::None);
+    let t = &translator;
+
+    reject!("hover", t.handle_hover(file(), beyond));
+    reject!("definition", t.handle_definition(file(), beyond, ctx));
+    reject!(
+        "type_definition",
+        t.handle_type_definition(file(), beyond, ctx)
+    );
+    reject!(
+        "implementation",
+        t.handle_implementation(file(), beyond, ctx)
+    );
+    reject!("declaration", t.handle_declaration(file(), beyond, ctx));
+    reject!("references", t.handle_references(file(), beyond, true, ctx));
+    reject!("completions", t.handle_completions(file(), beyond, None));
+    reject!("signature_help", t.handle_signature_help(file(), beyond));
+    reject!(
+        "call_hierarchy",
+        t.handle_call_hierarchy_prepare(file(), beyond)
+    );
+    reject!(
+        "type_hierarchy",
+        t.handle_type_hierarchy_prepare(file(), beyond)
+    );
+    reject!("highlights", t.handle_document_highlights(file(), beyond));
+    reject!("selection_range", t.handle_selection_range(file(), beyond));
+    reject!("rename", t.handle_rename(file(), beyond, "x".to_owned()));
+    reject!("prepare_rename", t.handle_prepare_rename(file(), beyond));
+    reject!(
+        "code_actions",
+        t.handle_code_actions(file(), bounded(pos(1, 1), beyond), None)
+    );
+    reject!(
+        "inlay_hints",
+        t.handle_inlay_hints(file(), span(pos(1, 1), beyond))
+    );
+}
+
 #[tokio::test]
 async fn prepare_rename_catch_all_error_logs_a_warning() {
     let logs = logs_of(Answer::Error(-32001, "internal clangd failure")).await;
@@ -481,7 +577,7 @@ async fn prepare_rename_requires_prepare_provider_not_just_rename() {
 fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
     LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: name.to_string(),
+        command: ServerCommand::new(name.to_string()).unwrap(),
         args: vec![],
         env: std::collections::HashMap::new(),
         file_patterns: vec![],
@@ -490,8 +586,8 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
         request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
         heuristics: None,
-        name: Some(name.to_string()),
-        handles: Some(handles),
+        name: Some(ServerId::from(name)),
+        handles: Some(ToolSet::new(handles).unwrap()),
         indexing: IndexingPolicy::Auto,
         selection: crate::config::ServerSelection::Explicit,
     }
@@ -509,7 +605,7 @@ async fn prepare_rename_routes_with_rename() {
     ];
     let mut translator = Translator::new()
         .with_extensions(std::collections::HashMap::from([(
-            "rs".to_string(),
+            FileExtension::from_static("rs"),
             crate::config::LanguageId::from_static("rust"),
         )]))
         .with_router(ToolRouter::from_configs(&configs).unwrap());

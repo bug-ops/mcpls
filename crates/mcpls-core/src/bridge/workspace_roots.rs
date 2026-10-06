@@ -15,7 +15,7 @@ use thiserror::Error as ThisError;
 use tracing::{debug, info, warn};
 
 use super::{ClientPath, uri_to_path};
-use crate::error::{BackgroundTask, Error};
+use crate::error::{BackgroundTask, ConfigError, Error};
 
 /// How path components are compared during containment checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,15 +218,16 @@ impl ProcessCwd {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidConfig`] when `probe` cannot be canonicalized.
+/// Returns [`Error::Config`] when `probe` cannot be canonicalized.
 pub fn probe_root(written: &Path, base_dir: &Path, probe: &Path) -> Result<PathBuf, Error> {
     dunce::canonicalize(probe).map_err(|source| {
-        Error::InvalidConfig(format!(
-            "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
-            written.display(),
-            base_dir.display(),
-            probe.display()
-        ))
+        ConfigError::UnresolvableWorkspaceRoot {
+            written: written.to_path_buf(),
+            base_dir: base_dir.to_path_buf(),
+            probe: probe.to_path_buf(),
+            source,
+        }
+        .into()
     })
 }
 
@@ -548,7 +549,7 @@ impl WorkspaceRoots {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] for a relative root that cannot be
+    /// Returns [`Error::Config`] for a relative root that cannot be
     /// canonicalized and [`Error::Io`] when the working directory is needed
     /// but unreadable.
     ///
@@ -959,9 +960,10 @@ mod tests {
 
         let err = resolve_in(&[PathBuf::from("missing")], &base).unwrap_err();
 
-        let Error::InvalidConfig(message) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
+        let Error::Config(config_err) = err else {
+            panic!("expected Config, got {err:?}");
         };
+        let message = config_err.to_string();
         assert!(message.contains("workspace root 'missing'"));
         assert!(message.contains(&base.display().to_string()));
     }

@@ -61,6 +61,18 @@ const READER_TASK_ABORT_GRACE: Duration = Duration::from_secs(1);
 /// may overrun it by a 50 ms settle.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many undecodable inbound frames in a row the reader tolerates before it
+/// treats the connection as broken.
+///
+/// A single frame that is not a valid message is dropped, so one bad message
+/// does not take the server down. A server that emits only garbage never makes
+/// progress, though: after this many consecutive undecodable frames the
+/// connection is torn down and the server respawned like any other lost
+/// connection.
+pub const MAX_CONSECUTIVE_UNDECODABLE_FRAMES: u32 = 64;
+
+const _: () = assert!(MAX_CONSECUTIVE_UNDECODABLE_FRAMES > 0);
+
 /// How long [`LspClient::shutdown_until`] waits for an aborted message loop
 /// to drop its command receiver before failing the pending requests.
 const SHUTDOWN_ABORT_SETTLE: Duration = Duration::from_millis(50);

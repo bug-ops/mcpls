@@ -223,7 +223,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let router = ToolRouter::from_configs(
         applicable_configs
             .iter()
-            .map(|c| &c.server_config)
+            .map(lsp::ServerInitConfig::server_config)
             .chain(refused.iter().map(|r| &r.config)),
     )?;
 
@@ -240,6 +240,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
         .with_extensions(extension_map)
+        .with_file_patterns(
+            config
+                .lsp_servers
+                .iter()
+                .flat_map(|server| server.file_patterns.iter().cloned()),
+        )
         .with_router(router)
         .with_notification_cache(Arc::clone(&notification_cache))
         .with_indexing_ready_timeout(config.workspace.indexing_ready_timeout_seconds);
@@ -253,7 +259,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // (instead of "no server configured"), telling the caller to wait and retry.
     let expected_servers: HashSet<ServerId> = applicable_configs
         .iter()
-        .map(|c| c.server_config.id())
+        .map(|c| c.server_config().id())
         .collect();
     translator.set_expected_servers(expected_servers);
     translator.record_refusals(&refusals);
@@ -334,8 +340,6 @@ mod tests {
     use std::assert_matches;
     use std::path::PathBuf;
 
-    use bridge::{DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE};
-
     use super::*;
     use crate::config::{
         IndexingReadyTimeoutSecs, LanguageId, PositionEncodings, ServerStartConcurrency,
@@ -345,6 +349,7 @@ mod tests {
     // Tests for graceful degradation behavior
     mod graceful_degradation_tests {
         use super::*;
+        use crate::config::{DocumentLimit, FilePattern, SearchDepth, ServerCommand, SizeLimit};
 
         #[tokio::test]
         async fn test_serve_degrades_when_all_servers_fail_to_spawn() {
@@ -365,18 +370,18 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: "nonexistent-command-that-will-fail-12345".to_string(),
+                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345"),
                     args: vec![],
                     env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.rs".to_string()],
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
                     timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -424,9 +429,9 @@ mod tests {
                     roots: vec![PathBuf::from("/tmp/test-workspace")],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
@@ -483,9 +488,9 @@ mod tests {
                     roots: vec![workspace_root],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
@@ -534,21 +539,21 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![PathBuf::new()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
-                    heuristics_max_depth: 10,
-                    max_documents: DEFAULT_MAX_DOCUMENTS,
-                    max_file_size: DEFAULT_MAX_FILE_SIZE,
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
                     indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
                     max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: String::new(),
+                    command: ServerCommand::from_static("rust-analyzer"),
                     args: vec![],
                     env: std::collections::HashMap::new(),
-                    file_patterns: vec!["**/*.rs".to_string()],
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
                     timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -578,9 +583,9 @@ mod tests {
                 ),
                 Ok(result) => assert_matches!(
                     result,
-                    Err(Error::InvalidConfig(_)),
-                    "serve() must reject a caller-supplied config with an empty `command` via \
-                     Error::InvalidConfig, matching the load_from path; got: {result:?}"
+                    Err(Error::Config(_)),
+                    "serve() must reject a caller-supplied config with an empty workspace root via \
+                     Error::Config, matching the load_from path; got: {result:?}"
                 ),
             }
         }

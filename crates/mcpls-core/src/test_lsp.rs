@@ -20,10 +20,11 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::Duration;
 
+use crate::ServerId;
 use crate::bridge::WorkspaceRoots;
 #[cfg(unix)]
 use crate::config::{LanguageId, TimeoutSecs};
-use crate::config::{LspServerConfig, PositionEncodings};
+use crate::config::{LspServerConfig, PositionEncodings, ServerCommand};
 use crate::lsp::{LspClient, LspTransport, LspTransportReader, ServerInitConfig};
 
 /// Duplex buffer capacity for the mock pipes below. Framed JSON-RPC
@@ -307,13 +308,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
 
 /// Minimal [`ServerInitConfig`] around `server_config` for test fixtures.
 pub fn init_config_for(server_config: LspServerConfig) -> ServerInitConfig {
-    ServerInitConfig {
+    ServerInitConfig::new(
         server_config,
-        workspace_roots: vec![],
-        initialization_options: None,
-        position_encodings: PositionEncodings::DEFAULT,
-        redactions: std::sync::Arc::default(),
-    }
+        WorkspaceRoots::default(),
+        PositionEncodings::DEFAULT,
+        std::sync::Arc::default(),
+    )
 }
 
 /// Creates a FIFO at `path`, panicking when `mkfifo` fails.
@@ -327,14 +327,15 @@ pub fn make_fifo(path: &std::path::Path) {
 }
 
 /// Extension map shared by routing tests: `.rs` and `.tsx`.
-pub fn test_extensions() -> std::collections::HashMap<String, crate::config::LanguageId> {
+pub fn test_extensions()
+-> std::collections::HashMap<crate::config::FileExtension, crate::config::LanguageId> {
     std::collections::HashMap::from([
         (
-            "rs".to_string(),
+            crate::config::FileExtension::from_static("rs"),
             crate::config::LanguageId::from_static("rust"),
         ),
         (
-            "tsx".to_string(),
+            crate::config::FileExtension::from_static("tsx"),
             crate::config::LanguageId::from_static("typescriptreact"),
         ),
     ])
@@ -347,7 +348,7 @@ pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> Server
     let script = dir.join("server.sh");
     std::fs::write(&script, script_body).unwrap();
     let mut server_config = LspServerConfig::rust_analyzer();
-    server_config.command = "sh".to_string();
+    server_config.command = ServerCommand::from_static("sh");
     server_config.args = vec![script.to_string_lossy().to_string()];
     init_config_for(server_config)
 }
@@ -384,9 +385,9 @@ pub fn named_sh_init_config(
     let sub = dir.join(name);
     std::fs::create_dir_all(&sub).unwrap();
     let mut config = sh_script_init_config(&sub, script_body);
-    config.server_config.name = Some(name.to_string());
-    config.server_config.language_id = LanguageId::new(language).unwrap();
-    config.server_config.timeout_seconds = TimeoutSecs::new(10).unwrap();
+    config.server_config_mut().name = Some(ServerId::from(name));
+    config.server_config_mut().language_id = LanguageId::new(language).unwrap();
+    config.server_config_mut().timeout_seconds = TimeoutSecs::new(10).unwrap();
     config
 }
 

@@ -221,6 +221,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         use super::super::*;
+        use crate::config::ServerCommand;
 
         fn executable(path: &Path) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -230,7 +231,7 @@ mod tests {
 
         fn config(command: &str) -> LspServerConfig {
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = command.to_string();
+            config.command = ServerCommand::new(command.to_string()).unwrap();
             config
         }
 

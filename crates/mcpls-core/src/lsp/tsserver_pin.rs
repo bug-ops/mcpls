@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::{BuiltinServer, LspServerConfig};
+use crate::config::{BuiltinServer, LspServerConfig, ServerCommand};
 use crate::error::InitFailureHint;
 use crate::lsp::command_path::{find_executable, is_executable_file};
 use crate::lsp::{LspNotification, child_env_var};
@@ -189,13 +189,13 @@ enum Launch<'a> {
 /// The launch kind of `config`, or `None` when it does not involve
 /// typescript-language-server.
 fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
-    if BuiltinServer::TypescriptLanguageServer.matches_command(&config.command) {
+    if BuiltinServer::TypescriptLanguageServer.matches_command(config.command.as_str()) {
         return Some(Launch::Server(Path::new(&config.command)));
     }
     if !config.args.iter().any(|arg| mentions_server(arg)) {
         return None;
     }
-    let script = command_stem_is(&config.command, &SCRIPT_INTERPRETERS)
+    let script = command_stem_is(config.command.as_str(), &SCRIPT_INTERPRETERS)
         .then(|| {
             config
                 .args
@@ -207,7 +207,7 @@ fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
     if let Some(script) = script {
         return Some(Launch::Script(script));
     }
-    let runner = command_stem_is(&config.command, &PACKAGE_RUNNERS)
+    let runner = command_stem_is(config.command.as_str(), &PACKAGE_RUNNERS)
         || config
             .args
             .iter()
@@ -469,7 +469,7 @@ pub fn resolve(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTsc {
     path: PathBuf,
-    command: String,
+    command: ServerCommand,
 }
 
 /// Why a `tsc` candidate was not accepted as a [`NativeTsc`].
@@ -540,10 +540,8 @@ impl NativeTsc {
         if !is_executable_file(&canonical) {
             return Err(CandidateRejected::NotExecutable);
         }
-        let command = canonical
-            .to_str()
-            .ok_or(CandidateRejected::NonUtf8Path)?
-            .to_owned();
+        let command = canonical.to_str().ok_or(CandidateRejected::NonUtf8Path)?;
+        let command = ServerCommand::new(command).map_err(|_| CandidateRejected::NotExecutable)?;
         Ok(Self {
             path: canonical,
             command,
@@ -556,7 +554,7 @@ impl NativeTsc {
         &self.path
     }
 
-    fn command(&self) -> String {
+    fn command(&self) -> ServerCommand {
         self.command.clone()
     }
 }
@@ -752,17 +750,17 @@ pub fn with_selected_typescript_server<'a>(
 /// path only.
 pub fn init_failure_hint(
     config: &LspServerConfig,
-    effective_options: Option<&serde_json::Value>,
-    workspace_roots: &[PathBuf],
+    workspace_roots: &WorkspaceRoots,
     parent_env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<InitFailureHint> {
-    if configured_tsserver_path(effective_options).is_some() {
+    if configured_tsserver_path(config.initialization_options.as_ref()).is_some() {
         return None;
     }
     let native = match resolve(config, parent_env)? {
         TsserverResolution::Unresolved(UnresolvedReason::NativeTypescriptNextToServer) => true,
         TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer) => {
             workspace_roots
+                .canonical()
                 .iter()
                 .any(|root| nearest_native_typescript(root).is_some())
         }
@@ -918,6 +916,7 @@ mod launch_tests {
     use std::fs;
 
     use super::*;
+    use crate::config::ServerCommand;
 
     struct Install {
         _dir: tempfile::TempDir,
@@ -965,7 +964,7 @@ mod launch_tests {
 
     fn config(command: &str, args: &[&str]) -> LspServerConfig {
         let mut config = LspServerConfig::typescript();
-        config.command = command.to_string();
+        config.command = ServerCommand::new(command.to_string()).unwrap();
         config.args = args.iter().map(ToString::to_string).collect();
         config
     }
@@ -1140,7 +1139,11 @@ mod launch_tests {
                 &config("typescript-language-server.cmd", &[]),
                 env_with_path(dir),
             );
-            init_failure_hint(&config(SERVER_STEM, &[]), None, &[], env_with_path(dir));
+            init_failure_hint(
+                &config(SERVER_STEM, &[]),
+                &WorkspaceRoots::default(),
+                env_with_path(dir),
+            );
             pinned_initialization_options(
                 &config(SERVER_STEM, &[]),
                 &WorkspaceRoots::default(),
@@ -1223,8 +1226,7 @@ mod launch_tests {
         let (install, _) = npm_shim_install(SERVER_STEM, "7.0.1", false);
         let hint = init_failure_hint(
             &config(SERVER_STEM, &[]),
-            None,
-            &[],
+            &WorkspaceRoots::default(),
             env_with_path(&install.base.join("npm")),
         );
         assert_eq!(hint, Some(InitFailureHint::NativeTypescriptOnly));
@@ -1232,7 +1234,11 @@ mod launch_tests {
 
     #[test]
     fn test_package_runner_gets_no_init_failure_hint() {
-        let hint = init_failure_hint(&config("npx", &[SERVER_STEM]), None, &[], |_| None);
+        let hint = init_failure_hint(
+            &config("npx", &[SERVER_STEM]),
+            &WorkspaceRoots::default(),
+            |_| None,
+        );
         assert_eq!(hint, None);
     }
 
@@ -1283,7 +1289,7 @@ mod tests {
     use std::{assert_matches, fs};
 
     use super::*;
-    use crate::config::BuiltinServer;
+    use crate::config::{BuiltinServer, ServerCommand};
 
     struct Layout {
         _dir: tempfile::TempDir,
@@ -1330,7 +1336,7 @@ mod tests {
 
     fn config(command: &str) -> LspServerConfig {
         let mut config = LspServerConfig::typescript();
-        config.command = command.to_string();
+        config.command = ServerCommand::new(command.to_string()).unwrap();
         config
     }
 
@@ -1688,7 +1694,8 @@ mod tests {
         config: &LspServerConfig,
         roots: &[PathBuf],
     ) -> Option<InitFailureHint> {
-        init_failure_hint(config, None, roots, env_with_path(&layout.bin))
+        let roots = WorkspaceRoots::for_test(roots.to_vec(), vec![]);
+        init_failure_hint(config, &roots, env_with_path(&layout.bin))
     }
 
     #[test]
@@ -1770,11 +1777,12 @@ mod tests {
         let layout = global_install(false);
         write_typescript(&layout.base.join("prefix/lib"), "7.0.2", false);
         let options = serde_json::json!({"tsserver": {"path": "/custom/tsserver.js"}});
+        let mut pinned = config(SERVER_STEM);
+        pinned.initialization_options = Some(options);
         assert_eq!(
             init_failure_hint(
-                &config(SERVER_STEM),
-                Some(&options),
-                &[],
+                &pinned,
+                &WorkspaceRoots::default(),
                 env_with_path(&layout.bin)
             ),
             None
@@ -1849,7 +1857,8 @@ mod tests {
         std::thread::spawn(move || {
             let env = env_with_path(&bin);
             let resolved = resolve(&config(SERVER_STEM), &env);
-            let hinted = init_failure_hint(&config(SERVER_STEM), None, &[root], &env);
+            let roots = WorkspaceRoots::for_test(vec![root], vec![]);
+            let hinted = init_failure_hint(&config(SERVER_STEM), &roots, &env);
             tx.send((resolved, hinted)).unwrap();
         });
         let (resolved, hinted) = rx
@@ -1884,13 +1893,12 @@ mod tests {
         write_typescript(&root, "7.0.2", false);
 
         let server_config = config(layout.bin.join(SERVER_STEM).to_str().unwrap());
-        let err = LspServer::spawn(ServerInitConfig {
+        let err = LspServer::spawn(ServerInitConfig::new(
             server_config,
-            workspace_roots: vec![root],
-            initialization_options: None,
-            position_encodings: crate::config::PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        })
+            WorkspaceRoots::for_test(vec![root], vec![]),
+            crate::config::PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        ))
         .await
         .map(|_| ())
         .unwrap_err();
@@ -1919,7 +1927,7 @@ mod tests {
     fn native_tsc(path: &Path) -> NativeTsc {
         NativeTsc {
             path: path.to_path_buf(),
-            command: path.to_str().unwrap().to_owned(),
+            command: ServerCommand::new(path.to_str().unwrap()).unwrap(),
         }
     }
 

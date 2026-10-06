@@ -1,7 +1,7 @@
 use std::assert_matches;
 
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
-use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
+use mcpls_core::config::{SearchDepth, ServerConfig, ServerId, ToolKind, ToolRouter};
 
 #[allow(unused, reason = "shared helpers; not every test uses all of them")]
 use crate::common::test_utils::{
@@ -117,7 +117,7 @@ fn test_mutually_exclusive_heuristics_fixture_loads() {
     let applicable: Vec<_> = config
         .lsp_servers
         .iter()
-        .filter(|s| s.should_spawn(tmp.path(), None))
+        .filter(|s| s.should_spawn(tmp.path(), SearchDepth::DEFAULT))
         .collect();
     assert_eq!(
         applicable.len(),
@@ -149,7 +149,7 @@ fn test_mutually_exclusive_heuristics_fixture_errors_when_both_applicable() {
     let applicable: Vec<_> = config
         .lsp_servers
         .iter()
-        .filter(|s| s.should_spawn(tmp.path(), None))
+        .filter(|s| s.should_spawn(tmp.path(), SearchDepth::DEFAULT))
         .collect();
     assert_eq!(
         applicable.len(),
@@ -159,5 +159,5 @@ fn test_mutually_exclusive_heuristics_fixture_errors_when_both_applicable() {
 
     let err = ToolRouter::from_configs(applicable)
         .expect_err("two applicable nameless servers for one language must be ambiguous");
-    assert_matches!(err, mcpls_core::error::Error::InvalidConfig(_));
+    assert_matches!(err, mcpls_core::error::Error::Config(_));
 }

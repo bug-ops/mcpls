@@ -4,6 +4,7 @@ use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::str::FromStr;
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 /// A language identifier was empty.
@@ -67,6 +68,20 @@ impl LanguageId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl JsonSchema for LanguageId {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("LanguageId")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({"type": "string"})
     }
 }
 
@@ -152,6 +167,13 @@ mod tests {
         assert_eq!(holder.id, LanguageId::from_static("python"));
         let text = toml::to_string(&holder).unwrap();
         assert_eq!(toml::from_str::<Holder>(&text).unwrap(), holder);
+    }
+
+    #[test]
+    fn test_schema_is_an_inline_string() {
+        let mut generator = SchemaGenerator::default();
+        let schema = LanguageId::json_schema(&mut generator);
+        assert_eq!(schema.as_value(), &serde_json::json!({"type": "string"}));
     }
 
     #[test]

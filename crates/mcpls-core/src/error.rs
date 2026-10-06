@@ -11,8 +11,13 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::bridge::resources::ResourceUriError;
-use crate::bridge::{InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange};
-use crate::config::{BuiltinServer, LanguageId, ServerId, ToolKind};
+use crate::bridge::{
+    Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
+};
+use crate::config::{
+    BuiltinServer, FileExtension, FilePattern, LanguageId, ServerId, ToolKind,
+    UnsupportedFilePattern,
+};
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
@@ -197,6 +202,24 @@ impl fmt::Display for HomeVariable {
     }
 }
 
+/// What untrusted-workspace mode resolved to a path that is not valid UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedItem {
+    /// The server's executable.
+    Executable,
+    /// The `PATH` handed to the server.
+    SearchPath,
+}
+
+impl fmt::Display for ResolvedItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Executable => "executable",
+            Self::SearchPath => "PATH",
+        })
+    }
+}
+
 /// Why untrusted-workspace mode refused to start a server.
 ///
 /// # Examples
@@ -256,6 +279,30 @@ pub enum UntrustedRefusal {
         /// The canonical path of the tsserver.
         tsserver: PathBuf,
     },
+    /// The configured command is a launcher that chooses the server from
+    /// files in the workspace (a package runner, task runner or toolchain
+    /// wrapper), so what would run is under the workspace's control.
+    ProjectLauncher {
+        /// The configured `command`.
+        command: String,
+    },
+    /// The configured command starts the TypeScript server through a launcher
+    /// that untrusted mode cannot pin to a binary outside the workspace.
+    UnpinnedTypescriptLauncher {
+        /// The configured `command`.
+        command: String,
+    },
+    /// A resolved path is not valid UTF-8, so untrusted mode cannot pass it
+    /// on unchanged.
+    NonUtf8Path {
+        /// What the path belongs to.
+        what: ResolvedItem,
+        /// The path, as resolved.
+        path: PathBuf,
+    },
+    /// No directory outside the workspace is available for the server to
+    /// start in.
+    NoSafeWorkingDirectory,
 }
 
 impl fmt::Display for UntrustedRefusal {
@@ -302,6 +349,27 @@ impl fmt::Display for UntrustedRefusal {
                 "the tsserver it would use, {}, lies inside the workspace, which untrusted \
                  mode never runs",
                 tsserver.display()
+            ),
+            Self::ProjectLauncher { command } => write!(
+                f,
+                "its launcher '{command}' chooses the server from files in the workspace, \
+                 which untrusted mode never runs; install the server globally and give its \
+                 absolute path as `command`"
+            ),
+            Self::UnpinnedTypescriptLauncher { command } => write!(
+                f,
+                "its launcher '{command}' starts the TypeScript server in a way untrusted \
+                 mode cannot pin to a binary outside the workspace; install the server \
+                 globally and give its absolute path as `command`"
+            ),
+            Self::NonUtf8Path { what, path } => write!(
+                f,
+                "its {what}, {}, is not valid UTF-8, so untrusted mode cannot pass it on",
+                path.display()
+            ),
+            Self::NoSafeWorkingDirectory => f.write_str(
+                "no directory outside the workspace is available to start it in, which \
+                 untrusted mode requires",
             ),
         }
     }
@@ -373,7 +441,11 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::WorkspaceHome { .. }
                     | UntrustedRefusal::EmptyHome { .. }
                     | UntrustedRefusal::UnknownHome
-                    | UntrustedRefusal::WorkspaceTsserver { .. } => Ok(()),
+                    | UntrustedRefusal::WorkspaceTsserver { .. }
+                    | UntrustedRefusal::ProjectLauncher { .. }
+                    | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
+                    | UntrustedRefusal::NonUtf8Path { .. }
+                    | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
                 }
             }
             reason @ (StartupFailure::Spawn(_) | StartupFailure::InitTaskPanicked) => write!(
@@ -609,6 +681,7 @@ impl fmt::Display for IdList<'_> {
 ///
 /// ```
 /// use mcpls_core::Error;
+/// use mcpls_core::error::InitPhase;
 ///
 /// fn server_output(err: &Error) -> Option<String> {
 ///     match err {
@@ -620,7 +693,12 @@ impl fmt::Display for IdList<'_> {
 ///     }
 /// }
 ///
-/// let err = Error::LspInitFailed { message: "timed out".into(), hint: None, stderr: None };
+/// let err = Error::LspInitFailed {
+///     phase: InitPhase::Initialize,
+///     source: Box::new(Error::ServerTerminated),
+///     hint: None,
+///     stderr: None,
+/// };
 /// assert_eq!(server_output(&err), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,6 +948,141 @@ impl fmt::Display for StdioStream {
     }
 }
 
+/// A configuration value that is invalid in the context of the entry that holds it.
+///
+/// Field-level rules live in the types of the fields (a rejected value cannot be
+/// built); this enum carries what only the surrounding entry or the whole
+/// configuration can add, such as which server a bad value belongs to.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A server entry lists a `file_patterns` form that maps to no extension.
+    #[error("lsp_servers entry '{server}': {pattern}")]
+    UnsupportedFilePattern {
+        /// The id of the entry that holds the pattern.
+        server: ServerId,
+        /// The rejected pattern and the supported forms.
+        #[source]
+        pattern: UnsupportedFilePattern,
+    },
+
+    /// The config file's bytes are not UTF-8.
+    #[error("config file is not valid UTF-8: {0}")]
+    NotUtf8(#[source] std::string::FromUtf8Error),
+
+    /// A config path has no directory to resolve relative entries against.
+    #[error("configuration path has no parent directory: {}", .path.display())]
+    NoParentDirectory {
+        /// The config path.
+        path: PathBuf,
+    },
+
+    /// `workspace.roots` holds an empty path.
+    #[error("workspace.roots entries cannot be empty")]
+    EmptyWorkspaceRoot,
+
+    /// `selection = "auto"` on an entry that is not typescript-language-server.
+    #[error(
+        "selection = \"auto\" is only valid for typescript-language-server entries (language \
+         '{language}'); remove `selection` to use `command` as written"
+    )]
+    SelectionAutoOnNonTypescript {
+        /// The language of the offending entry.
+        language: LanguageId,
+    },
+
+    /// An allowed server id names no configured server.
+    #[error(
+        "allowed server '{server}' is not a configured server (configured: {})",
+        IdList(configured)
+    )]
+    UnknownAllowedServer {
+        /// The allowed id that matches nothing.
+        server: ServerId,
+        /// The ids of the configured servers.
+        configured: Vec<ServerId>,
+    },
+
+    /// Two applicable entries share one server id.
+    #[error(
+        "duplicate server id '{id}' in this workspace (used by both an entry with {first} and \
+         one with {second}); add a unique `name` to each `[[lsp_servers]]` entry"
+    )]
+    DuplicateServerId {
+        /// The shared id.
+        id: ServerId,
+        /// Description of the first entry.
+        first: String,
+        /// Description of the second entry.
+        second: String,
+    },
+
+    /// A language has two servers that both omit `handles`.
+    #[error(
+        "language '{language}' has two catch-all servers ('{existing}' and '{id}'); at most one \
+         server per language may omit `handles`"
+    )]
+    TwoCatchAllServers {
+        /// The language both serve.
+        language: LanguageId,
+        /// The server registered first.
+        existing: ServerId,
+        /// The server that collides with it.
+        id: ServerId,
+    },
+
+    /// Two servers of one language claim the same tool in `handles`.
+    #[error("tool '{tool}' for language '{language}' is claimed by both '{existing}' and '{id}'")]
+    ToolClaimedTwice {
+        /// The contested tool.
+        tool: ToolKind,
+        /// The language both serve.
+        language: LanguageId,
+        /// The server registered first.
+        existing: ServerId,
+        /// The server that collides with it.
+        id: ServerId,
+    },
+
+    /// A configured workspace root cannot be canonicalized.
+    #[error(
+        "workspace root '{}' resolved relative to '{}' as '{}' could not be canonicalized: {source}",
+        .written.display(), .base_dir.display(), .probe.display()
+    )]
+    UnresolvableWorkspaceRoot {
+        /// The root as written in the config.
+        written: PathBuf,
+        /// The directory a relative root is resolved against.
+        base_dir: PathBuf,
+        /// The path that was canonicalized.
+        probe: PathBuf,
+        /// Why canonicalization failed.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// A step of the LSP initialization handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitPhase {
+    /// The `initialize` request.
+    Initialize,
+    /// The `initialized` notification.
+    Initialized,
+    /// The `workspace/didChangeConfiguration` notification.
+    DidChangeConfiguration,
+}
+
+impl fmt::Display for InitPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Initialize => "Initialize request failed",
+            Self::Initialized => "initialized notification failed",
+            Self::DidChangeConfiguration => "workspace/didChangeConfiguration notification failed",
+        })
+    }
+}
+
 /// The main error type for mcpls-core operations.
 ///
 /// This enum is `#[non_exhaustive]`: downstream crates that match on it must
@@ -879,10 +1092,14 @@ impl fmt::Display for StdioStream {
 #[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
-    #[error("LSP server initialization failed: {message}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
+    #[error("LSP server initialization failed: {phase}: {source}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
     LspInitFailed {
-        /// Description of the initialization failure.
-        message: String,
+        /// The handshake step that failed.
+        phase: InitPhase,
+        /// Why the step failed, so a timeout and a rejection by the server
+        /// stay distinguishable.
+        #[source]
+        source: Box<Self>,
         /// The likely cause and remedy, when one is known.
         hint: Option<InitFailureHint>,
         /// What the server wrote to stderr before failing, if anything.
@@ -936,8 +1153,17 @@ pub enum Error {
     DocumentNotFound(PathBuf),
 
     /// No LSP server configured for the given language.
-    #[error("no LSP server configured for language: {0}")]
-    NoServerForLanguage(LanguageId),
+    #[error("no LSP server configured for language: {language}")]
+    NoServerForLanguage {
+        /// The language detected for the file.
+        language: LanguageId,
+        /// The file's extension, `None` for an extensionless name or one that
+        /// is not a valid [`FileExtension`].
+        extension: Option<FileExtension>,
+        /// The `file_patterns` configured across all servers, so the error can
+        /// show what was available to map the extension.
+        patterns: Vec<FilePattern>,
+    },
 
     /// A server is configured for the language, but no server claims this
     /// specific tool (either no server lists it in `handles` and there is no
@@ -1037,9 +1263,9 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// Invalid configuration format.
+    /// Invalid configuration.
     #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
+    Config(#[from] ConfigError),
 
     /// I/O error.
     #[error("I/O error: {0}")]
@@ -1088,9 +1314,10 @@ pub enum Error {
     #[error("LSP protocol error: {}", escape_control(.0.as_str()))]
     LspProtocolError(RedactedText),
 
-    /// Invalid URI text supplied by the client.
-    #[error("invalid URI: {0}")]
-    InvalidUri(String),
+    /// None of the resource URIs a `subscriptions/listen` request named
+    /// resolves inside the workspace.
+    #[error("none of the requested resource URIs resolve inside the workspace")]
+    NoResolvableListenUris,
 
     /// A client-supplied position is out of bounds.
     #[error(transparent)]
@@ -1292,9 +1519,9 @@ pub enum Error {
     CapabilityNotSupported {
         /// Routing identity of the server that lacks the capability.
         server_id: ServerId,
-        /// The missing LSP capability's name (e.g. `"renameProvider"`), the
-        /// `ServerCapabilities` field mcpls checked.
-        capability: &'static str,
+        /// The missing LSP capability, naming the `ServerCapabilities` field
+        /// mcpls checked.
+        capability: Capability,
     },
 
     /// The routed server has an active signal indicating its initial
@@ -1534,7 +1761,7 @@ impl Error {
             | Self::MalformedPath { .. }
             | Self::PathOutsideWorkspace(_)
             | Self::NotARegularFile(_)
-            | Self::InvalidUri(_)
+            | Self::NoResolvableListenUris
             | Self::ResourceUri(_)
             | Self::InvalidPositionInput(_)
             | Self::InvalidRangeInput(_)
@@ -1613,13 +1840,13 @@ impl Error {
             | Self::StdioCapture(_)
             | Self::PathToUri(_)
             | Self::HttpBind { .. }
-            | Self::NoServerForLanguage(_)
+            | Self::NoServerForLanguage { .. }
             | Self::NoServerForTool { .. }
             | Self::NoServerConfigured
             | Self::NoServerForWorkspaceTool { .. }
             | Self::ConfigNotFound(_)
             | Self::ConfigInsideWorkspace { .. }
-            | Self::InvalidConfig(_)
+            | Self::Config(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::TomlDe(_)
@@ -1644,6 +1871,68 @@ impl Error {
             | Self::SubscriptionLimitReached { .. }
             | Self::AllServersFailedToInit { .. }
             | Self::CapabilityNotSupported { .. } => McpErrorKind::Internal,
+        }
+    }
+
+    /// A well-formed resource URI whose path cannot be resolved (deleted, outside
+    /// the workspace): unsubscribing falls back to the recorded alias (#499).
+    /// Every other failure is a malformed URI or an internal fault.
+    pub(crate) const fn is_unresolvable_resource(&self) -> bool {
+        match self {
+            Self::MalformedPath { .. }
+            | Self::FileIo { .. }
+            | Self::PathOutsideWorkspace(..)
+            | Self::NoWorkspaceRoots(..) => true,
+            Self::LspInitFailed { .. }
+            | Self::LspServerError { .. }
+            | Self::McpServerStart(..)
+            | Self::TaskFailed { .. }
+            | Self::StdioCapture(..)
+            | Self::HttpBind { .. }
+            | Self::DocumentNotFound(..)
+            | Self::NoServerForLanguage { .. }
+            | Self::NoServerForTool { .. }
+            | Self::ServerFailedToStart(..)
+            | Self::ServerInitializing { .. }
+            | Self::ServerRestarted { .. }
+            | Self::SymbolResolution(..)
+            | Self::UnknownServers { .. }
+            | Self::WorkspaceServersInitializing
+            | Self::NoServerConfigured
+            | Self::NoServerForWorkspaceTool { .. }
+            | Self::ConfigNotFound(..)
+            | Self::ConfigInsideWorkspace { .. }
+            | Self::Config(..)
+            | Self::Io(..)
+            | Self::Json(..)
+            | Self::TomlDe(..)
+            | Self::TomlSer(..)
+            | Self::Timeout(..)
+            | Self::ServerSpawnFailed { .. }
+            | Self::ServerNotFound { .. }
+            | Self::LspProtocolError(..)
+            | Self::NoResolvableListenUris
+            | Self::InvalidPositionInput(..)
+            | Self::InvalidRangeInput(..)
+            | Self::InvalidHierarchyItemInput(..)
+            | Self::PositionBeyondDocument { .. }
+            | Self::ResourceUri(..)
+            | Self::PathToUri(..)
+            | Self::ServerTerminated
+            | Self::ShutdownTimeout
+            | Self::ServerExitedDuringInit { .. }
+            | Self::ServerUnavailable { .. }
+            | Self::InvalidToolParams(..)
+            | Self::InvalidClientPath(..)
+            | Self::DocumentLimitExceeded { .. }
+            | Self::SubscriptionLimitReached { .. }
+            | Self::ListenStreamsExhausted { .. }
+            | Self::ListenFilterTooLarge { .. }
+            | Self::FileSizeLimitExceeded { .. }
+            | Self::NotARegularFile(..)
+            | Self::AllServersFailedToInit { .. }
+            | Self::CapabilityNotSupported { .. }
+            | Self::WorkspaceIndexing { .. } => false,
         }
     }
 }
@@ -1734,13 +2023,14 @@ mod tests {
     #[test]
     fn test_error_display_lsp_init_failed() {
         let err = Error::LspInitFailed {
-            message: "server not found".to_string(),
+            phase: InitPhase::Initialize,
+            source: Box::new(Error::Io(std::io::Error::other("server not found"))),
             hint: None,
             stderr: None,
         };
         assert_eq!(
             err.to_string(),
-            "LSP server initialization failed: server not found"
+            "LSP server initialization failed: Initialize request failed: I/O error: server not found"
         );
     }
 
@@ -1916,13 +2206,14 @@ mod tests {
     fn test_init_errors_append_stderr_to_display() {
         let stderr = StderrExcerpt::complete(b"fatal: bad config", &Redactions::default());
         let failed = Error::LspInitFailed {
-            message: "boom".to_string(),
+            phase: InitPhase::Initialize,
+            source: Box::new(Error::Io(std::io::Error::other("boom"))),
             hint: None,
             stderr: stderr.clone(),
         };
         assert_eq!(
             failed.to_string(),
-            "LSP server initialization failed: boom; stderr: fatal: bad config"
+            "LSP server initialization failed: Initialize request failed: I/O error: boom; stderr: fatal: bad config"
         );
         let exited = Error::ServerExitedDuringInit {
             command: "gopls".to_string(),
@@ -2003,7 +2294,7 @@ mod tests {
 
     #[test]
     fn test_error_display_no_server_for_language() {
-        let err = Error::NoServerForLanguage(LanguageId::from_static("rust"));
+        let err = no_server_for_language("rust");
         assert_eq!(
             err.to_string(),
             "no LSP server configured for language: rust"
@@ -2093,7 +2384,7 @@ mod tests {
     #[test]
     fn test_result_type_alias() {
         fn _returns_error() -> Result<i32> {
-            Err(Error::InvalidConfig("test error".to_string()))
+            Err(Error::Config(ConfigError::EmptyWorkspaceRoot))
         }
 
         let result: Result<i32> = Ok(42);
@@ -2187,14 +2478,15 @@ mod tests {
             "rust",
             "rust-analyzer",
             Error::LspInitFailed {
-                message: "boom".to_string(),
+                phase: InitPhase::Initialize,
+                source: Box::new(Error::Io(std::io::Error::other("boom"))),
                 hint: None,
                 stderr: None,
             },
         );
         assert_eq!(
             failure.to_string(),
-            "rust [rust] (rust-analyzer): LSP server initialization failed: boom"
+            "rust [rust] (rust-analyzer): LSP server initialization failed: Initialize request failed: I/O error: boom"
         );
     }
 
@@ -2262,7 +2554,8 @@ mod tests {
         let stderr = StderrExcerpt::complete(b"boom", &Redactions::default());
         let hint = Some(InitFailureHint::NativeTypescriptOnly);
         let failed = Error::LspInitFailed {
-            message: "x".to_string(),
+            phase: InitPhase::Initialize,
+            source: Box::new(Error::Io(std::io::Error::other("x"))),
             hint,
             stderr: stderr.clone(),
         }
@@ -2331,7 +2624,8 @@ mod tests {
                     "python",
                     "pyright",
                     Error::LspInitFailed {
-                        message: "denied".to_string(),
+                        phase: InitPhase::Initialize,
+                        source: Box::new(Error::Io(std::io::Error::other("denied"))),
                         hint: None,
                         stderr: None,
                     },
@@ -2348,10 +2642,43 @@ mod tests {
     }
 
     #[test]
+    fn test_untrusted_refusal_new_variants_name_their_cause() {
+        let launcher = UntrustedRefusal::ProjectLauncher {
+            command: "npx".to_owned(),
+        };
+        assert!(launcher.to_string().contains("'npx'"), "{launcher}");
+        let unpinned = UntrustedRefusal::UnpinnedTypescriptLauncher {
+            command: "pnpm".to_owned(),
+        };
+        assert!(unpinned.to_string().contains("'pnpm'"), "{unpinned}");
+        let non_utf8 = UntrustedRefusal::NonUtf8Path {
+            what: ResolvedItem::SearchPath,
+            path: PathBuf::from("/odd"),
+        };
+        assert_eq!(
+            non_utf8.to_string(),
+            "its PATH, /odd, is not valid UTF-8, so untrusted mode cannot pass it on"
+        );
+        assert!(
+            UntrustedRefusal::NoSafeWorkingDirectory
+                .to_string()
+                .contains("outside the workspace")
+        );
+    }
+
+    fn no_server_for_language(language: &'static str) -> Error {
+        Error::NoServerForLanguage {
+            language: LanguageId::from_static(language),
+            extension: None,
+            patterns: vec![],
+        }
+    }
+
+    #[test]
     fn test_error_display_capability_not_supported() {
         let err = Error::CapabilityNotSupported {
             server_id: ServerId::from("rust"),
-            capability: "renameProvider",
+            capability: Capability::Rename,
         };
         assert_eq!(
             err.to_string(),
@@ -2379,7 +2706,7 @@ mod tests {
             Error::InvalidToolParams("bad params".to_string()),
             Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
             Error::NotARegularFile(PathBuf::from("/dev/null")),
-            Error::InvalidUri("not a uri".to_string()),
+            Error::NoResolvableListenUris,
             Error::ResourceUri(ResourceUriError::InvalidScheme("x".to_string())),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
             Error::FileSizeLimitExceeded { size: 100, max: 10 },
@@ -2542,14 +2869,14 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_unretained_variants_stay_internal() {
         let internal_errors = vec![
-            Error::NoServerForLanguage(LanguageId::from_static("python")),
+            no_server_for_language("python"),
             Error::NoServerForTool {
                 language_id: LanguageId::from_static("rust"),
                 tool: crate::config::ToolKind::Hover,
             },
             Error::CapabilityNotSupported {
                 server_id: ServerId::from("rust"),
-                capability: "renameProvider",
+                capability: Capability::Rename,
             },
             Error::NoWorkspaceRoots(PathBuf::from("/tmp")),
             Error::DocumentLimitExceeded {

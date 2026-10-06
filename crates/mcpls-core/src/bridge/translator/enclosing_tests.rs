@@ -20,7 +20,7 @@ use super::symbols::FlatSymbol;
 use super::testing::*;
 use crate::bridge::NotificationCache;
 use crate::bridge::state::ResourceLimits;
-use crate::config::ServerId;
+use crate::config::{DocumentLimit, ServerId};
 use crate::test_lsp::client_path;
 
 fn at(line: u32, character: u32) -> Position2D {
@@ -398,7 +398,7 @@ async fn test_references_out_of_workspace_location_is_not_opened() {
 #[tokio::test]
 async fn test_references_file_cap_skips_later_files_and_reports_cut_short() {
     let limits = ResourceLimits {
-        max_documents: 4,
+        max_documents: DocumentLimit::new(4),
         ..ResourceLimits::default()
     };
     let mut fx = fixture(full_caps(), Some(limits));

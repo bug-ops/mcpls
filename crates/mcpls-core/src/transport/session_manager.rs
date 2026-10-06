@@ -14,7 +14,7 @@ use super::config::{ResponseStreamDeadline, SessionLimit, StreamLiveness, non_ze
 use super::liveness::{
     ProbeId, SESSION_CLOSE_TIMEOUT, SessionLiveness, StreamProbe, is_common_channel_event_id,
 };
-use crate::bridge::lock_std;
+use crate::util::lock_std;
 
 /// Log-safe correlation handle for a session: eight hex digits of a hash of
 /// the id, so log lines can be matched without disclosing the bearer secret.
@@ -1305,7 +1305,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_probing_fails_closed_when_session_slot_is_gone() {
         let (manager, id, serving) = probed_session().await;
-        crate::bridge::lock_std(&manager.slots).remove(&id);
+        crate::util::lock_std(&manager.slots).remove(&id);
 
         let error = manager.create_standalone_stream(&id).await.err().unwrap();
         assert_matches!(error, CappedSessionManagerError::SessionGone);

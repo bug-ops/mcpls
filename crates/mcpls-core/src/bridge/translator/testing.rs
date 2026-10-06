@@ -14,7 +14,7 @@ use super::encoding_ctx::EncodingCtx;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DiagnosticInfo, DocumentTracker, WorkspaceRoots};
-use crate::config::{LanguageId, ServerId, ToolRouter};
+use crate::config::{FileExtension, LanguageId, ServerId, ToolRouter};
 use crate::lsp::LspServer;
 pub(super) use crate::test_lsp::{
     FakeServer, fake_lsp_client, read_framed_message, write_error_response, write_response,
@@ -128,7 +128,10 @@ pub(super) fn translator_with_capabilities(
     capabilities: lsp_types::ServerCapabilities,
 ) -> (Translator, FakeServer) {
     let mut extensions = HashMap::new();
-    extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
+    extensions.insert(
+        FileExtension::from_static("rs"),
+        LanguageId::from_static("rust"),
+    );
 
     let mut translator =
         Translator::new()
@@ -157,7 +160,10 @@ pub(super) fn translator_with_capabilities_and_encoding(
     position_encoding: lsp_types::PositionEncodingKind,
 ) -> (Translator, FakeServer) {
     let mut extensions = HashMap::new();
-    extensions.insert("rs".to_string(), LanguageId::from_static("rust"));
+    extensions.insert(
+        FileExtension::from_static("rs"),
+        LanguageId::from_static("rust"),
+    );
 
     let mut translator =
         Translator::new()
@@ -187,7 +193,11 @@ mod sh_servers {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use crate::config::{LanguageId, LspServerConfig, PositionEncodings, TimeoutSecs};
+    use crate::ServerId;
+    use crate::bridge::WorkspaceRoots;
+    use crate::config::{
+        LanguageId, LspServerConfig, PositionEncodings, ServerCommand, TimeoutSecs,
+    };
     use crate::lsp::ServerInitConfig;
     use crate::test_lsp::with_read_preamble;
 
@@ -242,10 +252,10 @@ mod sh_servers {
         id: &str,
         script: &Path,
     ) -> ServerInitConfig {
-        ServerInitConfig {
-            server_config: LspServerConfig {
+        ServerInitConfig::new(
+            LspServerConfig {
                 language_id: LanguageId::new(id).unwrap(),
-                command: "sh".to_string(),
+                command: ServerCommand::from_static("sh"),
                 args: vec![script.to_string_lossy().to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -258,16 +268,15 @@ mod sh_servers {
                 timeout_seconds: TimeoutSecs::new(20).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(20).unwrap(),
                 heuristics: None,
-                name: Some(id.to_string()),
+                name: Some(ServerId::from(id)),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
                 selection: crate::config::ServerSelection::Explicit,
             },
-            workspace_roots: vec![],
-            initialization_options: None,
-            position_encodings: PositionEncodings::DEFAULT,
-            redactions: std::sync::Arc::default(),
-        }
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        )
     }
 
     pub(in crate::bridge::translator) fn pid_is_running(pid: u32) -> bool {

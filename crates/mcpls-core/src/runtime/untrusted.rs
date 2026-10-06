@@ -15,7 +15,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::{BuiltinServer, LspServerConfig, ServerConfig, WorkspaceTrust, login_home_dir};
+use crate::config::{
+    BuiltinServer, LspServerConfig, ServerCommand, ServerConfig, WorkspaceTrust, login_home_dir,
+};
 use crate::error::{HomeVariable, ServerSpawnFailure, StartupFailure, UntrustedRefusal};
 use crate::lsp::{self, ServerInitConfig};
 use crate::redaction::Redactions;
@@ -63,7 +65,7 @@ fn allowlist_refusal(
     (!trust.allows(&configured.id())).then(|| UntrustedRefusal::NotAllowed {
         builtin: BuiltinServer::ALL
             .into_iter()
-            .find(|builtin| builtin.matches_command(&configured.command)),
+            .find(|builtin| builtin.matches_command(configured.command.as_str())),
     })
 }
 
@@ -91,7 +93,7 @@ fn harden_for_untrusted(
         command: command.to_owned(),
     };
     let resolved = lsp::command_path::resolve_command(&effective, parent_env)
-        .ok_or_else(|| unresolved(&effective.command))?;
+        .ok_or_else(|| unresolved(effective.command.as_str()))?;
     if boundary.contains_canonical(&resolved.canonical) {
         return Err(UntrustedRefusal::WorkspaceExecutable {
             executable: resolved.canonical,
@@ -107,14 +109,15 @@ fn harden_for_untrusted(
         &resolved.spawn
     }
     .to_str()
-    .ok_or_else(|| unresolved(&effective.command))?
+    .ok_or_else(|| unresolved(effective.command.as_str()))?
     .to_owned();
     let path = lsp::child_env_var(&effective, "PATH", parent_env).unwrap_or_default();
     let path = lsp::command_path::or_system_path(lsp::command_path::path_outside(&path, boundary))
         .into_string()
         .map_err(|_| unresolved(&command))?;
     let home_env = home_overrides(&effective, boundary, login_home, parent_env)?;
-    effective.command = command;
+    effective.command =
+        ServerCommand::new(command).map_err(|_| unresolved(effective.command.as_str()))?;
     effective.env.insert("PATH".to_owned(), path);
     effective.env.extend(home_env);
     Ok(effective)
@@ -200,7 +203,7 @@ pub fn plan_server_starts(
     roots: &WorkspaceRoots,
     redactions: &Arc<Redactions>,
 ) -> StartPlan {
-    let max_depth = Some(config.workspace.heuristics_max_depth);
+    let max_depth = config.workspace.heuristics_max_depth;
     let untrusted = matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_));
     let login_home = untrusted.then(login_home_dir).flatten();
     let boundary = untrusted.then(|| {
@@ -223,7 +226,7 @@ pub fn plan_server_starts(
 
         if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
             plan.refused
-                .push(refused(lsp_config, &lsp_config.command, refusal));
+                .push(refused(lsp_config, lsp_config.command.as_str(), refusal));
             continue;
         }
 
@@ -239,8 +242,11 @@ pub fn plan_server_starts(
                 }) {
                     Ok(hardened) => hardened,
                     Err(refusal) => {
-                        plan.refused
-                            .push(refused(lsp_config, &lsp_config.command, refusal));
+                        plan.refused.push(refused(
+                            lsp_config,
+                            lsp_config.command.as_str(),
+                            refusal,
+                        ));
                         continue;
                     }
                 }
@@ -254,20 +260,20 @@ pub fn plan_server_starts(
         if let Some(tsserver) = workspace_tsserver {
             let refusal = UntrustedRefusal::WorkspaceTsserver { tsserver };
             plan.refused
-                .push(refused(lsp_config, &effective.command, refusal));
+                .push(refused(lsp_config, effective.command.as_str(), refusal));
             continue;
         }
-        plan.admitted.push(ServerInitConfig {
-            initialization_options: lsp::tsserver_pin::pinned_initialization_options(
-                &effective,
-                roots,
-                |key| std::env::var_os(key),
-            ),
-            server_config: effective,
-            workspace_roots: roots.canonical().to_vec(),
-            position_encodings: config.workspace.position_encodings.clone(),
-            redactions: Arc::clone(redactions),
-        });
+        let mut server_config = effective;
+        server_config.initialization_options =
+            lsp::tsserver_pin::pinned_initialization_options(&server_config, roots, |key| {
+                std::env::var_os(key)
+            });
+        plan.admitted.push(ServerInitConfig::new(
+            server_config,
+            roots.clone(),
+            config.workspace.position_encodings.clone(),
+            Arc::clone(redactions),
+        ));
     }
     plan
 }
@@ -294,7 +300,7 @@ fn refused(
 #[cfg(test)]
 mod plan_tests {
     use super::*;
-    use crate::config::ServerId;
+    use crate::config::{ServerCommand, ServerId};
 
     fn rust_workspace() -> (tempfile::TempDir, WorkspaceRoots) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -329,7 +335,7 @@ mod plan_tests {
     fn admitted_ids(plan: &StartPlan) -> Vec<ServerId> {
         plan.admitted
             .iter()
-            .map(|init| init.server_config.id())
+            .map(|init| init.server_config().id())
             .collect()
     }
 
@@ -390,7 +396,10 @@ mod plan_tests {
 
         assert_eq!(plan.admitted.len(), 1);
         assert!(plan.refused.is_empty());
-        assert_eq!(plan.admitted[0].workspace_roots, roots.canonical());
+        assert_eq!(
+            plan.admitted[0].workspace_roots().canonical(),
+            roots.canonical()
+        );
     }
 
     #[test]
@@ -428,7 +437,7 @@ mod plan_tests {
             std::fs::set_permissions(&gopls, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut go = LspServerConfig::gopls();
-        go.command = gopls.to_string_lossy().into_owned();
+        go.command = ServerCommand::new(gopls.to_string_lossy().into_owned()).unwrap();
         let config = config_with(
             vec![LspServerConfig::rust_analyzer(), go],
             WorkspaceTrust::untrusted([ServerId::from("go")]),
@@ -444,7 +453,7 @@ mod plan_tests {
     fn plan_untrusted_marks_a_custom_server_as_not_builtin() {
         let (_dir, roots) = rust_workspace();
         let mut custom = LspServerConfig::rust_analyzer();
-        custom.command = "my-rust-server".to_string();
+        custom.command = ServerCommand::from_static("my-rust-server");
         let config = config_with(vec![custom], WorkspaceTrust::untrusted([]));
 
         let plan = plan(&config, &roots);
@@ -475,11 +484,13 @@ mod plan_tests {
     fn plan_trusted_runs_no_executable_check() {
         let (dir, roots) = rust_workspace();
         let mut config = LspServerConfig::rust_analyzer();
-        config.command = dir
-            .path()
-            .join("bin/rust-analyzer")
-            .to_string_lossy()
-            .into_owned();
+        config.command = ServerCommand::new(
+            dir.path()
+                .join("bin/rust-analyzer")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .unwrap();
 
         let plan = plan(&config_with(vec![config], WorkspaceTrust::Trusted), &roots);
 
@@ -493,6 +504,7 @@ mod plan_tests {
         use std::path::{Component, Path, PathBuf};
 
         use super::*;
+        use crate::config::ServerCommand;
 
         struct Fixture {
             _dir: tempfile::TempDir,
@@ -534,7 +546,7 @@ mod plan_tests {
 
         fn rust_with(command: &str) -> LspServerConfig {
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = command.to_string();
+            config.command = ServerCommand::new(command.to_string()).unwrap();
             config
         }
 
@@ -675,7 +687,7 @@ mod plan_tests {
 
             let plan = plan_allowing_rust(config, &fx);
 
-            let admitted = &plan.admitted[0].server_config;
+            let admitted = &plan.admitted[0].server_config();
             assert_eq!(admitted.command, exe.to_str().unwrap());
             assert_eq!(
                 admitted.env.get("PATH").map(String::as_str),
@@ -693,7 +705,7 @@ mod plan_tests {
             let plan = plan_allowing_rust(rust_with_path(&fx.workspace.join("bin")), &fx);
 
             assert_eq!(
-                plan.admitted[0].server_config.command,
+                plan.admitted[0].server_config().command,
                 real.to_str().unwrap()
             );
         }
@@ -724,7 +736,7 @@ mod plan_tests {
                 &fx.roots,
             );
 
-            let admitted = &plan.admitted[0].server_config;
+            let admitted = &plan.admitted[0].server_config();
             assert_eq!(admitted.command, "rust-analyzer");
             assert!(admitted.env.is_empty());
         }
@@ -742,7 +754,7 @@ mod plan_tests {
 
             let plan = plan_allowing_rust(config, &fx);
 
-            let path = plan.admitted[0].server_config.env.get("PATH").unwrap();
+            let path = plan.admitted[0].server_config().env.get("PATH").unwrap();
             assert_eq!(path, "/usr/bin:/bin");
         }
 
@@ -757,7 +769,7 @@ mod plan_tests {
             let home = login_home_dir().unwrap();
             assert_eq!(
                 plan.admitted[0]
-                    .server_config
+                    .server_config()
                     .env
                     .get("HOME")
                     .map(String::as_str),
@@ -992,7 +1004,10 @@ mod plan_tests {
 
                 assert_eq!(
                     lsp::tsserver_pin::configured_tsserver_path(
-                        plan.admitted[0].initialization_options.as_ref()
+                        plan.admitted[0]
+                            .server_config()
+                            .initialization_options
+                            .as_ref()
                     ),
                     Some(tsserver)
                 );
@@ -1013,9 +1028,9 @@ mod plan_tests {
                 &fx.roots,
             );
 
-            let admitted = &plan.admitted[0].server_config;
+            let admitted = &plan.admitted[0].server_config();
             assert!(
-                admitted.command.ends_with("typescript/bin/tsc"),
+                admitted.command.as_str().ends_with("typescript/bin/tsc"),
                 "{}",
                 admitted.command
             );
@@ -1039,7 +1054,7 @@ mod plan_tests {
             );
 
             assert!(plan.admitted.is_empty());
-            assert_eq!(plan.refused[0].failure.command, configured.command);
+            assert_eq!(plan.refused[0].failure.command, configured.command.as_str());
             assert!(
                 !logs.iter().any(|m| m.contains("TypeScript server")
                     || m.contains("keeping typescript-language-server")),
@@ -1103,7 +1118,9 @@ mod refusal_spawn_tests {
 
     use super::*;
     use crate::bridge::{NotificationCache, Translator};
-    use crate::config::{ServerId, ServerStartConcurrency, ToolRouter, WorkspaceTrust};
+    use crate::config::{
+        ServerCommand, ServerId, ServerStartConcurrency, ToolRouter, WorkspaceTrust,
+    };
     use crate::mcp::SubscriptionRegistry;
     use crate::runtime::startup::spawn_lsp_servers_background;
     use crate::test_lsp::{answer_initialize_script, sh_script_init_config};
@@ -1152,7 +1169,8 @@ mod refusal_spawn_tests {
     fn case(trust: WorkspaceTrust) -> Case {
         case_with(trust, |outside, marker| {
             sh_script_init_config(outside, &answer_initialize_script(Some(marker), None))
-                .server_config
+                .server_config()
+                .clone()
         })
     }
 
@@ -1175,7 +1193,7 @@ mod refusal_spawn_tests {
         let router = ToolRouter::from_configs(
             admitted
                 .iter()
-                .map(|c| &c.server_config)
+                .map(ServerInitConfig::server_config)
                 .chain(refused.iter().map(|r| &r.config)),
         )
         .unwrap();
@@ -1257,7 +1275,7 @@ mod refusal_spawn_tests {
             let body = answer_initialize_script(Some(marker), None);
             executable(&script, &format!("#!/usr/bin/env sh\n{body}"));
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = script.to_string_lossy().into_owned();
+            config.command = ServerCommand::new(script.to_string_lossy().into_owned()).unwrap();
             config
         });
         let interpreter_marker = case.outside.join("interpreter-ran");

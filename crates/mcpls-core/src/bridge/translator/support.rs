@@ -20,9 +20,10 @@ use super::routing::{
     Capability, LanguageCandidates, RouteLookup, WorkspaceRouteLookup, lookup_route,
     lookup_workspace_route,
 };
-use crate::bridge::{ClientPath, lock_std};
+use crate::bridge::ClientPath;
 use crate::config::{LanguageId, ServerId, ToolKind, ToolRouter};
 use crate::error::Result;
+use crate::util::lock_std;
 
 /// Whether one route of a tool would be dispatched to a capable server.
 ///
@@ -33,6 +34,12 @@ use crate::error::Result;
 pub enum RouteSupport {
     /// The routed server is registered and advertises the tool's capability.
     Supported {
+        /// The server the call would be dispatched to.
+        server: ServerId,
+    },
+    /// The routed server is registered and publishes diagnostics but advertises
+    /// no pull provider, so `get_diagnostics` answers from the push cache.
+    PushOnly {
         /// The server the call would be dispatched to.
         server: ServerId,
     },

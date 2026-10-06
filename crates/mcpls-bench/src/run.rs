@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use mcpls_core::ServerConfig;
 use mcpls_core::bridge::IndexingPolicy;
-use mcpls_core::config::{LspServerConfig, TimeoutSecs};
+use mcpls_core::config::{FilePattern, LspServerConfig, ServerCommand, TimeoutSecs};
 use rmcp::model::{ContentBlock, ErrorCode};
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::{RoleClient, ServiceExt};
@@ -60,6 +60,11 @@ type Client = RunningService<RoleClient, ()>;
 
 /// Builds the mcpls configuration that routes the scenario's server over `repo`.
 ///
+/// # Errors
+///
+/// Returns an error if `server_path` is blank or a configured file pattern is
+/// not a supported form.
+///
 /// # Examples
 ///
 /// ```
@@ -69,20 +74,26 @@ type Client = RunningService<RoleClient, ()>;
 ///
 /// let scenario: Scenario =
 ///     toml::from_str(include_str!("../scenarios/smoke-fixture.toml")).unwrap();
-/// let config = mcpls_config(&scenario, Path::new("/repo"), Path::new("/bin/rust-analyzer"));
+/// let config =
+///     mcpls_config(&scenario, Path::new("/repo"), Path::new("/bin/rust-analyzer")).unwrap();
 /// assert_eq!(config.lsp_servers.len(), 1);
 /// assert_eq!(config.lsp_servers[0].language_id, "rust");
 /// ```
-#[must_use]
-pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> ServerConfig {
+pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Result<ServerConfig> {
+    let file_patterns = scenario
+        .server
+        .file_patterns
+        .iter()
+        .map(|pattern| FilePattern::parse(pattern))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut config = ServerConfig::default();
     config.workspace.roots = vec![repo.to_path_buf()];
     config.lsp_servers = vec![LspServerConfig {
         language_id: scenario.server.language_id.clone(),
-        command: server_path.to_string_lossy().into_owned(),
+        command: ServerCommand::new(server_path.to_string_lossy().into_owned())?,
         args: scenario.server.args.clone(),
         env: HashMap::new(),
-        file_patterns: scenario.server.file_patterns.clone(),
+        file_patterns,
         initialization_options: None,
         settings: None,
         timeout_seconds: LSP_TIMEOUT_SECS,
@@ -93,7 +104,7 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Ser
         indexing: IndexingPolicy::Auto,
         selection: mcpls_core::config::ServerSelection::Explicit,
     }];
-    config
+    Ok(config)
 }
 
 /// Runs the scenario against an already prepared repository and returns the report.
@@ -228,8 +239,8 @@ fn write_config(
     let dir = work_dir.join("configs");
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(format!("{}.toml", scenario.name.as_str()));
-    let text = toml::to_string(&mcpls_config(scenario, repo, server_path))
-        .context("failed to serialize the mcpls config")?;
+    let config = mcpls_config(scenario, repo, server_path).context("invalid server entry")?;
+    let text = toml::to_string(&config).context("failed to serialize the mcpls config")?;
     std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
 }
@@ -695,7 +706,8 @@ mod tests {
             &scenario,
             Path::new("/repo"),
             Path::new("/bin/rust-analyzer"),
-        );
+        )
+        .unwrap();
         let text = toml::to_string(&config).unwrap();
         let parsed: ServerConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.lsp_servers.len(), 1);

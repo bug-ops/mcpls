@@ -2,25 +2,23 @@
 //! shared cache and fans publications out to subscribed MCP sessions.
 
 use std::collections::HashSet;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::FutureExt as _;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{debug, error};
 
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{
-    self, DiagnosticsRole, NotificationCache, Publication, PublicationKind, PublishedPathResolver,
-    WorkspaceRoots,
+    self, DiagnosticsRole, IndexingReset, NotificationCache, Publication, PublicationKind,
+    PublishedPathResolver, WorkspaceRoots,
 };
 use crate::config::ServerId;
 use crate::lsp::LspNotification;
 use crate::lsp::tsserver_pin::warn_if_pin_ignored;
 use crate::mcp::SubscriptionRegistry;
-use crate::util::panic_message;
+use crate::util::catch_panic;
 
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
@@ -318,7 +316,7 @@ async fn publish_to_subscribers(
 pub async fn degrade_after_pump_panic(cache: &Mutex<NotificationCache>, id: &ServerId) {
     let mut cache = cache.lock().await;
     cache.mark_push_degraded(id);
-    cache.reset_indexing_state(id);
+    cache.reset_indexing_state(id, IndexingReset::Forget);
 }
 
 /// Re-starts diagnostics pumps for manually restarted servers over the same
@@ -366,10 +364,10 @@ impl bridge::NotificationWiring for PumpWiring {
                 receivers.pinned_tsserver,
                 shared,
             );
-            if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
+            if let Err(panicked) = catch_panic(pump).await {
                 error!(
                     "Diagnostics pump for LSP server '{id}' panicked: {}",
-                    panic_message(payload.as_ref())
+                    panicked.message()
                 );
                 degrade_after_pump_panic(&cache, &id).await;
             }

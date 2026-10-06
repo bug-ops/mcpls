@@ -54,10 +54,11 @@ impl Translator {
         position: Position,
     ) -> Result<TypeHierarchyResult> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::TypeHierarchy,
                 IndexingGate::NotRequired,
+                &[position],
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());

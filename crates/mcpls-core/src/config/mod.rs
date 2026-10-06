@@ -6,35 +6,46 @@
 mod bounded_secs;
 mod language;
 mod language_id;
+mod limits;
+mod patterns;
 mod position_encodings;
 mod routing;
 mod server;
 mod settings;
+mod text_newtype;
 mod trust;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
 
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
 pub use language::{base_language_id, react_variant_language_id};
 pub use language_id::{InvalidLanguageId, LanguageId};
+pub use limits::{
+    BoundedText, DocumentLimit, InvalidBoundedText, InvalidSearchDepth, InvalidSizeLimit,
+    MAX_FILE_SIZE_LIMIT, SearchDepth, SizeLimit,
+};
+pub use patterns::{
+    FileExtension, FilePattern, InvalidFileExtension, InvalidProjectMarker, ProjectMarker,
+    UnsupportedFilePattern,
+};
 pub use position_encodings::{InvalidPositionEncodings, PositionEncodings};
-pub use routing::{NoServerReason, ServerId, ServerSettlement, ToolKind, ToolRouter};
+pub use routing::{
+    InvalidServerId, InvalidToolSet, NoServerReason, ServerId, ServerSettlement, ToolKind,
+    ToolRouter, ToolSet,
+};
 use serde::{Deserialize, Serialize};
 pub use server::{
-    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, LspServerConfig, MAX_HEURISTICS_DEPTH,
-    MAX_TIMEOUT_SECONDS, ServerHeuristics, ServerSelection,
+    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, InvalidServerCommand, LspServerConfig,
+    MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, ServerCommand, ServerHeuristics, ServerSelection,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
 pub(crate) use trust::login_home_dir;
 pub use trust::{ServerAllowlist, WorkspaceTrust};
 
-use crate::bridge::{
-    DEFAULT_MAX_DOCUMENTS, DEFAULT_MAX_FILE_SIZE, ResourceLimits, WorkspaceRoots,
-    join_relative_root, probe_root,
-};
-use crate::error::{Error, Result};
+use crate::bridge::{ResourceLimits, WorkspaceRoots, join_relative_root, probe_root};
+use crate::error::{ConfigError, Error, Result};
 use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
 
 /// Maps file extensions to LSP language identifiers.
@@ -44,7 +55,7 @@ use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageExtensionMapping {
     /// Array of extensions and their corresponding language ID.
-    pub extensions: Vec<String>,
+    pub extensions: Vec<FileExtension>,
     /// Language ID to report to the LSP server.
     pub language_id: LanguageId,
 }
@@ -105,8 +116,8 @@ pub struct ServerConfig {
 ///
 /// Every field reaches an MCP client verbatim on every `initialize`
 /// response, into what is typically an LLM context window -- this is why
-/// [`ServerConfig::validate`] enforces the `MAX_MCP_*` byte caps on all
-/// three.
+/// their types ([`McpTitle`], [`McpDescription`], [`McpInstructions`])
+/// enforce the `MAX_MCP_*` byte caps on all three when the config is loaded.
 ///
 /// # Examples
 ///
@@ -120,26 +131,26 @@ pub struct ServerConfig {
 ///     instructions = "Use get_hover before get_definition."
 /// "#;
 /// let config: ServerConfig = toml::from_str(toml).unwrap();
-/// assert_eq!(config.mcp.title.as_deref(), Some("My Custom Bridge"));
+/// assert_eq!(config.mcp.title.unwrap(), "My Custom Bridge");
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
     /// Overrides `serverInfo.title`. Omit to keep the built-in title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
+    pub title: Option<McpTitle>,
 
     /// Overrides `serverInfo.description`. Omit to keep the built-in
     /// description (`CARGO_PKG_DESCRIPTION`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<McpDescription>,
 
     /// Replaces the built-in `RmcpServerConfig.instructions` capability blurb.
     /// Omit to keep the built-in text. The untrusted-project-config NOTE
     /// (see [`ServerConfig::project_config_status`]) is still appended
     /// after this value when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    pub instructions: Option<McpInstructions>,
 
     /// Prefixes every MCP tool name with `{tool_prefix}_`, so an MCP client
     /// running multiple mcpls bridges concurrently (one per project) can
@@ -151,8 +162,7 @@ pub struct McpConfig {
 
 /// Maximum byte length of a configured [`McpConfig::title`].
 ///
-/// UTF-8 bytes, not chars, consistent with `MAX_CONFIG_FILE_BYTES`. Named
-/// so the limit can appear in the [`Error::InvalidConfig`] message it backs.
+/// UTF-8 bytes, not chars, consistent with `MAX_CONFIG_FILE_BYTES`.
 pub const MAX_MCP_TITLE_BYTES: usize = 128;
 
 /// Maximum byte length of a configured [`McpConfig::description`].
@@ -180,6 +190,15 @@ pub const MAX_MCP_INSTRUCTIONS_BYTES: usize = 4096;
 /// tying this constant to the longest currently-registered tool name.
 pub const MAX_MCP_TOOL_PREFIX_BYTES: usize = 32;
 
+/// A validated [`McpConfig::title`].
+pub type McpTitle = BoundedText<MAX_MCP_TITLE_BYTES>;
+
+/// A validated [`McpConfig::description`].
+pub type McpDescription = BoundedText<MAX_MCP_DESCRIPTION_BYTES>;
+
+/// A validated [`McpConfig::instructions`].
+pub type McpInstructions = BoundedText<MAX_MCP_INSTRUCTIONS_BYTES>;
+
 /// A validated [`McpConfig::tool_prefix`] value.
 ///
 /// Every mcpls tool name gains a `{prefix}_` prefix when this is configured,
@@ -193,14 +212,12 @@ pub const MAX_MCP_TOOL_PREFIX_BYTES: usize = 32;
 /// an invalid prefix unrepresentable: there is no way to observe a
 /// `ToolPrefix` whose value doesn't already satisfy these rules.
 ///
-/// This differs from `title`/`description`/`instructions`, whose invalid
-/// values surface as [`Error::InvalidConfig`] from [`ServerConfig::validate`]
-/// -- called explicitly, after loading. A malformed prefix is not merely
-/// cosmetic (it would put an invalid tool name on the wire, an MCP protocol
-/// violation), and [`McplsServer::new`](crate::mcp::McplsServer::new)
-/// is `pub` and infallible, so this type validates eagerly during
-/// deserialization instead and surfaces failures as [`Error::TomlDe`], which
-/// additionally carries the offending line from the TOML source.
+/// A malformed prefix is not merely cosmetic (it would put an invalid tool
+/// name on the wire, an MCP protocol violation), and
+/// [`McplsServer::new`](crate::mcp::McplsServer::new) is `pub` and infallible,
+/// so this type validates eagerly during deserialization and surfaces
+/// failures as [`Error::TomlDe`], which additionally carries the offending
+/// line from the TOML source.
 ///
 /// # Examples
 ///
@@ -282,7 +299,7 @@ fn validate_tool_prefix(value: &str) -> std::result::Result<(), String> {
     // `value.trim().is_empty()` above already rejected the empty string, so
     // `next()`/`next_back()` never actually fall back here -- kept as a
     // defensive default rather than an `unwrap()`, since `clippy::unwrap_used`
-    // is a workspace-wide warn-as-error (mirrors `validate_mcp_field` above).
+    // is a workspace-wide warn-as-error.
     let first = value.chars().next().unwrap_or_default();
     let last = value.chars().next_back().unwrap_or_default();
     if !first.is_ascii_alphanumeric() {
@@ -332,9 +349,9 @@ pub struct WorkspaceConfig {
 
     /// Maximum depth for recursive project marker search.
     /// Controls how deeply nested projects can be detected.
-    /// Default: 10. Values above [`MAX_HEURISTICS_DEPTH`] are rejected by [`ServerConfig::validate`].
-    #[serde(default = "default_heuristics_max_depth")]
-    pub heuristics_max_depth: usize,
+    /// Default: 10. Values above [`MAX_HEURISTICS_DEPTH`] are rejected when the config is loaded.
+    #[serde(default)]
+    pub heuristics_max_depth: SearchDepth,
 
     /// Maximum number of documents `DocumentTracker` will keep open
     /// simultaneously. A `textDocument/didOpen`-triggering tool call (hover,
@@ -353,8 +370,8 @@ pub struct WorkspaceConfig {
     /// every access as the same handful of files repeatedly fall out of and
     /// back into the tracker. `0` disables the limit.
     /// Default: 100
-    #[serde(default = "default_max_documents")]
-    pub max_documents: usize,
+    #[serde(default)]
+    pub max_documents: DocumentLimit,
 
     /// Maximum size, in bytes, of a single file `DocumentTracker` will open.
     /// A file larger than this fails with `FileSizeLimitExceeded`. `0`
@@ -362,8 +379,8 @@ pub struct WorkspaceConfig {
     /// by [`ServerConfig::validate`]. The per-response disk-read budget for
     /// position conversion scales with this value.
     /// Default: 10485760 (10MB)
-    #[serde(default = "default_max_file_size")]
-    pub max_file_size: u64,
+    #[serde(default)]
+    pub max_file_size: SizeLimit,
 
     /// Maximum time, in seconds, a whole-workspace query (hover, definition,
     /// references, rename, completions, code actions, call hierarchy
@@ -458,32 +475,13 @@ impl Default for WorkspaceConfig {
             roots: Vec::new(),
             position_encodings: PositionEncodings::DEFAULT,
             language_extensions: default_language_extensions(),
-            heuristics_max_depth: default_heuristics_max_depth(),
-            max_documents: default_max_documents(),
-            max_file_size: default_max_file_size(),
+            heuristics_max_depth: SearchDepth::DEFAULT,
+            max_documents: DocumentLimit::DEFAULT,
+            max_file_size: SizeLimit::DEFAULT,
             indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         }
     }
-}
-
-/// Upper bound for `workspace.max_file_size` (1 GiB).
-///
-/// Keeps the derived per-response disk-read budget (a multiple of it) far from
-/// overflow, and a misconfiguration from making every response a
-/// gigabyte-scale scan.
-pub const MAX_FILE_SIZE_LIMIT: u64 = 1 << 30;
-
-const fn default_heuristics_max_depth() -> usize {
-    DEFAULT_HEURISTICS_MAX_DEPTH
-}
-
-const fn default_max_documents() -> usize {
-    DEFAULT_MAX_DOCUMENTS
-}
-
-const fn default_max_file_size() -> u64 {
-    DEFAULT_MAX_FILE_SIZE
 }
 
 impl WorkspaceConfig {
@@ -494,7 +492,7 @@ impl WorkspaceConfig {
     /// A `HashMap` where keys are file extensions (without the dot) and values
     /// are the corresponding language IDs to report to LSP servers.
     #[must_use]
-    pub fn build_extension_map(&self) -> HashMap<String, LanguageId> {
+    pub fn build_extension_map(&self) -> HashMap<FileExtension, LanguageId> {
         let mut map = HashMap::new();
         for mapping in &self.language_extensions {
             for ext in &mapping.extensions {
@@ -502,23 +500,6 @@ impl WorkspaceConfig {
             }
         }
         map
-    }
-
-    /// Returns the language ID for a file extension.
-    ///
-    /// # Arguments
-    ///
-    /// * `extension` - The file extension (without the dot)
-    ///
-    /// # Returns
-    ///
-    /// The language ID if found, `None` otherwise.
-    #[must_use]
-    pub fn language_for_extension(&self, extension: &str) -> Option<LanguageId> {
-        self.language_extensions
-            .iter()
-            .find(|mapping| mapping.extensions.iter().any(|e| e == extension))
-            .map(|mapping| mapping.language_id.clone())
     }
 
     /// Maps the configured `max_documents`/`max_file_size` onto the bridge
@@ -532,37 +513,11 @@ impl WorkspaceConfig {
     }
 }
 
-/// Extract a file extension from a glob-like file pattern.
-///
-/// Supports common patterns such as `**/*.rs` and `*.h`.
-/// Returns `None` for patterns without a simple trailing extension.
-fn extract_extension_from_pattern(pattern: &str) -> Option<String> {
-    let basename = pattern.rsplit('/').next().unwrap_or(pattern);
-    if basename.starts_with('.') {
-        return None;
-    }
-
-    let (_, ext) = basename.rsplit_once('.')?;
-    if ext.is_empty() {
-        return None;
-    }
-
-    // Keep this conservative: only accept plain extension-like tokens.
-    if ext
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        Some(ext.to_string())
-    } else {
-        None
-    }
-}
-
 fn language_id_for_pattern_extension(
     server_language_id: &LanguageId,
-    extension: &str,
+    extension: &FileExtension,
 ) -> LanguageId {
-    react_variant_language_id(server_language_id, extension)
+    react_variant_language_id(server_language_id, extension.as_str())
         .unwrap_or_else(|| server_language_id.clone())
 }
 
@@ -577,130 +532,171 @@ fn language_id_for_pattern_extension(
 fn default_language_extensions() -> Vec<LanguageExtensionMapping> {
     vec![
         LanguageExtensionMapping {
-            extensions: vec!["rs".to_string()],
+            extensions: vec![FileExtension::from_static("rs")],
             language_id: const { LanguageId::from_static("rust") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["py".to_string(), "pyw".to_string(), "pyi".to_string()],
+            extensions: vec![
+                FileExtension::from_static("py"),
+                FileExtension::from_static("pyw"),
+                FileExtension::from_static("pyi"),
+            ],
             language_id: const { LanguageId::from_static("python") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["js".to_string(), "mjs".to_string(), "cjs".to_string()],
+            extensions: vec![
+                FileExtension::from_static("js"),
+                FileExtension::from_static("mjs"),
+                FileExtension::from_static("cjs"),
+            ],
             language_id: const { LanguageId::from_static("javascript") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["ts".to_string(), "mts".to_string(), "cts".to_string()],
+            extensions: vec![
+                FileExtension::from_static("ts"),
+                FileExtension::from_static("mts"),
+                FileExtension::from_static("cts"),
+            ],
             language_id: const { LanguageId::from_static("typescript") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["tsx".to_string()],
+            extensions: vec![FileExtension::from_static("tsx")],
             language_id: const { LanguageId::from_static("typescriptreact") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["jsx".to_string()],
+            extensions: vec![FileExtension::from_static("jsx")],
             language_id: const { LanguageId::from_static("javascriptreact") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["go".to_string()],
+            extensions: vec![FileExtension::from_static("go")],
             language_id: const { LanguageId::from_static("go") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["c".to_string(), "h".to_string()],
+            extensions: vec![
+                FileExtension::from_static("c"),
+                FileExtension::from_static("h"),
+            ],
             language_id: const { LanguageId::from_static("c") },
         },
         LanguageExtensionMapping {
             extensions: vec![
-                "cpp".to_string(),
-                "cc".to_string(),
-                "cxx".to_string(),
-                "hpp".to_string(),
-                "hh".to_string(),
-                "hxx".to_string(),
+                FileExtension::from_static("cpp"),
+                FileExtension::from_static("cc"),
+                FileExtension::from_static("cxx"),
+                FileExtension::from_static("hpp"),
+                FileExtension::from_static("hh"),
+                FileExtension::from_static("hxx"),
             ],
             language_id: const { LanguageId::from_static("cpp") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["java".to_string()],
+            extensions: vec![FileExtension::from_static("java")],
             language_id: const { LanguageId::from_static("java") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["rb".to_string()],
+            extensions: vec![FileExtension::from_static("rb")],
             language_id: const { LanguageId::from_static("ruby") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["php".to_string()],
+            extensions: vec![FileExtension::from_static("php")],
             language_id: const { LanguageId::from_static("php") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["swift".to_string()],
+            extensions: vec![FileExtension::from_static("swift")],
             language_id: const { LanguageId::from_static("swift") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["kt".to_string(), "kts".to_string()],
+            extensions: vec![
+                FileExtension::from_static("kt"),
+                FileExtension::from_static("kts"),
+            ],
             language_id: const { LanguageId::from_static("kotlin") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["scala".to_string(), "sc".to_string()],
+            extensions: vec![
+                FileExtension::from_static("scala"),
+                FileExtension::from_static("sc"),
+            ],
             language_id: const { LanguageId::from_static("scala") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["zig".to_string()],
+            extensions: vec![FileExtension::from_static("zig")],
             language_id: const { LanguageId::from_static("zig") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["lua".to_string()],
+            extensions: vec![FileExtension::from_static("lua")],
             language_id: const { LanguageId::from_static("lua") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["sh".to_string(), "bash".to_string(), "zsh".to_string()],
+            extensions: vec![
+                FileExtension::from_static("sh"),
+                FileExtension::from_static("bash"),
+                FileExtension::from_static("zsh"),
+            ],
             language_id: const { LanguageId::from_static("shellscript") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["json".to_string()],
+            extensions: vec![FileExtension::from_static("json")],
             language_id: const { LanguageId::from_static("json") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["toml".to_string()],
+            extensions: vec![FileExtension::from_static("toml")],
             language_id: const { LanguageId::from_static("toml") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["yaml".to_string(), "yml".to_string()],
+            extensions: vec![
+                FileExtension::from_static("yaml"),
+                FileExtension::from_static("yml"),
+            ],
             language_id: const { LanguageId::from_static("yaml") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["xml".to_string()],
+            extensions: vec![FileExtension::from_static("xml")],
             language_id: const { LanguageId::from_static("xml") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["html".to_string(), "htm".to_string()],
+            extensions: vec![
+                FileExtension::from_static("html"),
+                FileExtension::from_static("htm"),
+            ],
             language_id: const { LanguageId::from_static("html") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["css".to_string()],
+            extensions: vec![FileExtension::from_static("css")],
             language_id: const { LanguageId::from_static("css") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["scss".to_string()],
+            extensions: vec![FileExtension::from_static("scss")],
             language_id: const { LanguageId::from_static("scss") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["less".to_string()],
+            extensions: vec![FileExtension::from_static("less")],
             language_id: const { LanguageId::from_static("less") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["md".to_string(), "markdown".to_string()],
+            extensions: vec![
+                FileExtension::from_static("md"),
+                FileExtension::from_static("markdown"),
+            ],
             language_id: const { LanguageId::from_static("markdown") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["cs".to_string()],
+            extensions: vec![FileExtension::from_static("cs")],
             language_id: const { LanguageId::from_static("csharp") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["fs".to_string(), "fsi".to_string(), "fsx".to_string()],
+            extensions: vec![
+                FileExtension::from_static("fs"),
+                FileExtension::from_static("fsi"),
+                FileExtension::from_static("fsx"),
+            ],
             language_id: const { LanguageId::from_static("fsharp") },
         },
         LanguageExtensionMapping {
-            extensions: vec!["r".to_string(), "R".to_string()],
+            extensions: vec![
+                FileExtension::from_static("r"),
+                FileExtension::from_static("R"),
+            ],
             language_id: const { LanguageId::from_static("r") },
         },
     ]
@@ -842,12 +838,9 @@ fn config_dir_as_given(config_path: &Path) -> Result<PathBuf> {
     } else {
         config_path.to_path_buf()
     };
-    path.parent().map(Path::to_path_buf).ok_or_else(|| {
-        Error::InvalidConfig(format!(
-            "configuration path has no parent directory: {}",
-            path.display()
-        ))
-    })
+    path.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ConfigError::NoParentDirectory { path }.into())
 }
 
 /// What a relative [`WorkspaceConfig::roots`] entry resolves against, for
@@ -873,15 +866,14 @@ impl ServerConfig {
     /// Starts with workspace mappings and overlays mappings inferred from
     /// configured LSP server `file_patterns`.
     #[must_use]
-    pub fn build_effective_extension_map(&self) -> HashMap<String, LanguageId> {
+    pub fn build_effective_extension_map(&self) -> HashMap<FileExtension, LanguageId> {
         let mut map = self.workspace.build_extension_map();
 
         for server in &self.lsp_servers {
             for pattern in &server.file_patterns {
-                if let Some(ext) = extract_extension_from_pattern(pattern) {
-                    let language_id = language_id_for_pattern_extension(&server.language_id, &ext);
-                    map.insert(ext, language_id);
-                }
+                let ext = pattern.extension();
+                let language_id = language_id_for_pattern_extension(&server.language_id, ext);
+                map.insert(ext.clone(), language_id);
             }
         }
 
@@ -1103,8 +1095,7 @@ impl ServerConfig {
                 }
                 ReadBoundedError::Io(e) => Error::Io(e),
             })?;
-        let content = String::from_utf8(buf)
-            .map_err(|e| Error::InvalidConfig(format!("config file is not valid UTF-8: {e}")))?;
+        let content = String::from_utf8(buf).map_err(ConfigError::NotUtf8)?;
 
         let mut config: Self = toml::from_str(&content)?;
         config.validate()?;
@@ -1147,7 +1138,7 @@ impl ServerConfig {
     /// [`Self::load_from`] always calls this, and so do [`crate::serve`] and
     /// [`crate::serve_with`] for every `ServerConfig` regardless of origin —
     /// a caller-constructed config (not loaded via TOML) gets the same
-    /// diagnosable [`Error::InvalidConfig`] rejection as one loaded from
+    /// diagnosable [`Error::Config`] rejection as one loaded from
     /// disk. Value ranges (timeouts, `position_encodings`, `language_id`)
     /// are not checked here: their types ([`TimeoutSecs`],
     /// [`IndexingReadyTimeoutSecs`], [`PositionEncodings`], [`LanguageId`])
@@ -1158,7 +1149,7 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] on the first rule violated.
+    /// Returns [`Error::Config`] on the first rule violated.
     ///
     /// # Examples
     ///
@@ -1169,8 +1160,6 @@ impl ServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
-        self.validate_mcp()?;
-        self.validate_workspace_bounds()?;
         self.validate_workspace_trust()?;
 
         // `Path::is_relative()` is `true` for an empty path, and joining it
@@ -1179,100 +1168,33 @@ impl ServerConfig {
         // to be an accident -- reject it explicitly instead of letting it
         // pass through workspace-root resolution unnoticed (#348 M4).
         if self.workspace.roots.iter().any(|root| root.is_empty()) {
-            return Err(Error::InvalidConfig(
-                "workspace.roots entries cannot be empty".to_string(),
-            ));
+            return Err(ConfigError::EmptyWorkspaceRoot.into());
         }
         let mut seen_names: HashMap<&str, &LanguageId> = HashMap::new();
         for server in &self.lsp_servers {
-            if server.command.is_empty() {
-                return Err(Error::InvalidConfig(format!(
-                    "command cannot be empty for language '{}'",
-                    server.language_id
-                )));
-            }
             if server.selection == ServerSelection::Auto
-                && !BuiltinServer::TypescriptLanguageServer.matches_command(&server.command)
+                && !BuiltinServer::TypescriptLanguageServer.matches_command(server.command.as_str())
             {
-                return Err(Error::InvalidConfig(format!(
-                    "selection = \"auto\" is only valid for typescript-language-server entries \
-                     (language '{}'); remove `selection` to use `command` as written",
-                    server.language_id
-                )));
-            }
-            if let Some(name) = &server.name {
-                if name.is_empty() {
-                    return Err(Error::InvalidConfig(format!(
-                        "name cannot be empty for language '{}' (omit `name` to default to \
-                         the language id)",
-                        server.language_id
-                    )));
+                return Err(ConfigError::SelectionAutoOnNonTypescript {
+                    language: server.language_id.clone(),
                 }
-                if let Some(prev_language) = seen_names.insert(name.as_str(), &server.language_id) {
-                    // Not a hard error here: whether this is actually ambiguous
-                    // depends on which of these servers end up applicable in a
-                    // given workspace, which this function cannot know. The
-                    // workspace-scoped check in `ToolRouter::from_configs` is
-                    // authoritative.
-                    tracing::warn!(
-                        "duplicate explicit server name '{name}' in config (language ids: \
+                .into());
+            }
+            if let Some(name) = &server.name
+                && let Some(prev_language) = seen_names.insert(name.as_str(), &server.language_id)
+            {
+                // Not a hard error here: whether this is actually ambiguous
+                // depends on which of these servers end up applicable in a
+                // given workspace, which this function cannot know. The
+                // workspace-scoped check in `ToolRouter::from_configs` is
+                // authoritative.
+                tracing::warn!(
+                    "duplicate explicit server name '{name}' in config (language ids: \
                          '{prev_language}', '{}'); this is only an error if both entries are \
                          applicable in the same workspace",
-                        server.language_id
-                    );
-                }
+                    server.language_id
+                );
             }
-            if let Some(handles) = &server.handles {
-                if handles.is_empty() {
-                    return Err(Error::InvalidConfig(format!(
-                        "handles cannot be empty for language '{}' (omit `handles` for a \
-                         catch-all server)",
-                        server.language_id
-                    )));
-                }
-                let mut seen_tools = HashSet::new();
-                for tool in handles {
-                    if !seen_tools.insert(*tool) {
-                        return Err(Error::InvalidConfig(format!(
-                            "duplicate tool '{tool}' in `handles` for language '{}'",
-                            server.language_id
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Runs the numeric-bound checks on `[workspace]`; split out of
-    /// [`Self::validate`] to keep that function under clippy's line count
-    /// threshold.
-    fn validate_workspace_bounds(&self) -> Result<()> {
-        self.validate_heuristics_max_depth()?;
-        self.validate_max_file_size()
-    }
-
-    /// Rejects `workspace.max_file_size` above [`MAX_FILE_SIZE_LIMIT`]; `0`
-    /// (unlimited) stays valid.
-    fn validate_max_file_size(&self) -> Result<()> {
-        let size = self.workspace.max_file_size;
-        if size > MAX_FILE_SIZE_LIMIT {
-            return Err(Error::InvalidConfig(format!(
-                "workspace.max_file_size ({size}) exceeds the hard cap of {MAX_FILE_SIZE_LIMIT} \
-                 bytes; use a lower value, or 0 to disable the per-file limit"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Rejects `workspace.heuristics_max_depth` above [`MAX_HEURISTICS_DEPTH`].
-    fn validate_heuristics_max_depth(&self) -> Result<()> {
-        let depth = self.workspace.heuristics_max_depth;
-        if depth > MAX_HEURISTICS_DEPTH {
-            return Err(Error::InvalidConfig(format!(
-                "workspace.heuristics_max_depth ({depth}) exceeds the maximum of \
-                 {MAX_HEURISTICS_DEPTH}"
-            )));
         }
         Ok(())
     }
@@ -1290,14 +1212,11 @@ impl ServerConfig {
             .iter()
             .find(|id| !configured.contains(id));
         unknown.map_or(Ok(()), |unknown| {
-            Err(Error::InvalidConfig(format!(
-                "allowed server '{unknown}' is not a configured server (configured: {})",
-                configured
-                    .iter()
-                    .map(ServerId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )))
+            Err(ConfigError::UnknownAllowedServer {
+                server: unknown.clone(),
+                configured: configured.clone(),
+            }
+            .into())
         })
     }
 
@@ -1333,53 +1252,6 @@ impl ServerConfig {
         }
         Ok(())
     }
-
-    /// Validates the `[mcp]` section: each configured field is rejected if
-    /// whitespace-only or over its `MAX_MCP_*` byte cap. Split out of
-    /// [`Self::validate`] to keep that function under clippy's line count
-    /// threshold.
-    fn validate_mcp(&self) -> Result<()> {
-        validate_mcp_field(self.mcp.title.as_deref(), "mcp.title", MAX_MCP_TITLE_BYTES)?;
-        validate_mcp_field(
-            self.mcp.description.as_deref(),
-            "mcp.description",
-            MAX_MCP_DESCRIPTION_BYTES,
-        )?;
-        validate_mcp_field(
-            self.mcp.instructions.as_deref(),
-            "mcp.instructions",
-            MAX_MCP_INSTRUCTIONS_BYTES,
-        )
-    }
-}
-
-/// Validates one [`McpConfig`] string field: rejects a whitespace-only value
-/// before checking length, so `title = "   "` reports "cannot be empty"
-/// rather than a length error, and caps only the raw configured string --
-/// text appended later (e.g. the untrusted-project-config NOTE in
-/// `McplsServer::get_info`) is not part of `value` and is unaffected.
-fn validate_mcp_field(value: Option<&str>, field: &str, max_bytes: usize) -> Result<()> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    if value.trim().is_empty() {
-        // `rsplit('.').next()` always yields at least one item for any
-        // input (including one with no '.'), so `unwrap_or(field)` never
-        // actually falls back for the "mcp.<field>" strings this is called
-        // with -- kept as a defensive default rather than an `unwrap()`,
-        // since `clippy::unwrap_used` is a workspace-wide warn-as-error.
-        return Err(Error::InvalidConfig(format!(
-            "{field} cannot be empty (omit `{}` from the `[mcp]` section to use the built-in default)",
-            field.rsplit('.').next().unwrap_or(field)
-        )));
-    }
-    let len = value.len();
-    if len > max_bytes {
-        return Err(Error::InvalidConfig(format!(
-            "{field} exceeds the maximum of {max_bytes} bytes ({len} given)"
-        )));
-    }
-    Ok(())
 }
 
 impl Default for ServerConfig {
@@ -1403,6 +1275,7 @@ impl Default for ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::{assert_matches, fs};
 
     use tempfile::TempDir;
@@ -1574,9 +1447,10 @@ mod tests {
 
         let err = ServerConfig::load_from(&config_path).unwrap_err();
 
-        let Error::InvalidConfig(message) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
+        let Error::Config(config_err) = err else {
+            panic!("expected Config, got {err:?}");
         };
+        let message = config_err.to_string();
         assert!(message.contains("workspace root 'missing'"));
         assert!(message.contains(&tmp_dir.path().display().to_string()));
     }
@@ -1780,9 +1654,10 @@ mod tests {
             ServerConfig::load_from(Path::new("mcpls.toml")).unwrap_err()
         };
 
-        let Error::InvalidConfig(message) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
+        let Error::Config(config_err) = err else {
+            panic!("expected Config, got {err:?}");
         };
+        let message = config_err.to_string();
         assert!(message.contains("workspace root 'missing'"), "{message}");
     }
 
@@ -1818,19 +1693,19 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("heuristics_max_depth"));
-            assert!(msg.contains("exceeds the maximum"));
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
+        assert_matches!(
+            result,
+            Err(Error::TomlDe(ref e))
+                if e.message().contains("heuristics_max_depth")
+                    && e.message().contains("exceeds the maximum")
+        );
     }
 
     #[test]
     fn test_validate_accepts_heuristics_max_depth_below_max() {
         for depth in [1, MAX_HEURISTICS_DEPTH - 1] {
             let mut config = ServerConfig::default();
-            config.workspace.heuristics_max_depth = depth;
+            config.workspace.heuristics_max_depth = SearchDepth::new(depth).unwrap();
             assert!(config.validate().is_ok(), "depth {depth} must be accepted");
         }
     }
@@ -1842,12 +1717,11 @@ mod tests {
             (MAX_FILE_SIZE_LIMIT, true),
             (MAX_FILE_SIZE_LIMIT + 1, false),
         ] {
-            let mut config = ServerConfig::default();
-            config.workspace.max_file_size = size;
-            let result = config.validate();
+            let result =
+                toml::from_str::<ServerConfig>(&format!("[workspace]\nmax_file_size = {size}\n"));
             assert_eq!(result.is_ok(), ok, "max_file_size {size}: {result:?}");
-            if let Err(Error::InvalidConfig(msg)) = result {
-                assert!(msg.contains("max_file_size"));
+            if let Err(e) = result {
+                assert!(e.message().contains("max_file_size"));
             }
         }
     }
@@ -1861,7 +1735,10 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.heuristics_max_depth, MAX_HEURISTICS_DEPTH);
+        assert_eq!(
+            config.workspace.heuristics_max_depth.get(),
+            MAX_HEURISTICS_DEPTH
+        );
     }
 
     #[test]
@@ -2111,7 +1988,7 @@ mod tests {
             "typescript-language-server.cmd",
         ] {
             let mut typescript = LspServerConfig::typescript();
-            typescript.command = command.to_string();
+            typescript.command = ServerCommand::new(command.to_string()).unwrap();
             let config = ServerConfig {
                 lsp_servers: vec![typescript],
                 ..ServerConfig::default()
@@ -2130,7 +2007,9 @@ mod tests {
         };
         assert_matches!(
             config.validate(),
-            Err(Error::InvalidConfig(msg)) if msg.contains("selection")
+            Err(Error::Config(
+                ConfigError::SelectionAutoOnNonTypescript { .. }
+            ))
         );
     }
 
@@ -2255,36 +2134,23 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert!(result.is_err());
 
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("command cannot be empty"));
-        } else {
-            panic!("Expected InvalidConfig error");
-        }
+        assert_matches!(result, Err(Error::TomlDe(ref e)) if e.message().contains("command cannot be blank"));
     }
 
     #[test]
-    fn test_validate_empty_name() {
-        let tmp_dir = TempDir::new().unwrap();
-        let config_path = tmp_dir.path().join("config.toml");
-
-        let toml_content = r#"
-            [[lsp_servers]]
-            name = ""
-            language_id = "python"
-            command = "pyright-langserver"
-        "#;
-
-        fs::write(&config_path, toml_content).unwrap();
-
-        let result = ServerConfig::load_from(&config_path);
-        assert!(result.is_err());
-
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("name cannot be empty"));
-        } else {
-            panic!("Expected InvalidConfig error");
+    fn test_blank_server_name_is_rejected_at_load() {
+        for name in ["", "  ", "\\t"] {
+            let toml = format!(
+                "[[lsp_servers]]\nname = \"{name}\"\nlanguage_id = \"python\"\n\
+                 command = \"pyright-langserver\"\n"
+            );
+            let err = toml::from_str::<ServerConfig>(&toml).unwrap_err();
+            assert!(
+                err.message().contains("server id cannot be blank"),
+                "{name:?}: {}",
+                err.message()
+            );
         }
     }
 
@@ -2303,13 +2169,8 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert!(result.is_err());
 
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("handles cannot be empty"));
-        } else {
-            panic!("Expected InvalidConfig error");
-        }
+        assert_matches!(result, Err(Error::TomlDe(ref e)) if e.message().contains("handles cannot be empty"));
     }
 
     #[test]
@@ -2327,14 +2188,11 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert!(result.is_err());
 
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("duplicate tool"));
-            assert!(msg.contains("diagnostics"));
-        } else {
-            panic!("Expected InvalidConfig error");
-        }
+        assert_matches!(
+            result,
+            Err(Error::TomlDe(ref e)) if e.message().contains("duplicate tool 'diagnostics'")
+        );
     }
 
     /// #348 M4: `roots = [""]` previously reached workspace-root resolution
@@ -2354,11 +2212,7 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(msg, "workspace.roots entries cannot be empty");
-        } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
-        }
+        assert_matches!(result, Err(Error::Config(ConfigError::EmptyWorkspaceRoot)));
     }
 
     #[test]
@@ -2395,7 +2249,10 @@ mod tests {
         assert_eq!(workspace.position_encodings, PositionEncodings::DEFAULT);
         assert!(!workspace.language_extensions.is_empty());
         assert_eq!(workspace.language_extensions.len(), 30);
-        assert_eq!(workspace.heuristics_max_depth, DEFAULT_HEURISTICS_MAX_DEPTH);
+        assert_eq!(
+            workspace.heuristics_max_depth.get(),
+            DEFAULT_HEURISTICS_MAX_DEPTH
+        );
     }
 
     #[test]
@@ -2522,17 +2379,21 @@ mod tests {
             position_encodings: PositionEncodings::DEFAULT,
             language_extensions: vec![
                 LanguageExtensionMapping {
-                    extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string()],
+                    extensions: vec![
+                        FileExtension::from_static("cpp"),
+                        FileExtension::from_static("cc"),
+                        FileExtension::from_static("cxx"),
+                    ],
                     language_id: LanguageId::from_static("cpp"),
                 },
                 LanguageExtensionMapping {
-                    extensions: vec!["nu".to_string()],
+                    extensions: vec![FileExtension::from_static("nu")],
                     language_id: LanguageId::from_static("nushell"),
                 },
             ],
-            heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
-            max_documents: DEFAULT_MAX_DOCUMENTS,
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            heuristics_max_depth: SearchDepth::DEFAULT,
+            max_documents: DocumentLimit::DEFAULT,
+            max_file_size: SizeLimit::DEFAULT,
             indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
@@ -2546,39 +2407,19 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_extension_from_pattern_empty_string() {
-        assert_eq!(extract_extension_from_pattern(""), None);
-    }
-
-    #[test]
-    fn test_extract_extension_from_pattern_without_dot() {
-        assert_eq!(extract_extension_from_pattern("**/*"), None);
-    }
-
-    #[test]
-    fn test_extract_extension_from_pattern_dotfile() {
-        assert_eq!(extract_extension_from_pattern(".gitignore"), None);
-    }
-
-    #[test]
-    fn test_extract_extension_from_pattern_multi_dot_extension() {
-        assert_eq!(
-            extract_extension_from_pattern("foo.tar.gz"),
-            Some("gz".to_string())
-        );
-    }
-
-    #[test]
     fn test_build_effective_extension_map_overrides_with_file_patterns() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("cpp"),
-                command: "clangd".to_string(),
+                command: ServerCommand::from_static("clangd"),
                 args: vec![],
                 env: HashMap::new(),
-                file_patterns: vec!["**/*.c".to_string(), "**/*.h".to_string()],
+                file_patterns: vec![
+                    FilePattern::from_static("**/*.c"),
+                    FilePattern::from_static("**/*.h"),
+                ],
                 initialization_options: None,
                 settings: None,
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -2605,10 +2446,13 @@ mod tests {
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("typescript"),
-                command: "tsgo".to_string(),
+                command: ServerCommand::from_static("tsgo"),
                 args: vec!["--lsp".to_string(), "--stdio".to_string()],
                 env: HashMap::new(),
-                file_patterns: vec!["**/*.ts".to_string(), "**/*.tsx".to_string()],
+                file_patterns: vec![
+                    FilePattern::from_static("**/*.ts"),
+                    FilePattern::from_static("**/*.tsx"),
+                ],
                 initialization_options: None,
                 settings: None,
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -2638,10 +2482,13 @@ mod tests {
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("javascript"),
-                command: "typescript-language-server".to_string(),
+                command: ServerCommand::from_static("typescript-language-server"),
                 args: vec!["--stdio".to_string()],
                 env: HashMap::new(),
-                file_patterns: vec!["**/*.js".to_string(), "**/*.jsx".to_string()],
+                file_patterns: vec![
+                    FilePattern::from_static("**/*.js"),
+                    FilePattern::from_static("**/*.jsx"),
+                ],
                 initialization_options: None,
                 settings: None,
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -2665,33 +2512,46 @@ mod tests {
     }
 
     #[test]
-    fn test_build_effective_extension_map_ignores_complex_patterns_without_extension() {
-        let config = ServerConfig {
-            mcp: McpConfig::default(),
-            workspace: WorkspaceConfig::default(),
-            lsp_servers: vec![LspServerConfig {
-                language_id: LanguageId::from_static("cpp"),
-                command: "clangd".to_string(),
-                args: vec![],
-                env: HashMap::new(),
-                file_patterns: vec!["**/*".to_string(), "**/*.{h,hpp}".to_string()],
-                initialization_options: None,
-                settings: None,
-                timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
-                heuristics: None,
-                name: None,
-                handles: None,
-                indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
-            }],
-            project_config_status: ProjectConfigStatus::NotIgnored,
-            workspace_trust: crate::config::WorkspaceTrust::default(),
-        };
+    fn test_load_rejects_every_unsupported_file_pattern_form_naming_the_server() {
+        for pattern in [
+            "**/*.{cpp,h}",
+            "**/*.[ch]",
+            "**/*.ts?",
+            "**/*",
+            "src/**",
+            "Makefile",
+            ".eslintrc",
+            "**/*.",
+            "src/main.rs",
+        ] {
+            let toml = format!(
+                "[[lsp_servers]]\nlanguage_id = \"cpp\"\ncommand = \"clangd\"\n\
+                 file_patterns = [{pattern:?}]\n"
+            );
+            let err = toml::from_str::<ServerConfig>(&toml).unwrap_err();
+            let message = err.message();
+            assert!(
+                message.contains("lsp_servers entry 'cpp'"),
+                "{pattern}: {message}"
+            );
+            assert!(
+                message.contains(&format!("'{pattern}'")),
+                "{pattern}: {message}"
+            );
+            assert!(message.contains("*.EXT"), "{pattern}: {message}");
+        }
+    }
 
-        let map = config.build_effective_extension_map();
-        // Default C/C++ mappings remain unchanged when patterns cannot be parsed.
-        assert_eq!(map.get("h"), Some(&LanguageId::from_static("c")));
+    #[test]
+    fn test_unsupported_file_pattern_names_the_explicit_server_name() {
+        let toml = "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pylsp\"\n\
+                    name = \"mine\"\nfile_patterns = [\"**/*.{py,pyi}\"]\n";
+        let err = toml::from_str::<ServerConfig>(toml).unwrap_err();
+        assert!(
+            err.message().contains("lsp_servers entry 'mine'"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]
@@ -2701,34 +2561,35 @@ mod tests {
             position_encodings: PositionEncodings::DEFAULT,
             language_extensions: vec![
                 LanguageExtensionMapping {
-                    extensions: vec!["hpp".to_string(), "hh".to_string()],
+                    extensions: vec![
+                        FileExtension::from_static("hpp"),
+                        FileExtension::from_static("hh"),
+                    ],
                     language_id: LanguageId::from_static("cpp"),
                 },
                 LanguageExtensionMapping {
-                    extensions: vec!["py".to_string()],
+                    extensions: vec![FileExtension::from_static("py")],
                     language_id: LanguageId::from_static("python"),
                 },
             ],
-            heuristics_max_depth: DEFAULT_HEURISTICS_MAX_DEPTH,
-            max_documents: DEFAULT_MAX_DOCUMENTS,
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            heuristics_max_depth: SearchDepth::DEFAULT,
+            max_documents: DocumentLimit::DEFAULT,
+            max_file_size: SizeLimit::DEFAULT,
             indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
             max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
         };
 
+        let map = workspace.build_extension_map();
         assert_eq!(
-            workspace.language_for_extension("hpp"),
+            map.get("hpp").cloned(),
             Some(LanguageId::from_static("cpp"))
         );
+        assert_eq!(map.get("hh").cloned(), Some(LanguageId::from_static("cpp")));
         assert_eq!(
-            workspace.language_for_extension("hh"),
-            Some(LanguageId::from_static("cpp"))
-        );
-        assert_eq!(
-            workspace.language_for_extension("py"),
+            map.get("py").cloned(),
             Some(LanguageId::from_static("python"))
         );
-        assert_eq!(workspace.language_for_extension("unknown"), None);
+        assert_eq!(map.get("unknown").cloned(), None);
     }
 
     #[test]
@@ -2737,15 +2598,15 @@ mod tests {
         let map = workspace.build_extension_map();
         assert!(!map.is_empty());
         assert_eq!(
-            workspace.language_for_extension("rs"),
+            map.get("rs").cloned(),
             Some(LanguageId::from_static("rust"))
         );
         assert_eq!(
-            workspace.language_for_extension("py"),
+            map.get("py").cloned(),
             Some(LanguageId::from_static("python"))
         );
         assert_eq!(
-            workspace.language_for_extension("cpp"),
+            map.get("cpp").cloned(),
             Some(LanguageId::from_static("cpp"))
         );
     }
@@ -2911,7 +2772,7 @@ mod tests {
                 .roots
                 .contains(&PathBuf::from("/attacker/controlled"))
         );
-        assert_ne!(config.workspace.heuristics_max_depth, 999_999);
+        assert_ne!(config.workspace.heuristics_max_depth.get(), 999_999);
         assert!(!config.lsp_servers.iter().any(|s| s.language_id == "evil"));
     }
 
@@ -2982,7 +2843,7 @@ mod tests {
     #[test]
     fn test_heuristics_max_depth_default() {
         let config = WorkspaceConfig::default();
-        assert_eq!(config.heuristics_max_depth, 10);
+        assert_eq!(config.heuristics_max_depth.get(), 10);
     }
 
     #[test]
@@ -2998,7 +2859,7 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.heuristics_max_depth, 5);
+        assert_eq!(config.workspace.heuristics_max_depth.get(), 5);
     }
 
     #[test]
@@ -3015,7 +2876,7 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
         assert_eq!(
-            config.workspace.heuristics_max_depth,
+            config.workspace.heuristics_max_depth.get(),
             DEFAULT_HEURISTICS_MAX_DEPTH
         );
     }
@@ -3023,13 +2884,13 @@ mod tests {
     #[test]
     fn test_max_documents_default() {
         let config = WorkspaceConfig::default();
-        assert_eq!(config.max_documents, DEFAULT_MAX_DOCUMENTS);
+        assert_eq!(config.max_documents, DocumentLimit::DEFAULT);
     }
 
     #[test]
     fn test_max_file_size_default() {
         let config = WorkspaceConfig::default();
-        assert_eq!(config.max_file_size, DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(config.max_file_size, SizeLimit::DEFAULT);
     }
 
     #[test]
@@ -3045,7 +2906,7 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.max_documents, 500);
+        assert_eq!(config.workspace.max_documents, DocumentLimit::new(500));
     }
 
     #[test]
@@ -3061,7 +2922,10 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.max_file_size, 20_971_520);
+        assert_eq!(
+            config.workspace.max_file_size,
+            SizeLimit::from_static(20_971_520)
+        );
     }
 
     #[test]
@@ -3077,8 +2941,8 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.max_documents, DEFAULT_MAX_DOCUMENTS);
-        assert_eq!(config.workspace.max_file_size, DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(config.workspace.max_documents, DocumentLimit::DEFAULT);
+        assert_eq!(config.workspace.max_file_size, SizeLimit::DEFAULT);
     }
 
     /// `max_file_size = 0` is the documented "unlimited" sentinel (see
@@ -3097,8 +2961,11 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.max_file_size, 0);
-        assert_eq!(config.workspace.resource_limits().max_file_size, 0);
+        assert_eq!(config.workspace.max_file_size, SizeLimit::UNLIMITED);
+        assert_eq!(
+            config.workspace.resource_limits().max_file_size,
+            SizeLimit::UNLIMITED
+        );
     }
 
     /// #325: `max_documents` is `usize`, so a negative TOML integer must fail
@@ -3162,14 +3029,14 @@ mod tests {
     #[test]
     fn test_workspace_config_resource_limits_maps_fields() {
         let workspace = WorkspaceConfig {
-            max_documents: 250,
-            max_file_size: 0,
+            max_documents: DocumentLimit::new(250),
+            max_file_size: SizeLimit::UNLIMITED,
             ..WorkspaceConfig::default()
         };
 
         let limits = workspace.resource_limits();
-        assert_eq!(limits.max_documents, 250);
-        assert_eq!(limits.max_file_size, 0);
+        assert_eq!(limits.max_documents, DocumentLimit::new(250));
+        assert_eq!(limits.max_file_size, SizeLimit::UNLIMITED);
     }
 
     #[test]
@@ -3178,12 +3045,12 @@ mod tests {
             roots: vec![PathBuf::from("/tmp/round-trip")],
             position_encodings: PositionEncodings::new(vec![PositionEncoding::Utf8]).unwrap(),
             language_extensions: vec![LanguageExtensionMapping {
-                extensions: vec!["nu".to_string()],
+                extensions: vec![FileExtension::from_static("nu")],
                 language_id: LanguageId::from_static("nushell"),
             }],
-            heuristics_max_depth: 5,
-            max_documents: 500,
-            max_file_size: 0,
+            heuristics_max_depth: SearchDepth::new(5).unwrap(),
+            max_documents: DocumentLimit::new(500),
+            max_file_size: SizeLimit::UNLIMITED,
             indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::new(45).unwrap(),
             max_concurrent_server_starts: ServerStartConcurrency::new(3).unwrap(),
         };
@@ -3235,15 +3102,9 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.mcp.title.as_deref(), Some("Custom Title"));
-        assert_eq!(
-            config.mcp.description.as_deref(),
-            Some("Custom description")
-        );
-        assert_eq!(
-            config.mcp.instructions.as_deref(),
-            Some("Custom instructions.")
-        );
+        assert_eq!(config.mcp.title.unwrap(), "Custom Title");
+        assert_eq!(config.mcp.description.unwrap(), "Custom description");
+        assert_eq!(config.mcp.instructions.unwrap(), "Custom instructions.");
     }
 
     #[test]
@@ -3278,14 +3139,11 @@ mod tests {
         fs::write(&config_path, "[mcp]\ntitle = \"\"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(
-                msg,
-                "mcp.title cannot be empty (omit `title` from the `[mcp]` section to use the \
-                 built-in default)"
-            );
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert_eq!(msg, "cannot be empty");
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3299,10 +3157,11 @@ mod tests {
         fs::write(&config_path, "[mcp]\ntitle = \"   \"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
             assert!(msg.contains("cannot be empty"));
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3314,14 +3173,11 @@ mod tests {
         fs::write(&config_path, "[mcp]\ndescription = \"\"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(
-                msg,
-                "mcp.description cannot be empty (omit `description` from the `[mcp]` section \
-                 to use the built-in default)"
-            );
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert_eq!(msg, "cannot be empty");
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3333,14 +3189,11 @@ mod tests {
         fs::write(&config_path, "[mcp]\ninstructions = \"\"\n").unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert_eq!(
-                msg,
-                "mcp.instructions cannot be empty (omit `instructions` from the `[mcp]` \
-                 section to use the built-in default)"
-            );
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert_eq!(msg, "cannot be empty");
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3353,16 +3206,17 @@ mod tests {
         fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
             assert_eq!(
                 msg,
                 format!(
-                    "mcp.title exceeds the maximum of {MAX_MCP_TITLE_BYTES} bytes ({} given)",
+                    "exceeds the maximum of {MAX_MCP_TITLE_BYTES} bytes ({} given)",
                     MAX_MCP_TITLE_BYTES + 1
                 )
             );
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3391,11 +3245,12 @@ mod tests {
         .unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("mcp.description exceeds the maximum"));
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert!(msg.contains("exceeds the maximum"));
             assert!(msg.contains(&(MAX_MCP_DESCRIPTION_BYTES + 1).to_string()));
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3430,10 +3285,11 @@ mod tests {
         fs::write(&config_path, format!("[mcp]\ntitle = \"{title}\"\n")).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("mcp.title exceeds the maximum"));
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert!(msg.contains("exceeds the maximum"));
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3463,11 +3319,12 @@ mod tests {
         .unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        if let Err(Error::InvalidConfig(msg)) = result {
-            assert!(msg.contains("mcp.instructions exceeds the maximum"));
+        if let Err(Error::TomlDe(e)) = result {
+            let msg = e.message();
+            assert!(msg.contains("exceeds the maximum"));
             assert!(msg.contains(&(MAX_MCP_INSTRUCTIONS_BYTES + 1).to_string()));
         } else {
-            panic!("Expected InvalidConfig error, got {result:?}");
+            panic!("Expected TomlDe error, got {result:?}");
         }
     }
 
@@ -3604,7 +3461,7 @@ mod tests {
     /// `toml` crate's line-reference attachment for such errors is not
     /// guaranteed by its public API and must be verified empirically rather
     /// than assumed (see [`ToolPrefix`]'s doc comment on the `Error::TomlDe`
-    /// vs `Error::InvalidConfig` trade-off).
+    /// trade-off).
     #[test]
     fn test_invalid_tool_prefix_error_names_field_and_offending_character() {
         let tmp_dir = TempDir::new().unwrap();
@@ -3622,8 +3479,7 @@ mod tests {
         // "line N, column M" reference to a `serde::de::Error::custom`
         // raised from within a field's `Deserialize` impl, giving this
         // error strictly more location information than the sibling
-        // `Error::InvalidConfig` fields (`title`/`description`/
-        // `instructions`) get.
+        // `title`/`description`/`instructions` fields get.
         assert!(msg.contains("line 2"), "{msg}");
     }
 
@@ -3648,7 +3504,11 @@ mod tests {
             let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rsut")]));
             let err = config.validate().unwrap_err();
             let text = err.to_string();
-            assert_matches!(err, Error::InvalidConfig(_));
+            assert_matches!(
+                err,
+                Error::Config(ConfigError::UnknownAllowedServer { ref server, .. })
+                    if server.as_str() == "rsut"
+            );
             assert!(text.contains("'rsut'") && text.contains("rust"), "{text}");
         }
 

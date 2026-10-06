@@ -6,9 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    FoldingKindFilter, HierarchyItem, InvalidPosition, LogLevel, MAX_RESTART_SERVER_IDS,
-    MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position, RestartTarget, ResultContext, ServerIds,
-    SymbolName, SymbolQuery, SymbolTarget, TabSize, parse_symbol_kind,
+    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, InvalidPosition, KindFilterInput,
+    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, Position,
+    RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
+    SymbolTarget, TabSize, parse_symbol_kind,
 };
 use crate::config::ServerId;
 
@@ -376,7 +377,7 @@ pub struct WorkspaceSymbolParams {
                         result rather than an error."
     )]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind_filter: Option<String>,
+    pub kind_filter: Option<KindFilterInput<SymbolKindFilter>>,
     /// Maximum results to return (default: 100).
     #[schemars(description = "Maximum results to return (default: 100).")]
     #[serde(default = "default_max_results")]
@@ -400,9 +401,11 @@ pub struct CodeActionsParams {
     #[serde(flatten)]
     pub range: RangeParams,
     /// Optional filter by action kind (quickfix, refactor, source, etc.).
-    #[schemars(description = "Optional filter by action kind (quickfix, refactor, source, etc.).")]
+    #[schemars(
+        description = "Optional filter by action kind, in any case; sent to the server in its canonical spelling."
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind_filter: Option<String>,
+    pub kind_filter: Option<KindFilterInput<CodeActionKindFilter>>,
 }
 
 /// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.

@@ -20,7 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use super::language_id::LanguageId;
 use super::server::LspServerConfig;
-use crate::error::{Error, Result};
+use crate::error::{ConfigError, Result};
+
+/// A server id was empty or whitespace-only.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("server id cannot be blank (omit `name` to default to the language id)")]
+pub struct InvalidServerId;
 
 /// Unique identity of a configured LSP server within a workspace.
 ///
@@ -29,10 +34,38 @@ use crate::error::{Error, Result};
 /// layer (the translator's server slots, notification receivers)
 /// instead of a raw language string, so two servers sharing a language no
 /// longer silently overwrite each other.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+///
+/// Deserializes from a string and rejects a blank one, so the config file and
+/// [`Self::new`] apply the same rule.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::ServerId;
+///
+/// assert_eq!(ServerId::new("pyright").unwrap().as_str(), "pyright");
+/// assert!(ServerId::new("  ").is_err());
+/// ```
+// TODO(D2): `From<&str>`/`From<String>` below can still build a blank id; replace them with
+// `from_static` and migrate the fixtures (follow-up issue "ServerId still has infallible
+// From<&str>/From<String> constructors").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 pub struct ServerId(String);
 
 impl ServerId {
+    /// Builds an id from any string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidServerId`] if `id` is blank.
+    pub fn new(id: impl Into<String>) -> std::result::Result<Self, InvalidServerId> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(InvalidServerId);
+        }
+        Ok(Self(id))
+    }
+
     /// Borrow the identity as a plain string, e.g. for log messages or map
     /// lookups against external APIs that expect `&str`.
     #[must_use]
@@ -44,6 +77,24 @@ impl ServerId {
 impl std::fmt::Display for ServerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for ServerId {
+    type Err = InvalidServerId;
+
+    fn from_str(id: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(id)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let id = String::deserialize(deserializer)?;
+        Self::new(id).map_err(serde::de::Error::custom)
     }
 }
 
@@ -199,6 +250,95 @@ impl std::fmt::Display for ToolKind {
     }
 }
 
+/// Why a list of tools is not a valid [`ToolSet`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidToolSet {
+    /// The list was empty.
+    #[error("handles cannot be empty (omit `handles` for a catch-all server)")]
+    Empty,
+    /// A tool appeared more than once.
+    #[error("duplicate tool '{0}' in `handles`")]
+    Duplicate(ToolKind),
+}
+
+/// The non-empty, duplicate-free tools one server is restricted to.
+///
+/// Deserializes from a list of tool names and rejects an empty list or a
+/// repeated tool at load time.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::{ToolKind, ToolSet};
+///
+/// let set = ToolSet::new(vec![ToolKind::Hover, ToolKind::Rename]).unwrap();
+/// assert!(set.contains(ToolKind::Hover));
+/// assert!(ToolSet::new(vec![]).is_err());
+/// assert!(ToolSet::new(vec![ToolKind::Hover, ToolKind::Hover]).is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<ToolKind>", into = "Vec<ToolKind>")]
+pub struct ToolSet(Vec<ToolKind>);
+
+impl ToolSet {
+    /// Builds a set from `tools`, preserving their order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidToolSet::Empty`] for an empty list and
+    /// [`InvalidToolSet::Duplicate`] for the first repeated tool.
+    pub fn new(tools: Vec<ToolKind>) -> std::result::Result<Self, InvalidToolSet> {
+        if tools.is_empty() {
+            return Err(InvalidToolSet::Empty);
+        }
+        let mut seen = HashSet::new();
+        if let Some(tool) = tools.iter().find(|tool| !seen.insert(**tool)) {
+            return Err(InvalidToolSet::Duplicate(*tool));
+        }
+        Ok(Self(tools))
+    }
+
+    /// A set holding exactly `tool`.
+    #[must_use]
+    pub fn single(tool: ToolKind) -> Self {
+        Self(vec![tool])
+    }
+
+    /// Whether `tool` is in the set.
+    #[must_use]
+    pub fn contains(&self, tool: ToolKind) -> bool {
+        self.0.contains(&tool)
+    }
+
+    /// The tools in configured order; never empty.
+    pub fn iter(&self) -> std::slice::Iter<'_, ToolKind> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ToolSet {
+    type Item = &'a ToolKind;
+    type IntoIter = std::slice::Iter<'a, ToolKind>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl TryFrom<Vec<ToolKind>> for ToolSet {
+    type Error = InvalidToolSet;
+
+    fn try_from(tools: Vec<ToolKind>) -> std::result::Result<Self, Self::Error> {
+        Self::new(tools)
+    }
+}
+
+impl From<ToolSet> for Vec<ToolKind> {
+    fn from(set: ToolSet) -> Self {
+        set.0
+    }
+}
+
 /// Describe a `[[lsp_servers]]` entry for use in error messages that must let
 /// a user tell apart two entries sharing the same [`ServerId`] — the id
 /// alone is useless there, since it's exactly what collided.
@@ -302,7 +442,7 @@ impl ToolRouter {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidConfig` naming the conflicting entries if any
+    /// Returns [`crate::error::Error::Config`] naming the conflicting entries if any
     /// of the three rules above is violated.
     pub fn from_configs<'a, I>(cfgs: I) -> Result<Self>
     where
@@ -316,12 +456,12 @@ impl ToolRouter {
             let id = cfg.id();
 
             if let Some(prev_description) = seen_ids.get(&id) {
-                return Err(Error::InvalidConfig(format!(
-                    "duplicate server id '{id}' in this workspace (used by both an entry with \
-                     {prev_description} and one with {}); add a unique `name` to each \
-                     `[[lsp_servers]]` entry",
-                    describe_entry(cfg)
-                )));
+                return Err(ConfigError::DuplicateServerId {
+                    id,
+                    first: prev_description.clone(),
+                    second: describe_entry(cfg),
+                }
+                .into());
             }
             seen_ids.insert(id.clone(), describe_entry(cfg));
             order.push(id.clone());
@@ -331,22 +471,25 @@ impl ToolRouter {
             match &cfg.handles {
                 None => {
                     if let Some(existing) = &routes.default {
-                        return Err(Error::InvalidConfig(format!(
-                            "language '{}' has two catch-all servers ('{existing}' and '{id}'); \
-                             at most one server per language may omit `handles`",
-                            cfg.language_id
-                        )));
+                        return Err(ConfigError::TwoCatchAllServers {
+                            language: cfg.language_id.clone(),
+                            existing: existing.clone(),
+                            id,
+                        }
+                        .into());
                     }
                     routes.default = Some(id);
                 }
                 Some(tools) => {
                     for tool in tools {
                         if let Some(existing) = routes.explicit.get(tool) {
-                            return Err(Error::InvalidConfig(format!(
-                                "tool '{tool}' for language '{}' is claimed by both \
-                                 '{existing}' and '{id}'",
-                                cfg.language_id
-                            )));
+                            return Err(ConfigError::ToolClaimedTwice {
+                                tool: *tool,
+                                language: cfg.language_id.clone(),
+                                existing: existing.clone(),
+                                id,
+                            }
+                            .into());
                         }
                         routes.explicit.insert(*tool, id.clone());
                     }
@@ -587,7 +730,44 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
-    use crate::config::TimeoutSecs;
+    use crate::config::{ServerCommand, TimeoutSecs};
+    use crate::error::Error;
+
+    #[test]
+    fn test_server_id_new_rejects_blank_and_deserialization_agrees() {
+        assert_eq!(ServerId::new(""), Err(InvalidServerId));
+        assert_eq!(ServerId::new("  \t"), Err(InvalidServerId));
+        assert_eq!("pyright".parse::<ServerId>().unwrap().as_str(), "pyright");
+        assert!(serde_json::from_str::<ServerId>("\" \"").is_err());
+        assert_eq!(
+            serde_json::from_str::<ServerId>("\"pylsp\"").unwrap(),
+            ServerId::from("pylsp")
+        );
+    }
+
+    #[test]
+    fn test_tool_set_rejects_empty_and_duplicates() {
+        assert_eq!(ToolSet::new(vec![]), Err(InvalidToolSet::Empty));
+        assert_eq!(
+            ToolSet::new(vec![ToolKind::Hover, ToolKind::Rename, ToolKind::Hover]),
+            Err(InvalidToolSet::Duplicate(ToolKind::Hover))
+        );
+    }
+
+    #[test]
+    fn test_tool_set_preserves_order_and_round_trips() {
+        let set = ToolSet::new(vec![ToolKind::Rename, ToolKind::Hover]).unwrap();
+        assert_eq!(
+            set.iter().copied().collect::<Vec<_>>(),
+            [ToolKind::Rename, ToolKind::Hover]
+        );
+        assert!(set.contains(ToolKind::Hover));
+        assert!(!set.contains(ToolKind::Definition));
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, r#"["rename","hover"]"#);
+        assert_eq!(serde_json::from_str::<ToolSet>(&json).unwrap(), set);
+        assert!(serde_json::from_str::<ToolSet>("[]").is_err());
+    }
 
     fn cfg(
         language_id: &str,
@@ -596,7 +776,7 @@ mod tests {
     ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::new(language_id).unwrap(),
-            command: "cmd".to_string(),
+            command: ServerCommand::from_static("cmd"),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -605,8 +785,8 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: name.map(str::to_string),
-            handles,
+            name: name.map(ServerId::from),
+            handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
             selection: crate::config::ServerSelection::Explicit,
         }
@@ -676,7 +856,7 @@ mod tests {
             cfg("typescript", Some("python"), None),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert_matches!(err, Error::InvalidConfig(_));
+        assert_matches!(err, Error::Config(ConfigError::DuplicateServerId { .. }));
     }
 
     #[test]
@@ -689,7 +869,7 @@ mod tests {
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: "rust-analyzer".to_string(),
+                command: ServerCommand::from_static("rust-analyzer"),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -705,7 +885,7 @@ mod tests {
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
-                command: "rust-analyzer".to_string(),
+                command: ServerCommand::from_static("rust-analyzer"),
                 args: vec!["--dummy-second-instance".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![],
@@ -721,9 +901,10 @@ mod tests {
             },
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        let Error::InvalidConfig(msg) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
+        let Error::Config(config_err) = err else {
+            panic!("expected Config, got {err:?}");
         };
+        let msg = config_err.to_string();
         // Must not print a positional index: `from_configs` only ever sees
         // the post-heuristics applicable subset, so any "entry #N" would
         // usually name the wrong `[[lsp_servers]]` array position.
@@ -743,9 +924,10 @@ mod tests {
         // fabricate a misleading index.
         let configs = vec![cfg("rust", None, None), cfg("rust", None, None)];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        let Error::InvalidConfig(msg) = err else {
-            panic!("expected InvalidConfig, got {err:?}");
+        let Error::Config(config_err) = err else {
+            panic!("expected Config, got {err:?}");
         };
+        let msg = config_err.to_string();
         assert!(!msg.contains("entry #"), "message was: {msg}");
         assert!(
             msg.contains("duplicate server id 'rust'"),
@@ -760,7 +942,7 @@ mod tests {
             cfg("python", Some("b"), None),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert_matches!(err, Error::InvalidConfig(_));
+        assert_matches!(err, Error::Config(ConfigError::TwoCatchAllServers { .. }));
     }
 
     #[test]
@@ -770,7 +952,7 @@ mod tests {
             cfg("python", Some("b"), Some(vec![ToolKind::Hover])),
         ];
         let err = ToolRouter::from_configs(&configs).unwrap_err();
-        assert_matches!(err, Error::InvalidConfig(_));
+        assert_matches!(err, Error::Config(ConfigError::ToolClaimedTwice { .. }));
     }
 
     #[test]

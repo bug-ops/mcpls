@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::bridge::indexing::{IndexingPolicy, IndexingState, IndexingTracker};
+use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, IndexingTracker};
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::config::ServerId;
 use crate::util::truncate_string;
@@ -1516,8 +1516,8 @@ impl NotificationCache {
         self.indexing.state(server_id)
     }
 
-    /// Forget `server_id`'s tracked [`IndexingState`], reverting it to
-    /// [`IndexingState::Unknown`].
+    /// Reset `server_id`'s tracked [`IndexingState`] as `reset` says;
+    /// [`IndexingReset::Forget`] reverts it to [`IndexingState::Unknown`].
     ///
     /// `Translator::respawn_if_dead` calls this after replacing a crashed
     /// server's process, since the new process starts indexing from
@@ -1526,8 +1526,10 @@ impl NotificationCache {
     /// leak into requests routed to its replacement. This is the only
     /// production caller: a timed-out [`Self::indexing_state`] read does
     /// *not* call this, so one caller's wait can never affect another's.
-    pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId) {
-        self.indexing.reset(server_id);
+    pub(crate) fn reset_indexing_state(&mut self, server_id: &ServerId, reset: IndexingReset) {
+        match reset {
+            IndexingReset::Forget => self.indexing.reset(server_id),
+        }
     }
 
     /// Get diagnostics for a document URI.
@@ -1782,6 +1784,7 @@ mod tests {
 
     use super::bounds::*;
     use super::*;
+    use crate::bridge::indexing::IndexingReset;
     use crate::test_lsp::CapturedLogs;
 
     /// Every test in this module that doesn't exercise multi-server
@@ -3194,7 +3197,7 @@ mod tests {
             "experimental/serverStatus",
             Some(&serde_json::json!({"quiescent": false})),
         );
-        cache.reset_indexing_state(&server);
+        cache.reset_indexing_state(&server, IndexingReset::Forget);
         assert_eq!(cache.indexing_state(&server), IndexingState::Unknown);
     }
 

@@ -571,7 +571,12 @@ impl Translator {
         validate_rename_params(&new_name)?;
 
         let doc = self
-            .prepare_gated_document(&file_path, Capability::Rename, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::Rename,
+                IndexingGate::Required,
+                &[position],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
@@ -632,13 +637,13 @@ impl Translator {
         position: Position,
     ) -> Result<PrepareRenameResult> {
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::PrepareRename,
                 IndexingGate::Required,
+                &[position],
             )
             .await?;
-        self.require_line_in_document(&doc, position)?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
@@ -751,14 +756,13 @@ impl Translator {
     ) -> Result<FormatDocumentResult> {
         let (start, end) = (range.range().start(), range.range().end());
         let doc = self
-            .prepare_gated_document(
+            .prepare_positioned_document(
                 &file_path,
                 Capability::FormatRange,
                 IndexingGate::NotRequired,
+                &[start, end],
             )
             .await?;
-        self.require_line_in_document(&doc, start)?;
-        self.require_line_in_document(&doc, end)?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
         let response_uri = uri.clone();
@@ -813,7 +817,12 @@ impl Translator {
         let (start, end) = (range.range().start(), range.range().end());
 
         let doc = self
-            .prepare_gated_document(&file_path, Capability::CodeActions, IndexingGate::Required)
+            .prepare_positioned_document(
+                &file_path,
+                Capability::CodeActions,
+                IndexingGate::Required,
+                &[start, end],
+            )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);

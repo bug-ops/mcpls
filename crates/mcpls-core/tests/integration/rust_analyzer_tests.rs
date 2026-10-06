@@ -20,7 +20,8 @@ use mcpls_core::bridge::{
     apply_lifecycle_notification,
 };
 use mcpls_core::config::{
-    LanguageId, LspServerConfig, PositionEncodings, ServerId, TimeoutSecs, ToolRouter,
+    FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
+    ServerId, TimeoutSecs, ToolRouter,
 };
 use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
 use tokio::sync::Mutex;
@@ -82,8 +83,10 @@ async fn setup_rust_analyzer_with_lifecycle_cache()
 
 fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
     let workspace_path = rust_workspace_path();
-    let extension_map =
-        std::collections::HashMap::from([("rs".to_string(), LanguageId::from_static("rust"))]);
+    let extension_map = std::collections::HashMap::from([(
+        FileExtension::from_static("rs"),
+        LanguageId::from_static("rust"),
+    )]);
     let mut translator = Translator::new()
         .with_extensions(extension_map)
         .with_router(ToolRouter::catch_all([(
@@ -102,10 +105,10 @@ async fn spawn_rust_analyzer() -> LspServer {
 
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: "rust-analyzer".to_string(),
+        command: ServerCommand::from_static("rust-analyzer"),
         args: vec![],
         env: std::collections::HashMap::new(),
-        file_patterns: vec!["**/*.rs".to_string()],
+        file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -117,13 +120,12 @@ async fn spawn_rust_analyzer() -> LspServer {
         selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
-    let server_init_config = ServerInitConfig {
-        server_config: lsp_config,
-        workspace_roots: vec![workspace_path.clone()],
-        initialization_options: None,
-        position_encodings: PositionEncodings::DEFAULT,
-        redactions: std::sync::Arc::default(),
-    };
+    let server_init_config = ServerInitConfig::new(
+        lsp_config,
+        WorkspaceRoots::from_configured(std::slice::from_ref(&workspace_path)).unwrap(),
+        PositionEncodings::DEFAULT,
+        std::sync::Arc::default(),
+    );
 
     LspServer::spawn(server_init_config)
         .await
@@ -1079,10 +1081,10 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
     let workspace_path = rust_workspace_path();
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
-        command: "rust-analyzer".to_string(),
+        command: ServerCommand::from_static("rust-analyzer"),
         args: vec![],
         env: std::collections::HashMap::new(),
-        file_patterns: vec!["**/*.rs".to_string()],
+        file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,
         timeout_seconds: TimeoutSecs::new(30).unwrap(),
@@ -1094,13 +1096,12 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         selection: mcpls_core::config::ServerSelection::Explicit,
     };
 
-    let server_init_config = ServerInitConfig {
-        server_config: lsp_config,
-        workspace_roots: vec![workspace_path],
-        initialization_options: None,
-        position_encodings: PositionEncodings::DEFAULT,
-        redactions: std::sync::Arc::default(),
-    };
+    let server_init_config = ServerInitConfig::new(
+        lsp_config,
+        WorkspaceRoots::from_configured(&[workspace_path]).unwrap(),
+        PositionEncodings::DEFAULT,
+        std::sync::Arc::default(),
+    );
 
     let mut server = LspServer::spawn(server_init_config)
         .await

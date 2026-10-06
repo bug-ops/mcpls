@@ -18,6 +18,7 @@ use super::Translator;
 use super::dto::{Diagnostic, Location, Position2D, PositionDegradation, Range, Symbol};
 use super::routing::{Capability, IndexingGate};
 use super::symbols::{DocumentSymbolTree, FetchedSymbols, FlatSymbol, symbol_tree};
+use crate::config::DocumentLimit;
 use crate::error::Error;
 use crate::redaction::{Redactions, ServerText};
 
@@ -187,14 +188,12 @@ pub(super) struct Contextualized<T> {
 }
 
 /// Number of distinct files one call may enrich: 16 when the tracker limit is
-/// disabled (`0`), else a quarter of the limit clamped to `1..=16`, so one
+/// disabled, else a quarter of the limit clamped to `1..=16`, so one
 /// call cannot evict most of the documents other handlers depend on.
-pub(super) fn enrichment_file_cap(max_documents: usize) -> usize {
-    if max_documents == 0 {
-        MAX_ENRICHED_FILES
-    } else {
-        (max_documents / 4).clamp(1, MAX_ENRICHED_FILES)
-    }
+pub(super) fn enrichment_file_cap(max_documents: DocumentLimit) -> usize {
+    max_documents.get().map_or(MAX_ENRICHED_FILES, |max| {
+        (max.get() / 4).clamp(1, MAX_ENRICHED_FILES)
+    })
 }
 
 /// How strictly a symbol must contain an item to enclose it.
@@ -581,12 +580,12 @@ mod tests {
 
     #[test]
     fn test_enrichment_file_cap() {
-        assert_eq!(enrichment_file_cap(0), 16);
-        assert_eq!(enrichment_file_cap(1), 1);
-        assert_eq!(enrichment_file_cap(3), 1);
-        assert_eq!(enrichment_file_cap(8), 2);
-        assert_eq!(enrichment_file_cap(64), 16);
-        assert_eq!(enrichment_file_cap(10_000), 16);
+        assert_eq!(enrichment_file_cap(DocumentLimit::UNLIMITED), 16);
+        assert_eq!(enrichment_file_cap(DocumentLimit::new(1)), 1);
+        assert_eq!(enrichment_file_cap(DocumentLimit::new(3)), 1);
+        assert_eq!(enrichment_file_cap(DocumentLimit::new(8)), 2);
+        assert_eq!(enrichment_file_cap(DocumentLimit::new(64)), 16);
+        assert_eq!(enrichment_file_cap(DocumentLimit::new(10_000)), 16);
     }
 }
 

@@ -1423,7 +1423,7 @@ mod resolver_tests {
         assert_matches!(
             err,
             Error::CapabilityNotSupported {
-                capability: "hoverProvider",
+                capability: Capability::Hover,
                 ..
             },
             "{err:?}"

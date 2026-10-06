@@ -19,9 +19,9 @@ use tokio::sync::watch;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
-use crate::bridge::lock_std;
 use crate::error::StderrExcerpt;
 use crate::redaction::Redactions;
+use crate::util::lock_std;
 
 /// Leading bytes of stderr kept verbatim.
 const HEAD_BYTES: usize = 1024;
