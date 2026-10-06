@@ -46,7 +46,7 @@ pub struct InvalidServerId;
 /// assert_eq!(ServerId::new("pyright").unwrap().as_str(), "pyright");
 /// assert!(ServerId::new("  ").is_err());
 /// ```
-// TODO(D2): `From<&str>`/`From<String>` below can still build a blank id; replace them with
+// TODO(#673): `From<&str>`/`From<String>` below can still build a blank id; replace them with
 // `from_static` and migrate the fixtures (follow-up issue "ServerId still has infallible
 // From<&str>/From<String> constructors").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]

@@ -196,7 +196,7 @@ async fn init_lsp_servers(
     };
 
     // TODO(#648): subscribed-file disk re-pull needs a task owned by serve_with
-    // TODO(D3): any change of this watch, including `send(false)` and a dropped sender, cancels here, while pump.rs waits for `true`
+    // TODO(#674): any change of this watch, including `send(false)` and a dropped sender, cancels here, while pump.rs waits for `true`
     let mut cancel_rx = cancel_rx;
     let mut cancelled = *cancel_rx.borrow();
     let mut pending = (!cancelled).then(|| start_servers(configs, max_concurrent_starts));
