@@ -321,7 +321,7 @@ impl Translator {
             });
         }
 
-        let config = match config.for_respawn() {
+        let config = match config.for_respawn().await {
             Ok(config) => config,
             Err(err) => {
                 self.record_respawn_failure(id);

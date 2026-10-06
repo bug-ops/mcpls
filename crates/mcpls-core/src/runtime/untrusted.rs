@@ -1647,7 +1647,7 @@ mod plan_tests {
         fn respawn_keeps_a_pin_that_still_exists() {
             let case = planned_typescript(WorkspaceTrust::Trusted);
 
-            let respawn = case.init.for_respawn().unwrap();
+            let respawn = case.init.plan_respawn().unwrap();
 
             assert_eq!(respawn.pinned_tsserver(), case.init.pinned_tsserver());
         }
@@ -1659,7 +1659,7 @@ mod plan_tests {
             let moved = case.fx.outside.join("prefix/node_modules/typescript");
             typescript_install_at(&moved);
 
-            let respawn = case.init.for_respawn().unwrap();
+            let respawn = case.init.plan_respawn().unwrap();
 
             assert_eq!(
                 respawn.pinned_tsserver(),
@@ -1672,7 +1672,7 @@ mod plan_tests {
             let case = planned_typescript(WorkspaceTrust::Trusted);
             std::fs::remove_dir_all(case.modules.join("typescript")).unwrap();
 
-            let respawn = case.init.for_respawn().unwrap();
+            let respawn = case.init.plan_respawn().unwrap();
 
             assert_eq!(respawn.pinned_tsserver(), None);
         }
@@ -1695,7 +1695,7 @@ mod plan_tests {
             .next()
             .unwrap();
 
-            let respawn = init.for_respawn().unwrap();
+            let respawn = init.plan_respawn().unwrap();
 
             assert_eq!(respawn.pinned_tsserver(), Some(missing));
         }
@@ -1709,7 +1709,7 @@ mod plan_tests {
             std::fs::remove_dir_all(&typescript).unwrap();
             std::os::unix::fs::symlink(&inside, &typescript).unwrap();
 
-            let refused = case.init.for_respawn().unwrap_err();
+            let refused = case.init.plan_respawn().unwrap_err();
 
             let Error::ServerFailedToStart(failure) = refused else {
                 panic!("expected a refusal, got {refused:?}");
@@ -1735,7 +1735,7 @@ mod plan_tests {
             std::fs::remove_file(&launcher).unwrap();
             executable(&launcher);
 
-            let refused = case.init.for_respawn().unwrap_err();
+            let refused = case.init.plan_respawn().unwrap_err();
 
             let Error::ServerFailedToStart(failure) = refused else {
                 panic!("expected a refusal, got {refused:?}");
@@ -1759,7 +1759,7 @@ mod plan_tests {
             std::fs::remove_file(&launcher).unwrap();
             executable(&launcher);
 
-            let respawn = case.init.for_respawn().unwrap();
+            let respawn = case.init.plan_respawn().unwrap();
 
             assert_eq!(respawn.pinned_tsserver(), None);
         }
@@ -1773,7 +1773,7 @@ mod plan_tests {
             std::fs::remove_dir_all(&typescript).unwrap();
             std::os::unix::fs::symlink(&inside, &typescript).unwrap();
 
-            let respawn = case.init.for_respawn().unwrap();
+            let respawn = case.init.plan_respawn().unwrap();
 
             assert!(respawn.pinned_tsserver().is_some());
         }

@@ -131,7 +131,7 @@ async fn plan_off_runtime(
 /// Runs `work` on the blocking pool and returns its result, re-raising a panic
 /// in it on the caller. A join that failed for any other reason (the runtime
 /// shutting down cancelled it) is returned as the error.
-async fn on_blocking_pool<T: Send + 'static>(
+pub(crate) async fn on_blocking_pool<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
     match tokio::task::spawn_blocking(work).await {

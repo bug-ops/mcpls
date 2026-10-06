@@ -394,7 +394,8 @@ impl ServerInitConfig {
 
     /// The config a respawn of this server spawns from.
     ///
-    /// Called by every respawn right before it spawns. A tsserver pin mcpls
+    /// Called by every respawn right before it spawns; the filesystem work
+    /// runs on the blocking pool and only for an auto-pinned server. A tsserver pin mcpls
     /// chose whose canonical path changed (the install was upgraded, moved or
     /// retargeted through a symlink) is resolved again and, in untrusted mode,
     /// checked against the boundary it was first vetted against. A pin the
@@ -406,7 +407,22 @@ impl ServerInitConfig {
     /// tsserver now resolves inside the workspace, or the server is now
     /// launched in a way no tsserver can be pinned for (the same two checks
     /// startup makes).
-    pub(crate) fn for_respawn(&self) -> Result<Self> {
+    pub(crate) async fn for_respawn(&self) -> Result<Self> {
+        if self.auto_pin.is_none() {
+            return Ok(self.clone());
+        }
+        let config = self.clone();
+        crate::on_blocking_pool(move || config.plan_respawn())
+            .await
+            .map_err(|source| Error::TaskFailed {
+                task: crate::error::BackgroundTask::ServerPlanning,
+                source,
+            })?
+    }
+
+    /// The blocking half of [`Self::for_respawn`]: canonicalizes the pin and
+    /// re-plans the tsserver, so it runs on the blocking pool.
+    pub(crate) fn plan_respawn(&self) -> Result<Self> {
         let Some(pin) = self
             .auto_pin
             .as_ref()
@@ -2824,8 +2840,8 @@ sleep 5
         );
     }
 
-    #[test]
-    fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
+    #[tokio::test]
+    async fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
         let mut server_config = LspServerConfig::typescript();
         server_config.initialization_options =
             Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
@@ -2840,7 +2856,7 @@ sleep 5
             Some(PathBuf::from("/pin/tsserver.js"))
         );
 
-        let respawn = config.for_respawn().unwrap();
+        let respawn = config.for_respawn().await.unwrap();
         assert_eq!(
             respawn.server_config().initialization_options,
             config.server_config().initialization_options
