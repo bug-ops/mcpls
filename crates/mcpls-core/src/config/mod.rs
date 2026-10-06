@@ -1240,7 +1240,7 @@ impl ServerConfig {
         let canonical = dunce::canonicalize(source).map_err(Error::Io)?;
         let roots = WorkspaceRoots::from_configured(&self.workspace.roots)?;
         let home = trust::login_home_dir();
-        let roots = roots.untrusted_boundary(!self.workspace.roots.is_empty(), home.as_deref());
+        let roots = roots.untrusted_boundary(&self.workspace.roots, home.as_deref());
         let cwd_matters = origin == ConfigOrigin::Environment || !source.is_absolute();
         let cwd = cwd_matters
             .then(|| WorkspaceRoots::from_configured(&[]))

@@ -2025,7 +2025,7 @@ pub async fn on_lifecycle(
     pinned_tsserver: Option<&std::path::Path>,
     notif: crate::lsp::LspNotification,
 ) {
-    crate::lsp::tsserver_pin::warn_if_pin_ignored(pinned_tsserver, &notif, server_id.as_str());
+    crate::lsp::tsserver_pin::warn_if_pin_ignored(pinned_tsserver, &notif, server_id);
     if let Some(cache) = cache {
         apply_lifecycle_notification(&mut *cache.lock().await, server_id, notif);
     }

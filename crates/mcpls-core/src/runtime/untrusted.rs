@@ -297,9 +297,8 @@ pub fn plan_server_starts(
 ) -> StartPlan {
     let untrusted = matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_));
     let login_home = untrusted.then(login_home_dir).flatten();
-    let boundary = untrusted.then(|| {
-        roots.untrusted_boundary(!config.workspace.roots.is_empty(), login_home.as_deref())
-    });
+    let boundary =
+        untrusted.then(|| roots.untrusted_boundary(&config.workspace.roots, login_home.as_deref()));
     let markers = MarkerScan::collect(
         roots.canonical(),
         &config.lsp_servers,
@@ -900,9 +899,12 @@ mod plan_tests {
             let fx = fixture();
             let elsewhere = fx.outside.clone();
 
-            let kept = fx.roots.untrusted_boundary(false, Some(&elsewhere));
-            let dropped = fx.roots.untrusted_boundary(false, Some(&fx.workspace));
-            let configured = fx.roots.untrusted_boundary(true, Some(&fx.workspace));
+            let configured_roots = std::slice::from_ref(&fx.workspace);
+            let kept = fx.roots.untrusted_boundary(&[], Some(&elsewhere));
+            let dropped = fx.roots.untrusted_boundary(&[], Some(&fx.workspace));
+            let configured = fx
+                .roots
+                .untrusted_boundary(configured_roots, Some(&fx.workspace));
 
             assert_eq!(kept.canonical(), fx.roots.canonical());
             assert!(dropped.canonical().is_empty());

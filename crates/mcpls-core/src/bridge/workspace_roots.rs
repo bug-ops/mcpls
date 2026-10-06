@@ -495,14 +495,14 @@ impl WorkspaceRoots {
         }
     }
 
-    /// The directories untrusted mode treats as the workspace: the configured
-    /// roots, or, when none are configured and the roots are only the
-    /// working directory, [`Self::checkout_scoped`] of them.
-    pub(crate) fn untrusted_boundary(&self, roots_configured: bool, home: Option<&Path>) -> Self {
-        if roots_configured {
-            self.clone()
-        } else {
+    /// The directories untrusted mode treats as the workspace: these roots
+    /// when `configured` names some, or, when it is empty and the roots are
+    /// only the working directory, [`Self::checkout_scoped`] of them.
+    pub(crate) fn untrusted_boundary(&self, configured: &[PathBuf], home: Option<&Path>) -> Self {
+        if configured.is_empty() {
             self.checkout_scoped(home)
+        } else {
+            self.clone()
         }
     }
 

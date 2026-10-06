@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
-use crate::config::{BuiltinServer, LspServerConfig, ServerCommand};
+use crate::config::{BuiltinServer, LspServerConfig, ServerCommand, ServerId};
 use crate::error::InitFailureHint;
 use crate::lsp::command_path::{is_executable_file, resolve_named};
 use crate::lsp::{LspNotification, ParentEnv};
@@ -939,7 +939,7 @@ impl TypescriptPlan {
 ///
 /// Catches a stale pin on respawn, where the server silently falls through to
 /// the workspace's tsserver.
-pub fn warn_if_pin_ignored(configured: Option<&Path>, notif: &LspNotification, server: &str) {
+pub fn warn_if_pin_ignored(configured: Option<&Path>, notif: &LspNotification, server: &ServerId) {
     let (Some(configured), LspNotification::Other { method, params }) = (configured, notif) else {
         return;
     };
@@ -948,7 +948,7 @@ pub fn warn_if_pin_ignored(configured: Option<&Path>, notif: &LspNotification, s
     }
     if let Some(ignored) = pin_ignored(params.as_ref()) {
         tracing::warn!(
-            server,
+            %server,
             configured = %configured.display(),
             source = ?ignored.source,
             version = %ignored.version,
