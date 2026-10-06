@@ -117,35 +117,43 @@ pub const fn is_pattern_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')
 }
 
-/// The first rule an extension breaks, without the offending character.
+/// The first rule a name token breaks, without the offending character.
 #[derive(Clone, Copy)]
-enum ExtensionFault {
+enum TokenFault {
     Empty,
     LeadingDot,
     InvalidByteAt(usize),
 }
 
-/// The one extension rule, shared by [`FileExtension::new`] and
-/// [`FileExtension::from_static`]. A non-ASCII byte is always offending, so
-/// the index it reports is the start of a character.
-const fn first_extension_fault(extension: &str) -> Option<ExtensionFault> {
-    let bytes = extension.as_bytes();
+/// The one rule shared by [`FileExtension`] and [`FileName`]: non-empty and
+/// made only of [`is_pattern_name_byte`] bytes. A non-ASCII byte is always
+/// offending, so the index it reports is the start of a character.
+const fn first_token_fault(token: &str) -> Option<TokenFault> {
+    let bytes = token.as_bytes();
     let mut rest = bytes;
     if let [b'.', ..] = rest {
-        return Some(ExtensionFault::LeadingDot);
+        return Some(TokenFault::LeadingDot);
     }
     if rest.is_empty() {
-        return Some(ExtensionFault::Empty);
+        return Some(TokenFault::Empty);
     }
     while let [byte, tail @ ..] = rest {
         if !is_pattern_name_byte(*byte) {
-            return Some(ExtensionFault::InvalidByteAt(
+            return Some(TokenFault::InvalidByteAt(
                 bytes.len().saturating_sub(rest.len()),
             ));
         }
         rest = tail;
     }
     None
+}
+
+/// The character of `token` that starts at byte `index`.
+fn offender_at(token: &str, index: usize) -> char {
+    token
+        .get(index..)
+        .and_then(|rest| rest.chars().next())
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
 }
 
 /// A file extension as `Path::extension` reports it: no leading dot, and only
@@ -178,7 +186,7 @@ impl FileExtension {
     #[must_use]
     pub const fn from_static(extension: &'static str) -> Self {
         assert!(
-            first_extension_fault(extension).is_none(),
+            first_token_fault(extension).is_none(),
             "invalid file extension"
         );
         Self(Cow::Borrowed(extension))
@@ -192,29 +200,91 @@ impl FileExtension {
     /// breaks.
     pub fn new(extension: impl Into<String>) -> Result<Self, InvalidFileExtension> {
         let extension = extension.into();
-        match first_extension_fault(&extension) {
+        match first_token_fault(&extension) {
             None => Ok(Self(Cow::Owned(extension))),
-            Some(ExtensionFault::Empty) => Err(InvalidFileExtension::Empty),
-            Some(ExtensionFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
-            Some(ExtensionFault::InvalidByteAt(index)) => {
-                let offender = extension
-                    .get(index..)
-                    .and_then(|rest| rest.chars().next())
-                    .unwrap_or(char::REPLACEMENT_CHARACTER);
-                Err(InvalidFileExtension::InvalidChar(offender))
-            }
+            Some(TokenFault::Empty) => Err(InvalidFileExtension::Empty),
+            Some(TokenFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
+            Some(TokenFault::InvalidByteAt(index)) => Err(InvalidFileExtension::InvalidChar(
+                offender_at(&extension, index),
+            )),
         }
     }
 }
 
 impl_text_newtype!(FileExtension, InvalidFileExtension);
 
-/// A `file_patterns` entry that cannot be mapped to a file extension.
+/// Why a string is not a valid [`FileName`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidFileName {
+    /// The name was empty.
+    #[error("file name cannot be empty")]
+    Empty,
+    /// The name contained a character other than an ASCII letter, an ASCII
+    /// digit, `_`, `-` or `+`; a dot is rejected, so a name never has an
+    /// extension.
+    #[error("file name may contain only ASCII letters, digits, '_', '-' and '+', found {0:?}")]
+    InvalidChar(char),
+}
+
+/// The name of an extensionless file such as `Makefile` or `Dockerfile`, as
+/// `Path::file_name` reports it.
+///
+/// A name has no dot, so `Path::extension` never reports one for it and the
+/// extension and name maps cannot both claim a file. Case is significant.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::FileName;
+///
+/// assert_eq!(FileName::new("Makefile").unwrap(), "Makefile");
+/// assert!(FileName::new("Cargo.toml").is_err());
+/// assert!(FileName::new(".eslintrc").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FileName(Cow<'static, str>);
+
+impl FileName {
+    /// Builds a name from an ASCII literal, checked at compile time when
+    /// evaluated in a `const` context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a valid file name.
+    #[must_use]
+    pub const fn from_static(name: &'static str) -> Self {
+        assert!(first_token_fault(name).is_none(), "invalid file name");
+        Self(Cow::Borrowed(name))
+    }
+
+    /// Builds a name from any string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidFileName`] naming the first rule `name` breaks.
+    pub fn new(name: impl Into<String>) -> Result<Self, InvalidFileName> {
+        let name = name.into();
+        match first_token_fault(&name) {
+            None => Ok(Self(Cow::Owned(name))),
+            Some(TokenFault::Empty) => Err(InvalidFileName::Empty),
+            Some(TokenFault::LeadingDot) => Err(InvalidFileName::InvalidChar('.')),
+            Some(TokenFault::InvalidByteAt(index)) => {
+                Err(InvalidFileName::InvalidChar(offender_at(&name, index)))
+            }
+        }
+    }
+}
+
+impl_text_newtype!(FileName, InvalidFileName);
+
+/// A `file_patterns` entry that cannot be mapped to a file extension or name.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error(
     "file pattern '{pattern}' is not supported: the final path segment must be `*.EXT`, where EXT \
-     is a run of letters, digits, '_', '-' or '+' (for example `**/*.rs`); to cover several \
-     extensions list one pattern per extension, such as [\"**/*.cpp\", \"**/*.h\"]"
+     is a run of letters, digits, '_', '-' or '+' (for example `**/*.rs`), or the bare name of an \
+     extensionless file written as `NAME` or `**/NAME` (for example `**/Makefile`); to cover \
+     several extensions list one pattern per extension, such as [\"**/*.cpp\", \"**/*.h\"]"
 )]
 pub struct UnsupportedFilePattern {
     pattern: String,
@@ -228,32 +298,51 @@ impl UnsupportedFilePattern {
     }
 }
 
-/// A `file_patterns` entry: an optional directory part followed by a final
-/// segment of the form `*.EXT`.
+/// What a [`FilePattern`] matches: every file with an extension, or the one
+/// extensionless file name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PatternTarget {
+    /// Files with this extension, from a `*.EXT` final segment.
+    Extension(FileExtension),
+    /// Files with exactly this name, from a bare `NAME` or `**/NAME` pattern.
+    Name(FileName),
+}
+
+/// A `file_patterns` entry: either an optional directory part followed by a
+/// final segment of the form `*.EXT`, or the bare name of an extensionless
+/// file written as `NAME` or `**/NAME`.
 ///
-/// The extension is the only part mcpls reads, so the directory part (such as
-/// `**/`) is kept for display and ignored for routing. Every other form
-/// (brace expansion, character classes, `?`, extensionless names, single
-/// files) has no extension to map and is rejected rather than dropped
-/// silently. [`Self::parse`] is the only constructor, so the config validator
-/// and the extension-map builder cannot disagree on what is supported.
+/// The extension or name is the only part mcpls reads, so the directory part
+/// of an extension pattern (such as `**/`) is kept for display and ignored for
+/// routing. A name pattern admits no directory part other than `**/`, so it
+/// never claims every file of that name below one directory. Every other form
+/// (brace expansion, character classes, `?`, dotted names, dotfiles, single
+/// files below a directory) has nothing to map and is rejected rather than
+/// dropped silently. [`Self::parse`] is the only constructor, so the config
+/// validator and the language-map builder cannot disagree on what is
+/// supported.
 ///
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::FilePattern;
+/// use mcpls_core::config::{FilePattern, PatternTarget};
 ///
 /// let pattern = FilePattern::parse("**/*.rs").unwrap();
-/// assert_eq!(pattern.extension(), "rs");
+/// assert!(matches!(pattern.target(), PatternTarget::Extension(e) if e == "rs"));
 /// assert_eq!(pattern.as_str(), "**/*.rs");
+///
+/// let makefile = FilePattern::parse("**/Makefile").unwrap();
+/// assert!(matches!(makefile.target(), PatternTarget::Name(n) if n == "Makefile"));
+///
 /// assert!(FilePattern::parse("**/*.{cpp,h}").is_err());
 /// assert!(FilePattern::parse("src/main.rs").is_err());
+/// assert!(FilePattern::parse("docs/Makefile").is_err());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(into = "String")]
 pub struct FilePattern {
     raw: String,
-    extension: FileExtension,
+    target: PatternTarget,
 }
 
 impl FilePattern {
@@ -262,15 +351,23 @@ impl FilePattern {
     /// # Errors
     ///
     /// Returns [`UnsupportedFilePattern`] if the final path segment (after the
-    /// last `/`) is not `*.EXT` with a valid [`FileExtension`].
+    /// last `/`) is neither `*.EXT` with a valid [`FileExtension`] nor a valid
+    /// [`FileName`] reached through no directory part but `**/`.
     pub fn parse(pattern: &str) -> Result<Self, UnsupportedFilePattern> {
-        let basename = pattern.rsplit('/').next().unwrap_or(pattern);
-        basename
-            .strip_prefix("*.")
-            .and_then(|extension| FileExtension::new(extension).ok())
-            .map(|extension| Self {
+        let (directory, basename) = pattern.rsplit_once('/').unwrap_or(("", pattern));
+        let target = match basename.strip_prefix("*.") {
+            Some(extension) => FileExtension::new(extension)
+                .ok()
+                .map(PatternTarget::Extension),
+            None if matches!(directory, "" | "**") => {
+                FileName::new(basename).ok().map(PatternTarget::Name)
+            }
+            None => None,
+        };
+        target
+            .map(|target| Self {
                 raw: pattern.to_owned(),
-                extension,
+                target,
             })
             .ok_or_else(|| UnsupportedFilePattern {
                 pattern: pattern.to_owned(),
@@ -296,10 +393,10 @@ impl FilePattern {
         &self.raw
     }
 
-    /// The extension this pattern maps.
+    /// The extension or file name this pattern maps.
     #[must_use]
-    pub const fn extension(&self) -> &FileExtension {
-        &self.extension
+    pub const fn target(&self) -> &PatternTarget {
+        &self.target
     }
 }
 
@@ -336,7 +433,10 @@ pub(super) const UNSUPPORTED_FILE_PATTERNS: &[&str] = &[
     "**/*.ts?",
     "**/*",
     "src/**",
-    "Makefile",
+    "docs/Makefile",
+    "src/**/Dockerfile",
+    "**/Makefile.am",
+    "**/.eslintrc",
     ".eslintrc",
     "**/*.",
     "**/*.tar.gz",
@@ -427,9 +527,63 @@ mod tests {
             ("**/*.R", "R"),
         ] {
             let pattern = FilePattern::parse(raw).unwrap();
-            assert_eq!(pattern.extension(), ext, "{raw}");
+            assert_eq!(
+                pattern.target(),
+                &PatternTarget::Extension(FileExtension::from_static(ext)),
+                "{raw}"
+            );
             assert_eq!(pattern.as_str(), raw);
         }
+    }
+
+    #[test]
+    fn test_file_pattern_accepts_bare_and_globstar_names() {
+        for (raw, name) in [
+            ("Makefile", "Makefile"),
+            ("**/Dockerfile", "Dockerfile"),
+            ("**/Justfile", "Justfile"),
+        ] {
+            let pattern = FilePattern::parse(raw).unwrap();
+            assert_eq!(
+                pattern.target(),
+                &PatternTarget::Name(FileName::from_static(name)),
+                "{raw}"
+            );
+            assert_eq!(pattern.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn test_file_name_rejects_dots_empty_and_glob_forms() {
+        assert_eq!(FileName::new(""), Err(InvalidFileName::Empty));
+        for (bad, ch) in [
+            (".eslintrc", '.'),
+            ("Cargo.toml", '.'),
+            ("Make*", '*'),
+            ("a/b", '/'),
+            ("m\u{e9}", '\u{e9}'),
+        ] {
+            assert_eq!(
+                FileName::new(bad),
+                Err(InvalidFileName::InvalidChar(ch)),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_file_name_serde_and_borrowed_lookup() {
+        let name: FileName = serde_json::from_str("\"Makefile\"").unwrap();
+        assert_eq!(serde_json::to_string(&name).unwrap(), "\"Makefile\"");
+        assert!(serde_json::from_str::<FileName>("\"a.b\"").is_err());
+        let map = std::collections::HashMap::from([(name, 1)]);
+        assert_eq!(map.get("Makefile"), Some(&1));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid file name")]
+    fn test_file_name_from_static_panics_on_invalid() {
+        let _ = FileName::from_static("a.b");
     }
 
     #[test]

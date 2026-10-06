@@ -490,12 +490,12 @@ args = ["--stdio"]  # Many servers require --stdio flag
 
 ### `file_patterns`
 
-**Type**: Array of strings (`*.EXT` patterns)
+**Type**: Array of strings (`*.EXT` or bare file-name patterns)
 **Required**: No (defaults to empty array)
 
 File patterns to associate with this language server. mcpls routes a file by its
-extension, so a pattern's only effect is to map one extension to this server's
-`language_id`.
+extension, or by its name when it has none, so a pattern's only effect is to map one
+extension or one extensionless file name to this server's `language_id`.
 
 ```toml
 [[lsp_servers]]
@@ -516,15 +516,20 @@ digits, `_`, `-` or `+` (for example `**/*.rs`).
 - To cover several extensions, list one pattern per extension:
   `file_patterns = ["**/*.cpp", "**/*.h"]`. Brace expansion (`**/*.{cpp,h}`) is not
   supported.
+- An extensionless file is mapped by its bare name, written `NAME` or `**/NAME`
+  (`Makefile`, `**/Dockerfile`). The name is letters, digits, `_`, `-` or `+`, matches
+  case-sensitively, and takes no directory part other than `**/`: `docs/Makefile` is
+  rejected, since the pattern would claim every file of that name.
 - Any other form is rejected at startup with an error naming the server entry and the
-  pattern, never ignored: character classes (`**/*.[ch]`), `?`, extensionless names
-  (`Makefile`, `src/**`, `**/*`), dotfiles (`.eslintrc`), single files
+  pattern, never ignored: character classes (`**/*.[ch]`), `?`, `src/**`, `**/*`,
+  dotfiles and dotted names (`.eslintrc`, `Makefile.am`), single files
   (`src/main.rs`) and multi-part extensions (`**/*.tar.gz`).
-- Extensionless files cannot be mapped through `file_patterns`.
+- `workspace.language_extensions` maps extensions only; use a `file_patterns` name entry
+  for an extensionless file.
 
 When a file has no mapping at all, tool calls fail with
-`no LSP server configured for language: plaintext`, followed by the file's extension and
-the `file_patterns` configured across servers, so an unmapped extension is easy to spot.
+`no LSP server configured for language: plaintext`, followed by the file's extension or
+name and the `file_patterns` configured across servers, so an unmapped file is easy to spot.
 
 ### `timeout_seconds`
 
@@ -1070,26 +1075,26 @@ language_id = "typescript"
 extensions = ["py", "pyi"]
 language_id = "python"
 
-# Rust backend
+# Rust (backend and CLI)
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"
 args = []
-file_patterns = ["**/backend/**/*.rs", "**/cli/**/*.rs"]
+file_patterns = ["**/*.rs"]
 
 # TypeScript frontend
 [[lsp_servers]]
 language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
-file_patterns = ["**/frontend/**/*.ts", "**/frontend/**/*.tsx"]
+file_patterns = ["**/*.ts", "**/*.tsx"]
 
 # Python scripts
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
 args = ["--stdio"]
-file_patterns = ["**/scripts/**/*.py"]
+file_patterns = ["**/*.py"]
 ```
 
 ### C/C++ Project

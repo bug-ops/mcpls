@@ -15,7 +15,7 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, FileExtension, FilePattern, LanguageId, ServerCommand, ServerId, ToolKind,
+    BuiltinServer, FileKey, FilePattern, LanguageId, ServerCommand, ServerId, ToolKind,
     UnsupportedFilePattern,
 };
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
@@ -23,29 +23,34 @@ pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 use crate::util::{escape_control, truncate_str};
 
-/// Explains a `plaintext` routing failure: which extension had no mapping and
-/// which `file_patterns` were configured. Empty for any other language.
-fn no_server_detail(
-    language: &LanguageId,
-    extension: Option<&FileExtension>,
-    patterns: &[FilePattern],
-) -> String {
+/// Explains a `plaintext` routing failure: which extension or file name had no
+/// mapping and which `file_patterns` were configured. Empty for any other
+/// language.
+fn no_server_detail(language: &LanguageId, file: &FileKey, patterns: &[FilePattern]) -> String {
     if *language != LanguageId::PLAINTEXT {
         return String::new();
     }
-    let subject = extension.map_or_else(
-        || "the file has no usable extension".to_owned(),
-        |ext| format!("file extension '{ext}' is not mapped to any language"),
-    );
+    let (subject, remedy) = match file {
+        FileKey::Extension(ext) => (
+            format!("file extension '{ext}' is not mapped to any language"),
+            "a `*.EXT` file_patterns entry or workspace.language_extensions".to_owned(),
+        ),
+        FileKey::Name(name) => (
+            format!("file name '{name}' is not mapped to any language"),
+            format!("a `**/{name}` file_patterns entry"),
+        ),
+        FileKey::Unmappable => (
+            "the file has no usable extension or name".to_owned(),
+            "a `*.EXT` file_patterns entry or workspace.language_extensions".to_owned(),
+        ),
+    };
     let configured = if patterns.is_empty() {
         "no file_patterns are configured".to_owned()
     } else {
         let list: Vec<&str> = patterns.iter().map(FilePattern::as_str).collect();
         format!("configured file_patterns: {}", list.join(", "))
     };
-    format!(
-        " ({subject}; {configured}; map it with a `*.EXT` file_patterns entry or workspace.language_extensions)"
-    )
+    format!(" ({subject}; {configured}; map it with {remedy})")
 }
 
 /// Host platform, as far as [`NotFoundGuidance`] cares.
@@ -1179,14 +1184,14 @@ pub enum Error {
     /// No LSP server configured for the given language.
     #[error(
         "no LSP server configured for language: {language}{}",
-        no_server_detail(.language, .extension.as_ref(), .patterns)
+        no_server_detail(.language, .file, .patterns)
     )]
     NoServerForLanguage {
         /// The language detected for the file.
         language: LanguageId,
-        /// The file's extension, `None` for an extensionless name or one that
-        /// is not a valid [`FileExtension`].
-        extension: Option<FileExtension>,
+        /// What identifies the file to the language map: its extension, its
+        /// extensionless name, or [`FileKey::Unmappable`].
+        file: FileKey,
         /// The `file_patterns` configured across all servers, so the error can
         /// show what was available to map the extension.
         patterns: Vec<FilePattern>,
@@ -1972,6 +1977,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::{FileExtension, FileName};
 
     #[test]
     fn test_all_servers_failed_to_init_error() {
@@ -2698,7 +2704,7 @@ mod tests {
     fn no_server_for_language(language: &'static str) -> Error {
         Error::NoServerForLanguage {
             language: LanguageId::from_static(language),
-            extension: None,
+            file: FileKey::Unmappable,
             patterns: vec![],
         }
     }
@@ -2707,7 +2713,7 @@ mod tests {
     fn test_no_server_for_plaintext_names_extension_and_patterns() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
-            extension: Some(FileExtension::from_static("cpp")),
+            file: FileKey::Extension(FileExtension::from_static("cpp")),
             patterns: vec![
                 FilePattern::from_static("**/*.rs"),
                 FilePattern::from_static("**/*.h"),
@@ -2729,12 +2735,12 @@ mod tests {
     fn test_no_server_for_plaintext_without_patterns_or_extension() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
-            extension: None,
+            file: FileKey::Unmappable,
             patterns: vec![],
         };
         let message = err.to_string();
         assert!(
-            message.contains("the file has no usable extension"),
+            message.contains("the file has no usable extension or name"),
             "{message}"
         );
         assert!(
@@ -2747,13 +2753,32 @@ mod tests {
     fn test_no_server_for_other_language_text_is_unchanged() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::from_static("nushell"),
-            extension: Some(FileExtension::from_static("nu")),
+            file: FileKey::Extension(FileExtension::from_static("nu")),
             patterns: vec![FilePattern::from_static("**/*.rs")],
         };
         assert_eq!(
             err.to_string(),
             "no LSP server configured for language: nushell"
         );
+    }
+
+    #[test]
+    fn test_no_server_for_plaintext_name_suggests_a_name_pattern() {
+        let err = Error::NoServerForLanguage {
+            language: LanguageId::PLAINTEXT,
+            file: FileKey::Name(FileName::from_static("Makefile")),
+            patterns: vec![FilePattern::from_static("**/*.rs")],
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("file name 'Makefile' is not mapped"),
+            "{message}"
+        );
+        assert!(
+            message.contains("a `**/Makefile` file_patterns entry"),
+            "{message}"
+        );
+        assert!(!message.contains("*.EXT"), "{message}");
     }
 
     #[test]

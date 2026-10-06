@@ -5,10 +5,9 @@ use std::path::{Path, PathBuf};
 
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
-use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath};
 use crate::config::{
-    FileExtension, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
+    FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -805,10 +804,7 @@ impl Translator {
                 } else {
                     Err(Error::NoServerForLanguage {
                         language,
-                        extension: path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .and_then(|ext| FileExtension::new(ext).ok()),
+                        file: FileKey::of(path),
                         patterns: self.file_patterns.to_vec(),
                     })
                 }
@@ -818,7 +814,7 @@ impl Translator {
 
     /// The detected language of `path` plus its React base-language fallback.
     pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
-        LanguageCandidates::new(detect_language(path, &self.extension_map))
+        LanguageCandidates::new(self.language_map.detect(path))
     }
 
     /// The startup failure of the server the pre-rebind routing table would
@@ -1311,8 +1307,8 @@ mod tests {
     use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
         DocumentLimit, FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId,
-        LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit, TimeoutSecs,
-        ToolRouter, ToolSet,
+        LanguageMap, LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit,
+        TimeoutSecs, ToolRouter, ToolSet,
     };
     use crate::error::Error;
     use crate::lsp::LspServer;
@@ -1326,7 +1322,7 @@ mod tests {
         // yet (large solution still loading via OmniSharp) must surface
         // ServerInitializing — "wait and retry" — not NoServerForLanguage.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &HashMap::new());
+        let lang = LanguageMap::default().detect(&path);
         let id = ServerId::from(lang.clone());
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
@@ -1349,7 +1345,7 @@ mod tests {
         // stays NoServerForLanguage.
         let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &translator.extension_map);
+        let lang = translator.language_map.detect(&path);
 
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
@@ -1833,17 +1829,34 @@ mod tests {
         let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
-        if let Err(Error::NoServerForLanguage {
-            language,
-            extension,
-            ..
-        }) = result
-        {
+        if let Err(Error::NoServerForLanguage { language, file, .. }) = result {
             assert_eq!(language, "nushell");
-            assert_eq!(extension, Some(FileExtension::from_static("nu")));
+            assert_eq!(file, FileKey::Extension(FileExtension::from_static("nu")));
         } else {
             panic!("Expected NoServerForLanguage(nushell) error");
         }
+    }
+
+    #[test]
+    fn test_client_for_file_reports_an_extensionless_name() {
+        let mut language_map = LanguageMap::default();
+        language_map.insert(
+            crate::config::PatternTarget::Name(crate::config::FileName::from_static("Makefile")),
+            LanguageId::from_static("make"),
+        );
+        let translator = Translator::new().with_extensions(language_map);
+
+        let result = translator.client_for_file(Path::new("/ws/Makefile"), ToolKind::Hover);
+        assert_matches!(
+            result,
+            Err(Error::NoServerForLanguage { language, .. }) if language == "make"
+        );
+
+        let result = translator.client_for_file(Path::new("/ws/Dockerfile"), ToolKind::Hover);
+        assert_matches!(
+            result,
+            Err(Error::NoServerForLanguage { file: FileKey::Name(name), .. }) if name == "Dockerfile"
+        );
     }
 
     #[test]
@@ -1867,12 +1880,12 @@ mod tests {
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage {
             language,
-            extension,
+            file,
             patterns,
         }) = result
         {
             assert_eq!(language, "plaintext");
-            assert_eq!(extension, Some(FileExtension::from_static("xyz")));
+            assert_eq!(file, FileKey::Extension(FileExtension::from_static("xyz")));
             assert_eq!(patterns, ["**/*.rs"]);
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
@@ -2290,15 +2303,9 @@ mod tests {
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let extension_map = config.build_effective_extension_map();
-        assert_eq!(
-            extension_map.get("nu"),
-            Some(&LanguageId::from_static("nushell"))
-        );
-        assert_eq!(
-            extension_map.get("rs"),
-            Some(&LanguageId::from_static("rust"))
-        );
+        let language_map = config.build_effective_language_map();
+        assert_eq!(language_map.detect(Path::new("a.nu")), "nushell");
+        assert_eq!(language_map.detect(Path::new("a.rs")), "rust");
 
         // serve() starts in protocol-only mode when no LSP servers are configured;
         // it may return a transport error but must not report a startup failure.

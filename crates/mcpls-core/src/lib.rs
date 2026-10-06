@@ -218,7 +218,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     config.validate()?;
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
-    let extension_map = config.build_effective_extension_map();
+    let extension_map = config.build_effective_language_map();
 
     let startup_redactions = Arc::new(redaction::Redactions::for_servers(
         &config.lsp_servers,

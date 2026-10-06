@@ -128,7 +128,7 @@ args = ["--stdio"]
 file_patterns = ["**/*.ts", "**/*.tsx"]
 ```
 
-Each `file_patterns` entry must end in `*.EXT` (one pattern per extension, no braces); see [Configuration](configuration.md#file_patterns).
+Each `file_patterns` entry must end in `*.EXT` (one pattern per extension, no braces) or be the bare name of an extensionless file such as `**/Makefile`; see [Configuration](configuration.md#file_patterns).
 
 ## Example Usage
 

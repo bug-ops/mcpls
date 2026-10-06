@@ -2187,7 +2187,7 @@ mod tests {
     fn test_map_bridge_error_other_variant_uses_internal_error_code() {
         let err = crate::error::Error::NoServerForLanguage {
             language: LanguageId::from_static("python"),
-            extension: None,
+            file: crate::config::FileKey::Unmappable,
             patterns: vec![],
         };
         let mcp_err = map_bridge_error(err);

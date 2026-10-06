@@ -6,6 +6,7 @@
 mod bounded_secs;
 mod language;
 mod language_id;
+mod language_map;
 mod limits;
 mod patterns;
 mod position_encodings;
@@ -23,13 +24,14 @@ use std::path::{Component, Path, PathBuf};
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
 pub use language::{base_language_id, react_variant_language_id};
 pub use language_id::{InvalidLanguageId, LanguageId};
+pub use language_map::{FileKey, LanguageMap};
 pub use limits::{
     BoundedText, DocumentLimit, InvalidBoundedText, InvalidSearchDepth, InvalidSizeLimit,
     MAX_FILE_SIZE_LIMIT, SearchDepth, SizeLimit,
 };
 pub use patterns::{
-    FileExtension, FilePattern, InvalidFileExtension, InvalidProjectMarker, ProjectMarker,
-    UnsupportedFilePattern,
+    FileExtension, FileName, FilePattern, InvalidFileExtension, InvalidFileName,
+    InvalidProjectMarker, PatternTarget, ProjectMarker, UnsupportedFilePattern,
 };
 pub use position_encodings::{InvalidPositionEncodings, PositionEncodings};
 pub use routing::{
@@ -530,12 +532,17 @@ impl WorkspaceConfig {
     }
 }
 
-fn language_id_for_pattern_extension(
+fn language_id_for_pattern_target(
     server_language_id: &LanguageId,
-    extension: &FileExtension,
+    target: &PatternTarget,
 ) -> LanguageId {
-    react_variant_language_id(server_language_id, extension.as_str())
-        .unwrap_or_else(|| server_language_id.clone())
+    match target {
+        PatternTarget::Extension(extension) => {
+            react_variant_language_id(server_language_id, extension.as_str())
+                .unwrap_or_else(|| server_language_id.clone())
+        }
+        PatternTarget::Name(_) => server_language_id.clone(),
+    }
 }
 
 /// Build default language extension mappings.
@@ -878,19 +885,20 @@ enum RelativeRootBase {
 }
 
 impl ServerConfig {
-    /// Build the effective extension map used for language detection.
+    /// Build the effective language map used for language detection.
     ///
     /// Starts with workspace mappings and overlays mappings inferred from
-    /// configured LSP server `file_patterns`.
+    /// configured LSP server `file_patterns`: `*.EXT` patterns map extensions
+    /// and bare `NAME` patterns map extensionless file names.
     #[must_use]
-    pub fn build_effective_extension_map(&self) -> HashMap<FileExtension, LanguageId> {
-        let mut map = self.workspace.build_extension_map();
+    pub fn build_effective_language_map(&self) -> LanguageMap {
+        let mut map = LanguageMap::from(self.workspace.build_extension_map());
 
         for server in &self.lsp_servers {
             for pattern in &server.file_patterns {
-                let ext = pattern.extension();
-                let language_id = language_id_for_pattern_extension(&server.language_id, ext);
-                map.insert(ext.clone(), language_id);
+                let target = pattern.target().clone();
+                let language_id = language_id_for_pattern_target(&server.language_id, &target);
+                map.insert(target, language_id);
             }
         }
 
@@ -2498,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_effective_extension_map_overrides_with_file_patterns() {
+    fn test_build_effective_language_map_overrides_with_file_patterns() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -2524,13 +2532,13 @@ mod tests {
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("c"), Some(&LanguageId::from_static("cpp")));
-        assert_eq!(map.get("h"), Some(&LanguageId::from_static("cpp")));
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.c")), "cpp");
+        assert_eq!(map.detect(Path::new("x.h")), "cpp");
     }
 
     #[test]
-    fn test_build_effective_extension_map_derives_tsx_language_id() {
+    fn test_build_effective_language_map_derives_tsx_language_id() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -2556,16 +2564,13 @@ mod tests {
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("ts"), Some(&LanguageId::from_static("typescript")));
-        assert_eq!(
-            map.get("tsx"),
-            Some(&LanguageId::from_static("typescriptreact"))
-        );
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.ts")), "typescript");
+        assert_eq!(map.detect(Path::new("x.tsx")), "typescriptreact");
     }
 
     #[test]
-    fn test_build_effective_extension_map_derives_jsx_language_id() {
+    fn test_build_effective_language_map_derives_jsx_language_id() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -2591,12 +2596,21 @@ mod tests {
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("js"), Some(&LanguageId::from_static("javascript")));
-        assert_eq!(
-            map.get("jsx"),
-            Some(&LanguageId::from_static("javascriptreact"))
-        );
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.js")), "javascript");
+        assert_eq!(map.detect(Path::new("x.jsx")), "javascriptreact");
+    }
+
+    #[test]
+    fn test_build_effective_language_map_maps_name_patterns() {
+        let toml = "[[lsp_servers]]\nlanguage_id = \"make\"\ncommand = \"make-lsp\"\n\
+                    file_patterns = [\"**/Makefile\", \"GNUmakefile\", \"**/*.mk\"]\n";
+        let config = toml::from_str::<ServerConfig>(toml).unwrap();
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("sub/Makefile")), "make");
+        assert_eq!(map.detect(Path::new("GNUmakefile")), "make");
+        assert_eq!(map.detect(Path::new("rules.mk")), "make");
+        assert_eq!(map.detect(Path::new("Dockerfile")), LanguageId::PLAINTEXT);
     }
 
     #[test]

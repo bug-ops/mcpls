@@ -352,7 +352,7 @@ args = []
 file_patterns = ["**/*.go"]
 ```
 
-Each `file_patterns` entry must end in `*.EXT`: list one pattern per extension (`["**/*.cpp", "**/*.h"]`), not `**/*.{cpp,h}`. The directory part is ignored; see [Configuration Reference](configuration.md#file_patterns).
+Each `file_patterns` entry must end in `*.EXT` (list one pattern per extension, `["**/*.cpp", "**/*.h"]`, not `**/*.{cpp,h}`) or be the bare name of an extensionless file such as `**/Makefile`. The directory part is ignored; see [Configuration Reference](configuration.md#file_patterns).
 
 ## PATH Configuration
 

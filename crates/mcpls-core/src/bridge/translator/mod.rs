@@ -20,7 +20,7 @@ use crate::bridge::indexing::IndexingReset;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots};
 use crate::config::{
-    FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId, ServerId, ServerSettlement,
+    FilePattern, IndexingReadyTimeoutSecs, LanguageId, LanguageMap, ServerId, ServerSettlement,
     ToolKind, ToolRouter,
 };
 use crate::error::{ServerSpawnFailure, StartupFailure};
@@ -115,15 +115,15 @@ pub struct Translator {
     /// Resource limits `document_tracker` was last built with. Kept
     /// alongside `document_tracker` so [`Self::with_extensions`] and
     /// [`Self::with_resource_limits`] can each rebuild the tracker from
-    /// whichever of (limits, extension map) the other has already set,
+    /// whichever of (limits, language map) the other has already set,
     /// regardless of call order -- see [`Self::with_resource_limits`].
     resource_limits: ResourceLimits,
     /// Allowed workspace roots for path validation. Read-only after `serve()`
     /// setup, so no lock is needed.
     workspace_roots: WorkspaceRoots,
-    /// Custom file extension to language ID mappings. Read-only after
+    /// File extension and name to language ID mappings. Read-only after
     /// `serve()` setup, so no lock is needed.
-    extension_map: Arc<HashMap<FileExtension, LanguageId>>,
+    language_map: Arc<LanguageMap>,
     /// The `file_patterns` configured across all servers, reported when a
     /// file's language has no server. Read-only after `serve()` setup.
     file_patterns: Arc<[FilePattern]>,
@@ -184,7 +184,7 @@ impl Translator {
             )),
             resource_limits: ResourceLimits::default(),
             workspace_roots: WorkspaceRoots::default(),
-            extension_map: Arc::new(HashMap::new()),
+            language_map: Arc::default(),
             file_patterns: Arc::default(),
             router: Arc::new(StdMutex::new(Arc::new(ToolRouter::default()))),
             configured_router: Arc::new(ToolRouter::default()),
@@ -497,7 +497,7 @@ impl Translator {
     }
 
     /// Rebuilds `document_tracker` from `self.resource_limits` and
-    /// `self.extension_map`, whatever the two are currently set to.
+    /// `self.language_map`, whatever the two are currently set to.
     ///
     /// Called by every builder that touches either input ([`Self::with_extensions`],
     /// [`Self::with_resource_limits`]), so each one only needs to set its own
@@ -509,7 +509,7 @@ impl Translator {
     fn rebuild_document_tracker(&mut self) {
         self.document_tracker = Arc::new(DocumentTracker::new(
             self.resource_limits,
-            (*self.extension_map).clone(),
+            (*self.language_map).clone(),
         ));
     }
 
@@ -522,16 +522,17 @@ impl Translator {
         self
     }
 
-    /// Configure custom file extension mappings.
+    /// Configure the file extension and name mappings.
     ///
-    /// This method sets the extension map and updates the document tracker
-    /// to use the same mappings for language detection.
+    /// This method sets the language map and updates the document tracker
+    /// to use the same mappings for language detection. A plain
+    /// extension-to-language `HashMap` is accepted too.
     ///
     /// Only called during single-owner setup, before the translator is
     /// shared, so this replaces the `Arc`-wrapped fields wholesale.
     #[must_use]
-    pub fn with_extensions(mut self, extension_map: HashMap<FileExtension, LanguageId>) -> Self {
-        self.extension_map = Arc::new(extension_map);
+    pub fn with_extensions(mut self, language_map: impl Into<LanguageMap>) -> Self {
+        self.language_map = Arc::new(language_map.into());
         self.rebuild_document_tracker();
         self
     }
@@ -542,9 +543,9 @@ impl Translator {
     /// Only called during single-owner setup, before the translator is
     /// shared. This builder and [`Self::with_extensions`] may be called in
     /// either order -- each rebuilds `document_tracker` from *both* of
-    /// `self.resource_limits`/`self.extension_map`'s current values,
+    /// `self.resource_limits`/`self.language_map`'s current values,
     /// instead of one of them starting fresh from
-    /// `ResourceLimits::default()`/an empty extension map, which previously
+    /// `ResourceLimits::default()`/an empty language map, which previously
     /// meant whichever builder ran last silently discarded the other's
     /// effect.
     #[must_use]
@@ -782,9 +783,9 @@ mod tests {
     use tokio::time::Duration;
 
     use super::*;
-    use crate::bridge::state::detect_language;
     use crate::config::{
-        DocumentLimit, ServerCommand, ServerId, SizeLimit, ToolKind, ToolRouter, ToolSet,
+        DocumentLimit, FileExtension, ServerCommand, ServerId, SizeLimit, ToolKind, ToolRouter,
+        ToolSet,
     };
     use crate::error::Error;
     use crate::test_lsp::fake_lsp_client;
@@ -1349,7 +1350,7 @@ mod tests {
         // NoServerForLanguage rather than keep implying the server is still
         // on its way.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &HashMap::new());
+        let lang = LanguageMap::default().detect(&path);
         let id = ServerId::from(lang.clone());
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
@@ -1381,17 +1382,14 @@ mod tests {
             LanguageId::from_static("customlang"),
         );
 
-        let translator = Translator::new().with_extensions(extension_map.clone());
+        let translator = Translator::new().with_extensions(extension_map);
 
-        assert_eq!(translator.extension_map.len(), 2);
+        assert_eq!(translator.language_map.detect(Path::new("a.nu")), "nushell");
         assert_eq!(
-            translator.extension_map.get("nu"),
-            Some(&LanguageId::from_static("nushell"))
+            translator.language_map.detect(Path::new("a.customext")),
+            "customlang"
         );
-        assert_eq!(
-            translator.extension_map.get("customext"),
-            Some(&LanguageId::from_static("customlang"))
-        );
+        assert_eq!(translator.language_map.languages().count(), 2);
     }
 
     /// `with_resource_limits` called before `with_extensions` (the order
@@ -1409,7 +1407,7 @@ mod tests {
         };
         let translator = Translator::new()
             .with_resource_limits(limits)
-            .with_extensions(HashMap::new());
+            .with_extensions(LanguageMap::default());
 
         let dir = TempDir::new().unwrap();
         let path_a = dir.path().join("a.rs");

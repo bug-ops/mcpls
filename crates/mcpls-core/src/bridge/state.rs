@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
-use crate::config::{DocumentLimit, FileExtension, LanguageId, ServerId, SizeLimit};
+use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
 use crate::util::{
@@ -551,8 +551,8 @@ pub struct DocumentTracker {
     generations: StdMutex<HashMap<ServerId, u64>>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
-    /// Custom file extension to language ID mappings.
-    extension_map: HashMap<FileExtension, LanguageId>,
+    /// File extension and name to language ID mappings.
+    language_map: LanguageMap,
     /// `didClose` notifications owed after `Self::open`'s LRU eviction (#495),
     /// per path and server. See [`PendingClose`].
     ///
@@ -565,16 +565,16 @@ pub struct DocumentTracker {
 }
 
 impl DocumentTracker {
-    /// Create a new document tracker with custom limits and extension mappings.
+    /// Create a new document tracker with custom limits and language mappings.
     #[must_use]
-    pub fn new(limits: ResourceLimits, extension_map: HashMap<FileExtension, LanguageId>) -> Self {
+    pub fn new(limits: ResourceLimits, language_map: impl Into<LanguageMap>) -> Self {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
             in_flight: Arc::default(),
             generations: StdMutex::new(HashMap::new()),
             limits,
-            extension_map,
+            language_map: language_map.into(),
             pending_closes: StdMutex::new(HashMap::new()),
             next_opening: AtomicU64::new(0),
         }
@@ -754,7 +754,7 @@ impl DocumentTracker {
         self.check_file_size(text.as_str().len() as u64)?;
 
         let uri = path_to_uri(&path)?;
-        let language_id = detect_language(&path, &self.extension_map);
+        let language_id = self.language_map.detect(&path);
 
         let opened = self.next_opening.fetch_add(1, Ordering::Relaxed);
         let state = DocumentState::new(uri.clone(), language_id, text, opened);
@@ -1806,28 +1806,19 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     url.to_file_path().ok()
 }
 
-/// Detect the language ID from a file path.
-///
-/// Consults the extension map to determine the language ID for a file.
-/// If the extension is not found in the map, returns [`LanguageId::PLAINTEXT`].
-#[must_use]
-pub fn detect_language(
-    path: &Path,
-    extension_map: &HashMap<FileExtension, LanguageId>,
-) -> LanguageId {
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    extension_map
-        .get(extension)
-        .cloned()
-        .unwrap_or(LanguageId::PLAINTEXT)
-}
-
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::FileExtension;
+
+    fn detect_language(
+        path: &Path,
+        extension_map: &HashMap<FileExtension, LanguageId>,
+    ) -> LanguageId {
+        LanguageMap::from(extension_map.clone()).detect(path)
+    }
 
     #[test]
     fn test_detect_language() {
