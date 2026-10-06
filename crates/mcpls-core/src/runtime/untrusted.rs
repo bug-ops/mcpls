@@ -2029,7 +2029,7 @@ mod windows_spawn_tests {
         std::fs::write(
             &script,
             format!(
-                "@echo off\r\necho %CD%> \"{0}\"\r\necho %NoDefaultCurrentDirectoryInExePath%>> \"{0}\"\r\n",
+                "@echo off\r\necho %CD% > \"{0}\"\r\necho %NoDefaultCurrentDirectoryInExePath% >> \"{0}\"\r\n",
                 record.display()
             ),
         )

@@ -318,9 +318,9 @@ fn sc_get_hover(client: &mut McpClient, workspace: &Path) -> Result<(), String> 
     Ok(())
 }
 
-/// A position far past the end of the document is a caller fault: `-32602`
-/// carrying the server's raw error as `data.raw_message` (#465.6).
-fn sc_out_of_range_position_is_invalid_params_with_raw_error(
+/// A line past the end of the document is a caller fault rejected as `-32602`
+/// before any LSP request, so there is no server `raw_message` (#641).
+fn sc_line_past_document_end_is_invalid_params(
     client: &mut McpClient,
     workspace: &Path,
 ) -> Result<(), String> {
@@ -336,10 +336,12 @@ fn sc_out_of_range_position_is_invalid_params_with_raw_error(
     match result {
         Err(e) => {
             let message = e.to_string();
-            if message.contains("-32602") && message.contains("raw_message") {
+            if message.contains("-32602") && message.contains("beyond the end of the document") {
                 Ok(())
             } else {
-                Err(format!("expected -32602 with raw_message, got: {message}"))
+                Err(format!(
+                    "expected -32602 for a line past the end, got: {message}"
+                ))
             }
         }
         Ok(resp) => Err(format!("expected an error, got: {resp}")),
@@ -1565,7 +1567,7 @@ fn sc_get_server_messages(client: &mut McpClient, _workspace: &Path) -> Result<(
 fn sub_cases() -> Vec<SubCase> {
     vec![
         sub_case!(sc_get_hover),
-        sub_case!(sc_out_of_range_position_is_invalid_params_with_raw_error),
+        sub_case!(sc_line_past_document_end_is_invalid_params),
         sub_case!(sc_get_definition),
         sub_case!(sc_get_definition_by_name),
         sub_case!(sc_get_references),

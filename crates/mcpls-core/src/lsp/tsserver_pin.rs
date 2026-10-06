@@ -1011,6 +1011,12 @@ mod launch_tests {
     }
 
     fn write_executable(path: &Path, body: &str) {
+        // Windows spawns an extensionless command as `<command>.exe`.
+        let path = &if cfg!(windows) && path.extension().is_none() {
+            path.with_added_extension("exe")
+        } else {
+            path.to_path_buf()
+        };
         write(path, body);
         #[cfg(unix)]
         {
