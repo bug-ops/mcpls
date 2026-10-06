@@ -202,6 +202,18 @@ impl ServerState {
 ///
 /// A closed type so a spawn never silently depends on the working directory
 /// mcpls itself happens to have.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use mcpls_core::lsp::ChildWorkingDir;
+///
+/// assert_eq!(ChildWorkingDir::default(), ChildWorkingDir::Inherit);
+/// let fixed = ChildWorkingDir::Fixed(PathBuf::from("project"));
+/// assert_ne!(fixed, ChildWorkingDir::Inherit);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ChildWorkingDir {
     /// The server inherits mcpls's working directory.
@@ -253,6 +265,24 @@ impl ServerInitConfig {
     /// configuration and current environment, so an empty set still hides
     /// them, and `serve` fills it with the secrets of every configured server
     /// so a server that echoes another's secret has it hidden too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::WorkspaceRoots;
+    /// use mcpls_core::config::{LspServerConfig, PositionEncodings};
+    /// use mcpls_core::lsp::{ChildWorkingDir, ServerInitConfig};
+    ///
+    /// let config = ServerInitConfig::new(
+    ///     LspServerConfig::rust_analyzer(),
+    ///     WorkspaceRoots::default(),
+    ///     PositionEncodings::DEFAULT,
+    ///     Arc::default(),
+    /// );
+    /// assert_eq!(config.child_working_dir(), &ChildWorkingDir::Inherit);
+    /// ```
     #[must_use]
     pub const fn new(
         server_config: LspServerConfig,
@@ -286,6 +316,27 @@ impl ServerInitConfig {
     }
 
     /// This config with the child started in `dir`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::WorkspaceRoots;
+    /// use mcpls_core::config::{LspServerConfig, PositionEncodings};
+    /// use mcpls_core::lsp::{ChildWorkingDir, ServerInitConfig};
+    ///
+    /// let dir = ChildWorkingDir::Fixed(PathBuf::from("project"));
+    /// let config = ServerInitConfig::new(
+    ///     LspServerConfig::rust_analyzer(),
+    ///     WorkspaceRoots::default(),
+    ///     PositionEncodings::DEFAULT,
+    ///     Arc::default(),
+    /// )
+    /// .with_child_working_dir(dir.clone());
+    /// assert_eq!(config.child_working_dir(), &dir);
+    /// ```
     #[must_use]
     pub fn with_child_working_dir(mut self, dir: ChildWorkingDir) -> Self {
         self.child_working_dir = dir;
