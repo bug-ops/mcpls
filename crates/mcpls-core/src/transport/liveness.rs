@@ -376,7 +376,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let (probe, _liveness) = probe(Duration::from_secs(60), Duration::from_secs(60));
+        let (probe, _liveness) = probe(Duration::from_mins(1), Duration::from_mins(1));
         let panicking =
             futures::stream::poll_fn(|_| -> std::task::Poll<Option<ServerSseMessage>> {
                 panic!("inner stream failure")

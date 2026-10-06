@@ -117,18 +117,28 @@ async fn plan_off_runtime(
     config: &ServerConfig,
     roots: &WorkspaceRoots,
     redactions: &Arc<redaction::Redactions>,
-) -> StartPlan {
+) -> Result<StartPlan, Error> {
     let (config, roots, redactions) = (config.clone(), roots.clone(), Arc::clone(redactions));
-    on_blocking_pool(move || plan_server_starts(&config, &roots, &redactions)).await
+    on_blocking_pool(move || plan_server_starts(&config, &roots, &redactions))
+        .await
+        .map_err(|source| Error::TaskFailed {
+            task: error::BackgroundTask::ServerPlanning,
+            source,
+        })
 }
 
 /// Runs `work` on the blocking pool and returns its result, re-raising a panic
-/// in it on the caller.
-async fn on_blocking_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+/// in it on the caller. A join that failed for any other reason (the runtime
+/// shutting down cancelled it) is returned as the error.
+async fn on_blocking_pool<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
     match tokio::task::spawn_blocking(work).await {
-        Ok(value) => value,
-        // The pool does not cancel a running blocking task, so a failed join is a panic in `work`.
-        Err(error) => std::panic::resume_unwind(error.into_panic()),
+        Ok(value) => Ok(value),
+        Err(error) => match error.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(cancelled) => Err(cancelled),
+        },
     }
 }
 
@@ -214,7 +224,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let plan = plan_off_runtime(&config, &workspace_roots, &startup_redactions).await;
+    let plan = plan_off_runtime(&config, &workspace_roots, &startup_redactions).await?;
     let (applicable_configs, refused, refusals) = plan.into_parts();
 
     info!(
@@ -356,7 +366,7 @@ mod tests {
     /// being swallowed by the blocking pool.
     #[tokio::test]
     async fn test_on_blocking_pool_returns_the_value_and_propagates_a_panic() {
-        assert_eq!(on_blocking_pool(|| 7).await, 7);
+        assert_eq!(on_blocking_pool(|| 7).await.unwrap(), 7);
 
         let panicked =
             crate::util::catch_panic(on_blocking_pool(|| -> u8 { panic!("planning exploded") }))

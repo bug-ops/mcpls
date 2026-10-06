@@ -228,8 +228,11 @@ impl KindFilter for SymbolKindFilter {
     const SCHEMA_NAME: &'static str = "SymbolKindFilter";
 
     fn parse(text: &str) -> Option<Self> {
-        if let Ok(numeric) = text.parse::<u32>() {
-            return Some(Self(lsp_types::SymbolKind::from(numeric)));
+        if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return text
+                .parse::<u32>()
+                .ok()
+                .map(|numeric| Self(lsp_types::SymbolKind::from(numeric)));
         }
         SUPPORTED_SYMBOL_KINDS
             .into_iter()
@@ -336,6 +339,18 @@ mod tests {
         assert_eq!(by_number, by_name);
         let custom = Symbol::from("4000".to_owned()).into_known().unwrap();
         assert_eq!(custom.canonical(), "4000");
+    }
+
+    /// The schema's `^[0-9]+$` is the whole numeric form: no sign, no padding.
+    #[test]
+    fn test_only_plain_digits_are_a_numeric_symbol_kind() {
+        for rejected in ["+5", "-5", " 5", "5 ", "", "4294967296"] {
+            assert!(
+                Symbol::from(rejected.to_owned()).into_known().is_err(),
+                "{rejected:?}"
+            );
+        }
+        assert!(Symbol::from("007".to_owned()).into_known().is_ok());
     }
 
     #[test]

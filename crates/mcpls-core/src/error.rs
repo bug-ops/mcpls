@@ -937,6 +937,8 @@ pub enum BackgroundTask {
     PathValidation,
     /// Opening and verifying a file on the blocking pool.
     FileOpen,
+    /// Planning which configured servers to start, on the blocking pool.
+    ServerPlanning,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -947,6 +949,7 @@ impl fmt::Display for BackgroundTask {
             Self::ListenResolution => "listen URI resolution",
             Self::PathValidation => "path validation",
             Self::FileOpen => "file open",
+            Self::ServerPlanning => "server start planning",
         })
     }
 }

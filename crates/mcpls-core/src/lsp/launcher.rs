@@ -102,8 +102,7 @@ pub fn launches_from_workspace(command: &str, args: &[String]) -> bool {
 fn command_stem(command: &str) -> String {
     Path::new(command)
         .file_stem()
-        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
+        .map_or_default(|stem| stem.to_string_lossy().to_ascii_lowercase())
 }
 
 fn launch_selects_workspace_code(command: &str, args: &[String], env_depth: usize) -> bool {
@@ -154,7 +153,7 @@ fn is_command_flag(shell: &str, arg: &str) -> bool {
                         .iter()
                         .any(|parameter| parameter.starts_with(name)))
         }),
-        _ => has_short_flag(&arg, &['c']),
+        _ => arg == "--command" || has_short_flag(&arg, &['c']),
     }
 }
 
@@ -167,11 +166,19 @@ fn has_short_flag(arg: &str, flags: &[char]) -> bool {
     })
 }
 
+/// Whether `stem` is the interpreter `name`, optionally followed by a version
+/// (`python3.12`, `node18`), but not another tool sharing the prefix
+/// (`nodemon`, `phpunit`).
+fn is_interpreter(stem: &str, name: &str) -> bool {
+    stem.strip_prefix(name)
+        .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
 /// Whether `arg` makes the interpreter `stem` run a program given inline.
 fn is_inline_eval_flag(stem: &str, arg: &str) -> bool {
     INLINE_EVAL
         .iter()
-        .filter(|(name, _, _)| stem.starts_with(name))
+        .filter(|(name, _, _)| is_interpreter(stem, name))
         .any(|(_, letters, long)| has_short_flag(arg, letters) || long.contains(&arg))
 }
 
@@ -378,6 +385,22 @@ mod tests {
         for flag in ["-NonInteractive", "-NoProfile", "-NoLogo", "-Version"] {
             assert!(!launches("pwsh", &[flag, "server.ps1"]), "{flag}");
         }
+    }
+
+    #[test]
+    fn tools_sharing_an_interpreter_prefix_are_not_interpreters() {
+        assert!(!launches("nodemon", &["-e", "js"]));
+        assert!(!launches("phpunit", &["-r"]));
+        assert!(!launches("perltidy", &["-e"]));
+        assert!(launches("python3.12", &["-c", "x"]));
+        assert!(launches("node18", &["-e", "x"]));
+    }
+
+    #[test]
+    fn fish_command_is_recognized_in_long_and_short_form() {
+        assert!(launches("fish", &["--command", "server"]));
+        assert!(launches("fish", &["-c", "server"]));
+        assert!(!launches("fish", &["server.fish"]));
     }
 
     #[test]
