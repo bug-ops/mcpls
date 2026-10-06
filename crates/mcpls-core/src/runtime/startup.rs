@@ -14,58 +14,11 @@ use tracing::{error, info, warn};
 
 use super::pump::{PumpShared, PumpWiring, degrade_after_pump_panic, diagnostics_pump};
 use crate::bridge::{DiagnosticsRole, NotificationCache, Translator, WorkspaceRoots};
-use crate::config::{LanguageId, ServerConfig, ServerId, ServerStartConcurrency};
+use crate::config::{LanguageId, ServerId, ServerStartConcurrency};
 use crate::error::ServerSpawnFailure;
 use crate::lsp::{self, LspServer, ServerInitConfig, ServerStartOutcome};
 use crate::mcp::SubscriptionRegistry;
-use crate::redaction::Redactions;
 use crate::util::panic_message;
-
-/// The servers worth starting for this run: every configured server whose
-/// project markers are found under at least one workspace root, paired with
-/// the roots, position encodings and (for the TypeScript server) the pinned
-/// `tsserver` it is initialized with.
-pub fn plan_server_starts(
-    config: &ServerConfig,
-    roots: &WorkspaceRoots,
-    redactions: &Arc<Redactions>,
-) -> Vec<ServerInitConfig> {
-    let max_depth = Some(config.workspace.heuristics_max_depth);
-    config
-        .lsp_servers
-        .iter()
-        .filter_map(|lsp_config| {
-            let should_spawn = roots
-                .canonical()
-                .iter()
-                .any(|root| lsp_config.should_spawn(root, max_depth));
-
-            if !should_spawn {
-                info!(
-                    "Skipping LSP server '{}' ({}): no project markers found",
-                    lsp_config.language_id, lsp_config.command
-                );
-                return None;
-            }
-
-            let lsp_config =
-                lsp::tsserver_pin::with_selected_typescript_server(lsp_config, roots, |key| {
-                    std::env::var_os(key)
-                });
-            Some(ServerInitConfig {
-                initialization_options: lsp::tsserver_pin::pinned_initialization_options(
-                    &lsp_config,
-                    roots,
-                    |key| std::env::var_os(key),
-                ),
-                server_config: lsp_config.into_owned(),
-                workspace_roots: roots.canonical().to_vec(),
-                position_encodings: config.workspace.position_encodings.clone(),
-                redactions: Arc::clone(redactions),
-            })
-        })
-        .collect()
-}
 
 /// Spawn the applicable LSP servers in a background task and register them into
 /// the shared `translator` once ready.
@@ -575,7 +528,7 @@ mod settler_tests {
         )));
         let release = async {
             tokio::task::yield_now().await;
-            cancel_tx.send(true).unwrap();
+            cancel_tx.send_replace(true);
             drop(guard);
         };
         tokio::join!(settle, release);
@@ -594,7 +547,7 @@ mod settler_tests {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let mut settler = settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
         settler.cancel_rx = cancel_rx;
-        cancel_tx.send(true).unwrap();
+        cancel_tx.send_replace(true);
 
         settler
             .settle(ServerStartOutcome::Started(Box::new(
@@ -765,7 +718,7 @@ mod startup_tests {
                 )
             })
             .await;
-            startup.cancel_tx.send(true).unwrap();
+            startup.cancel_tx.send_replace(true);
             startup.task.await.unwrap();
         }
     }
@@ -806,7 +759,7 @@ mod startup_tests {
             .unwrap();
         std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
 
-        startup.cancel_tx.send(true).unwrap();
+        startup.cancel_tx.send_replace(true);
         startup.task.await.unwrap();
     }
 
@@ -880,7 +833,7 @@ mod startup_tests {
 
         std::fs::write(&gate, "").unwrap();
         wait_until("the second server to start", || b_up.exists()).await;
-        startup.cancel_tx.send(true).unwrap();
+        startup.cancel_tx.send_replace(true);
         startup.task.await.unwrap();
     }
 
@@ -908,7 +861,7 @@ mod startup_tests {
         let startup = start(vec![stuck]);
 
         wait_until("the stuck server to start", || up.exists()).await;
-        startup.cancel_tx.send(true).unwrap();
+        startup.cancel_tx.send_replace(true);
         tokio::time::timeout(std::time::Duration::from_secs(5), startup.task)
             .await
             .unwrap()
@@ -1121,46 +1074,5 @@ mod init_supervision_tests {
         }
 
         assert!(!cache.lock().await.is_push_degraded(&id));
-    }
-}
-
-#[cfg(test)]
-mod plan_tests {
-    use super::*;
-    use crate::config::LspServerConfig;
-
-    fn config_with_rust_analyzer() -> ServerConfig {
-        ServerConfig {
-            lsp_servers: vec![LspServerConfig::rust_analyzer()],
-            ..ServerConfig::default()
-        }
-    }
-
-    fn plan(config: &ServerConfig, roots: &WorkspaceRoots) -> Vec<ServerInitConfig> {
-        let redactions = Arc::new(Redactions::for_servers(
-            &config.lsp_servers,
-            lsp::current_environment(),
-        ));
-        plan_server_starts(config, roots, &redactions)
-    }
-
-    #[test]
-    fn plan_skips_server_without_project_markers() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
-
-        assert!(plan(&config_with_rust_analyzer(), &roots).is_empty());
-    }
-
-    #[test]
-    fn plan_keeps_server_with_project_markers() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
-
-        let plan = plan(&config_with_rust_analyzer(), &roots);
-
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].workspace_roots, roots.canonical());
     }
 }

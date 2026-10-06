@@ -4,6 +4,7 @@
 //! over JSON-RPC 2.0.
 
 mod client;
+pub(crate) mod command_path;
 mod lifecycle;
 mod process;
 mod stderr;

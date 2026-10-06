@@ -31,6 +31,7 @@ ignore = "0.4"
 libc = "0.2"
 lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }
 mcpls-core = { path = "crates/mcpls-core", version = "0.6.0" }
+nix = { version = "0.31", default-features = false, features = ["user"] }
 predicates = "3.1"
 process-wrap = { version = "10.0.1", default-features = false }
 proptest = "1.11"

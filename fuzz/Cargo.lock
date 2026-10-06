@@ -624,6 +624,7 @@ dependencies = [
  "gen-lsp-types",
  "ignore",
  "libc",
+ "nix",
  "process-wrap",
  "rmcp",
  "rustix",

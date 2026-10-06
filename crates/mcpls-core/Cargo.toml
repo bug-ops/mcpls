@@ -34,6 +34,7 @@ url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+nix = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

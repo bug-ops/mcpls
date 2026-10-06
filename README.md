@@ -286,9 +286,17 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml", ".rust-version"]
 > That flag does not make analyzing a workspace safe: language servers run
 > workspace code (build scripts, procedural macros, tsserver plugins). By
 > default mcpls pins the TypeScript server's `tsserver` to the one bundled with
-> `typescript-language-server`, for `npm -g` style symlink installs (verified
-> with Homebrew's node) with a global `typescript`. Windows `.cmd` shims, pnpm,
-> Volta, asdf, mise and `npx`/`bunx` launchers are not covered (#604). See [SECURITY.md](SECURITY.md) for the trust model.
+> `typescript-language-server`, for npm symlink and `.cmd`/`.ps1` shim installs,
+> pnpm global installs and `node`/`bun` running an absolute `cli.mjs`. Volta,
+> asdf, mise and `npx`/`bunx`/`deno npm:` launchers are not covered; set
+> `initialization_options.tsserver.path` for them. See [SECURITY.md](SECURITY.md) for the trust model.
+
+> [!WARNING]
+> `--workspace-trust untrusted` starts only the servers you name with
+> `--allow-server <id>` (repeatable) and refuses a config file or server
+> executable inside the workspace. It is not a sandbox: an allowed server still
+> runs workspace code. Set it in your user-scoped MCP client config, because a
+> project-scoped one is controlled by the repository. See [SECURITY.md](SECURITY.md#untrusted-workspace-mode).
 
 </details>
 

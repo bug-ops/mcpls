@@ -478,3 +478,296 @@ fn test_default_port_allowed_host_env_exits_with_usage_error_before_binding() {
         .stderr(predicate::str::contains("list the host without a port"))
         .stderr(predicate::str::contains("starting mcpls").not());
 }
+
+fn rust_config(root: &std::path::Path) -> String {
+    format!(
+        "[workspace]\nroots = ['{}']\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"rust-analyzer\"\nargs = []\nfile_patterns = [\"**/*.rs\"]\n",
+        root.display()
+    )
+}
+
+#[test]
+fn test_allow_server_without_untrusted_is_a_usage_error() {
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+
+    clear_ambient_env(&mut cmd)
+        .args(["--allow-server", "rust"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--workspace-trust untrusted"))
+        .stderr(predicate::str::contains("starting mcpls").not());
+}
+
+#[test]
+fn test_untrusted_with_trust_project_config_is_a_usage_error() {
+    let mut flag = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut flag)
+        .args(["--workspace-trust", "untrusted", "--trust-project-config"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--trust-project-config"));
+
+    let mut env = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut env)
+        .env("MCPLS_TRUST_PROJECT_CONFIG", "1")
+        .args(["--workspace-trust", "untrusted"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn test_untrusted_rejects_a_config_file_inside_the_workspace() {
+    let workspace = TempDir::new().unwrap();
+    let config_path = workspace.path().join("mcpls.toml");
+    fs::write(&config_path, rust_config(workspace.path())).unwrap();
+
+    let mut by_flag = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut by_flag)
+        .current_dir(workspace.path())
+        .args(["--workspace-trust", "untrusted", "--config"])
+        .arg(&config_path)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("lies inside the workspace"));
+
+    let mut by_env = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut by_env)
+        .current_dir(workspace.path())
+        .env("MCPLS_CONFIG", "./mcpls.toml")
+        .args(["--workspace-trust", "untrusted"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("lies inside the workspace"));
+}
+
+#[test]
+fn test_untrusted_rejects_an_allowed_server_that_is_not_configured() {
+    let workspace = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("mcpls.toml");
+    fs::write(&config_path, rust_config(workspace.path())).unwrap();
+
+    let mut cmd = Command::cargo_bin("mcpls").unwrap();
+    clear_ambient_env(&mut cmd)
+        .current_dir(workspace.path())
+        .args([
+            "--workspace-trust",
+            "untrusted",
+            "--allow-server",
+            "rsut",
+            "--config",
+        ])
+        .arg(&config_path)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "'rsut' is not a configured server",
+        ));
+}
+
+/// A user config reached through `$HOME` / `$XDG_CONFIG_HOME`, both pointed
+/// into the workspace, as direnv-style tooling in a checkout can do.
+#[cfg(unix)]
+#[test]
+fn test_untrusted_rejects_an_auto_discovered_config_inside_the_workspace() {
+    let workspace = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let marker = elsewhere.path().join("evil-ran");
+    let evil = workspace.path().join("evil.sh");
+    fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    let config = format!(
+        "[workspace]\nroots = ['{root}']\n\n[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"/bin/sh\"\nargs = ['{evil}']\nfile_patterns = [\"**/*.rs\"]\n",
+        root = workspace.path().display(),
+        evil = evil.display()
+    );
+    for dir in [
+        workspace.path().join("Library/Application Support/mcpls"),
+        workspace.path().join("xdg/mcpls"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mcpls.toml"), &config).unwrap();
+    }
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    cmd.env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .current_dir(elsewhere.path())
+        .env("HOME", workspace.path())
+        .env("XDG_CONFIG_HOME", workspace.path().join("xdg"))
+        .args(["--workspace-trust", "untrusted", "--allow-server", "rust"])
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("lies inside the workspace"));
+
+    assert!(!marker.exists(), "the workspace script ran");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_untrusted_does_not_create_the_default_config() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    cmd.env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .current_dir(cwd.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("xdg"))
+        .args(["--workspace-trust", "untrusted"])
+        .timeout(Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+/// GUI MCP clients often launch with cwd `/`; that is not a checkout.
+#[cfg(unix)]
+#[test]
+fn test_untrusted_accepts_a_config_outside_the_roots_when_cwd_is_the_filesystem_root() {
+    let workspace = TempDir::new().unwrap();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("mcpls.toml");
+    fs::write(&config_path, rust_config(workspace.path())).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    let output = cmd
+        .env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .env_remove("MCPLS_LOG_JSON")
+        .current_dir("/")
+        .args(["--workspace-trust", "untrusted", "--config"])
+        .arg(&config_path)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("starting mcpls"), "{stderr}");
+    assert!(!stderr.contains("lies inside"), "{stderr}");
+}
+
+/// `$HOME` is set by whoever launches mcpls, so a checkout cannot use it to
+/// exempt itself as "the home directory": the working directory, defaulted as
+/// the only root, is still the workspace.
+#[cfg(unix)]
+#[test]
+fn test_untrusted_does_not_take_a_home_pointing_at_the_workspace_for_the_home_directory() {
+    let workspace = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let marker = elsewhere.path().join("evil-ran");
+    let config = format!(
+        "[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch '{}'\"]\nfile_patterns = [\"**/*.rs\"]\n",
+        marker.display()
+    );
+    for dir in [
+        workspace.path().join("Library/Application Support/mcpls"),
+        workspace.path().join("xdg/mcpls"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mcpls.toml"), &config).unwrap();
+    }
+
+    let mut cmd = assert_cmd::Command::cargo_bin("mcpls").unwrap();
+    cmd.env_remove("MCPLS_LOG")
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env("XDG_CONFIG_HOME", workspace.path().join("xdg"))
+        .args(["--workspace-trust", "untrusted", "--allow-server", "rust"])
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("lies inside the workspace"));
+
+    assert!(!marker.exists(), "the workspace config ran a command");
+}
+
+/// A script outside the workspace whose `#!/usr/bin/env sh` interpreter must
+/// not resolve through a `PATH` entry in the workspace, even when `$HOME`
+/// names the workspace and the config has no roots.
+#[cfg(unix)]
+#[test]
+fn test_untrusted_strips_workspace_path_entries_when_home_points_at_the_workspace() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
+
+    let workspace = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let (started, interpreter) = (
+        outside.path().join("started"),
+        outside.path().join("interpreter-ran"),
+    );
+    let script = outside.path().join("server.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/env sh\ntouch '{}'\nexec sleep 30\n",
+            started.display()
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.path().join("bin")).unwrap();
+    let fake_sh = workspace.path().join("bin/sh");
+    fs::write(
+        &fake_sh,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", interpreter.display()),
+    )
+    .unwrap();
+    for file in [&script, &fake_sh] {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let config_path = outside.path().join("mcpls.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[[lsp_servers]]\nlanguage_id = \"rust\"\ncommand = \"{}\"\nargs = []\nfile_patterns = [\"**/*.rs\"]\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::cargo_bin("mcpls")
+        .unwrap()
+        .env_remove("MCPLS_CONFIG")
+        .env_remove("MCPLS_TRUST_PROJECT_CONFIG")
+        .current_dir(workspace.path())
+        .env("HOME", workspace.path())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", workspace.path().join("bin").display()),
+        )
+        .args([
+            "--workspace-trust",
+            "untrusted",
+            "--allow-server",
+            "rust",
+            "--config",
+        ])
+        .arg(&config_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !started.exists() && !interpreter.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(!interpreter.exists(), "the workspace interpreter was run");
+    assert!(
+        started.exists(),
+        "the server outside the workspace must start"
+    );
+}

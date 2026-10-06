@@ -1643,6 +1643,7 @@ const fn is_unresolvable_resource(error: &crate::error::Error) -> bool {
         | Error::NoServerConfigured
         | Error::NoServerForWorkspaceTool { .. }
         | Error::ConfigNotFound(..)
+        | Error::ConfigInsideWorkspace { .. }
         | Error::InvalidConfig(..)
         | Error::Io(..)
         | Error::Json(..)

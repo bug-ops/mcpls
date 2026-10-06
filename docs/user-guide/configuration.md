@@ -41,6 +41,27 @@ e.g. a `Cargo.toml` in the workspace still spawns rust-analyzer. An explicit
 `--config <path>` or `$MCPLS_CONFIG` is always trusted, since naming a path is
 itself the user's consent.
 
+#### Untrusted workspace mode
+
+`--workspace-trust untrusted` starts only the servers you allow with `--allow-server <id>`
+(repeatable). The id is the server's `name`, else its `language_id` (`rust`, `python`, ...); an id
+that matches no configured server is rejected at startup. Every other applicable server is refused
+before it can spawn, and a tool call routed to it returns an error naming the server and the flag
+that would start it. Neither flag has an environment variable or a config key, so a config file in
+the workspace cannot grant consent. The mode conflicts with `--trust-project-config`, and
+`--allow-server` without it is a usage error.
+
+It also refuses a config file inside a workspace root (the `--config` or `$MCPLS_CONFIG` file, or
+the auto-discovered user config; a relative or environment-derived path is also checked against the
+current directory, unless that is `/` or your login home directory from the account database), refuses a server whose executable
+cannot be found or lies inside a workspace root, and spawns the resolved executable with a `PATH`
+stripped of workspace, relative and empty entries (and `HOME` and `USERPROFILE` set to the login home; set `HOME` in a server's `env` where `$HOME` legitimately differs, and configure `workspace.roots` when the working directory is your home directory and no account entry exists). No default config file is created. It is not a
+sandbox: an allowed server still runs workspace code, and interpreter arguments such as
+`node <workspace>/cli.mjs` are not checked, nor are launchers that pick the real server from
+workspace files (rustup's `rust-toolchain.toml` `path`, asdf, mise, Volta, `go.mod` toolchains). Configure it in a user-scoped MCP client config; a
+project-scoped one is controlled by the repository. See
+[SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
+
 #### Trust model
 
 `--trust-project-config` governs only the mcpls config. It does not make the workspace itself safe
@@ -63,10 +84,11 @@ willing to have that code execute in (a container or a disposable VM).
 **tsserver pin (TypeScript).** By default mcpls passes the tsserver bundled next to
 `typescript-language-server` as `initializationOptions.tsserver.path`, so a workspace's own
 `node_modules` tsserver is not selected. Covered: `npm -g` style symlink installs (verified with
-Homebrew's node) that have a global `typescript` package with a `package.json` `version` next to
-the server. Not covered (#604), with a warning logged: Windows `.cmd` shims, script launchers (pnpm,
-Volta, asdf, mise), `npx`/`bunx`/`node cli.mjs` wrappers, and installs with no valid `typescript`
-package. A server installed inside the workspace is pinned with a warning, but that narrows
+Homebrew's node), npm `.cmd`/`.ps1`/extensionless shims, pnpm global installs and `node`/`bun`
+running an absolute `cli.mjs`, each with a `typescript` package with a `package.json` `version`
+next to the server. Not covered, with a warning logged: Volta, asdf and mise shims,
+`npx`/`bunx`/`pnpm dlx`/`deno npm:` launchers, relative-script wrappers, and installs with no valid
+`typescript` package. A server installed inside the workspace is pinned with a warning, but that narrows
 nothing because the server itself is workspace code. A
 `tsserver.path` in your own `initialization_options` always wins; set it to a workspace path to opt
 back in to the workspace's TypeScript. Other `initialization_options` that do not set

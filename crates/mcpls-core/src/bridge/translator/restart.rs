@@ -195,6 +195,7 @@ impl RestartFailure {
             | Error::NoServerConfigured
             | Error::NoServerForWorkspaceTool { .. }
             | Error::ConfigNotFound(_)
+            | Error::ConfigInsideWorkspace { .. }
             | Error::InvalidConfig(_)
             | Error::TomlDe(_)
             | Error::TomlSer(_)
@@ -1082,6 +1083,33 @@ mod tests {
             assert_matches!(
                 only_outcome(&result),
                 RestartOutcome::NotRunning { .. },
+                "{result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_restart_all_reports_a_refused_server_as_not_running() {
+            let config = crate::config::LspServerConfig::rust_analyzer();
+            let translator =
+                Translator::new().with_router(ToolRouter::from_configs([&config]).unwrap());
+            translator.record_refusals(&[ServerSpawnFailure {
+                server_id: config.id(),
+                language_id: config.language_id.clone(),
+                command: config.command.clone(),
+                reason: StartupFailure::RefusedUntrustedWorkspace(
+                    crate::error::UntrustedRefusal::NotAllowed { builtin: None },
+                ),
+            }]);
+
+            let result = translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            let outcome = only_outcome(&result);
+            assert_matches!(
+                outcome,
+                RestartOutcome::NotRunning { message } if message.contains("--allow-server rust"),
                 "{result:?}"
             );
         }

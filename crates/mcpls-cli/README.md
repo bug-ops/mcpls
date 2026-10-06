@@ -50,6 +50,8 @@ See the main [README](../../README.md) for configuration examples and custom ext
 |------|-----|-------------|
 | `-c, --config <PATH>` | `MCPLS_CONFIG` | Configuration file path |
 | `--trust-project-config` | `MCPLS_TRUST_PROJECT_CONFIG` | Load a `./mcpls.toml` found in the current directory |
+| `--workspace-trust <MODE>` | — | `trusted` (default) or `untrusted`: with `untrusted`, start only the servers named with `--allow-server`; conflicts with `--trust-project-config` |
+| `--allow-server <ID>` | — | Start this server in an untrusted workspace (repeatable; the server's `name`, else its `language_id`); requires `--workspace-trust untrusted` |
 | `-l, --log-level <LEVEL>` | `MCPLS_LOG` | trace, debug, info, warn, error (default: info) |
 | `--log-json` | `MCPLS_LOG_JSON` | JSON-formatted logs for tooling |
 | `--listen <ADDR>` | `MCPLS_LISTEN` | Bind address for HTTP transport (`transport-http` feature) |

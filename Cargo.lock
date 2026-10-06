@@ -1041,6 +1041,7 @@ dependencies = [
  "hyper-util",
  "ignore",
  "libc",
+ "nix",
  "process-wrap",
  "proptest",
  "rmcp",

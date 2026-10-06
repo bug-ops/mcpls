@@ -290,6 +290,28 @@ impl Translator {
         lock_std(&self.servers).failures()
     }
 
+    /// Records the servers untrusted-workspace mode refused to start and
+    /// rebinds the router away from them.
+    ///
+    /// Does nothing for an empty list, so a trusted workspace is untouched.
+    /// Not [`Self::settle_failed`]: a refused server was never expected, so
+    /// its "settled twice or was never expected" error would be wrong.
+    pub(crate) fn record_refusals(&self, refused: &[ServerSpawnFailure]) {
+        if refused.is_empty() {
+            return;
+        }
+        {
+            let mut servers = lock_std(&self.servers);
+            for failure in refused {
+                servers.record_failure(failure);
+            }
+        }
+        self.rebind_router_to_settled();
+        for failure in refused {
+            self.warn_failed_routes(&failure.server_id, &RouteLoss::of(failure));
+        }
+    }
+
     /// Settle the translator after the background init task panicked.
     ///
     /// Every config that never registered is recorded as
@@ -394,12 +416,12 @@ impl Translator {
         if !was_expected {
             tracing::error!("LSP server '{id}' settled twice or was never expected");
         }
-        self.warn_failed_routes(&id);
+        self.warn_failed_routes(&id, &RouteLoss::FailedToStart);
     }
 
     /// Logs which languages lost a route to the failed server `id` and what
     /// the state of each language's catch-all is.
-    fn warn_failed_routes(&self, id: &ServerId) {
+    fn warn_failed_routes(&self, id: &ServerId, loss: &RouteLoss<'_>) {
         let languages = self.configured_router.languages_routed_to(id);
         let catch_all_states: Vec<String> = languages
             .iter()
@@ -419,7 +441,7 @@ impl Translator {
             })
             .collect();
         tracing::warn!(
-            "server '{id}' failed to start; routes of [{}] are rebound or dropped",
+            "server '{id}' {loss}; routes of [{}] are rebound or dropped",
             catch_all_states.join(", ")
         );
     }
@@ -701,6 +723,30 @@ impl MergedRedactions {
             && sources
                 .iter()
                 .all(|set| self.sources.iter().any(|known| Arc::ptr_eq(known, set)))
+    }
+}
+
+/// Why a server's routes were lost, as the startup log line words it.
+enum RouteLoss<'a> {
+    FailedToStart,
+    Refused(&'a crate::error::UntrustedRefusal),
+}
+
+impl<'a> RouteLoss<'a> {
+    const fn of(failure: &'a ServerSpawnFailure) -> Self {
+        match &failure.reason {
+            StartupFailure::RefusedUntrustedWorkspace(refusal) => Self::Refused(refusal),
+            StartupFailure::Spawn(_) | StartupFailure::InitTaskPanicked => Self::FailedToStart,
+        }
+    }
+}
+
+impl std::fmt::Display for RouteLoss<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FailedToStart => f.write_str("failed to start"),
+            Self::Refused(refusal) => write!(f, "refused (untrusted workspace: {refusal})"),
+        }
     }
 }
 
@@ -1409,5 +1455,66 @@ mod tests {
             "rust",
             "extension map must have survived with_resource_limits's rebuild"
         );
+    }
+
+    fn refusal_of(config: &crate::config::LspServerConfig) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            reason: StartupFailure::RefusedUntrustedWorkspace(
+                crate::error::UntrustedRefusal::NotAllowed {
+                    builtin: Some(crate::config::BuiltinServer::RustAnalyzer),
+                },
+            ),
+            ..spawn_failure(config)
+        }
+    }
+
+    #[test]
+    fn test_record_refusals_without_refusals_leaves_translator_untouched() {
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let translator =
+            Translator::new().with_router(ToolRouter::from_configs([&config]).unwrap());
+        let before = translator.router_snapshot();
+
+        translator.record_refusals(&[]);
+
+        assert!(translator.startup_failures().is_empty());
+        assert!(Arc::ptr_eq(&before, &translator.router_snapshot()));
+    }
+
+    #[test]
+    fn test_refused_server_without_catch_all_reports_the_refusal() {
+        let config = crate::config::LspServerConfig::rust_analyzer();
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::from_configs([&config]).unwrap());
+
+        translator.record_refusals(&[refusal_of(&config)]);
+
+        let err = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Hover)
+            .unwrap_err();
+        assert_matches!(&err, Error::ServerFailedToStart(f) if f.server_id == config.id());
+        let text = err.to_string();
+        assert!(text.contains("'rust'"), "{text}");
+        assert!(text.contains("--allow-server rust"), "{text}");
+        assert!(!text.contains("not retried"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_refused_explicit_server_leaves_allowed_catch_all_serving() {
+        let explicit = named_config("explicit", "rust", Some(vec![ToolKind::Hover]));
+        let catch_all = named_config("allowed", "rust", None);
+        let translator = Translator::new()
+            .with_extensions(crate::test_lsp::test_extensions())
+            .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
+        translator.set_expected_servers(HashSet::from([catch_all.id()]));
+
+        translator.record_refusals(&[refusal_of(&explicit)]);
+        translator.settle_started(crate::lsp::fake_lsp_server_with_config(catch_all.clone()));
+
+        let (routed, _client) = translator
+            .client_for_file(Path::new("/ws/main.rs"), ToolKind::Hover)
+            .unwrap();
+        assert_eq!(routed, catch_all.id());
     }
 }
