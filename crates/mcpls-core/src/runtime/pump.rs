@@ -2152,6 +2152,7 @@ mod pump_tests {
 
     /// #692: a publish the cache refuses (the file's URI spellings are at their
     /// cap) is not announced; the next accepted publish is.
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_pump_does_not_notify_for_a_dropped_publish() {
         use crate::mcp::{SessionHandle, Target};
