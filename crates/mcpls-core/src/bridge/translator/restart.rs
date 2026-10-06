@@ -362,8 +362,21 @@ pub trait NotificationWiring: std::fmt::Debug + Send + Sync {
     ) -> AbortHandle;
 
     /// Tell subscribers of the resources behind the `cleared` cache keys to
-    /// re-read them.
+    /// re-read them: after a server's entries were cleared, and after a pull
+    /// write evicted other files' entries.
     fn publish_invalidated<'a>(&'a self, cleared: &'a [DiagnosticsKey]) -> BoxFuture<'a, ()>;
+
+    /// Whether any session holds a subscription at all, so a caller can skip
+    /// work that only matters to subscribers. Defaults to `true`, which only
+    /// forgoes the saving.
+    fn has_subscriptions(&self) -> BoxFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    /// Tell subscribers of the resource behind `file`, the canonical URI of a
+    /// tracked file, that a `textDocument/diagnostic` report changed what a
+    /// read of it returns.
+    fn publish_changed<'a>(&'a self, file: &'a lsp_types::Uri) -> BoxFuture<'a, ()>;
 }
 
 /// Keeps restarts reporting `initializing` until dropped, so an init panic,

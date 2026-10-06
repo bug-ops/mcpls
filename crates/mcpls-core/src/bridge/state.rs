@@ -609,6 +609,22 @@ impl DocumentTracker {
         lock_std(&self.in_flight).get(path).copied().unwrap_or(0)
     }
 
+    /// Last document version of `path` that `server` was told about, or
+    /// `None` when `path` is not tracked or `server` never saw it.
+    #[must_use]
+    pub(crate) fn synced_version(&self, path: &Path, server: &ServerId) -> Option<i32> {
+        lock_std(&self.documents).get(path)?.synced_version(server)
+    }
+
+    /// Overwrites `server`'s synced version of `path`, to simulate a resync
+    /// landing while a request is in flight.
+    #[cfg(test)]
+    pub(crate) fn set_synced_version_for_test(&self, path: &Path, server: &ServerId, version: i32) {
+        if let Some(state) = lock_std(&self.documents).get_mut(path) {
+            state.mark_synced(server.clone(), version);
+        }
+    }
+
     /// Check if a document is currently open.
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {

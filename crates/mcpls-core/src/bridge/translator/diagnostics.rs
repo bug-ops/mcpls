@@ -8,19 +8,24 @@ use lsp_types::{
     WorkDoneProgressParams,
 };
 use tokio::sync::Mutex;
+use tracing::debug;
 
 use super::Translator;
 use super::dto::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, Position2D,
-    Range, ServerLogsResult, ServerMessagesResult,
+    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, ServerLogsResult,
+    ServerMessagesResult,
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
+use super::routing::PreparedDocument;
 use crate::bridge::encoding::PositionEncoding;
-use crate::bridge::notifications::{LogLevel, message_as_str};
+use crate::bridge::notifications::{
+    BoundedDiagnostics, ChangeOutcome, LogLevel, PullStamp, PullWrite, ReportedSeverity,
+    SlotChange, VersionCheck, message_as_str, reported_code,
+};
 use crate::bridge::{
-    ClientPath, DiagnosticInfo, DocumentTracker, NotificationCache, WorkspacePath, WorkspaceRoots,
-    path_to_uri,
+    ClientPath, DiagnosticInfo, DiagnosticSources, DiagnosticsKey, DocumentTracker,
+    NotificationCache, WorkspacePath, WorkspaceRoots, path_to_uri,
 };
 use crate::config::ToolKind;
 use crate::error::Result;
@@ -53,6 +58,46 @@ enum DocumentDiagnosticReportResult {
     ),
 }
 
+/// What a `textDocument/diagnostic` answer says about the file.
+enum PullReport {
+    /// A full report: the file's diagnostics as the server sees them now.
+    Full(Vec<lsp_types::Diagnostic>),
+    /// An `unchanged` or partial answer, which says nothing a cache could
+    /// replace its slot with.
+    NotStored,
+}
+
+impl From<DocumentDiagnosticReportResult> for PullReport {
+    fn from(response: DocumentDiagnosticReportResult) -> Self {
+        match response {
+            DocumentDiagnosticReportResult::Report(
+                lsp_types::DocumentDiagnosticReport::RelatedFullDocumentDiagnosticReport(full),
+            ) => Self::Full(full.full_document_diagnostic_report.items),
+            DocumentDiagnosticReportResult::Report(
+                lsp_types::DocumentDiagnosticReport::RelatedUnchangedDocumentDiagnosticReport(_),
+            )
+            | DocumentDiagnosticReportResult::Partial(_) => Self::NotStored,
+        }
+    }
+}
+
+/// Whether a pull report became the file's pulled slot.
+enum PullStorage {
+    /// Stored; the change it made to the slot.
+    Stored(SlotChange),
+    /// Only part of the result, not of the cache.
+    NotStored,
+}
+
+/// A pull report after it met the cache.
+struct PullSettlement {
+    /// Snapshot of the file's sources with the report in it.
+    sources: DiagnosticSources,
+    storage: PullStorage,
+    /// Files whose entries were evicted to make room for the report.
+    evicted: Vec<DiagnosticsKey>,
+}
+
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
 /// where it's documented as never read -- avoids a per-poll `Arc` allocation.
 static EMPTY_WORKSPACE_ROOTS: LazyLock<WorkspaceRoots> = LazyLock::new(WorkspaceRoots::default);
@@ -61,8 +106,7 @@ static EMPTY_WORKSPACE_ROOTS: LazyLock<WorkspaceRoots> = LazyLock::new(Workspace
 ///
 /// Shared by both the pull-model (`handle_diagnostics`) and cache-derived
 /// (`diagnostics_from_cache_entry`) diagnostic paths, so their output never
-/// diverges in formatting — `merge_diagnostics`'s dedup logic depends on
-/// both sides mapping severity/code identically.
+/// diverges in formatting.
 pub(super) async fn diagnostic_to_mcp(
     diag: &lsp_types::Diagnostic,
     ctx: &EncodingCtx,
@@ -70,18 +114,14 @@ pub(super) async fn diagnostic_to_mcp(
 ) -> Diagnostic {
     Diagnostic {
         range: ctx.normalize_range(uri, diag.range).await,
-        severity: match diag.severity {
-            Some(lsp_types::DiagnosticSeverity::Error) => DiagnosticSeverity::Error,
-            Some(lsp_types::DiagnosticSeverity::Warning) => DiagnosticSeverity::Warning,
-            Some(lsp_types::DiagnosticSeverity::Hint) => DiagnosticSeverity::Hint,
-            // INFORMATION and None (no severity reported) both fall here.
-            _ => DiagnosticSeverity::Information,
+        severity: match ReportedSeverity::of(diag) {
+            ReportedSeverity::Error => DiagnosticSeverity::Error,
+            ReportedSeverity::Warning => DiagnosticSeverity::Warning,
+            ReportedSeverity::Information => DiagnosticSeverity::Information,
+            ReportedSeverity::Hint => DiagnosticSeverity::Hint,
         },
         message: message_as_str(&diag.message).to_string(),
-        code: diag.code.as_ref().map(|c| match c {
-            lsp_types::Code::Int(n) => n.to_string(),
-            lsp_types::Code::String(s) => s.clone(),
-        }),
+        code: reported_code(diag).map(std::borrow::Cow::into_owned),
     }
 }
 
@@ -131,25 +171,35 @@ impl Translator {
 
     /// Handle diagnostics request.
     ///
-    /// Merges the LSP pull-model response (`textDocument/diagnostic`) with
-    /// whatever is already cached from `textDocument/publishDiagnostics` push
-    /// notifications for the same file, so this returns the same diagnostics
-    /// `get_cached_diagnostics` would for the file at the same point in time
-    /// (see #244 — rust-analyzer's pull endpoint omits flycheck/clippy-sourced
-    /// diagnostics, and empirically also some native ones, that are only ever
-    /// delivered via the push path). If the pull request itself fails (e.g. a
-    /// push-only server answering `-32601`, or a timeout), a non-empty cache
-    /// entry is returned as a cache-only result instead of propagating the
-    /// error, since the cache is not required to be fresher than the pull
-    /// response to be useful here.
+    /// Pulls `textDocument/diagnostic`, stores a full report as the file's
+    /// pulled slot in `notification_cache` next to whatever the server pushed
+    /// (`NotificationCache::store_pulled_diagnostics`), and returns the merged
+    /// view of both -- the same diagnostics `get_cached_diagnostics` and
+    /// `resources/read` return for the file right after. The push side is
+    /// merged in because rust-analyzer's pull endpoint omits
+    /// flycheck/clippy-sourced diagnostics, and empirically some native ones,
+    /// that are only ever delivered via push (#244). When the merged view
+    /// changed, subscribers of the file's `lsp-diagnostics://` resource are
+    /// notified before this returns (#574).
     ///
-    /// The cache is read only after the pull request settles (success or
-    /// failure) and held only for the lookup itself — never across the LSP
-    /// round-trip — matching the lock-ordering discipline documented on
-    /// `cached_diagnostics_uri`. Like `get_cached_diagnostics`, the cache is
-    /// treated as eventually consistent: a cached entry may reflect a
-    /// slightly older document version than the fresh pull result if an edit
-    /// landed inside the server's flycheck debounce window.
+    /// A report is not stored when it is not a full report (`unchanged` and
+    /// partial results), when a pull issued later or a server clear got there
+    /// first, or when the document was resynced to another version while the
+    /// request was in flight; the result then still contains the report, but
+    /// the cache and the subscribers are left alone. If the pull request itself
+    /// fails (e.g. a push-only server answering `-32601`, or a timeout), a
+    /// non-empty cache entry is returned as a cache-only result instead of
+    /// propagating the error, since the cache is not required to be fresher
+    /// than the pull response to be useful here.
+    ///
+    /// The cache is locked once, after the pull request settles (success or
+    /// failure), for the store and the snapshot -- never across the LSP
+    /// round-trip -- matching the lock-ordering discipline documented on
+    /// `cached_diagnostics_uri`. Merging, conversion and publishing run after
+    /// the lock is dropped. Like `get_cached_diagnostics`, the cache is treated
+    /// as eventually consistent: a pushed entry may reflect a slightly older
+    /// document version than the fresh pull result if an edit landed inside
+    /// the server's flycheck debounce window.
     ///
     /// Deliberately not gated on workspace-indexing readiness the way
     /// `IndexingGate::Required` whole-workspace queries are (#445, see
@@ -193,6 +243,16 @@ impl Translator {
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
 
+        let stamp = match self.document_tracker.synced_version(doc.path(), server_id) {
+            Some(version) => Some(
+                notification_cache
+                    .lock()
+                    .await
+                    .begin_pull(server_id, version),
+            ),
+            None => None,
+        };
+
         let params = DocumentDiagnosticParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             identifier: None,
@@ -204,62 +264,64 @@ impl Translator {
         let pull_response: Result<DocumentDiagnosticReportResult> = client
             .request("textDocument/diagnostic", params, client.request_timeout())
             .await;
-
-        let sources = {
-            let cache = notification_cache.lock().await;
-            cache.diagnostic_sources(uri)
-        };
-        let diag_info = sources.merge();
-
-        let merged = match pull_response {
-            Ok(response) => {
-                let mut items = match response {
-                    DocumentDiagnosticReportResult::Report(report) => match report {
-                        lsp_types::DocumentDiagnosticReport::RelatedFullDocumentDiagnosticReport(
-                            full,
-                        ) => full.full_document_diagnostic_report.items,
-                        lsp_types::DocumentDiagnosticReport::RelatedUnchangedDocumentDiagnosticReport(
-                            _,
-                        ) => vec![],
-                    },
-                    DocumentDiagnosticReportResult::Partial(_) => vec![],
-                };
+        let report = pull_response.map(|response| match PullReport::from(response) {
+            PullReport::Full(mut items) => {
                 let redactions = client.redactions();
                 if !redactions.is_empty() {
                     for d in &mut items {
                         redactions.redact_diagnostic(d);
                     }
                 }
-                let mut diagnostics = Vec::with_capacity(items.len());
-                for d in &items {
-                    diagnostics.push(diagnostic_to_mcp(d, &ctx, uri).await);
-                }
-                let pull = DiagnosticsResult {
-                    diagnostics,
-                    positions_degraded: ctx.positions_degraded(),
+                Some(BoundedDiagnostics::new(uri, items))
+            }
+            PullReport::NotStored => None,
+        });
+        let (pulled, failure) = match report {
+            Ok(pulled) => (pulled, None),
+            Err(e) => (None, Some(e)),
+        };
+
+        let PullSettlement {
+            sources,
+            storage,
+            evicted,
+        } = {
+            let mut cache = notification_cache.lock().await;
+            self.settle_pull(&mut cache, &doc, stamp, pulled)
+        };
+        let diag_info = sources.merge();
+
+        if let Some(wiring) = self.wiring.get() {
+            if let PullStorage::Stored(slot) = storage
+                && wiring.has_subscriptions().await
+            {
+                let outcome = match slot {
+                    SlotChange::Identical => ChangeOutcome::Unchanged,
+                    SlotChange::Replaced { before } => {
+                        ChangeOutcome::of(before.merge().as_ref(), diag_info.as_ref())
+                    }
                 };
-                Ok(Self::merge_diagnostics(
-                    pull,
-                    diag_info.as_ref(),
-                    ctx.encoding,
-                    &self.document_tracker,
-                )
-                .await)
-            }
-            Err(e) => {
-                let cache_only = Self::diagnostics_from_cache_entry(
-                    diag_info.as_ref(),
-                    ctx.encoding,
-                    &self.document_tracker,
-                )
-                .await;
-                if cache_only.diagnostics.is_empty() {
-                    Err(e)
-                } else {
-                    Ok(cache_only)
+                match outcome {
+                    ChangeOutcome::Changed => wiring.publish_changed(uri).await,
+                    ChangeOutcome::Unchanged => {}
                 }
             }
-        }?;
+            if !evicted.is_empty() {
+                wiring.publish_invalidated(&evicted).await;
+            }
+        }
+
+        let merged = Self::diagnostics_from_cache_entry(
+            diag_info.as_ref(),
+            ctx.encoding,
+            &self.document_tracker,
+        )
+        .await;
+        if let Some(e) = failure
+            && merged.diagnostics.is_empty()
+        {
+            return Err(e);
+        }
 
         let Contextualized {
             items: diagnostics,
@@ -278,6 +340,64 @@ impl Translator {
             positions_degraded,
             enrichment,
         })
+    }
+
+    /// Meets a settled pull with the cache, under the caller's lock: stores
+    /// `pulled` when it may be stored, and snapshots the file's sources with
+    /// the report in them either way.
+    fn settle_pull(
+        &self,
+        cache: &mut NotificationCache,
+        doc: &PreparedDocument,
+        stamp: Option<PullStamp>,
+        pulled: Option<BoundedDiagnostics>,
+    ) -> PullSettlement {
+        let (server_id, uri) = (doc.server_id(), doc.uri());
+        let unstored = |cache: &NotificationCache, items, version| PullSettlement {
+            sources: cache
+                .diagnostic_sources(uri)
+                .with_pulled(uri, version, items),
+            storage: PullStorage::NotStored,
+            evicted: Vec::new(),
+        };
+        let Some(items) = pulled else {
+            return PullSettlement {
+                sources: cache.diagnostic_sources(uri),
+                storage: PullStorage::NotStored,
+                evicted: Vec::new(),
+            };
+        };
+        let Some(stamp) = stamp else {
+            return unstored(cache, items, None);
+        };
+        let check = if self.document_tracker.synced_version(doc.path(), server_id)
+            == Some(stamp.version())
+        {
+            VersionCheck::Current
+        } else {
+            VersionCheck::Moved
+        };
+        match cache.store_pulled_diagnostics(server_id, uri, stamp, check, items) {
+            PullWrite::Stored { slot, evicted } => PullSettlement {
+                sources: cache.diagnostic_sources(uri),
+                storage: PullStorage::Stored(slot),
+                evicted,
+            },
+            PullWrite::Discarded {
+                reason,
+                evicted,
+                items,
+            } => {
+                debug!(
+                    "discarding the pulled diagnostics of {}: {reason:?}",
+                    uri.as_ref()
+                );
+                PullSettlement {
+                    evicted,
+                    ..unstored(cache, items, Some(stamp.version()))
+                }
+            }
+        }
     }
 
     /// Convert a cached diagnostics entry into the MCP-facing result shape.
@@ -318,88 +438,6 @@ impl Translator {
         }
     }
 
-    /// Merge push-model diagnostics from the notification cache into a
-    /// pull-model (`textDocument/diagnostic`) result.
-    ///
-    /// rust-analyzer's pull endpoint omits diagnostics that are only ever
-    /// delivered via `textDocument/publishDiagnostics` push notifications —
-    /// not just flycheck/clippy lints, but empirically (verified against a
-    /// live rust-analyzer 1.97.1 session, see #244) some native diagnostics
-    /// too. Those are cached separately in `NotificationCache`.
-    ///
-    /// Where the *same* logical problem is reported through both paths, the
-    /// two representations were observed to differ in both `range` and
-    /// rendered `message`. Captured example, a "not all trait items
-    /// implemented" (E0046) error for one `impl` block: pull reported range
-    /// `(96,7)-(96,12)` (the trait name) with message "not all trait items
-    /// implemented, missing: `fn hello`"; the push notification for the same
-    /// error reported range `(95,1)-(95,32)` (the impl block) with message
-    /// "not all trait items implemented, missing: `hello`\nmissing `hello`
-    /// in implementation" — same `code`/`severity`, adjacent but distinct
-    /// ranges, different message text. Exact field equality never dedups
-    /// cases like that.
-    ///
-    /// Given that, a cache entry is treated as a duplicate of a pull entry
-    /// when both carry a `code`, the `(severity, code)` pair matches, *and*
-    /// the two ranges are either overlapping or start within
-    /// `DUPLICATE_RANGE_PROXIMITY_LINES` lines of each other — close
-    /// enough to be the same underlying model divergence, not two distinct
-    /// occurrences of the same error class (e.g. two unrelated `E0308`
-    /// mismatches at different call sites in one file, one caught only
-    /// natively and one only by flycheck). Diagnostics with no `code` fall
-    /// back to full-field equality, since there is no cheaper stable
-    /// identity available for them.
-    ///
-    /// Output is sorted by `(start.line, start.character)` so merged
-    /// cache-only entries don't land out of document order after the
-    /// pull-model ones.
-    #[must_use]
-    pub async fn merge_diagnostics(
-        mut pull: DiagnosticsResult,
-        diag_info: Option<&DiagnosticInfo>,
-        encoding: PositionEncoding,
-        tracker: &Arc<DocumentTracker>,
-    ) -> DiagnosticsResult {
-        /// Start-line distance within which same-code, same-severity
-        /// diagnostics from the two models are still considered the same
-        /// underlying problem. Derived from the captured E0046 case above
-        /// (1 line apart); wide enough to absorb span drift between
-        /// rust-analyzer's own spans and rustc's, narrow enough that two
-        /// genuinely distinct same-code errors elsewhere in a file are not
-        /// collapsed into one.
-        const DUPLICATE_RANGE_PROXIMITY_LINES: u32 = 3;
-
-        fn position_le(a: &Position2D, b: &Position2D) -> bool {
-            (a.line, a.character) <= (b.line, b.character)
-        }
-
-        fn ranges_close(a: &Range, b: &Range) -> bool {
-            let overlaps = position_le(&a.start, &b.end) && position_le(&b.start, &a.end);
-            overlaps || a.start.line.abs_diff(b.start.line) <= DUPLICATE_RANGE_PROXIMITY_LINES
-        }
-
-        fn is_duplicate(pull: &[Diagnostic], candidate: &Diagnostic) -> bool {
-            pull.iter().any(|p| match (&candidate.code, &p.code) {
-                (Some(c), Some(pc)) if c == pc && p.severity == candidate.severity => {
-                    ranges_close(&p.range, &candidate.range)
-                }
-                _ => p == candidate,
-            })
-        }
-
-        let cached = Self::diagnostics_from_cache_entry(diag_info, encoding, tracker).await;
-        pull.positions_degraded = pull.positions_degraded.max(cached.positions_degraded);
-        let new_diagnostics: Vec<_> = cached
-            .diagnostics
-            .into_iter()
-            .filter(|c| !is_duplicate(&pull.diagnostics, c))
-            .collect();
-        pull.diagnostics.extend(new_diagnostics);
-        pull.diagnostics
-            .sort_by_key(|d| (d.range.start.line, d.range.start.character));
-        pull
-    }
-
     /// Handle server logs request.
     ///
     /// Logs at least as severe as `min_level` are returned, or all of them
@@ -435,6 +473,9 @@ impl Translator {
         Ok(ServerMessagesResult { messages })
     }
 }
+
+#[cfg(test)]
+mod pull_tests;
 
 #[cfg(test)]
 mod tests {
@@ -792,13 +833,11 @@ mod tests {
         assert_matches!(result, Err(Error::FileIo { .. }));
     }
 
+    /// #497: a non-UTF-16 server whose document cannot be resolved reports
+    /// its positions as degraded, so the merged result carries the flag.
     #[tokio::test]
-    async fn test_merge_diagnostics_cache_only_appends_to_empty_pull() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-            positions_degraded: None,
-        };
-        let cache = diag_info(vec![lsp_diag(
+    async fn test_diagnostics_from_cache_entry_flags_degraded_positions() {
+        let info = diag_info(vec![lsp_diag(
             0,
             10,
             lsp_types::DiagnosticSeverity::Warning,
@@ -806,360 +845,24 @@ mod tests {
             None,
         )]);
 
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(merged.diagnostics.len(), 1);
-        assert_eq!(merged.diagnostics[0].message, "unused import: `std::fmt`");
-        assert_matches!(merged.diagnostics[0].severity, DiagnosticSeverity::Warning);
-    }
-
-    #[tokio::test]
-    async fn test_merge_diagnostics_exact_duplicate_not_repeated() {
-        // Same range/severity/message/code as the cache entry below, expressed
-        // in the 1-based MCP shape `diagnostics_from_cache_entry` would produce.
-        let pull_diag = Diagnostic {
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 11,
-                },
-            },
-            severity: DiagnosticSeverity::Error,
-            message: "mismatched types".to_string(),
-            code: Some("E0308".to_string()),
-        };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-            positions_degraded: None,
-        };
-        let cache = diag_info(vec![lsp_diag(
-            0,
-            10,
-            lsp_types::DiagnosticSeverity::Error,
-            "mismatched types",
-            Some("E0308"),
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(merged.diagnostics.len(), 1);
-        assert_eq!(merged.diagnostics[0], pull_diag);
-    }
-
-    /// #497 test gap: `merge_diagnostics` must actually take the worse of the
-    /// pull and cache `positions_degraded` values, not just
-    /// pass one through -- exercised here with the pull side degraded and
-    /// the cache side (UTF-16, never degradable) not.
-    #[tokio::test]
-    async fn test_merge_diagnostics_positions_degraded_true_when_pull_side_is_degraded() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-            positions_degraded: Some(PositionDegradation::Response),
-        };
-        let cache = diag_info(vec![lsp_diag(
-            0,
-            10,
-            lsp_types::DiagnosticSeverity::Warning,
-            "unused import: `std::fmt`",
-            None,
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(
-            merged.positions_degraded,
-            Some(PositionDegradation::Response),
-            "the pull side's degraded flag must survive the merge even when the cache side \
-             isn't degraded"
-        );
-    }
-
-    /// #497 test gap companion: the same OR-merge, but with the degradation
-    /// coming from the *cache* side instead -- `diagnostics_from_cache_entry`
-    /// under a non-UTF-16 encoding, resolving `diag_info`'s uri
-    /// (`file:///test.rs`, which does not exist on disk), degrades on its
-    /// own. Proves the merge isn't only ever driven by the pull side.
-    #[tokio::test]
-    async fn test_merge_diagnostics_positions_degraded_true_when_cache_side_is_degraded() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-            positions_degraded: None,
-        };
-        let cache = diag_info(vec![lsp_diag(
-            0,
-            10,
-            lsp_types::DiagnosticSeverity::Warning,
-            "unused import: `std::fmt`",
-            None,
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
+        let result = Translator::diagnostics_from_cache_entry(
+            Some(&info),
             PositionEncoding::Utf8,
             &test_tracker(),
         )
         .await;
 
         assert_eq!(
-            merged.positions_degraded,
-            Some(PositionDegradation::Response),
-            "the cache side's degraded flag must be OR-ed into the merged result even when the \
-             pull side isn't degraded"
+            result.positions_degraded,
+            Some(PositionDegradation::Response)
         );
-    }
-
-    #[tokio::test]
-    async fn test_merge_diagnostics_no_cache_entry_returns_pull_unchanged() {
-        let pull_diag = Diagnostic {
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 5,
-                },
-            },
-            severity: DiagnosticSeverity::Error,
-            message: "syntax error".to_string(),
-            code: None,
-        };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-            positions_degraded: None,
-        };
-
-        let merged =
-            Translator::merge_diagnostics(pull, None, PositionEncoding::Utf16, &test_tracker())
-                .await;
-
-        assert_eq!(merged.diagnostics, vec![pull_diag]);
-    }
-
-    #[tokio::test]
-    async fn test_merge_diagnostics_multiple_distinct_cache_entries_all_appear() {
-        let pull = DiagnosticsResult {
-            diagnostics: vec![],
-            positions_degraded: None,
-        };
-        let cache = diag_info(vec![
-            lsp_diag(
-                0,
-                10,
-                lsp_types::DiagnosticSeverity::Warning,
-                "unused import: `std::fmt`",
-                None,
-            ),
-            lsp_diag(
-                5,
-                8,
-                lsp_types::DiagnosticSeverity::Warning,
-                "function `helper` is never used",
-                None,
-            ),
-        ]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
+        let utf16 = Translator::diagnostics_from_cache_entry(
+            Some(&info),
             PositionEncoding::Utf16,
             &test_tracker(),
         )
         .await;
-
-        assert_eq!(merged.diagnostics.len(), 2);
-        assert!(
-            merged
-                .diagnostics
-                .iter()
-                .any(|d| d.message == "unused import: `std::fmt`")
-        );
-        assert!(
-            merged
-                .diagnostics
-                .iter()
-                .any(|d| d.message == "function `helper` is never used")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_merge_diagnostics_same_range_different_message_not_deduped() {
-        let pull_diag = Diagnostic {
-            range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 11,
-                },
-            },
-            severity: DiagnosticSeverity::Error,
-            message: "mismatched types".to_string(),
-            code: None,
-        };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag],
-            positions_degraded: None,
-        };
-        // Same range and severity as the pull diagnostic, but a different
-        // message — must be treated as a distinct diagnostic, not a duplicate.
-        let cache = diag_info(vec![lsp_diag(
-            0,
-            10,
-            lsp_types::DiagnosticSeverity::Error,
-            "expected `i32`, found `&str`",
-            None,
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(merged.diagnostics.len(), 2);
-    }
-
-    /// Pins a cross-model duplicate shape verified empirically against a live
-    /// rust-analyzer 1.97.1 session (#244): the pull and push diagnostics for
-    /// the *same* "not all trait items implemented" (E0046) error had
-    /// different ranges (trait name vs. impl block) and different messages
-    /// (terse vs. rustc's full rendering), but shared `code` and `severity`.
-    /// Exact-field dedup would report this twice; the `(severity, code)`
-    /// fingerprint must collapse it to one entry.
-    #[tokio::test]
-    async fn test_merge_diagnostics_same_code_different_range_and_message_deduped() {
-        let pull_diag = Diagnostic {
-            range: Range {
-                start: Position2D {
-                    line: 96,
-                    character: 7,
-                },
-                end: Position2D {
-                    line: 96,
-                    character: 12,
-                },
-            },
-            severity: DiagnosticSeverity::Error,
-            message: "not all trait items implemented, missing: `fn hello`".to_string(),
-            code: Some("E0046".to_string()),
-        };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-            positions_degraded: None,
-        };
-        // Same code and severity, but a different range and a longer,
-        // differently-worded message -- the rustc-rendered push side of the
-        // same underlying error.
-        let cache = diag_info(vec![lsp_diag(
-            94,
-            31,
-            lsp_types::DiagnosticSeverity::Error,
-            "not all trait items implemented, missing: `hello`\nmissing `hello` in implementation",
-            Some("E0046"),
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(merged.diagnostics.len(), 1);
-        assert_eq!(merged.diagnostics[0], pull_diag);
-    }
-
-    /// Regression: `merge_diagnostics`'s `(severity, code)` fingerprint alone
-    /// is coarser than full-field equality and cannot tell apart two
-    /// genuinely distinct diagnostics that happen to share `code` and
-    /// `severity` -- e.g. two separate `E0308` mismatched-type errors at
-    /// different locations in the same file, one caught only by native
-    /// (pull) analysis and a second, unrelated one caught only by
-    /// flycheck/cargo check (cache), such as an error inside macro-expanded
-    /// code the native pass did not evaluate. This previously caused the
-    /// cache-only entry to be silently dropped -- reproducing #244's exact
-    /// failure mode, just relocated from "no merge" to "over-eager dedup".
-    ///
-    /// The range-proximity check on `is_duplicate` (see `merge_diagnostics`)
-    /// closes this: these two diagnostics are 45 lines apart, far outside
-    /// `DUPLICATE_RANGE_PROXIMITY_LINES`, so both must survive the merge.
-    #[tokio::test]
-    async fn test_merge_diagnostics_same_code_distinct_diagnostics_at_different_locations_both_kept()
-     {
-        let pull_diag = Diagnostic {
-            range: Range {
-                start: Position2D {
-                    line: 5,
-                    character: 9,
-                },
-                end: Position2D {
-                    line: 5,
-                    character: 20,
-                },
-            },
-            severity: DiagnosticSeverity::Error,
-            message: "mismatched types: expected `i32`, found `&str`".to_string(),
-            code: Some("E0308".to_string()),
-        };
-        let pull = DiagnosticsResult {
-            diagnostics: vec![pull_diag.clone()],
-            positions_degraded: None,
-        };
-        // A second, unrelated E0308 at a completely different location with
-        // a completely different message -- a real, distinct diagnostic,
-        // not a duplicate of pull_diag.
-        let cache = diag_info(vec![lsp_diag(
-            49,
-            22,
-            lsp_types::DiagnosticSeverity::Error,
-            "mismatched types: expected `String`, found `Vec<u8>`",
-            Some("E0308"),
-        )]);
-
-        let merged = Translator::merge_diagnostics(
-            pull,
-            Some(&cache),
-            PositionEncoding::Utf16,
-            &test_tracker(),
-        )
-        .await;
-
-        assert_eq!(merged.diagnostics.len(), 2);
-        assert_eq!(merged.diagnostics[0], pull_diag);
-        assert_eq!(
-            merged.diagnostics[1].message,
-            "mismatched types: expected `String`, found `Vec<u8>`"
-        );
+        assert_eq!(utf16.positions_degraded, None);
     }
 
     #[test]

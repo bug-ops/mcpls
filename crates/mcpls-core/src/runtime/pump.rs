@@ -272,26 +272,8 @@ async fn apply_notification(
                 cache.store_published_diagnostics(server_id, &published, p.version, p.diagnostics);
             }
 
-            let sessions = subs.live_sessions();
-
-            // Fast path: skip URI construction when nothing is subscribed.
-            let mut any_subscribed = false;
-            for session in &sessions {
-                if !session.is_empty().await {
-                    any_subscribed = true;
-                    break;
-                }
-            }
-            if !any_subscribed {
-                return;
-            }
-
-            let Some(mcp_uri) = DiagnosticsResourceUri::for_published(&published) else {
-                return;
-            };
-            for session in &sessions {
-                session.publish_if_subscribed(&mcp_uri).await;
-            }
+            publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
+                .await;
         }
         LspNotification::LogMessage(m) => {
             notification_cache
@@ -307,6 +289,26 @@ async fn apply_notification(
         }
         // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
         LspNotification::Progress(_) | LspNotification::Other { .. } => {}
+    }
+}
+
+/// Queues the resource `make_uri` builds on every session subscribed to it.
+///
+/// `make_uri` is only called when some session has a subscription at all, so
+/// the common case of nobody subscribed costs no URI construction.
+async fn publish_to_subscribers(
+    subs: &SubscriptionRegistry,
+    make_uri: impl FnOnce() -> Option<DiagnosticsResourceUri>,
+) {
+    if !subs.any_subscription().await {
+        return;
+    }
+
+    let Some(mcp_uri) = make_uri() else {
+        return;
+    };
+    for session in &subs.live_sessions() {
+        session.publish_if_subscribed(&mcp_uri).await;
     }
 }
 
@@ -391,6 +393,19 @@ impl bridge::NotificationWiring for PumpWiring {
                 })
                 .await;
         })
+    }
+
+    fn has_subscriptions(&self) -> futures::future::BoxFuture<'_, bool> {
+        Box::pin(self.shared.subs.any_subscription())
+    }
+
+    fn publish_changed<'a>(
+        &'a self,
+        file: &'a lsp_types::Uri,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(publish_to_subscribers(&self.shared.subs, || {
+            DiagnosticsResourceUri::for_canonical_file(file)
+        }))
     }
 }
 
@@ -1066,6 +1081,123 @@ mod pump_tests {
         assert_eq!(recv_within(&mut rx_cleared).await, cleared_uri);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    /// #574 FR-007: a file that already has a pulled slot is notified exactly
+    /// once per accepted push, as before the pulled slot existed.
+    #[tokio::test]
+    async fn test_push_beside_a_pulled_slot_notifies_exactly_once() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_session, mut rx_session) = mpsc::channel(8);
+        let x = test_mcp_uri("x.rs");
+        session
+            .subscribe_for_test(&x, Target::Channel(tx_session.clone()))
+            .await
+            .unwrap();
+        let cache = make_cache();
+        cache.lock().await.store_pulled_for_test(
+            &ServerId::from("rust"),
+            &test_uri("x.rs"),
+            vec![lsp_types::Diagnostic::default()],
+        );
+
+        let (tx, _cancel_tx) =
+            spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
+        tx.send(publish("x.rs")).await.unwrap();
+
+        assert_eq!(recv_within(&mut rx_session).await, x.as_str());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_matches!(rx_session.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+        assert!(
+            cache
+                .lock()
+                .await
+                .diagnostic_sources(&test_uri("x.rs"))
+                .merge()
+                .is_some_and(|info| info.diagnostics.len() == 1)
+        );
+    }
+
+    /// A pull that changed a file notifies the subscribers of that file only.
+    #[tokio::test]
+    async fn test_publish_changed_notifies_only_subscribers_of_the_file() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_x, mut rx_x) = mpsc::channel(8);
+        let (tx_y, mut rx_y) = mpsc::channel(8);
+        let (x, y) = (test_mcp_uri("x.rs"), test_mcp_uri("y.rs"));
+        session
+            .subscribe_for_test(&x, Target::Channel(tx_x.clone()))
+            .await
+            .unwrap();
+        session
+            .subscribe_for_test(&y, Target::Channel(tx_y.clone()))
+            .await
+            .unwrap();
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let wiring = PumpWiring {
+            shared: PumpShared {
+                notification_cache: make_cache(),
+                subs,
+                workspace_roots: test_workspace_roots(),
+            },
+            cancel_rx,
+        };
+
+        bridge::NotificationWiring::publish_changed(&wiring, &test_uri("x.rs")).await;
+
+        assert_eq!(recv_within(&mut rx_x).await, x.as_str());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_matches!(rx_y.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    /// With nobody subscribed a changed pull builds no URI and queues nothing.
+    #[tokio::test]
+    async fn test_publish_changed_without_subscribers_is_a_no_op() {
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let wiring = PumpWiring {
+            shared: PumpShared {
+                notification_cache: make_cache(),
+                subs: make_subs(),
+                workspace_roots: test_workspace_roots(),
+            },
+            cancel_rx,
+        };
+
+        bridge::NotificationWiring::publish_changed(&wiring, &test_uri("x.rs")).await;
+    }
+
+    /// The wiring reports whether any session subscribed, so a caller can skip
+    /// work only subscribers care about.
+    #[tokio::test]
+    async fn test_wiring_reports_whether_anything_is_subscribed() {
+        use crate::mcp::{SessionHandle, Target};
+
+        let subs = make_subs();
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let wiring = PumpWiring {
+            shared: PumpShared {
+                notification_cache: make_cache(),
+                subs: subs.clone(),
+                workspace_roots: test_workspace_roots(),
+            },
+            cancel_rx,
+        };
+        assert!(!bridge::NotificationWiring::has_subscriptions(&wiring).await);
+
+        let session = SessionHandle::new(subs);
+        let (tx_session, _rx_session) = mpsc::channel(8);
+        session
+            .subscribe_for_test(&test_mcp_uri("x.rs"), Target::Channel(tx_session))
+            .await
+            .unwrap();
+
+        assert!(bridge::NotificationWiring::has_subscriptions(&wiring).await);
     }
 
     /// #532: diagnostics a server publishes through a symlinked spelling

@@ -75,7 +75,7 @@ pub(super) fn test_uri() -> lsp_types::Uri {
 }
 
 /// A fresh, empty `DocumentTracker` for tests that call
-/// `diagnostics_from_cache_entry`/`merge_diagnostics` directly and don't
+/// `diagnostics_from_cache_entry` directly and don't
 /// care about the tracker fast path.
 pub(super) fn test_tracker() -> Arc<DocumentTracker> {
     Arc::new(DocumentTracker::new(
@@ -84,7 +84,7 @@ pub(super) fn test_tracker() -> Arc<DocumentTracker> {
     ))
 }
 
-/// Builds an LSP-side diagnostic for `merge_diagnostics` cache fixtures.
+/// Builds an LSP-side diagnostic for cache fixtures.
 pub(super) fn lsp_diag(
     line: u32,
     end_character: u32,

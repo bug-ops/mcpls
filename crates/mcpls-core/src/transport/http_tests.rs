@@ -2107,3 +2107,183 @@ async fn test_enforce_session_cap_leaves_unrelated_500_untouched() {
 
     server_task.abort();
 }
+
+/// #574 end to end over real sockets: a `get_diagnostics` pull that changes a
+/// file's diagnostics notifies exactly the sessions subscribed to that file, an
+/// identical pull notifies nobody, and a session that never reads its stream
+/// delays no other.
+///
+/// A and B (and the unread D) subscribe to `main.rs` and to `sentinel.rs`, C to
+/// `util.rs`. A push for `util.rs` through the pump shows the pull never
+/// reached C. Two pushes for `sentinel.rs` then flush A's and B's streams: an
+/// update left queued by the repeated pull would sit ahead of the second
+/// sentinel and fail the comparison.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one end-to-end scenario")]
+async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
+    use std::sync::Arc;
+
+    use tokio::io::BufReader;
+    use tokio::sync::{Mutex, watch};
+
+    use crate::bridge::{NotificationCache, ResultContext, Translator};
+    use crate::config::{LanguageId, ServerId, ToolRouter};
+    use crate::runtime::pump::{PumpShared, PumpWiring};
+    use crate::test_lsp::{client_path, fake_lsp_client, read_framed_message, write_response};
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(workspace.path()).unwrap();
+    let file_main = root.join("main.rs");
+    let file_util = root.join("util.rs");
+    let file_sentinel = root.join("sentinel.rs");
+    std::fs::write(&file_main, "fn main() {}").unwrap();
+    std::fs::write(&file_util, "fn util() {}").unwrap();
+    std::fs::write(&file_sentinel, "fn sentinel() {}").unwrap();
+    let uri_main = crate::bridge::resources::make_uri(&file_main).unwrap();
+    let uri_util = crate::bridge::resources::make_uri(&file_util).unwrap();
+    let uri_sentinel = crate::bridge::resources::make_uri(&file_sentinel).unwrap();
+    let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&root)).unwrap();
+
+    let server = test_server_with_roots(roots.clone());
+    let registry = server.subscription_registry();
+    let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
+    let cache = Arc::new(Mutex::new(NotificationCache::new()));
+
+    let mut translator = Translator::new()
+        .with_extensions(crate::test_lsp::test_extensions())
+        .with_router(ToolRouter::catch_all([(
+            ServerId::from("rust"),
+            LanguageId::from_static("rust"),
+        )]));
+    translator.set_workspace_roots(roots.clone());
+    let (client, mut fake) = fake_lsp_client();
+    translator.register_client("rust".to_string(), client);
+    let (_cancel, cancel_rx) = watch::channel(false);
+    translator.install_wiring(Arc::new(PumpWiring::new(
+        PumpShared {
+            notification_cache: Arc::clone(&cache),
+            subs: registry.clone(),
+            workspace_roots: roots.clone(),
+        },
+        cancel_rx,
+    )));
+    let translator = Arc::new(translator);
+
+    let (session_a, mut stream_a) = establish_session(addr).await;
+    let (session_b, mut stream_b) = establish_session(addr).await;
+    let (session_c, mut stream_c) = establish_session(addr).await;
+    let (session_d, _unread_stream_d) = establish_session(addr).await;
+    for session in [&session_a, &session_b, &session_d] {
+        subscribe_in_session(addr, session, &uri_main).await;
+        subscribe_in_session(addr, session, &uri_sentinel).await;
+    }
+    subscribe_in_session(addr, &session_c, &uri_util).await;
+
+    let mut wire = BufReader::new(&mut fake.write_stdout);
+    let report = serde_json::json!({
+        "kind": "full",
+        "items": [{
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}},
+            "severity": 1,
+            "message": "E0308 expected i32, found &str",
+            "code": "E0308"
+        }]
+    });
+    for round in 0..2 {
+        let task = {
+            let (translator, cache, path) = (
+                Arc::clone(&translator),
+                Arc::clone(&cache),
+                file_main.clone(),
+            );
+            tokio::spawn(async move {
+                translator
+                    .handle_diagnostics(client_path(path), ResultContext::None, &cache)
+                    .await
+            })
+        };
+        loop {
+            let request = read_framed_message(&mut wire).await;
+            if request["method"] == "textDocument/diagnostic" {
+                write_response(&mut fake.read_half_stdin, &request["id"], report.clone()).await;
+                break;
+            }
+        }
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.diagnostics.len(), 1, "round {round}");
+        if round == 0 {
+            assert_eq!(stream_a.next_resource_update().await, uri_main);
+            assert_eq!(stream_b.next_resource_update().await, uri_main);
+        }
+    }
+
+    let (tx, _cancel_tx) =
+        crate::test_lsp::spawn_test_pump_with_cache(registry, roots, Arc::clone(&cache));
+    let publish = |file: &std::path::Path| {
+        let notification =
+            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+                uri: crate::bridge::path_to_uri(file).unwrap(),
+                diagnostics: vec![],
+                version: None,
+            });
+        let tx = tx.clone();
+        async move { tx.send(notification).await.unwrap() }
+    };
+    publish(&file_util).await;
+    assert_eq!(stream_c.next_resource_update().await, uri_util);
+    for _ in 0..2 {
+        publish(&file_sentinel).await;
+        assert_eq!(stream_a.next_resource_update().await, uri_sentinel);
+        assert_eq!(stream_b.next_resource_update().await, uri_sentinel);
+    }
+
+    server_task.abort();
+}
+
+/// #574: a file known only through a pull is replayed exactly once, on a
+/// legacy `resources/subscribe` and on a `subscriptions/listen`.
+#[tokio::test]
+async fn test_pull_only_file_is_replayed_once_on_subscribe_and_listen() {
+    let (_workspace, root, file) = crate::test_lsp::workspace_with_main_rs();
+    let uri = crate::bridge::resources::make_uri(&file).unwrap();
+    let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::bridge::NotificationCache::new(),
+    ));
+    cache.lock().await.store_pulled_for_test(
+        &crate::config::ServerId::from("rust"),
+        &crate::bridge::path_to_uri(&file).unwrap(),
+        vec![lsp_types::Diagnostic::default()],
+    );
+    let server = crate::mcp::McplsServer::new(
+        std::sync::Arc::new(crate::bridge::Translator::new()),
+        cache,
+        WorkspaceRoots::from_configured(&[root]).unwrap(),
+        crate::mcp::SubscriptionRegistry::new(),
+        crate::ProjectConfigStatus::NotIgnored,
+        crate::config::McpConfig::default(),
+    );
+    let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
+    let quiet = std::time::Duration::from_millis(300);
+
+    let (session, mut stream) = establish_session(addr).await;
+    subscribe_in_session(addr, &session, &uri).await;
+    assert_eq!(stream.next_resource_update().await, uri);
+    assert!(
+        tokio::time::timeout(quiet, stream.next_resource_update())
+            .await
+            .is_err(),
+        "subscribe replayed more than once"
+    );
+
+    let mut listen =
+        SseStream::open_listen(addr, &serde_json::json!({"resourceSubscriptions": [uri]})).await;
+    assert_eq!(listen.next_resource_update().await, uri);
+    assert!(
+        tokio::time::timeout(quiet, listen.next_resource_update())
+            .await
+            .is_err(),
+        "listen replayed more than once"
+    );
+
+    server_task.abort();
+}
