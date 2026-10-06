@@ -2,9 +2,51 @@
 
 /// Implements the read-only conversions every validated text newtype shares.
 ///
-/// The type must be a tuple struct over `Cow<'static, str>` that provides
-/// `fn new(impl Into<String>) -> Result<Self, $err>`.
+/// The type must be a tuple struct over `Cow<'static, str>` or `String` that
+/// provides `fn new(impl Into<String>) -> Result<Self, $err>`.
+///
+/// The `non_blank` form also generates that constructor and `from_static`
+/// for a `Cow<'static, str>` newtype whose only rule is "not blank": `new`
+/// rejects blank text, `from_static` additionally requires ASCII so the
+/// literal check is a subset of `new`'s. `$what` names the value in the
+/// `from_static` panic message.
 macro_rules! impl_text_newtype {
+    ($ty:ident, $err:ident, non_blank, $what:literal) => {
+        impl $ty {
+            /// Builds the value from a literal, checked at compile time when
+            /// evaluated in a `const` context.
+            ///
+            /// Accepts only ASCII, non-blank literals, a subset of what
+            /// [`Self::new`] accepts.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the literal is blank or not ASCII.
+            #[must_use]
+            pub const fn from_static(text: &'static str) -> Self {
+                assert!(
+                    text.is_ascii() && !text.trim_ascii().is_empty(),
+                    concat!($what, " must be ASCII and not blank")
+                );
+                Self(::std::borrow::Cow::Borrowed(text))
+            }
+
+            /// Builds the value from any string.
+            ///
+            /// # Errors
+            ///
+            #[doc = concat!("Returns [`", stringify!($err), "`] if `text` is blank.")]
+            pub fn new(text: impl Into<String>) -> ::std::result::Result<Self, $err> {
+                let text = text.into();
+                if text.trim().is_empty() {
+                    return ::std::result::Result::Err($err);
+                }
+                Ok(Self(::std::borrow::Cow::Owned(text)))
+            }
+        }
+
+        impl_text_newtype!($ty, $err);
+    };
     ($ty:ident, $err:ty) => {
         impl $ty {
             /// The validated text.
@@ -30,7 +72,7 @@ macro_rules! impl_text_newtype {
 
         impl From<$ty> for String {
             fn from(value: $ty) -> Self {
-                value.0.into_owned()
+                Self::from(value.0)
             }
         }
 

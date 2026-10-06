@@ -4,8 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use lsp_types::{
     DocumentFormattingParams, DocumentRangeFormattingParams, FormattingOptions,
-    PartialResultParams, PrepareRenameParams, RenameParams as LspRenameParams,
-    TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
+    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 use tokio::task::JoinSet;
 
@@ -19,6 +18,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
+use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
@@ -546,29 +546,18 @@ impl Translator {
     ) -> Result<RenameResult> {
         validate_rename_params(&new_name)?;
 
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc: _doc,
+        } = self
+            .position_request::<lsp_types::RenameRequest>(
                 &file_path,
+                position,
                 Capability::Rename,
                 IndexingGate::Required,
-                &[position],
+                new_name,
             )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = LspRenameParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            new_name,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::RenameRequest>(params, client.request_timeout())
             .await?;
 
         let (changes, dropped) = if let Some(edit) = response {
@@ -612,43 +601,32 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<PrepareRenameResult> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .position_call::<lsp_types::PrepareRenameRequest>(
                 &file_path,
+                position,
                 Capability::PrepareRename,
                 IndexingGate::Required,
-                &[position],
+                (),
             )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = PrepareRenameParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let response = client
-            .request_typed_classified::<lsp_types::PrepareRenameRequest>(
-                params,
-                client.request_timeout(),
-            )
+            .await?
+            .send_classified()
             .await;
+        let response_uri = doc.uri();
         let outcome = match response {
             Ok(Some(lsp_types::PrepareRenameResult::Range(range))) => {
                 PrepareRenameOutcome::Renameable {
-                    range: ctx.normalize_range(&response_uri, range).await,
+                    range: ctx.normalize_range(response_uri, range).await,
                     placeholder: None,
                 }
             }
             Ok(Some(lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(p))) => {
                 PrepareRenameOutcome::Renameable {
-                    range: ctx.normalize_range(&response_uri, p.range).await,
+                    range: ctx.normalize_range(response_uri, p.range).await,
                     placeholder: Some(p.placeholder),
                 }
             }
@@ -687,7 +665,7 @@ impl Translator {
             .prepare_gated_document(
                 &file_path,
                 Capability::FormatDocument,
-                IndexingGate::NotRequired,
+                IndexingGate::FileLocal,
             )
             .await?;
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
@@ -735,7 +713,7 @@ impl Translator {
             .prepare_positioned_document(
                 &file_path,
                 Capability::FormatRange,
-                IndexingGate::NotRequired,
+                IndexingGate::FileLocal,
                 &[start, end],
             )
             .await?;

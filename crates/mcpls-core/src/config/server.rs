@@ -1,7 +1,7 @@
 //! LSP server configuration types.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -10,17 +10,19 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::bounded_secs::TimeoutSecs;
+use super::command_stem::CommandStem;
 use super::language_id::LanguageId;
+#[cfg(test)]
+use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
+use super::server_env::ServerEnv;
 use super::settings::LspSettings;
 use super::text_newtype::impl_text_newtype;
 use crate::bridge::IndexingPolicy;
 use crate::error::ConfigError;
-
-/// Default max depth for recursive marker search.
-pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
+use crate::lsp::HostOs;
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -69,60 +71,6 @@ impl ServerHeuristics {
         Self {
             project_markers: markers.into_iter().collect(),
         }
-    }
-
-    /// Check if any marker exists at the given workspace root.
-    ///
-    /// Returns `true` if:
-    /// - No markers are defined (empty = always applicable)
-    /// - At least one marker file/directory exists
-    #[must_use]
-    pub fn is_applicable(&self, workspace_root: &Path) -> bool {
-        if self.project_markers.is_empty() {
-            return true;
-        }
-        self.project_markers
-            .iter()
-            .any(|marker| workspace_root.join(marker.as_str()).exists())
-    }
-
-    /// Check if any marker exists anywhere in the workspace tree.
-    ///
-    /// Recursively searches the workspace for project markers, excluding
-    /// well-known directories like `node_modules`, `target`, `.git`, etc.
-    ///
-    /// # Arguments
-    ///
-    /// * `workspace_root` - Root directory to search from
-    /// * `max_depth` - Maximum recursion depth
-    ///
-    /// # Returns
-    ///
-    /// `true` if any marker is found, `false` otherwise.
-    #[must_use]
-    pub fn is_applicable_recursive(&self, workspace_root: &Path, max_depth: SearchDepth) -> bool {
-        if self.project_markers.is_empty() {
-            return true;
-        }
-
-        // First check the root level (fast path)
-        if self.is_applicable(workspace_root) {
-            return true;
-        }
-
-        self.find_any_marker_recursive(workspace_root, max_depth)
-    }
-
-    /// Search recursively for any marker file.
-    fn find_any_marker_recursive(&self, workspace_root: &Path, max_depth: SearchDepth) -> bool {
-        walk_names(workspace_root, max_depth, |name| {
-            if self.project_markers.iter().any(|m| m == name) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .is_break()
     }
 }
 
@@ -304,34 +252,7 @@ pub struct InvalidServerCommand;
 #[serde(try_from = "String", into = "String")]
 pub struct ServerCommand(Cow<'static, str>);
 
-impl ServerCommand {
-    /// Builds a command from a literal, checked at compile time when evaluated
-    /// in a `const` context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `command` is blank.
-    #[must_use]
-    pub const fn from_static(command: &'static str) -> Self {
-        assert!(!command.trim_ascii().is_empty(), "command cannot be blank");
-        Self(Cow::Borrowed(command))
-    }
-
-    /// Builds a command from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidServerCommand`] if `command` is blank.
-    pub fn new(command: impl Into<String>) -> Result<Self, InvalidServerCommand> {
-        let command = command.into();
-        if command.trim().is_empty() {
-            return Err(InvalidServerCommand);
-        }
-        Ok(Self(Cow::Owned(command)))
-    }
-}
-
-impl_text_newtype!(ServerCommand, InvalidServerCommand);
+impl_text_newtype!(ServerCommand, InvalidServerCommand, non_blank, "command");
 
 impl AsRef<OsStr> for ServerCommand {
     fn as_ref(&self) -> &OsStr {
@@ -519,7 +440,7 @@ pub struct LspServerConfig {
     pub args: Vec<String>,
 
     /// Environment variables for the LSP server process.
-    pub env: HashMap<String, String>,
+    pub env: ServerEnv,
 
     /// File patterns this server handles (glob patterns).
     pub file_patterns: Vec<FilePattern>,
@@ -605,7 +526,7 @@ struct RawLspServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    env: BTreeMap<String, String>,
     #[serde(default)]
     file_patterns: Vec<String>,
     #[serde(default)]
@@ -650,7 +571,7 @@ impl From<LspServerConfig> for RawLspServerConfig {
             language_id,
             command,
             args,
-            env,
+            env: env.into(),
             file_patterns: file_patterns.into_iter().map(String::from).collect(),
             initialization_options,
             settings,
@@ -690,6 +611,14 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
                 language: language_id.clone(),
             }
         })?;
+        let env = ServerEnv::from_entries(env, HostOs::CURRENT).map_err(|error| {
+            ConfigError::DuplicateEnvKey {
+                server: name
+                    .clone()
+                    .unwrap_or_else(|| ServerId::from(language_id.clone())),
+                error,
+            }
+        })?;
         let file_patterns = file_patterns
             .iter()
             .map(|pattern| {
@@ -718,35 +647,6 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
         })
     }
 }
-
-/// Maximum allowed value, in seconds, for both [`LspServerConfig::timeout_seconds`]
-/// and [`LspServerConfig::request_timeout_seconds`], enforced by [`TimeoutSecs`].
-///
-/// tokio's `timeout`/`sleep` fall back to `Instant::far_future()` for
-/// astronomically large durations instead of panicking, so an unbounded value
-/// on either field (misconfiguration or typo) would silently disable the
-/// timeout rather than fail with a diagnosable error.
-///
-/// Set to 900 (15 minutes), not a rounder 3600 (1 hour): [`LspClient::request`]
-/// retries a request up to 4 times total on a `-32802` (`ServerCancelled`) or
-/// `-32801` (`ContentModified`) response (one shared budget across both
-/// codes), so the worst-case latency for a single call bounded by this value
-/// is `4 * 900 + 3.5s` ≈ 1 hour, not 4 hours — this constant bounds one
-/// attempt, so it is chosen such that the actually-experienced worst case
-/// (the retried total) stays within about an hour.
-///
-/// [`LspClient::request`]: crate::lsp::LspClient::request
-pub const MAX_TIMEOUT_SECONDS: u64 = 900;
-
-/// Upper bound on `workspace.heuristics_max_depth`.
-///
-/// A guard against typos and misconfiguration (e.g. `999999`), not a bound on
-/// walk cost: the recursive project-marker walk in
-/// [`ServerHeuristics::is_applicable_recursive`] does not follow links, so
-/// its cost is bounded by the size of the tree regardless of this value.
-/// 64 is several times the default of 10 and well beyond any realistic
-/// project nesting.
-pub const MAX_HEURISTICS_DEPTH: usize = 64;
 
 /// Language servers mcpls ships a default configuration for.
 ///
@@ -873,14 +773,7 @@ impl BuiltinServer {
     /// ```
     #[must_use]
     pub fn matches_command(self, command: &str) -> bool {
-        let Some(stem) = Path::new(command).file_stem().and_then(OsStr::to_str) else {
-            return false;
-        };
-        if cfg!(windows) {
-            stem.eq_ignore_ascii_case(self.command())
-        } else {
-            stem == self.command()
-        }
+        CommandStem::of(command).is(self.command())
     }
 
     /// Look up a builtin by its exact executable name.
@@ -900,21 +793,6 @@ impl BuiltinServer {
 }
 
 impl LspServerConfig {
-    /// Check if this server should be spawned for the given workspace.
-    ///
-    /// Uses recursive marker search to detect nested projects.
-    ///
-    /// # Arguments
-    ///
-    /// * `workspace_root` - Root directory of the workspace
-    /// * `max_depth` - Maximum depth for recursive search
-    #[must_use]
-    pub fn should_spawn(&self, workspace_root: &Path, max_depth: SearchDepth) -> bool {
-        self.heuristics
-            .as_ref()
-            .is_none_or(|h| h.is_applicable_recursive(workspace_root, max_depth))
-    }
-
     /// The routing identity of this server: `name` if set, otherwise `language_id`.
     ///
     /// This is the key used across `Translator`'s client/server maps, so two
@@ -940,7 +818,7 @@ impl LspServerConfig {
             language_id,
             command: ServerCommand::from_static(server.command()).into(),
             args: args.iter().map(ToString::to_string).collect(),
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: file_patterns
                 .iter()
                 .map(|pattern| FilePattern::from_static(pattern))
@@ -1072,9 +950,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "command cannot be blank")]
+    #[should_panic(expected = "command must be ASCII and not blank")]
     fn test_server_command_from_static_panics_on_blank() {
         let _ = ServerCommand::from_static(" ");
+    }
+
+    #[test]
+    #[should_panic(expected = "command must be ASCII and not blank")]
+    fn test_server_command_from_static_panics_on_non_ascii_blank() {
+        let _ = ServerCommand::from_static("\u{a0}");
     }
 
     #[test]
@@ -1199,8 +1083,12 @@ mod tests {
 
     #[test]
     fn test_custom_config() {
-        let mut env = HashMap::new();
-        env.insert("RUST_LOG".to_string(), "debug".to_string());
+        let mut env = ServerEnv::default();
+        env.insert(
+            "RUST_LOG".to_string(),
+            "debug".to_string(),
+            crate::lsp::HostOs::CURRENT,
+        );
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
@@ -1221,7 +1109,10 @@ mod tests {
         assert_eq!(config.language_id, "custom");
         assert_eq!(config.command, "custom-lsp");
         assert_eq!(config.args, vec!["--flag"]);
-        assert_eq!(config.env.get("RUST_LOG"), Some(&"debug".to_string()));
+        assert_eq!(
+            config.env.get("RUST_LOG", crate::lsp::HostOs::CURRENT),
+            Some("debug")
+        );
         assert_eq!(config.file_patterns, ["**/*.custom"]);
         assert!(config.initialization_options.is_some());
         assert_eq!(config.timeout_seconds.get(), 60);
@@ -1354,7 +1245,7 @@ mod tests {
     fn test_heuristics_empty_always_applicable() {
         let heuristics = ServerHeuristics::default();
         let tmp = TempDir::new().unwrap();
-        assert!(heuristics.is_applicable(tmp.path()));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1363,14 +1254,14 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(heuristics.is_applicable(tmp.path()));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
     fn test_heuristics_marker_absent() {
         let tmp = TempDir::new().unwrap();
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(!heuristics.is_applicable(tmp.path()));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1379,7 +1270,7 @@ mod tests {
         std::fs::write(tmp.path().join("setup.py"), "").unwrap();
 
         let heuristics = heuristics_with(["pyproject.toml", "setup.py", "requirements.txt"]);
-        assert!(heuristics.is_applicable(tmp.path()));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1388,7 +1279,7 @@ mod tests {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("test-lsp").into(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
@@ -1401,7 +1292,7 @@ mod tests {
         };
 
         let tmp = TempDir::new().unwrap();
-        assert!(config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+        assert!(spawns(&config, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1410,14 +1301,14 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
 
         let config = LspServerConfig::rust_analyzer();
-        assert!(config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+        assert!(spawns(&config, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
     fn test_should_not_spawn_without_markers() {
         let tmp = TempDir::new().unwrap();
         let config = LspServerConfig::rust_analyzer();
-        assert!(!config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!spawns(&config, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1480,7 +1371,7 @@ mod tests {
     fn test_recursive_empty_markers_always_applicable() {
         let heuristics = ServerHeuristics::default();
         let tmp = TempDir::new().unwrap();
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1489,7 +1380,7 @@ mod tests {
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1503,7 +1394,7 @@ mod tests {
         std::fs::write(python_dir.join("pyproject.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["pyproject.toml", "setup.py"]);
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1515,7 +1406,7 @@ mod tests {
         std::fs::write(deep_path.join("go.mod"), "").unwrap();
 
         let heuristics = heuristics_with(["go.mod"]);
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1525,7 +1416,7 @@ mod tests {
         std::fs::write(tmp.path().join("src").join("main.rs"), "").unwrap();
 
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1538,9 +1429,13 @@ mod tests {
 
         let heuristics = heuristics_with(["Cargo.toml"]);
         // With max_depth=3, should not find marker at depth 5
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::new(3).unwrap()));
+        assert!(!applies(
+            &heuristics,
+            tmp.path(),
+            SearchDepth::new(3).unwrap()
+        ));
         // With max_depth=10 (default), should find it
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1552,7 +1447,7 @@ mod tests {
         std::fs::write(node_modules.join("package.json"), "").unwrap();
 
         let heuristics = heuristics_with(["package.json"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1564,7 +1459,7 @@ mod tests {
         std::fs::write(target.join("Cargo.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1575,7 +1470,7 @@ mod tests {
         std::fs::write(git_dir.join("Cargo.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["Cargo.toml"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1586,7 +1481,7 @@ mod tests {
         std::fs::write(pycache.join("pyproject.toml"), "").unwrap();
 
         let heuristics = heuristics_with(["pyproject.toml"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1597,7 +1492,7 @@ mod tests {
         std::fs::write(venv.join("setup.py"), "").unwrap();
 
         let heuristics = heuristics_with(["setup.py"]);
-        assert!(!heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(!applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     /// #476: `standard_filters(false)` is a bulk setter that resets
@@ -1618,7 +1513,7 @@ mod tests {
 
         let heuristics = heuristics_with(["Cargo.toml"]);
         assert!(
-            !heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT),
+            !applies(&heuristics, tmp.path(), SearchDepth::DEFAULT),
             "marker inside a gitignored directory must not make the server applicable"
         );
     }
@@ -1636,7 +1531,7 @@ mod tests {
         std::fs::write(src.join("package.json"), "").unwrap();
 
         let heuristics = heuristics_with(["package.json"]);
-        assert!(heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1660,9 +1555,13 @@ mod tests {
         let python_heuristics = heuristics_with(["pyproject.toml"]);
         let ts_heuristics = heuristics_with(["package.json"]);
 
-        assert!(rust_heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
-        assert!(python_heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
-        assert!(ts_heuristics.is_applicable_recursive(tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(&rust_heuristics, tmp.path(), SearchDepth::DEFAULT));
+        assert!(applies(
+            &python_heuristics,
+            tmp.path(),
+            SearchDepth::DEFAULT
+        ));
+        assert!(applies(&ts_heuristics, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1674,7 +1573,7 @@ mod tests {
         std::fs::write(python_dir.join("pyproject.toml"), "").unwrap();
 
         let config = LspServerConfig::pyright();
-        assert!(config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+        assert!(spawns(&config, tmp.path(), SearchDepth::DEFAULT));
     }
 
     #[test]
@@ -1686,9 +1585,21 @@ mod tests {
 
         let config = LspServerConfig::rust_analyzer();
         // Shallow depth should not find it
-        assert!(!config.should_spawn(tmp.path(), SearchDepth::new(2).unwrap()));
+        assert!(!spawns(&config, tmp.path(), SearchDepth::new(2).unwrap()));
         // Default depth should find it
-        assert!(config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+        assert!(spawns(&config, tmp.path(), SearchDepth::DEFAULT));
+    }
+
+    fn applies(heuristics: &ServerHeuristics, root: &Path, depth: SearchDepth) -> bool {
+        let server = LspServerConfig {
+            heuristics: Some(heuristics.clone()),
+            ..LspServerConfig::rust_analyzer()
+        };
+        spawns(&server, root, depth)
+    }
+
+    fn spawns(server: &LspServerConfig, root: &Path, depth: SearchDepth) -> bool {
+        scan(&[root], std::slice::from_ref(server), depth).applies_to(server)
     }
 
     fn scan(roots: &[&Path], servers: &[LspServerConfig], depth: SearchDepth) -> MarkerScan {
@@ -1727,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_marker_scan_agrees_with_should_spawn() {
+    fn test_marker_scan_skips_excluded_directories_and_markers_below_the_depth() {
         let tmp = TempDir::new().unwrap();
         for (dir, file) in [
             ("a/b", "go.mod"),
@@ -1741,14 +1652,12 @@ mod tests {
         let servers = all_builtins();
         let found = scan(&[tmp.path()], &servers, SearchDepth::DEFAULT);
 
-        for server in &servers {
-            assert_eq!(
-                found.applies_to(server),
-                server.should_spawn(tmp.path(), SearchDepth::DEFAULT),
-                "{}",
-                server.language_id
-            );
-        }
+        let applying: Vec<_> = servers
+            .iter()
+            .filter(|server| found.applies_to(server))
+            .map(|server| server.language_id.as_str())
+            .collect();
+        assert_eq!(applying, ["typescript", "go"]);
     }
 
     #[test]

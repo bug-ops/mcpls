@@ -250,7 +250,7 @@ pub fn init(level: &LogFilter, format: LogFormat) -> Result<()> {
     // Use stderr for logs so stdout remains clean for MCP protocol
     let registry = tracing_subscriber::registry().with(filter);
 
-    match format {
+    let installed = match format {
         LogFormat::Json => registry
             .with(
                 fmt::layer()
@@ -271,8 +271,10 @@ pub fn init(level: &LogFilter, format: LogFormat) -> Result<()> {
                     .compact(),
             )
             .try_init(),
+    };
+    if let Err(err) = installed {
+        eprintln!("mcpls: tracing subscriber not installed: {err}");
     }
-    .ok(); // Ignore if already initialized
 
     Ok(())
 }

@@ -255,7 +255,7 @@ request and again after it, and the two samples are combined with `IndexingSigna
 read that overlapped indexing is flagged even when indexing ends mid-request. Only a tracked
 `Loading` state sets the flag; `Unknown` never does (FR-006).
 
-**Audit of every `IndexingGate::NotRequired` site (FR-001).**
+**Audit of every ungated site, formerly `IndexingGate::NotRequired` (FR-001).**
 
 | Tool | Class | Decision |
 |------|-------|----------|
@@ -268,8 +268,11 @@ read that overlapped indexing is flagged even when indexing ends mid-request. On
 | `get_folding_ranges`, `get_selection_ranges` | file-local | exempt |
 | `format_document`, `format_range` | file-local | exempt |
 
-The classification is repeated on the `IndexingGate::NotRequired` doc comment so a new ungated
-site has to pick a class. The incoming and outgoing call tools stay `Required` (FR-009).
+The classification is typed (#690): `IndexingGate` is `Required` or `FileLocal`, and the four
+flagged tools open through `Translator::prepare_disclosed_document`, whose `DisclosedDocument` has
+no client accessor and answers only through `request`, which samples around the call and returns
+`Indexed<T>`. A new name-resolving tool therefore cannot omit the flag. The incoming and outgoing
+call tools stay `Required` (FR-009).
 
 **Shape.** The field is the flattened `IndexingSignal` (`indexing_in_progress`), not the full
 `RouteSignals` object: `push_notifications_degraded` concerns push-delivered diagnostics and has no

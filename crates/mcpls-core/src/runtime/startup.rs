@@ -166,6 +166,7 @@ async fn init_lsp_servers(
         .await
         .attach_documents(Arc::clone(translator.document_tracker()));
     let pump_shared = PumpShared {
+        roles: crate::runtime::pump::DiagnosticsRoles::default(),
         notification_cache: Arc::clone(&notification_cache),
         subs: subscription_registry,
         workspace_roots,
@@ -191,7 +192,7 @@ async fn init_lsp_servers(
                 )
             })
             .collect(),
-        roles: HashMap::new(),
+        languages: HashMap::new(),
         pumps: JoinSet::new(),
         tally: StartupTally::default(),
     };
@@ -260,7 +261,8 @@ struct StartupSettler<'a> {
     cancel: CancellationToken,
     /// `(id, language)` of every configured server, settled or not.
     configured: Vec<(ServerId, LanguageId)>,
-    roles: HashMap<ServerId, (LanguageId, tokio::sync::watch::Sender<DiagnosticsRole>)>,
+    /// The language of every server that has a pump, for recomputing its role.
+    languages: HashMap<ServerId, LanguageId>,
     pumps: JoinSet<()>,
     tally: StartupTally,
 }
@@ -279,7 +281,7 @@ impl StartupSettler<'_> {
         if self.cancel.is_cancelled() {
             return;
         }
-        let notification_rx = server.take_notification_rx();
+        let notification_inbox = server.take_notification_inbox();
         let lifecycle_rx = server.take_lifecycle_rx();
         let pinned_tsserver = server.init_config().pinned_tsserver();
         let policy = server.init_config().server_config().indexing;
@@ -299,13 +301,16 @@ impl StartupSettler<'_> {
             .respawn_lock(&server.init_config().server_config().id());
         let serialized = respawn_lock.lock().await;
         let (id, language) = self.translator.settle_started(server);
-        let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
-        self.roles.insert(id.clone(), (language, role_tx));
+        let role_rx = self
+            .pump_shared
+            .roles
+            .subscribe(&id, self.diagnostics_role(&language, &id));
+        self.languages.insert(id.clone(), language);
         self.recompute_roles().await;
         let pump = self.pumps.spawn(supervised_pump(
             id.clone(),
             NotificationReceivers {
-                notifications: notification_rx,
+                notifications: notification_inbox,
                 lifecycle: lifecycle_rx,
                 pinned_tsserver,
             },
@@ -346,13 +351,10 @@ impl StartupSettler<'_> {
     /// Pending servers count toward the route count, so it equals the batch
     /// value once every server has settled.
     async fn recompute_roles(&self) {
-        for (id, (language, role_tx)) in &self.roles {
-            let role = self.diagnostics_role(language, id);
-            role_tx.send_if_modified(|current| {
-                let changed = *current != role;
-                *current = role;
-                changed
-            });
+        for (id, language) in &self.languages {
+            self.pump_shared
+                .roles
+                .set(id, self.diagnostics_role(language, id));
         }
         let route_count = self
             .configured
@@ -387,6 +389,7 @@ mod settler_tests {
             translator,
             notification_cache: Arc::clone(cache),
             pump_shared: PumpShared {
+                roles: crate::runtime::pump::DiagnosticsRoles::default(),
                 notification_cache: Arc::clone(cache),
                 subs,
                 workspace_roots: WorkspaceRoots::default(),
@@ -396,7 +399,7 @@ mod settler_tests {
                 .iter()
                 .map(|c| (c.id(), c.language_id.clone()))
                 .collect(),
-            roles: HashMap::new(),
+            languages: HashMap::new(),
             pumps: JoinSet::new(),
             tally: StartupTally::default(),
         }
@@ -570,7 +573,8 @@ mod settler_tests {
                 crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
             )))
             .await;
-        let role = |settler: &StartupSettler<'_>| *settler.roles[&catch_all.id()].1.borrow();
+        let role =
+            |settler: &StartupSettler<'_>| settler.pump_shared.roles.get(&catch_all.id()).unwrap();
         assert_eq!(role(&settler), DiagnosticsRole::Secondary);
         assert_eq!(cache.lock().await.configured_route_count(), Some(1));
 

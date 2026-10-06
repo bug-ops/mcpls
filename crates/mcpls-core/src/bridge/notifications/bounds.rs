@@ -4,7 +4,7 @@
 use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use tracing::warn;
 
-use super::message_as_str;
+use super::{ReportedSeverity, message_as_str};
 use crate::util::{truncate_str, truncate_string};
 
 /// Maximum size, in bytes, of a single cached log message, server message,
@@ -51,6 +51,11 @@ pub(super) const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 pub struct BoundedDiagnostics(pub(super) Vec<LspDiagnostic>);
 
 impl BoundedDiagnostics {
+    /// The bounded list.
+    pub(crate) fn into_vec(self) -> Vec<LspDiagnostic> {
+        self.0
+    }
+
     /// Truncates each message to `MAX_ENTRY_TEXT_BYTES` and bounds the list to
     /// `MAX_DIAGNOSTICS_ENTRY_BYTES`, keeping the most severe diagnostics when
     /// the list has to be cut.
@@ -97,27 +102,6 @@ const JSON_ESCAPE_WORST_CASE_FACTOR: usize = 6;
 /// regardless of JSON encoding overhead.
 pub(super) const DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES: usize = 1024;
 
-/// Ordinal rank used to sort diagnostics by severity before
-/// [`cap_diagnostics_entry_size`] truncates an oversized list -- lower rank
-/// sorts first, so it is kept preferentially (#311 S6).
-///
-/// `DiagnosticSeverity`'s inner value is private, so its natural numeric
-/// ordering (`ERROR` < `WARNING` < `INFORMATION` < `HINT`) can't be read
-/// directly; `Option<DiagnosticSeverity>`'s *derived* `Ord` would also rank
-/// `None` before every `Some` value, the opposite of what's wanted here
-/// (no reported severity is treated as least important, same as `HINT`).
-/// This maps explicitly instead of relying on either.
-pub(super) const fn diagnostic_severity_rank(diagnostic: &LspDiagnostic) -> u8 {
-    match diagnostic.severity {
-        Some(lsp_types::DiagnosticSeverity::Error) => 0,
-        Some(lsp_types::DiagnosticSeverity::Warning) => 1,
-        Some(lsp_types::DiagnosticSeverity::Information) => 2,
-        // An unrecognized (future) severity value is treated the same as
-        // no severity at all: least important, not most.
-        Some(_) | None => 3,
-    }
-}
-
 /// Largest `k` such that `fits(&diagnostics[..k])`, found via binary search
 /// rather than a linear scan or a flat halve (#311 S6).
 ///
@@ -161,6 +145,45 @@ pub(super) fn truncate_message(
             m.value = truncate_string(m.value, max_bytes);
             lsp_types::Message::MarkupContent(m)
         }
+    }
+}
+
+/// An upper bound of the serialized size of `diagnostics`, or `None` when a
+/// field that needs real serialization to size (`data`, `code_description`,
+/// `related_information`, `tags`) is present.
+fn cheap_size_estimate(diagnostics: &[LspDiagnostic]) -> Option<usize> {
+    let cheaply_estimable = diagnostics.iter().all(|d| {
+        d.data.is_none()
+            && d.code_description.is_none()
+            && d.related_information.is_none()
+            && d.tags.is_none()
+    });
+    cheaply_estimable.then(|| {
+        diagnostics
+            .iter()
+            .map(|d| {
+                let raw_string_bytes = message_as_str(&d.message)
+                    .len()
+                    .saturating_add(d.source.as_deref().map_or(0, str::len))
+                    .saturating_add(match &d.code {
+                        Some(lsp_types::Code::String(s)) => s.len(),
+                        _ => 0,
+                    });
+                raw_string_bytes
+                    .saturating_mul(JSON_ESCAPE_WORST_CASE_FACTOR)
+                    .saturating_add(DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES)
+            })
+            .sum()
+    })
+}
+
+impl BoundedDiagnostics {
+    /// The bytes the list takes in a buffer: a cheap upper bound of its
+    /// serialized size, or the real one when a field cannot be sized cheaply.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        cheap_size_estimate(&self.0).unwrap_or_else(|| {
+            serde_json::to_vec(&self.0).map_or(MAX_DIAGNOSTICS_ENTRY_BYTES, |bytes| bytes.len())
+        })
     }
 }
 
@@ -217,31 +240,10 @@ pub(super) fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDia
         serde_json::to_vec(ds).is_ok_and(|bytes| bytes.len() <= MAX_DIAGNOSTICS_ENTRY_BYTES)
     };
 
-    let cheaply_estimable = diagnostics.iter().all(|d| {
-        d.data.is_none()
-            && d.code_description.is_none()
-            && d.related_information.is_none()
-            && d.tags.is_none()
-    });
-    if cheaply_estimable {
-        let estimated: usize = diagnostics
-            .iter()
-            .map(|d| {
-                let raw_string_bytes = message_as_str(&d.message)
-                    .len()
-                    .saturating_add(d.source.as_deref().map_or(0, str::len))
-                    .saturating_add(match &d.code {
-                        Some(lsp_types::Code::String(s)) => s.len(),
-                        _ => 0,
-                    });
-                raw_string_bytes
-                    .saturating_mul(JSON_ESCAPE_WORST_CASE_FACTOR)
-                    .saturating_add(DIAGNOSTIC_ESTIMATE_OVERHEAD_BYTES)
-            })
-            .sum();
-        if estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES {
-            return;
-        }
+    if cheap_size_estimate(diagnostics)
+        .is_some_and(|estimated| estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES)
+    {
+        return;
     }
 
     if fits(diagnostics) {
@@ -258,7 +260,7 @@ pub(super) fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDia
     // diagnostics) and was severity-blind (would keep hundreds of leading
     // HINT-level noise over a later ERROR). At least one diagnostic is
     // always kept here so the mitigations below have a survivor to act on.
-    diagnostics.sort_by_key(diagnostic_severity_rank);
+    diagnostics.sort_by_key(ReportedSeverity::of);
     let keep = largest_fitting_prefix(diagnostics, fits).max(1);
     diagnostics.truncate(keep);
     if diagnostics.len() < original_count {

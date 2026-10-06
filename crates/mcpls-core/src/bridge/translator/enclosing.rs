@@ -496,7 +496,7 @@ impl Translator {
                 .prepare_gated_document_for_path(
                     &path,
                     Capability::DocumentSymbols,
-                    IndexingGate::NotRequired,
+                    IndexingGate::FileLocal,
                 )
                 .await?;
             let FetchedSymbols { doc, ctx, response } = self.fetch_document_symbols(doc).await?;

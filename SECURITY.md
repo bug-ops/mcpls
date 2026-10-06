@@ -165,14 +165,30 @@ enforces the following, and nothing more:
 - **Launcher.** A `command` that lets the workspace choose the program is
   refused: package runners (`npm`, `npx`, `bunx`, `pnpm`, `pnpx`, `yarn`, `uvx`,
   `corepack`, `deno npm:`), task runners (`make`, `just`, `task`, `rake`, `mvn`,
-  `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`,
-  `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
+  `sbt`), programs that run their arguments (`xargs`, `find`, `awk`, `gawk`,
+  `mawk`, `nawk`, `script`, `su`, `flock`, `watch`) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
+  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
   `./node_modules/.bin/<name>` from the working directory before anything else
   and reads a workspace `.npmrc`, so the planted package would run. `env` is
-  unwrapped; `env -S` and a shell started with `-c` cannot be analyzed and are
-  refused. `deno lsp` is allowed. The list matches the command's file stem and
-  arguments and is best-effort: the trusted configuration is the boundary, so
-  install the server globally and give its absolute path as `command`.
+  unwrapped; `env -S` cannot be analyzed and is refused. A command string
+  cannot be analyzed either, so it is refused for these shells (`-c`, `--command`,
+  `--commands`, `/c`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
+  `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`,
+  `powershell`, `pwsh` (also as a `busybox` applet, and with a version suffix such
+  as `ksh93`), and for these interpreters given an inline program (`-e`, `-E`,
+  `-c`, `-p`, `-r`, `--eval`, `--print`, also with the value glued on or after
+  `=`): `node`, `nodejs`,
+  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`.
+  Wrappers that start the command in their arguments (`time`, `nice`, `nohup`,
+  `timeout`, `setsid`, `stdbuf`, `ionice`, `chrt`, `taskset`, `sudo`, `doas`,
+  `arch`, `caffeinate`, `chroot`, `unshare`, `nsenter`, `strace`, `systemd-run`, and `env`;
+  `sudo`/`doas` with `-s`, `-i` or a `NAME=value` argument are refused outright) are refused when any argument would start a refused
+  command, and when they nest deeper than 8 levels. `deno lsp` is allowed. These
+  lists are closed, not exhaustive: a shell or interpreter that is not named here
+  is admitted with its command string unexamined. The list matches the command's
+  file stem and arguments and is best-effort: the trusted configuration is the
+  boundary, so install the server globally and give its absolute path as
+  `command`.
 - **Working directory.** The server starts in your login home directory (else
   the system temporary directory when no other user can write to it, which
   rules out a shared `/tmp`), never in the checkout, and is refused when

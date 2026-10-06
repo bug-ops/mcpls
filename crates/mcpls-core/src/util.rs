@@ -15,17 +15,51 @@ use tokio::task::JoinHandle;
 
 use crate::config::SizeLimit;
 
+/// A byte count that went over its limit.
+///
+/// The one shape of every "too large" error, so each reader reports the same
+/// two numbers and converts it without re-spelling the fields.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("{size} bytes exceed the limit of {max} bytes")]
+pub struct SizeExceeded {
+    /// The size found, in bytes.
+    pub size: u64,
+    /// The limit that was exceeded, in bytes.
+    pub max: NonZeroU64,
+}
+
+impl SizeExceeded {
+    /// Checks `size` against `max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exceeded limit when `size` is over `max`.
+    pub const fn check(size: u64, max: NonZeroU64) -> Result<(), Self> {
+        if size > max.get() {
+            return Err(Self { size, max });
+        }
+        Ok(())
+    }
+
+    /// Checks `size` against `limit`, which admits everything when unlimited.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exceeded limit when `size` is over `limit`.
+    pub const fn check_limit(size: u64, limit: SizeLimit) -> Result<(), Self> {
+        match limit.get() {
+            Some(max) => Self::check(size, max),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Why [`check_bounded_utf8`] rejected the bytes of a bounded read.
 #[derive(thiserror::Error, Debug)]
 pub enum BoundedUtf8Error {
-    /// The bytes were longer than the limit; carries the actual byte count.
-    #[error("{size} bytes exceed the limit")]
-    TooLarge {
-        /// Number of bytes actually read.
-        size: u64,
-        /// The byte limit that was exceeded.
-        max: NonZeroU64,
-    },
+    /// The bytes were longer than the limit.
+    #[error(transparent)]
+    TooLarge(#[from] SizeExceeded),
     /// The bytes were within the limit but not valid UTF-8.
     #[error(transparent)]
     InvalidUtf8(#[from] FromUtf8Error),
@@ -44,12 +78,7 @@ pub enum BoundedUtf8Error {
 /// [`BoundedUtf8Error::TooLarge`] past `max`, otherwise
 /// [`BoundedUtf8Error::InvalidUtf8`].
 pub fn check_bounded_utf8(buf: Vec<u8>, max: SizeLimit) -> Result<String, BoundedUtf8Error> {
-    let size = buf.len() as u64;
-    if let Some(limit) = max.get()
-        && size > limit.get()
-    {
-        return Err(BoundedUtf8Error::TooLarge { size, max: limit });
-    }
+    SizeExceeded::check_limit(buf.len() as u64, max)?;
     Ok(String::from_utf8(buf)?)
 }
 
@@ -70,15 +99,10 @@ pub enum ReadBoundedError {
     /// Reading the open file failed.
     #[error(transparent)]
     Io(std::io::Error),
-    /// The file is larger than the allowed number of bytes.
-    #[error("larger than {max} bytes")]
-    TooLarge {
-        /// The file's stat length, or the bytes read when the stat length
-        /// understated them.
-        size: u64,
-        /// The byte limit that was exceeded.
-        max: NonZeroU64,
-    },
+    /// The file is larger than the allowed number of bytes; the size is its
+    /// stat length, or the bytes read when the stat length understated them.
+    #[error(transparent)]
+    TooLarge(SizeExceeded),
 }
 
 /// Why [`read_regular_file_bounded`] did not return the file's bytes.
@@ -152,19 +176,13 @@ impl RegularFile {
     /// [`ReadBoundedError::TooLarge`] past `max` bytes and
     /// [`ReadBoundedError::Io`] when the read fails.
     pub fn read_bounded(self, max: NonZeroU64) -> Result<Vec<u8>, ReadBoundedError> {
-        let size = self.metadata.len();
-        if size > max.get() {
-            return Err(ReadBoundedError::TooLarge { size, max });
-        }
+        SizeExceeded::check(self.metadata.len(), max).map_err(ReadBoundedError::TooLarge)?;
         let mut buf = Vec::new();
         self.file
-            .take(max.get().saturating_add(1))
+            .take(SizeLimit::read_cap_for(max))
             .read_to_end(&mut buf)
             .map_err(ReadBoundedError::Io)?;
-        let read = buf.len() as u64;
-        if read > max.get() {
-            return Err(ReadBoundedError::TooLarge { size: read, max });
-        }
+        SizeExceeded::check(buf.len() as u64, max).map_err(ReadBoundedError::TooLarge)?;
         Ok(buf)
     }
 }
@@ -371,6 +389,12 @@ impl WarnLimiter {
     /// The period most warnings use between two lines.
     pub const DEFAULT_PERIOD: Duration = Duration::from_mins(1);
 
+    /// A limiter whose first warning is due at once.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { last: None }
+    }
+
     /// Whether a warning is due at `now`; when it is, `now` becomes the new
     /// reference point.
     pub fn due(&mut self, now: Instant, every: Duration) -> bool {
@@ -523,7 +547,7 @@ mod tests {
         std::fs::write(&path, b"{ }").unwrap();
         assert_matches!(
             read_regular_file_bounded(&path, limit(2)),
-            Err(BoundedFileError::Read(ReadBoundedError::TooLarge { size: 3, max })) if max == limit(2)
+            Err(BoundedFileError::Read(ReadBoundedError::TooLarge(SizeExceeded { size: 3, max }))) if max == limit(2)
         );
     }
 
@@ -603,6 +627,28 @@ mod tests {
     }
 
     #[test]
+    fn size_exceeded_check_admits_up_to_the_limit_and_reports_both_numbers() {
+        let max = NonZeroU64::new(4).unwrap();
+        assert_eq!(SizeExceeded::check(4, max), Ok(()));
+        assert_eq!(
+            SizeExceeded::check(5, max),
+            Err(SizeExceeded { size: 5, max })
+        );
+        assert_eq!(
+            SizeExceeded::check_limit(u64::MAX, SizeLimit::UNLIMITED),
+            Ok(())
+        );
+        assert_eq!(
+            SizeExceeded::check_limit(5, size(4)),
+            Err(SizeExceeded { size: 5, max })
+        );
+        assert_eq!(
+            SizeExceeded { size: 5, max }.to_string(),
+            "5 bytes exceed the limit of 4 bytes"
+        );
+    }
+
+    #[test]
     fn check_bounded_utf8_within_limit() {
         assert_eq!(
             check_bounded_utf8(b"hello".to_vec(), size(10)).unwrap(),
@@ -614,7 +660,7 @@ mod tests {
     fn check_bounded_utf8_too_large() {
         assert_matches!(
             check_bounded_utf8(b"hello".to_vec(), size(4)),
-            Err(BoundedUtf8Error::TooLarge { size: 5, max }) if max.get() == 4
+            Err(BoundedUtf8Error::TooLarge(SizeExceeded { size: 5, max })) if max.get() == 4
         );
     }
 
@@ -641,7 +687,7 @@ mod tests {
         buf.truncate(5);
         assert_matches!(
             check_bounded_utf8(buf, size(4)),
-            Err(BoundedUtf8Error::TooLarge { size: 5, .. })
+            Err(BoundedUtf8Error::TooLarge(SizeExceeded { size: 5, .. }))
         );
     }
 

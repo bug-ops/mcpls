@@ -15,6 +15,7 @@ use lsp_types::{
     DidOpenTextDocumentParams, TextDocumentContentChangeEvent, TextDocumentItem, Uri,
     VersionedTextDocumentIdentifier,
 };
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -25,7 +26,7 @@ use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit}
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
 use crate::util::{
-    BoundedUtf8Error, OpenRegularFileError, RegularFile, check_bounded_utf8, lock_std,
+    BoundedUtf8Error, OpenRegularFileError, RegularFile, SizeExceeded, check_bounded_utf8, lock_std,
 };
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
@@ -260,6 +261,44 @@ impl PartialEq for DiskSync {
 
 impl Eq for DiskSync {}
 
+/// Version of a tracked document as sent to language servers in
+/// `didOpen`/`didChange`.
+///
+/// A distinct type so a document version is never confused with another
+/// integer, such as an opening counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DocumentVersion(i32);
+
+impl DocumentVersion {
+    /// The version a document starts at when first opened.
+    pub const FIRST: Self = Self(1);
+
+    /// Wraps the version number a server reported or was told.
+    #[must_use]
+    pub const fn new(version: i32) -> Self {
+        Self(version)
+    }
+
+    /// The version number as the LSP wire carries it.
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+
+    /// The version after this one, clamped at `i32::MAX`.
+    #[must_use]
+    pub(crate) const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+/// Which opening of a path a tracked document belongs to; a reopened path
+/// gets a new one, so a cached result of an earlier opening is recognizably
+/// stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opening(u64);
+
 /// State of a single document.
 ///
 /// All fields are private. `DocumentTracker::open` (via `Self::new`)
@@ -288,13 +327,11 @@ impl Eq for DiskSync {}
 pub(super) struct DocumentState {
     uri: Uri,
     language_id: LanguageId,
-    version: i32,
+    version: DocumentVersion,
     text: DocumentText,
     disk: Option<DiskSync>,
-    synced: HashMap<ServerId, i32>,
-    /// Which opening of the path this state belongs to; a reopened path gets a
-    /// new one, so a cached result of an earlier opening is recognizably stale.
-    opened: u64,
+    synced: HashMap<ServerId, DocumentVersion>,
+    opened: Opening,
     /// When this document was last accessed via `ensure_open`
     /// (`Self::touch`), used to pick the least-recently-used entry when
     /// `DocumentTracker::open` must evict to stay under
@@ -332,11 +369,11 @@ impl Eq for DocumentState {}
 impl DocumentState {
     /// Creates a new document state at version 1, with unknown disk
     /// provenance and no server yet recorded as synced.
-    fn new(uri: Uri, language_id: LanguageId, text: DocumentText, opened: u64) -> Self {
+    fn new(uri: Uri, language_id: LanguageId, text: DocumentText, opened: Opening) -> Self {
         Self {
             uri,
             language_id,
-            version: 1,
+            version: DocumentVersion::FIRST,
             text,
             disk: None,
             synced: HashMap::new(),
@@ -370,7 +407,7 @@ impl DocumentState {
     /// this, and never decreases it.
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn version(&self) -> i32 {
+    pub(crate) const fn version(&self) -> DocumentVersion {
         self.version
     }
 
@@ -396,7 +433,7 @@ impl DocumentState {
     /// from this map has never seen the document and must receive
     /// `didOpen`, not `didChange`, on its next `ensure_open` call.
     #[must_use]
-    pub(crate) fn synced_version(&self, server: &ServerId) -> Option<i32> {
+    pub(crate) fn synced_version(&self, server: &ServerId) -> Option<DocumentVersion> {
         self.synced.get(server).copied()
     }
 
@@ -410,7 +447,12 @@ impl DocumentState {
     /// preserving the monotonicity invariant. (Not strictly greater: the
     /// caller computes `version` via `saturating_add`, which can legitimately
     /// clamp to the current value at `i32::MAX`.)
-    fn commit_reload(&mut self, version: i32, text: DocumentText, snap: Option<DiskSync>) {
+    fn commit_reload(
+        &mut self,
+        version: DocumentVersion,
+        text: DocumentText,
+        snap: Option<DiskSync>,
+    ) {
         debug_assert!(
             version >= self.version,
             "document version must be monotonically increasing"
@@ -426,7 +468,7 @@ impl DocumentState {
     }
 
     /// Records that `server` has synced up to `version`.
-    fn mark_synced(&mut self, server: ServerId, version: i32) {
+    fn mark_synced(&mut self, server: ServerId, version: DocumentVersion) {
         self.synced.insert(server, version);
     }
 
@@ -630,13 +672,13 @@ impl DocumentTracker {
     /// Last document version of `path` that `server` was told about, or
     /// `None` when `path` is not tracked or `server` never saw it.
     #[must_use]
-    pub(crate) fn synced_version(&self, path: &Path, server: &ServerId) -> Option<i32> {
+    pub(crate) fn synced_version(&self, path: &Path, server: &ServerId) -> Option<DocumentVersion> {
         lock_std(&self.documents).get(path)?.synced_version(server)
     }
 
     /// Which opening of `path` is tracked; `None` when it is not tracked.
     #[must_use]
-    pub(crate) fn opening(&self, path: &Path) -> Option<u64> {
+    pub(crate) fn opening(&self, path: &Path) -> Option<Opening> {
         lock_std(&self.documents)
             .get(path)
             .map(|state| state.opened)
@@ -647,7 +689,7 @@ impl DocumentTracker {
     #[cfg(test)]
     pub(crate) fn set_synced_version_for_test(&self, path: &Path, server: &ServerId, version: i32) {
         if let Some(state) = lock_std(&self.documents).get_mut(path) {
-            state.mark_synced(server.clone(), version);
+            state.mark_synced(server.clone(), DocumentVersion::new(version));
         }
     }
 
@@ -776,7 +818,7 @@ impl DocumentTracker {
         let uri = path_to_uri(&path)?;
         let language_id = self.language_map.detect(&path);
 
-        let opened = self.next_opening.fetch_add(1, Ordering::Relaxed);
+        let opened = Opening(self.next_opening.fetch_add(1, Ordering::Relaxed));
         let state = DocumentState::new(uri.clone(), language_id, text, opened);
 
         // Check document limit and insert under a single lock acquisition so
@@ -800,7 +842,7 @@ impl DocumentTracker {
             else {
                 return Err(Error::DocumentLimitExceeded {
                     current: documents.len(),
-                    max: max.get(),
+                    max,
                 });
             };
             self.record_pending_close(evicted_path, evicted_state);
@@ -861,12 +903,10 @@ impl DocumentTracker {
 
     /// Returns an error if `size` exceeds the configured file size limit.
     const fn check_file_size(&self, size: u64) -> Result<()> {
-        if let Some(max) = self.limits.max_file_size.get()
-            && size > max.get()
-        {
-            return Err(Error::FileSizeLimitExceeded { size, max });
+        match SizeExceeded::check_limit(size, self.limits.max_file_size) {
+            Ok(()) => Ok(()),
+            Err(exceeded) => Err(Error::FileSizeLimitExceeded(exceeded)),
         }
-        Ok(())
     }
 
     /// Sets the disk snapshot for an already-tracked document.
@@ -1217,7 +1257,7 @@ impl DocumentTracker {
 
         Ok(Decision {
             uri,
-            target_version: current_version.saturating_add(1),
+            target_version: current_version.next(),
             fresh_content: Some(DocumentText::build(fresh).await?),
             snap: Some(snap),
         })
@@ -1241,7 +1281,7 @@ impl DocumentTracker {
             },
         );
 
-        Ok(Decision::unchanged(uri, 1))
+        Ok(Decision::unchanged(uri, DocumentVersion::FIRST))
     }
 
     /// Opens `path` for reading and verifies, via that same open handle's
@@ -1306,7 +1346,7 @@ impl DocumentTracker {
             .await
             .map_err(io_err)?;
         check_bounded_utf8(buf, max).map_err(|e| match e {
-            BoundedUtf8Error::TooLarge { size, max } => Error::FileSizeLimitExceeded { size, max },
+            BoundedUtf8Error::TooLarge(exceeded) => Error::FileSizeLimitExceeded(exceeded),
             BoundedUtf8Error::InvalidUtf8(e) => {
                 io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
@@ -1494,7 +1534,7 @@ impl DocumentTracker {
                                 text_document: TextDocumentItem {
                                     uri: uri.clone(),
                                     language_id: String::from(language_id).into(),
-                                    version: target_version,
+                                    version: target_version.get(),
                                     text,
                                 },
                             },
@@ -1507,7 +1547,7 @@ impl DocumentTracker {
             lsp_client
                 .notify_typed::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
                     text_document: VersionedTextDocumentIdentifier {
-                        version: target_version,
+                        version: target_version.get(),
                         text_document_identifier: lsp_types::TextDocumentIdentifier {
                             uri: uri.clone(),
                         },
@@ -1717,7 +1757,7 @@ impl Drop for PathLockGuard<'_> {
 /// commit alongside it.
 struct Decision {
     uri: Uri,
-    target_version: i32,
+    target_version: DocumentVersion,
     fresh_content: Option<DocumentText>,
     snap: Option<DiskSync>,
 }
@@ -1725,7 +1765,7 @@ struct Decision {
 impl Decision {
     /// A decision where nothing changed on disk this call: `target_version`
     /// is already what's committed in `DocumentState`.
-    const fn unchanged(uri: Uri, target_version: i32) -> Self {
+    const fn unchanged(uri: Uri, target_version: DocumentVersion) -> Self {
         Self {
             uri,
             target_version,
@@ -1882,7 +1922,7 @@ mod tests {
         assert_eq!(tracker.len(), 1);
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version(), 1);
+        assert_eq!(state.version().get(), 1);
         assert_eq!(state.language_id(), "rust");
 
         tracker.close(&path);
@@ -1909,12 +1949,12 @@ mod tests {
             .get_mut(&path)
             .unwrap()
             .synced
-            .insert(respawned.clone(), 1);
+            .insert(respawned.clone(), DocumentVersion::FIRST);
         lock_std(&tracker.documents)
             .get_mut(&path)
             .unwrap()
             .synced
-            .insert(untouched.clone(), 1);
+            .insert(untouched.clone(), DocumentVersion::FIRST);
 
         tracker.forget_server(&respawned);
 
@@ -1987,7 +2027,10 @@ mod tests {
         tracker.ensure_open(&path, &server, &client).await.unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.synced_version(&server), Some(1));
+        assert_eq!(
+            state.synced_version(&server).map(DocumentVersion::get),
+            Some(1)
+        );
     }
 
     /// Marks `path`'s tracked document as disk-verified, for a test that
@@ -2356,11 +2399,11 @@ mod tests {
         let state = DocumentState {
             uri: Uri::from("file:///test.rs"),
             language_id: LanguageId::from_static("rust"),
-            version: 5,
+            version: DocumentVersion::new(5),
             text: DocumentText::new("fn main() {}".to_string()),
             disk: None,
             synced: HashMap::new(),
-            opened: 0,
+            opened: Opening(0),
             last_accessed: Instant::now(),
         };
 
@@ -2368,7 +2411,7 @@ mod tests {
         let cloned = state.clone();
         assert_eq!(cloned.uri(), state.uri());
         assert_eq!(cloned.language_id(), state.language_id());
-        assert_eq!(cloned.version(), 5);
+        assert_eq!(cloned.version().get(), 5);
         assert_eq!(cloned.content(), state.content());
     }
 
@@ -3194,14 +3237,14 @@ mod tests {
             .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
 
         let uri2 = tracker
             .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(uri1, uri2);
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
     }
 
@@ -3227,7 +3270,7 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version(), 2);
+        assert_eq!(state.version().get(), 2);
         assert_eq!(state.content(), "fn main() { println!(\"hi\"); }");
     }
 
@@ -3259,7 +3302,7 @@ mod tests {
             .unwrap();
         let state = tracker.get(&path).unwrap();
         assert_eq!(
-            state.version(),
+            state.version().get(),
             2,
             "must resync despite identical (mtime, size)"
         );
@@ -3294,7 +3337,11 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version(), 1, "documented limitation: fast path taken");
+        assert_eq!(
+            state.version().get(),
+            1,
+            "documented limitation: fast path taken"
+        );
         assert_eq!(state.content(), "AAAA");
     }
 
@@ -3321,7 +3368,7 @@ mod tests {
             .unwrap();
 
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version(), 2);
+        assert_eq!(state.version().get(), 2);
         assert_eq!(state.content(), "BBBBBBBB");
     }
 
@@ -3348,7 +3395,7 @@ mod tests {
             .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
 
         tokio::time::advance(Duration::from_millis(300)).await;
         tracker
@@ -3356,7 +3403,7 @@ mod tests {
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
-        assert_eq!(state.version(), 2);
+        assert_eq!(state.version().get(), 2);
         assert_eq!(state.content(), "BBBB");
     }
 
@@ -3381,7 +3428,7 @@ mod tests {
             .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
         assert!(tracker.is_open(&path));
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
     }
 
@@ -3410,7 +3457,7 @@ mod tests {
             .await;
         assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
         assert_eq!(tracker.get(&path).unwrap().content(), "small");
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
     }
 
     #[tokio::test]
@@ -3441,7 +3488,7 @@ mod tests {
             "resync must not re-run the doc-count check on an already-tracked path"
         );
         assert_eq!(tracker.len(), 1);
-        assert_eq!(tracker.get(&path).unwrap().version(), 2);
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 2);
     }
 
     #[tokio::test]
@@ -3603,7 +3650,11 @@ mod tests {
         let opened = read_framed_message(&mut wire).await;
         assert_eq!(opened["method"], "textDocument/didOpen");
         assert_eq!(
-            tracker.get(&path).unwrap().synced_version(&id),
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id)
+                .map(DocumentVersion::get),
             Some(1),
             "second call for the same server must not re-open or re-change"
         );
@@ -3646,9 +3697,23 @@ mod tests {
         // what was actually acknowledged over the wire.
         assert!(tracker.is_open(&path));
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
-        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_a), Some(1));
-        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_b), Some(1));
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
+        assert_eq!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id_a)
+                .map(DocumentVersion::get),
+            Some(1)
+        );
+        assert_eq!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id_b)
+                .map(DocumentVersion::get),
+            Some(1)
+        );
 
         // A's next call must independently detect the disk change (B's
         // failure did not consume it) and successfully advance both the
@@ -3658,8 +3723,22 @@ mod tests {
             tracker.get(&path).unwrap().content(),
             "fn main() { updated(); }"
         );
-        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_a), Some(2));
-        assert_eq!(tracker.get(&path).unwrap().synced_version(&id_b), Some(1));
+        assert_eq!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id_a)
+                .map(DocumentVersion::get),
+            Some(2)
+        );
+        assert_eq!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id_b)
+                .map(DocumentVersion::get),
+            Some(1)
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3785,8 +3864,15 @@ mod tests {
             "expected no additional notification after the single didOpen"
         );
 
-        assert_eq!(tracker.get(&path).unwrap().synced_version(&id), Some(1));
-        assert_eq!(tracker.get(&path).unwrap().version(), 1);
+        assert_eq!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&id)
+                .map(DocumentVersion::get),
+            Some(1)
+        );
+        assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
     }
 
     /// Regression for #227: `lock_path`'s guard must evict its `path_locks`
@@ -3916,7 +4002,7 @@ mod tests {
         let result = tracker.read_to_string_checked(&path).await;
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { size: 11, max }) if max.get() == 10
+            Err(Error::FileSizeLimitExceeded(SizeExceeded { size: 11, max })) if max.get() == 10
         );
     }
 

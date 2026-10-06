@@ -10,7 +10,7 @@ tags:
   - diagnostics
   - backpressure
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]]"
@@ -272,18 +272,17 @@ No new persistent entity beyond a per-owner lost marker.
 - Special-case a server by name.
 - Silence the loss by lowering the log level without recording it in state.
 
-## 9. Open Questions
+## 9. Decisions
 
-> [!question] Open
-> The mechanism and the surfaced shape are plan-time decisions; the requirements above are the
-> contract either way.
-
-- [NEEDS CLARIFICATION: mechanism. Backpressure (await capacity) risks stalling the message loop and, through it, request responses, so it needs a bounded wait plus a fallback to recorded loss. Per-URI coalescing before the channel bounds memory by the number of distinct URIs and removes most of the loss, but needs a pending-publish map keyed by (owner, URI). A dedicated diagnostics lane isolates publishes from log frames (FR-009). Which of these, or which combination, does the plan adopt?]
-- [NEEDS CLARIFICATION: lost outcome shape. Reuse the `evicted` availability for files lost before the cache, add a distinct `lost` value, or set a per-owner flag next to `push_notifications_degraded` and leave per-file availability as `evicted`? The recorded loss cannot name the lost URIs when the frame was discarded before it was read, so the signal is per owner, not per file; confirm that is acceptable.]
-- [NEEDS CLARIFICATION: when the lost state ends (FR-006). The overflow marker for capacity eviction ends with the next accepted write; the same rule may leave a still-lost file reading `pending` afterwards. Is that trade-off acceptable here, or does a lost owner need an explicit way to clear (for example `restart_server` or a refreshing pull)?]
-- [NEEDS CLARIFICATION: capacity. If the mechanism leaves a bounded channel, is the 256 capacity retuned (for example to `MAX_DIAGNOSTIC_ENTRIES`) so that the channel is never the narrower bound, or does the mechanism make the capacity irrelevant for diagnostics?]
-- [NEEDS CLARIFICATION: log and `showMessage` frames. Is losing them under pressure acceptable (they are bounded history already), or must they be delivered with the same guarantee as diagnostics?]
-- [NEEDS CLARIFICATION: respawn race. A frame already parsed from the replaced process when the swap happens: is dropping it enough, or does the plan need the connection identity used for the pull probe in [[bridge/011-push-only-server-diagnostics/spec|bridge/011]] on the delivery path too?]
+> [!success] Resolved for #704
+> - **Mechanism.** `publishDiagnostics` leaves the 256-slot channel. Each server's message loop writes it into a per-client mailbox (`lsp/publish_mailbox.rs`): one pending publish per file (a later publish replaces an earlier one), bounded to `MAX_DIAGNOSTIC_ENTRIES` files and 64 MiB per server, each entry bounded like the cache bounds one. Log and `showMessage` frames keep the channel and yield under pressure; they never mark a file.
+> - **Lost outcome.** A publish the mailbox cannot hold is recorded per file. The pump hands the lost files to the cache (`NotificationCache::record_lost_publishes`), which removes the owner's older entries of those files and marks them lost, so the file reads `evicted` (the existing availability value; no schema change) until the owner publishes it again, and its subscribers get `resources/updated`. Only when more files are lost than the lost list names (`MAX_DIAGNOSTIC_ENTRIES`) does the owner's eviction overflow flag stand in, set after the burst's own writes.
+> - **Replacement over the byte cap.** When a replacement for a pending file does not fit, both the pending and the new publish are dropped and the file is marked lost, so it never reads as published with content older than the server's last word.
+> - **End of the lost state (FR-006).** A file's mark ends with the owner's next entry for it; the overflow flag ends with the owner's next accepted write (the same trade-off as capacity eviction: a file lost before that write may read `pending` again). Both are dropped with the server's diagnostics on respawn or restart.
+> - **Capacity.** The channel capacity stays 256 for log/`showMessage`; the mailbox is as wide as the cache, so it is never the narrower bound.
+> - **Respawn (FR-014).** The discard consumer of an automatically respawned server drops the mailbox reader, which discards what is pending and makes the writer stop buffering; a closed mailbox ends the pump.
+> - **Known limits.** The 64 MiB mailbox bound is per server, not a shared budget across servers; the mailbox's own warning is limited per server while the channel lanes' warnings are limited per process; bytes count a cheap upper bound of the serialized size, not heap.
+> - **Logging (FR-007/008).** Overflows warn through `WarnLimiter`: one line per minute per lane (mailbox, notification channel, lifecycle channel) with the dropped count; each dropped frame is logged at DEBUG.
 
 ## 10. See Also
 

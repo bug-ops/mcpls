@@ -33,6 +33,8 @@ pub enum DiagnosticsOrigin {
     Pull,
     /// The push cache alone, because the server advertises no pull provider.
     PushCache,
+    /// The pull request failed, so the push cache and the last stored pull answered.
+    CacheAfterFailedPull,
 }
 
 /// A `get_diagnostics` answer together with the state the cache was in when
@@ -74,6 +76,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(DiagnosticsOrigin::PushCache).unwrap(),
             "push_cache"
+        );
+        assert_eq!(
+            serde_json::to_value(DiagnosticsOrigin::CacheAfterFailedPull).unwrap(),
+            "cache_after_failed_pull"
         );
     }
 }

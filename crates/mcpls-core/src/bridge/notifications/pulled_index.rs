@@ -19,15 +19,23 @@ pub(super) const DUPLICATE_RANGE_PROXIMITY_LINES: u32 = 3;
 
 /// A diagnostic's severity as `get_diagnostics` reports it: no severity and
 /// unrecognized ones read as information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordered from most to least severe, which is also the order the size cap
+/// keeps diagnostics in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReportedSeverity {
+    /// An error.
     Error,
+    /// A warning.
     Warning,
+    /// Information, also what a diagnostic without a usable severity reads as.
     Information,
+    /// A hint.
     Hint,
 }
 
 impl ReportedSeverity {
+    /// The severity `diagnostic` is reported with.
     pub const fn of(diagnostic: &LspDiagnostic) -> Self {
         match diagnostic.severity {
             Some(lsp_types::DiagnosticSeverity::Error) => Self::Error,

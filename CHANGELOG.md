@@ -51,6 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Untrusted mode also refuses inline code glued to a flag or given with `=` (`python3 -c'..'`, `node --eval=..`, `fish --command=..`), `script`, `su`, `flock`, `watch`, `sudo -s`/`-i`/`NAME=value`, `deno repl`, versioned shell names, and more exec wrappers (`arch`, `caffeinate`, `chroot`, `unshare`, `nsenter`, `strace`, `systemd-run`). (#686)
+- **Breaking:** `LspServer` gains `publish_rx` and `take_publish_rx`/`take_notification_inbox`, `diagnostics_pump` takes a `NotificationInbox`, and `PumpShared` gains `roles`; `publishDiagnostics` no longer travels on `notification_rx`. (#704, #696)
+- **Breaking:** a tool argument the tool does not declare is rejected naming the first unknown field and the accepted ones (was silently ignored), every `tools/list` input schema carries `additionalProperties: false`, the `tools/list` size budget is 135,500 B, and `PositionParams` no longer implements `Serialize`, `RangeParams` neither `Serialize`, `Deserialize` nor `JsonSchema`. (#705)
+- **Breaking:** every kind filter input fails as `-32602` with a bounded message: `symbol_kind` no longer fails as a deserialization error, `get_folding_ranges` `kind` is case-insensitive and rejected the same way, an over-long value is not echoed; `KindFilter` is sealed, `KindFilterInput::Rejected` holds a `Rejection`, `into_known` takes a `KindFilterField`, `FoldingKindFilter` is no longer `Deserialize`, and `SymbolTargetInput::Name` is a struct variant. (#700)
+- `get_diagnostics`/`get_cached_diagnostics` and the diagnostics resource share one cache snapshot, and tool support keeps capabilities and pull support together per running server. (#695)
+- Positioned tool handlers build their request through one `position_request` path, and tools that report `indexing_in_progress` open a `DisclosedDocument` that can only answer with an `Indexed` result. (#689, #690)
+- **Breaking:** `Error::NoServerForLanguage::patterns` is an `Arc<[FilePattern]>`, so a routing miss no longer clones every pattern. (#701)
+- **Breaking:** `get_diagnostics` reports `origin: "cache_after_failed_pull"` (new `DiagnosticsOrigin::CacheAfterFailedPull`) when the pull failed and the cache answered, instead of `pull`. (#688)
+- **Breaking:** `LspServerConfig::env` is a `ServerEnv` whose keys compare as the host compares names (fixes Windows `Path` overrides being missed by command resolution), a Windows config with two case variants of one key is rejected, `child_env_var` takes a `HostOs`, and `lsp::HostOs` is public. (#691)
+- **Breaking:** one `CommandStem` (ASCII-case-insensitive on every host) serves the launcher rules, TypeScript pin and `BuiltinServer::matches_command`, and `ServerSpawnFailed`, `ServerNotFound` and `ServerExitedDuringInit` carry a `ServerCommand`. (#697)
+- **Breaking:** new `UntrustedRefusal::AutoSelectionTarget` for an auto-selected TypeScript command that resolves to another program (was "not found"); `command_path::resolve_command` and `or_system_path` take a `HostOs`, so untrusted hardening follows the given host's rules; the TypeScript launcher check is shared by startup and respawn and names the configured command; outbound JSON-RPC replies use `JsonRpcReply`/`JsonRpcOutcome` with `lsp_types::ErrorCodes`. (#697)
+- The init-failure hint is computed on the blocking pool instead of the start task. (#698)
+- **Breaking:** one `util::SizeExceeded` replaces three size-error shapes (`Error::FileSizeLimitExceeded` and `ReadBoundedError`/`BoundedUtf8Error::TooLarge` now hold it), `Error::DocumentLimitExceeded::max` is `NonZeroUsize`, `ConfigError::DuplicateServerId` carries `EntrySummary` values, and `ServerCommand::from_static` now requires ASCII like the other text newtypes. (#699)
+- **Breaking:** `ServerStartConcurrency`, `MAX_TIMEOUT_SECONDS`, `MAX_HEURISTICS_DEPTH` and `DEFAULT_HEURISTICS_MAX_DEPTH` live in `config::limits`, and `BoundedSecs::new`/`ServerStartConcurrency::new` return `Result`. (#699)
+- **Breaking:** removed `LspServerConfig::should_spawn` and `ServerHeuristics::is_applicable`/`is_applicable_recursive`; `MarkerScan` is the only marker check. (#699)
+- **Breaking:** `ServerConfig::validate` only checks the allowlist; `load_from` no longer calls it, trust application rejects an unknown `--allow-server` id, and the duplicate-name warning is dropped. (#694)
+- **Breaking:** config load errors forward their source instead of repeating it (`Error::TomlDe`, `TomlSer`, `Config` are transparent), and an oversized config file reports `ConfigError::FileTooLarge` naming its fixed limit. (#706, #684)
+- The CLI loads its config before the runtime starts, `serve_with` resolves workspace roots on the blocking pool, and the idle-session reaper restarts with backoff and a throttled panic log. (#698, #701)
+- **Breaking:** diagnostics cache and indexing tracker encode their invariants in types (`DocumentVersion` replaces bare `i32` in `DiagnosticInfo::version`), and the size cap ranks a diagnostic without severity as information instead of hint. (#693)
 - **Breaking:** removed `Translator::merge_diagnostics`; `NotificationWiring` gains `publish_changed`, and `NotificationCache::diagnostics` reads pushed entries only. (#671)
 - **Breaking:** `get_diagnostics` merges through the cache, which can reorder items and bounds pulled ones like pushed ones. (#671)
 - **Breaking:** `go_to_declaration` accepts `context: "enclosing_symbol"` like the other location tools, and `Translator::handle_declaration` takes a `ResultContext`. (#640)
@@ -178,6 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `publishDiagnostics` bursts are no longer dropped above 256 frames: each server's publishes go through a per-file coalescing mailbox bounded to 1000 files and 64 MiB, files it cannot hold read `evicted` and notify subscribers, and overflow warnings are rate limited. (#704)
+- A respawned server's diagnostics pump now follows later role changes made while servers settle, and the pump loop tracks its sources in one state type. (#696)
+- `get_diagnostics` and the cache reads no longer list a pushed error the server's pull for the edited document already reported as fixed; only pull-covered items of an older push are dropped. (#703)
+- A dropped alias diagnostics publish no longer notifies resource subscribers (`PushWrite` is `Stored` or `Dropped`). (#692)
+- Untrusted mode refuses more shells (`ash`, `hush`, `mksh`, `nu`, ...) and inline interpreters (`deno eval`, `bun -e`, ...) given a command string, and exec wrappers (`time`, `nice`, `timeout`, `sudo`, ...) whose arguments start a refused command, failing closed past 8 nested wrappers; `SECURITY.md` calls the lists closed, not exhaustive. (#686)
 - A server restart or respawn now also notifies subscribers of files cached only under a symlink spelling. (#671)
 - `get_diagnostics` stores a full pull report in the diagnostics cache and notifies `lsp-diagnostics://` subscribers when a file's diagnostics change; `get_cached_diagnostics` and `resources/read` include pulled diagnostics. (#671)
 - A language-server response that cannot be decoded (for example nested past the JSON recursion limit) now fails only its own request instead of tearing down the connection; new `InboundMessage::UndecodableResponse`. (#644)

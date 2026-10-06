@@ -100,11 +100,20 @@ related:
   `pnpm`, `pnpx`, `yarn`, `uvx`, `corepack`, any `npm:` argument), task runners (`make`, `just`, `task`,
   `rake`, `mvn`, `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`, `poetry`,
   `pdm`, `hatch`, `bundle`, `dotnet` (`lsp/launcher.rs`, a `LaunchRule` per command stem); `env` is
-  unwrapped, `env -S` and a shell with `-c` or `/c` are refused as unanalyzable, `deno lsp` is allowed.
+  unwrapped, `env -S` is refused as unanalyzable, and so is a command string: `-c`, `--command`,
+  `--commands` or `/c` for `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`, `oksh`, `yash`,
+  `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`, `powershell`, `pwsh` (also as a `busybox`
+  applet) and an inline program for `node`, `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`,
+  `julia`, `osascript` and `deno eval`. `xargs`, `find` and the `awk` family are refused outright; the
+  exec wrappers `time`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `ionice`, `chrt`, `taskset`, `sudo`,
+  `doas`, `script` are refused when any argument would start a refused command, and past 8 nested
+  wrappers (fail closed). `deno lsp` is allowed. The lists are closed, not exhaustive (#686).
   `UntrustedRefusal::UnpinnedTypescriptLauncher` refuses a TypeScript server whose launcher no tsserver
   can be pinned for (`PackageRunner` or `UnsupportedLauncher` resolution), also when the user set
   `tsserver.path`. An unresolved pin for another reason (no `typescript` next to the server) stays
-  admitted. The list is best-effort; the trusted configuration is the boundary (`SECURITY.md`).
+  admitted. `UntrustedRefusal::AutoSelectionTarget` refuses an auto-selected TypeScript command whose
+  `PATH` entry resolves to another program (#697). The list is best-effort; the trusted configuration is the
+  boundary (`SECURITY.md`).
 - **Working directory and Windows lookups (#653).** An untrusted server starts in the login home, else the
   system temporary directory when it is not writable by group or others (a shared `/tmp` is not used), whichever lies outside the boundary (`ChildWorkingDir::Fixed`), else the
   server is refused as `NoSafeWorkingDirectory`; a non-UTF-8 executable or `PATH` is refused as

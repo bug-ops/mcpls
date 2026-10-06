@@ -4,6 +4,7 @@
 //! including LSP server definitions and workspace settings.
 
 mod bounded_secs;
+mod command_stem;
 mod language;
 mod language_id;
 mod language_map;
@@ -12,22 +13,25 @@ mod patterns;
 mod position_encodings;
 mod routing;
 mod server;
+mod server_env;
 mod settings;
 mod text_newtype;
 mod trust;
 mod workspace_root;
 
 use std::collections::HashMap;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
+pub use command_stem::CommandStem;
 pub use language::{base_language_id, react_variant_language_id};
 pub use language_id::{InvalidLanguageId, LanguageId};
 pub use language_map::{FileKey, LanguageMap};
 pub use limits::{
-    BoundedText, DocumentLimit, InvalidBoundedText, InvalidSearchDepth, InvalidSizeLimit,
-    MAX_FILE_SIZE_LIMIT, SearchDepth, SizeLimit,
+    BoundedText, DEFAULT_HEURISTICS_MAX_DEPTH, DocumentLimit, InvalidBoundedText,
+    InvalidSearchDepth, InvalidServerStartConcurrency, InvalidSizeLimit, MAX_FILE_SIZE_LIMIT,
+    MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, SearchDepth, ServerStartConcurrency, SizeLimit,
 };
 pub use patterns::{
     FileExtension, FileName, FilePattern, InvalidFileExtension, InvalidFileName,
@@ -35,17 +39,18 @@ pub use patterns::{
 };
 pub use position_encodings::{InvalidPositionEncodings, PositionEncodings};
 pub use routing::{
-    InvalidServerId, InvalidToolSet, NoServerReason, ServerId, ServerSettlement, ToolKind,
-    ToolRouter, ToolSet,
+    EntrySummary, InvalidServerId, InvalidToolSet, NoServerReason, ServerId, ServerSettlement,
+    ToolKind, ToolRouter, ToolSet,
 };
 use serde::{Deserialize, Serialize};
 pub(crate) use server::MarkerScan;
 pub use server::{
-    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, InvalidAutoSelection, InvalidServerCommand,
-    LaunchCommand, LspServerConfig, MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, ServerCommand,
-    ServerHeuristics, ServerSelection,
+    BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
+    ServerCommand, ServerHeuristics, ServerSelection,
 };
+pub use server_env::{DuplicateEnvKey, ServerEnv};
 pub use settings::{InvalidLspSettings, LspSettings};
+use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;
 pub use trust::{ServerAllowlist, WorkspaceTrust};
 pub use workspace_root::{ConfiguredRoot, InvalidWorkspaceRoot};
@@ -234,43 +239,23 @@ pub type McpInstructions = BoundedText<MAX_MCP_INSTRUCTIONS_BYTES>;
 /// assert_eq!(prefix.as_str(), "optics");
 /// assert!("optics_".parse::<ToolPrefix>().is_err());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct ToolPrefix(String);
 
 impl ToolPrefix {
-    /// Returns the validated prefix as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Validates `value` as a tool prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`InvalidToolPrefix`] reason when `value` is not accepted.
+    pub fn new(value: impl Into<String>) -> std::result::Result<Self, InvalidToolPrefix> {
+        let value = value.into();
+        InvalidToolPrefix::check(&value).map_or(Ok(Self(value)), Err)
     }
 }
 
-impl std::fmt::Display for ToolPrefix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::str::FromStr for ToolPrefix {
-    type Err = InvalidToolPrefix;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if let Some(reason) = InvalidToolPrefix::check(s) {
-            return Err(reason);
-        }
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolPrefix {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        value.parse().map_err(serde::de::Error::custom)
-    }
-}
+impl_text_newtype!(ToolPrefix, InvalidToolPrefix);
 
 /// Why a string is not a valid [`ToolPrefix`].
 ///
@@ -395,7 +380,7 @@ pub struct WorkspaceConfig {
     /// Maximum size, in bytes, of a single file `DocumentTracker` will open.
     /// A file larger than this fails with `FileSizeLimitExceeded`. `0`
     /// disables the limit. Values above [`MAX_FILE_SIZE_LIMIT`] are rejected
-    /// by [`ServerConfig::validate`]. The per-response disk-read budget for
+    /// when the config is loaded. The per-response disk-read budget for
     /// position conversion scales with this value.
     /// Default: 10485760 (10MB)
     #[serde(default)]
@@ -421,71 +406,6 @@ pub struct WorkspaceConfig {
     /// Default: 8
     #[serde(default)]
     pub max_concurrent_server_starts: ServerStartConcurrency,
-}
-
-/// Why a value is not a valid [`ServerStartConcurrency`].
-#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error("max_concurrent_server_starts must be at least 1")]
-pub struct InvalidServerStartConcurrency;
-
-/// How many LSP servers may be starting at the same time.
-///
-/// A fixed default keeps a generated configuration machine-independent.
-///
-/// # Examples
-///
-/// ```
-/// use mcpls_core::config::ServerStartConcurrency;
-///
-/// assert!(ServerStartConcurrency::new(0).is_none());
-/// assert_eq!(ServerStartConcurrency::new(2).unwrap().get(), 2);
-/// assert_eq!(ServerStartConcurrency::default(), ServerStartConcurrency::DEFAULT);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "usize", into = "usize")]
-pub struct ServerStartConcurrency(NonZeroUsize);
-
-impl ServerStartConcurrency {
-    /// Eight servers at a time.
-    pub const DEFAULT: Self = match Self::new(8) {
-        Some(limit) => limit,
-        None => panic!("the default concurrency must be non-zero"),
-    };
-
-    /// `None` for zero.
-    #[must_use]
-    pub const fn new(limit: usize) -> Option<Self> {
-        match NonZeroUsize::new(limit) {
-            Some(limit) => Some(Self(limit)),
-            None => None,
-        }
-    }
-
-    /// The wrapped limit, at least 1.
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-impl Default for ServerStartConcurrency {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl TryFrom<usize> for ServerStartConcurrency {
-    type Error = InvalidServerStartConcurrency;
-
-    fn try_from(limit: usize) -> std::result::Result<Self, Self::Error> {
-        Self::new(limit).ok_or(InvalidServerStartConcurrency)
-    }
-}
-
-impl From<ServerStartConcurrency> for usize {
-    fn from(limit: ServerStartConcurrency) -> Self {
-        limit.get()
-    }
 }
 
 impl Default for WorkspaceConfig {
@@ -1039,6 +959,7 @@ impl ServerConfig {
         if let (WorkspaceTrust::Untrusted(_), Some((source, origin))) = (workspace, source) {
             self.ensure_outside_workspace(source, origin)?;
         }
+        Self::check_allowlist(workspace, &self.lsp_servers)?;
         self.workspace_trust = workspace.clone();
         Ok(())
     }
@@ -1056,9 +977,9 @@ impl ServerConfig {
         // callers that invoke this function directly without going through
         // `Args`. The actual, CLI-enforced guarantee that `$MCPLS_CONFIG` is
         // always trusted lives in `main.rs`'s `--config` branch, not here.
-        if let Ok(path) = std::env::var("MCPLS_CONFIG") {
-            return Self::load_from(Path::new(&path))
-                .map(|config| (config, Some(PathBuf::from(path))));
+        if let Some(path) = std::env::var_os("MCPLS_CONFIG") {
+            let path = PathBuf::from(path);
+            return Self::load_from(&path).map(|config| (config, Some(path)));
         }
 
         let mut project_config_status = ProjectConfigStatus::NotIgnored;
@@ -1164,15 +1085,12 @@ impl ServerConfig {
         let buf = file
             .read_bounded(MAX_CONFIG_FILE_BYTES)
             .map_err(|e| match e {
-                ReadBoundedError::TooLarge { size, max } => {
-                    Error::FileSizeLimitExceeded { size, max }
-                }
+                ReadBoundedError::TooLarge(exceeded) => ConfigError::FileTooLarge(exceeded).into(),
                 ReadBoundedError::Io(e) => Error::Io(e),
             })?;
         let content = String::from_utf8(buf).map_err(ConfigError::NotUtf8)?;
 
         let mut config: Self = toml::from_str(&content)?;
-        config.validate()?;
 
         rebase_relative_roots(&mut config.workspace.roots, path, relative_root_base)?;
 
@@ -1198,28 +1116,23 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Validate the configuration.
+    /// Validate a configuration built in code.
     ///
-    /// This covers only workspace-*independent* rules — checks that hold
-    /// regardless of which servers end up applicable in a given workspace.
-    /// Workspace-scoped routing rules (duplicate `ServerId`, conflicting
-    /// `handles` claims across applicable servers) are enforced later, by
-    /// `ToolRouter::from_configs` over the post-heuristics config subset in
-    /// `serve_with` — see that function's module docs for why the split
-    /// exists (two servers for one language with mutually exclusive
-    /// `heuristics` is a legitimate config that must still load here).
-    ///
-    /// [`Self::load_from`] always calls this, and so do [`crate::serve`] and
-    /// [`crate::serve_with`] for every `ServerConfig` regardless of origin —
-    /// a caller-constructed config (not loaded via TOML) gets the same
-    /// diagnosable [`Error::Config`] rejection as one loaded from
-    /// disk. Value ranges (timeouts, `position_encodings`, `language_id`)
-    /// are not checked here: their types ([`TimeoutSecs`],
+    /// Covers the rules that no field type enforces: today, that every id
+    /// allowed by an untrusted [`Self::workspace_trust`] names a configured
+    /// server. Value ranges (timeouts, `position_encodings`, `language_id`) are
+    /// not checked here: their types ([`TimeoutSecs`],
     /// [`IndexingReadyTimeoutSecs`], [`PositionEncodings`], [`LanguageId`])
-    /// reject invalid values at construction. Remains `pub` so a caller can
-    /// also validate a config up front, before handing it to
-    /// `serve`/`serve_with` (which consume it by value and run until
-    /// shutdown).
+    /// reject invalid values at construction. Workspace-scoped routing rules
+    /// (duplicate `ServerId`, conflicting `handles` claims across applicable
+    /// servers) are enforced later, by `ToolRouter::from_configs` over the
+    /// post-heuristics config subset in `serve_with`, because two servers for
+    /// one language with mutually exclusive `heuristics` are a legitimate
+    /// config.
+    ///
+    /// The `load_*` functions check the allowlist as they apply the trust, so a
+    /// loaded config needs no call; [`crate::serve`] and [`crate::serve_with`]
+    /// run this once for every config regardless of origin.
     ///
     /// # Errors
     ///
@@ -1234,37 +1147,17 @@ impl ServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<()> {
-        self.validate_workspace_trust()?;
-
-        let mut seen_names: HashMap<&str, &LanguageId> = HashMap::new();
-        for server in &self.lsp_servers {
-            if let Some(name) = &server.name
-                && let Some(prev_language) = seen_names.insert(name.as_str(), &server.language_id)
-            {
-                // Not a hard error here: whether this is actually ambiguous
-                // depends on which of these servers end up applicable in a
-                // given workspace, which this function cannot know. The
-                // workspace-scoped check in `ToolRouter::from_configs` is
-                // authoritative.
-                tracing::warn!(
-                    "duplicate explicit server name '{name}' in config (language ids: \
-                         '{prev_language}', '{}'); this is only an error if both entries are \
-                         applicable in the same workspace",
-                    server.language_id
-                );
-            }
-        }
-        Ok(())
+        Self::check_allowlist(&self.workspace_trust, &self.lsp_servers)
     }
 
     /// Rejects an allowed server id that names no configured server, so a typo
     /// in `--allow-server` cannot silently leave a server refused. A server
     /// that heuristics later skip is still a configured one.
-    fn validate_workspace_trust(&self) -> Result<()> {
-        let WorkspaceTrust::Untrusted(allowlist) = &self.workspace_trust else {
+    fn check_allowlist(trust: &WorkspaceTrust, servers: &[LspServerConfig]) -> Result<()> {
+        let WorkspaceTrust::Untrusted(allowlist) = trust else {
             return Ok(());
         };
-        let configured: Vec<ServerId> = self.lsp_servers.iter().map(LspServerConfig::id).collect();
+        let configured: Vec<ServerId> = servers.iter().map(LspServerConfig::id).collect();
         let unknown = allowlist
             .as_slice()
             .iter()
@@ -1347,6 +1240,7 @@ mod tests {
     #[cfg(unix)]
     use crate::test_lsp::client_path;
     use crate::test_lsp::toml_path_literal;
+    use crate::util::SizeExceeded;
 
     #[test]
     fn test_default_commands_match_builtin_servers() {
@@ -2148,7 +2042,8 @@ mod tests {
         let result = ServerConfig::load_from(&config_path);
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
+            Err(Error::Config(ConfigError::FileTooLarge(SizeExceeded { max, .. })))
+                if max == MAX_CONFIG_FILE_BYTES
         );
     }
 
@@ -2514,7 +2409,7 @@ mod tests {
                 language_id: LanguageId::from_static("cpp"),
                 command: ServerCommand::from_static("clangd").into(),
                 args: vec![],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.c"),
                     FilePattern::from_static("**/*.h"),
@@ -2546,7 +2441,7 @@ mod tests {
                 language_id: LanguageId::from_static("typescript"),
                 command: ServerCommand::from_static("tsgo").into(),
                 args: vec!["--lsp".to_string(), "--stdio".to_string()],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.ts"),
                     FilePattern::from_static("**/*.tsx"),
@@ -2578,7 +2473,7 @@ mod tests {
                 language_id: LanguageId::from_static("javascript"),
                 command: ServerCommand::from_static("typescript-language-server").into(),
                 args: vec!["--stdio".to_string()],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.js"),
                     FilePattern::from_static("**/*.jsx"),
@@ -3611,6 +3506,23 @@ mod tests {
                     if server.as_str() == "rsut"
             );
             assert!(text.contains("'rsut'") && text.contains("rust"), "{text}");
+        }
+
+        #[test]
+        fn test_apply_workspace_trust_rejects_an_unknown_allowed_id_and_keeps_the_trust() {
+            let mut config = ServerConfig::default();
+            let err = config
+                .apply_workspace_trust(
+                    &WorkspaceTrust::untrusted([ServerId::from_static("rsut")]),
+                    None,
+                )
+                .unwrap_err();
+            assert_matches!(
+                err,
+                Error::Config(ConfigError::UnknownAllowedServer { ref server, .. })
+                    if server.as_str() == "rsut"
+            );
+            assert_eq!(config.workspace_trust, WorkspaceTrust::Trusted);
         }
 
         #[test]

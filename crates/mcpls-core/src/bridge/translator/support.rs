@@ -92,9 +92,16 @@ pub struct ToolSupportSnapshot {
     language_map: Arc<LanguageMap>,
     router: Arc<ToolRouter>,
     expected: HashSet<ServerId>,
-    capabilities: HashMap<ServerId, CapabilitySet>,
-    pull_support: HashMap<ServerId, PullSupport>,
+    running: HashMap<ServerId, RunningSupport>,
     registered: HashSet<ServerId>,
+}
+
+/// What a running server's capabilities and pull behavior allow, read in one
+/// pass so an id never has one without the other.
+#[derive(Debug, Clone, Copy)]
+struct RunningSupport {
+    caps: CapabilitySet,
+    pull: PullSupport,
 }
 
 impl ToolSupportSnapshot {
@@ -192,13 +199,13 @@ impl ToolSupportSnapshot {
     /// advertises no pull provider and has not shown that it answers pulls.
     fn answers_from_push_cache(&self, server: &ServerId) -> bool {
         matches!(
-            self.pull_support.get(server),
+            self.running.get(server).map(|running| running.pull),
             Some(PullSupport::Probing | PullSupport::Unsupported)
         )
     }
 
     fn registered_support(&self, server: ServerId, capability: Option<Capability>) -> RouteSupport {
-        let Some(caps) = self.capabilities.get(&server) else {
+        let Some(RunningSupport { caps, .. }) = self.running.get(&server) else {
             return RouteSupport::Initializing;
         };
         match capability {
@@ -219,17 +226,15 @@ impl Translator {
     pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
         let servers = lock_std(&self.servers);
         let expected = servers.expected();
-        let capabilities = servers
-            .running_servers()
-            .map(|(id, server)| (id.clone(), CapabilitySet::of(server.capabilities())))
-            .collect();
-        let pull_support = servers
+        let running = servers
             .running_servers()
             .map(|(id, server)| {
-                let advertised = server.capabilities().diagnostic_provider.is_some();
                 (
                     id.clone(),
-                    PullSupport::of(advertised, servers.pull_probe(id)),
+                    RunningSupport {
+                        caps: CapabilitySet::of(server.capabilities()),
+                        pull: servers.pull_support(id),
+                    },
                 )
             })
             .collect();
@@ -247,8 +252,7 @@ impl Translator {
             language_map: Arc::clone(&self.language_map),
             router,
             expected,
-            capabilities,
-            pull_support,
+            running,
             registered,
         }
     }
@@ -303,11 +307,18 @@ mod tests {
                 LanguageId::from_static("rust"),
             )])),
             expected: ids(expected),
-            capabilities: caps
+            running: caps
                 .iter()
-                .map(|(id, caps)| (ServerId::new(*id).unwrap(), CapabilitySet::of(caps)))
+                .map(|(id, caps)| {
+                    (
+                        ServerId::new(*id).unwrap(),
+                        RunningSupport {
+                            caps: CapabilitySet::of(caps),
+                            pull: PullSupport::Advertised,
+                        },
+                    )
+                })
                 .collect(),
-            pull_support: HashMap::new(),
             registered: ids(registered),
         }
     }
@@ -430,7 +441,13 @@ mod tests {
     fn snapshot_with_pull(pull: PullSupport) -> ToolSupportSnapshot {
         ToolSupportSnapshot {
             language_map: rust_language_map(),
-            pull_support: HashMap::from([(ServerId::from_static("rust"), pull)]),
+            running: HashMap::from([(
+                ServerId::from_static("rust"),
+                RunningSupport {
+                    caps: CapabilitySet::of(&rust_caps(true)),
+                    pull,
+                },
+            )]),
             ..snapshot(&["rust"], &[], &[("rust", rust_caps(true))])
         }
     }
@@ -563,8 +580,7 @@ mod tests {
             language_map: rust_language_map(),
             router: Arc::new(router),
             expected: HashSet::new(),
-            capabilities: HashMap::new(),
-            pull_support: HashMap::new(),
+            running: HashMap::new(),
             registered: HashSet::new(),
         };
         assert_eq!(snap.languages(), ["rust"]);
@@ -611,8 +627,7 @@ mod tests {
                 ),
             ])),
             expected: HashSet::new(),
-            capabilities: HashMap::new(),
-            pull_support: HashMap::new(),
+            running: HashMap::new(),
             registered: HashSet::new(),
         };
         assert_eq!(snap.languages(), ["make", "typescript", "typescriptreact"]);
@@ -624,8 +639,7 @@ mod tests {
             language_map: rust_language_map(),
             router: Arc::new(ToolRouter::default()),
             expected: HashSet::new(),
-            capabilities: HashMap::new(),
-            pull_support: HashMap::new(),
+            running: HashMap::new(),
             registered: HashSet::new(),
         };
         assert!(snap.languages().is_empty());

@@ -110,22 +110,26 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
 
-/// Plans the server starts on the blocking pool, since it walks the workspace.
+/// Resolves the workspace roots and plans the server starts on the blocking
+/// pool, since both walk the file system.
 ///
 /// `initialize` still waits for the plan: it is needed to build the router the
 /// MCP server answers from. Only the runtime workers stay free.
 async fn plan_off_runtime(
     config: &ServerConfig,
-    roots: &WorkspaceRoots,
     redactions: &Arc<redaction::Redactions>,
-) -> Result<StartPlan, Error> {
-    let (config, roots, redactions) = (config.clone(), roots.clone(), Arc::clone(redactions));
-    on_blocking_pool(move || plan_server_starts(&config, &roots, &redactions))
-        .await
-        .map_err(|source| Error::TaskFailed {
-            task: error::BackgroundTask::ServerPlanning,
-            source,
-        })
+) -> Result<(WorkspaceRoots, StartPlan), Error> {
+    let (config, redactions) = (config.clone(), Arc::clone(redactions));
+    on_blocking_pool(move || {
+        let roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
+        let plan = plan_server_starts(&config, &roots, &redactions);
+        Ok((roots, plan))
+    })
+    .await
+    .map_err(|source| Error::TaskFailed {
+        task: error::BackgroundTask::ServerPlanning,
+        source,
+    })?
 }
 
 /// Runs `work` on the blocking pool and returns its result, re-raising a panic
@@ -215,17 +219,16 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
 
-    // A programmatic `ServerConfig` skips the validation `load`/`load_from` run.
+    // A programmatic `ServerConfig` skips the allowlist check the `load_*` functions run.
     config.validate()?;
 
-    let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
     let language_map = config.build_effective_language_map();
 
     let startup_redactions = Arc::new(redaction::Redactions::for_servers(
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let plan = plan_off_runtime(&config, &workspace_roots, &startup_redactions).await?;
+    let (workspace_roots, plan) = plan_off_runtime(&config, &startup_redactions).await?;
     let (applicable_configs, refused, refusals) = plan.into_parts();
 
     info!(
@@ -421,7 +424,7 @@ mod tests {
                     command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345")
                         .into(),
                     args: vec![],
-                    env: std::collections::HashMap::new(),
+                    env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
@@ -484,7 +487,7 @@ mod tests {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
                     args: vec!["-c".to_owned(), script],
-                    env: std::collections::HashMap::new(),
+                    env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,
@@ -669,7 +672,7 @@ mod tests {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("rust-analyzer").into(),
                     args: vec![],
-                    env: std::collections::HashMap::new(),
+                    env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
                     settings: None,

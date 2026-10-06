@@ -325,14 +325,16 @@ pub enum PatternTarget {
 /// # Examples
 ///
 /// ```
+/// use std::assert_matches;
+///
 /// use mcpls_core::config::{FilePattern, PatternTarget};
 ///
 /// let pattern = FilePattern::parse("**/*.rs").unwrap();
-/// assert!(matches!(pattern.target(), PatternTarget::Extension(e) if e == "rs"));
+/// assert_matches!(pattern.target(), PatternTarget::Extension(e) if e == "rs");
 /// assert_eq!(pattern.as_str(), "**/*.rs");
 ///
 /// let makefile = FilePattern::parse("**/Makefile").unwrap();
-/// assert!(matches!(makefile.target(), PatternTarget::Name(n) if n == "Makefile"));
+/// assert_matches!(makefile.target(), PatternTarget::Name(n) if n == "Makefile");
 ///
 /// assert!(FilePattern::parse("**/*.{cpp,h}").is_err());
 /// assert!(FilePattern::parse("src/main.rs").is_err());

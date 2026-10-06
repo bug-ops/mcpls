@@ -1,11 +1,11 @@
 //! The LSP language identifier of a configured server.
 
-use std::borrow::{Borrow, Cow};
-use std::fmt;
-use std::str::FromStr;
+use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+
+use super::text_newtype::impl_text_newtype;
 
 /// A language identifier was empty or whitespace-only.
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,50 +32,6 @@ pub struct LanguageId(Cow<'static, str>);
 impl LanguageId {
     /// Language reported for a file whose extension has no mapping.
     pub const PLAINTEXT: Self = Self::from_static("plaintext");
-
-    /// Builds an id from a literal, checked at compile time when evaluated in a
-    /// `const` context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `id` is blank or not ASCII. A literal that passes is also
-    /// accepted by [`Self::new`], which additionally allows non-ASCII text.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::config::LanguageId;
-    ///
-    /// const RUST: LanguageId = LanguageId::from_static("rust");
-    /// assert_eq!(RUST.as_str(), "rust");
-    /// ```
-    #[must_use]
-    pub const fn from_static(id: &'static str) -> Self {
-        assert!(
-            id.is_ascii() && !id.trim_ascii().is_empty(),
-            "language_id must be ASCII and not blank"
-        );
-        Self(Cow::Borrowed(id))
-    }
-
-    /// Builds an id from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidLanguageId`] if `id` is blank.
-    pub fn new(id: impl Into<String>) -> Result<Self, InvalidLanguageId> {
-        let id = id.into();
-        if id.trim().is_empty() {
-            return Err(InvalidLanguageId);
-        }
-        Ok(Self(Cow::Owned(id)))
-    }
-
-    /// The identifier text; never empty.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl JsonSchema for LanguageId {
@@ -92,57 +48,7 @@ impl JsonSchema for LanguageId {
     }
 }
 
-impl fmt::Display for LanguageId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl TryFrom<String> for LanguageId {
-    type Error = InvalidLanguageId;
-
-    fn try_from(id: String) -> Result<Self, Self::Error> {
-        Self::new(id)
-    }
-}
-
-impl From<LanguageId> for String {
-    fn from(id: LanguageId) -> Self {
-        id.0.into_owned()
-    }
-}
-
-impl FromStr for LanguageId {
-    type Err = InvalidLanguageId;
-
-    fn from_str(id: &str) -> Result<Self, Self::Err> {
-        Self::new(id)
-    }
-}
-
-impl AsRef<str> for LanguageId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl Borrow<str> for LanguageId {
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl PartialEq<str> for LanguageId {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for LanguageId {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
+impl_text_newtype!(LanguageId, InvalidLanguageId, non_blank, "language_id");
 
 #[cfg(test)]
 mod tests {

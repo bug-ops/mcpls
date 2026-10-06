@@ -110,6 +110,12 @@ Results that depend on the server's index carry `indexing_in_progress`, which is
 
 Keys that mcpls defines are `snake_case`. Objects passed through from the language server keep LSP's casing, such as the `Diagnostic` items and `selectionRange` on call hierarchy items.
 
+### Arguments
+
+A tool accepts only the arguments its schema declares. An argument name the tool does not declare, such as `kinds` instead of `kind_filter`, is rejected with an error that names the first unknown field and lists the accepted ones, instead of being ignored. Every `tools/list` input schema carries `additionalProperties: false`, so a schema-validating client sees the same rule. The `data` field of a call or type hierarchy item stays open, because it is opaque by contract.
+
+Kind filters (`kind_filter` of `workspace_symbol_search` and `get_code_actions`, `symbol_kind` of the symbol-addressed tools, `kind` of `get_folding_ranges`) accept their names in any case, and an unknown or over-long value is rejected as `-32602` with the valid values.
+
 ## Errors
 
 Failures are returned as MCP errors with a code and a message. Common ones:
@@ -118,6 +124,7 @@ Failures are returned as MCP errors with a code and a message. Common ones:
 |-----------|-----------|
 | No server for the file's language | Add an `[[lsp_servers]]` entry, or install the server |
 | `-32602` invalid params | Fix the path or parameters; a path outside every root is rejected |
+| `failed to deserialize parameters: unknown field ...` | Use only the arguments the tool declares; the message lists them |
 | Server still starting (`ServerInitializing`, `-32051`, retryable) | Wait and retry |
 | Server still indexing (`-32050`, retryable) | Wait and retry, or raise `workspace.indexing_ready_timeout_seconds` |
 | Server restarted while a request was in flight (`-32054`, retryable) | Retry the request |

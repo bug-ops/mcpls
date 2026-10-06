@@ -13,7 +13,7 @@ use tracing::{debug, info};
 use super::Translator;
 use super::availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 use super::dto::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsResult, DocumentDiagnosticsResult, ServerLogsResult,
+    Diagnostic, DiagnosticsResult, DocumentDiagnosticsResult, ServerLogsResult,
     ServerMessagesResult,
 };
 use super::enclosing::{Contextualized, ResultContext};
@@ -23,7 +23,7 @@ use super::routing::PreparedDocument;
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::{
     BoundedDiagnostics, ChangeOutcome, LogLevel, PullStamp, PullWrite, ReportedSeverity,
-    SlotChange, VersionCheck, message_as_str, reported_code,
+    SlotChange, SnapshotBefore, VersionCheck, message_as_str, reported_code,
 };
 use crate::bridge::{
     ClientPath, DiagnosticInfo, DiagnosticSources, DiagnosticsKey, DocumentTracker,
@@ -85,6 +85,17 @@ enum PullAttempt {
     PushOnly,
     /// The request failed.
     Failed(Error),
+}
+
+impl PullAttempt {
+    /// Where an answer built after this attempt came from.
+    const fn origin(&self) -> DiagnosticsOrigin {
+        match self {
+            Self::Answered(_) => DiagnosticsOrigin::Pull,
+            Self::PushOnly => DiagnosticsOrigin::PushCache,
+            Self::Failed(_) => DiagnosticsOrigin::CacheAfterFailedPull,
+        }
+    }
 }
 
 /// What a `textDocument/diagnostic` answer says about the file.
@@ -196,12 +207,7 @@ pub(super) async fn diagnostic_to_mcp(
 ) -> Diagnostic {
     Diagnostic {
         range: ctx.normalize_range(uri, diag.range).await,
-        severity: match ReportedSeverity::of(diag) {
-            ReportedSeverity::Error => DiagnosticSeverity::Error,
-            ReportedSeverity::Warning => DiagnosticSeverity::Warning,
-            ReportedSeverity::Information => DiagnosticSeverity::Information,
-            ReportedSeverity::Hint => DiagnosticSeverity::Hint,
-        },
+        severity: ReportedSeverity::of(diag).into(),
         message: message_as_str(&diag.message).to_string(),
         code: reported_code(diag).map(std::borrow::Cow::into_owned),
     }
@@ -343,12 +349,18 @@ impl Translator {
             _ => None,
         };
 
-        let (pulled, failure, origin) = match self.request_pull(&doc, support).await {
-            PullAttempt::Answered(pulled) => (pulled, None, DiagnosticsOrigin::Pull),
-            PullAttempt::PushOnly => (None, None, DiagnosticsOrigin::PushCache),
-            PullAttempt::Failed(e) => (None, Some(e), DiagnosticsOrigin::Pull),
+        let attempt = self.request_pull(&doc, support).await;
+        let origin = attempt.origin();
+        let (pulled, failure) = match attempt {
+            PullAttempt::Answered(pulled) => (pulled, None),
+            PullAttempt::PushOnly => (None, None),
+            PullAttempt::Failed(e) => (None, Some(e)),
         };
 
+        let snapshot_before = match self.wiring.get() {
+            Some(wiring) if wiring.has_subscriptions().await => SnapshotBefore::Take,
+            _ => SnapshotBefore::Skip,
+        };
         let PullSettlement {
             sources,
             storage,
@@ -356,7 +368,7 @@ impl Translator {
             availability,
         } = {
             let mut cache = notification_cache.lock().await;
-            self.settle_pull(&mut cache, &doc, stamp, pulled)
+            self.settle_pull(&mut cache, &doc, stamp, pulled, snapshot_before)
         };
         let diag_info = sources.merge();
 
@@ -366,9 +378,10 @@ impl Translator {
             {
                 let outcome = match slot {
                     SlotChange::Identical => ChangeOutcome::Unchanged,
-                    SlotChange::Replaced { before } => {
-                        ChangeOutcome::of(before.merge().as_ref(), diag_info.as_ref())
-                    }
+                    SlotChange::Replaced { before } => before
+                        .map_or(ChangeOutcome::Changed, |before| {
+                            ChangeOutcome::of(before.merge().as_ref(), diag_info.as_ref())
+                        }),
                 };
                 match outcome {
                     ChangeOutcome::Changed => wiring.publish_changed(uri).await,
@@ -520,11 +533,7 @@ impl Translator {
 
     /// What is known about `id` answering `textDocument/diagnostic`.
     pub(super) fn pull_support(&self, id: &ServerId) -> PullSupport {
-        let servers = lock_std(&self.servers);
-        let advertised = servers
-            .server(id)
-            .is_some_and(|server| server.capabilities().diagnostic_provider.is_some());
-        PullSupport::of(advertised, servers.pull_probe(id))
+        lock_std(&self.servers).pull_support(id)
     }
 
     fn pull_probe_of(&self, id: &ServerId) -> PullProbe {
@@ -549,6 +558,7 @@ impl Translator {
         doc: &PreparedDocument,
         stamp: Option<PullStamp>,
         pulled: Option<BoundedDiagnostics>,
+        snapshot_before: SnapshotBefore,
     ) -> PullSettlement {
         let (server_id, uri) = (doc.server_id(), doc.uri());
         let unstored = |cache: &NotificationCache, items, version| PullSettlement {
@@ -577,7 +587,14 @@ impl Translator {
         } else {
             VersionCheck::Moved
         };
-        match cache.store_pulled_diagnostics(server_id, uri, stamp, check, items) {
+        match cache.store_pulled_diagnostics_with(
+            server_id,
+            uri,
+            stamp,
+            check,
+            items,
+            snapshot_before,
+        ) {
             PullWrite::Stored { slot, evicted } => PullSettlement {
                 sources: cache.diagnostic_sources(uri),
                 storage: PullStorage::Stored(slot),
@@ -691,7 +708,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::PositionDegradation;
+    use crate::bridge::translator::dto::{DiagnosticSeverity, PositionDegradation};
     use crate::bridge::translator::testing::*;
     use crate::config::{FileExtension, LanguageId, ServerId, ToolRouter};
     use crate::error::Error;

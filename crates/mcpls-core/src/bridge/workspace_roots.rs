@@ -698,11 +698,8 @@ impl WorkspaceRoots {
         }
         let absolute = std::path::absolute(path).map_err(|source| path_io_error(path, source))?;
         let normalized = lexically_normalize(dunce::simplified(&absolute));
-        if self.admits_lexically(&normalized) {
-            Ok(())
-        } else {
-            Err(Error::PathOutsideWorkspace(path.to_path_buf()))
-        }
+        self.admits_lexically(&normalized)
+            .ok_or_else(|| Error::PathOutsideWorkspace(path.to_path_buf()))
     }
 
     fn canonical_gate(&self, path: &ClientPath) -> Result<WorkspacePath, Error> {

@@ -325,7 +325,7 @@ impl RestartGeneration {
 #[derive(Debug)]
 pub struct NotificationReceivers {
     /// Diagnostics, log and `showMessage` lane.
-    pub(crate) notifications: mpsc::Receiver<LspNotification>,
+    pub(crate) notifications: crate::lsp::NotificationInbox,
     /// `$/progress` and unrecognized notifications lane.
     pub(crate) lifecycle: mpsc::Receiver<LspNotification>,
     /// The `tsserver` path mcpls pinned for this server, so the lifecycle lane
@@ -589,9 +589,9 @@ impl Translator {
     }
 
     /// Declare that the initial server startup is still settling; restarts
-    /// report `initializing` until the returned guard is dropped, because a
-    /// restarted pump's diagnostics role is fixed at spawn and routes still
-    /// change while servers settle.
+    /// report `initializing` until the returned guard is dropped, because routes
+    /// (and so diagnostics roles) still change while servers settle; a restarted
+    /// pump follows those changes through the shared role registry.
     pub(crate) fn begin_startup(&self) -> StartupGuard<'_> {
         lock_std(&self.phase).begin_startup();
         StartupGuard(self)
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn spawn_errors_map_to_spawn_failed_and_the_rest_to_initialize_failed() {
         let not_found = Error::ServerNotFound {
-            command: "x".to_string(),
+            command: crate::config::ServerCommand::from_static("x"),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         };
         assert_matches!(
@@ -974,7 +974,7 @@ mod tests {
                 .await
                 .unwrap();
             let receivers = NotificationReceivers {
-                notifications: server.take_notification_rx(),
+                notifications: server.take_notification_inbox(),
                 lifecycle: server.take_lifecycle_rx(),
                 pinned_tsserver: None,
             };
@@ -982,6 +982,7 @@ mod tests {
 
             let wiring = PumpWiring::new(
                 PumpShared {
+                    roles: crate::runtime::pump::DiagnosticsRoles::default(),
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
@@ -1571,6 +1572,7 @@ mod tests {
             );
             let wiring = PumpWiring::new(
                 PumpShared {
+                    roles: crate::runtime::pump::DiagnosticsRoles::default(),
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
@@ -1588,7 +1590,7 @@ mod tests {
                     .await
                     .unwrap();
                 let receivers = NotificationReceivers {
-                    notifications: server.take_notification_rx(),
+                    notifications: server.take_notification_inbox(),
                     lifecycle: server.take_lifecycle_rx(),
                     pinned_tsserver: None,
                 };

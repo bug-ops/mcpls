@@ -36,6 +36,7 @@ pub enum ManagedEnvVar {
 
 impl ManagedEnvVar {
     /// Every managed variable.
+    #[cfg(test)]
     pub const ALL: [Self; 4] = [
         Self::Path,
         Self::Home,

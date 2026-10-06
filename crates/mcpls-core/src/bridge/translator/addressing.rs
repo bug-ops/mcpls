@@ -584,7 +584,7 @@ impl Translator {
         };
 
         drop(
-            self.prepare_gated_document(file_path, tool.capability(), IndexingGate::NotRequired)
+            self.prepare_gated_document(file_path, tool.capability(), IndexingGate::FileLocal)
                 .await?,
         );
         let fetched = self.request_document_symbols(file_path).await?;

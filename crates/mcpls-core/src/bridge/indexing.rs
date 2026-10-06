@@ -122,11 +122,11 @@ impl IndexingPolicy {
     }
 }
 
-/// Which signal kind last drove a server's [`IndexingEntry`].
+/// Which signal source a server has reported.
 ///
-/// Both sources write the same entry, so once one has spoken it must not be
-/// silently overwritten by stale reasoning from the other (S2/#421): a
-/// `Ready(ServerStatus)` rust-analyzer entry must not be knocked back to
+/// Both sources feed the same per-server state, so once one has spoken it must
+/// not be silently overwritten by stale reasoning from the other (S2/#421): a
+/// ready rust-analyzer `serverStatus` reading must not be knocked back to
 /// `Loading` by a later `$/progress` sequence it never asked for, and
 /// conversely a `ServerStatus` signal -- authoritative, since it is
 /// rust-analyzer's own purpose-built readiness notification -- always
@@ -142,39 +142,59 @@ enum IndexingSignalSource {
 }
 
 /// What is tracked for one server: the wait for a replacement's first signal,
-/// or the entry a real signal produced.
+/// or what a real signal produced.
 #[derive(Debug, Clone)]
 enum TrackedIndexing {
     /// A replacement process has not reported a signal yet; reads
     /// [`IndexingState::Loading`] until `since + within` has elapsed.
     AwaitingFirstSignal { since: Instant, within: Duration },
     /// A real signal has been observed.
-    Signalled(IndexingEntry),
+    Signalled(Signalled),
 }
 
-/// A tracked [`IndexingState`] plus the bookkeeping needed to derive it.
+/// What a `serverStatus` notification reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusReading {
+    /// `quiescent: false`: indexing is in progress.
+    Loading,
+    /// `quiescent: true`: the initial workspace load is complete.
+    Ready,
+}
+
+impl From<StatusReading> for IndexingState {
+    fn from(reading: StatusReading) -> Self {
+        match reading {
+            StatusReading::Loading => Self::Loading,
+            StatusReading::Ready => Self::Ready,
+        }
+    }
+}
+
+/// A tracked [`IndexingState`] plus the bookkeeping its source needs.
 ///
-/// `last_updated` is the *only* timestamp field (N5): both signal sources
-/// refresh it on every accepted update, so [`IndexingTracker::state`]'s
-/// staleness check (`INDEXING_STALENESS_BOUND`) works identically for
-/// either source without a second, source-specific clock to keep in sync.
-/// For a `Progress`-sourced entry this also means a multi-phase load whose
-/// individual phases each stay under the staleness bound remains gated for
-/// its whole duration, even if the load as a whole runs past
-/// `INDEXING_STALENESS_BOUND` -- only a single phase that itself never
-/// reports a boundary for that long fails open.
-///
-/// `open`/`empty_since`/`latched` are meaningful only for a `Progress`
-/// source; a `ServerStatus`-sourced entry leaves them at their initial
-/// values and `state` is read directly instead -- see
-/// [`IndexingTracker::state`].
+/// `last_updated` is the *only* timestamp of either variant (N5): both signal
+/// sources refresh it on every accepted update, so [`IndexingTracker::state`]'s
+/// staleness check (`INDEXING_STALENESS_BOUND`) works identically for either
+/// source without a second, source-specific clock to keep in sync. For a
+/// `Progress` source this also means a multi-phase load whose individual
+/// phases each stay under the staleness bound remains gated for its whole
+/// duration, even if the load as a whole runs past `INDEXING_STALENESS_BOUND`
+/// -- only a single phase that itself never reports a boundary for that long
+/// fails open.
 #[derive(Debug, Clone)]
-struct IndexingEntry {
-    /// Directly authoritative for a `ServerStatus` source; ignored on read
-    /// for a `Progress` source, which recomputes state from
-    /// `open`/`empty_since`/`latched` instead.
-    state: IndexingState,
-    source: IndexingSignalSource,
+enum Signalled {
+    /// Directly authoritative: the reading is the state.
+    ServerStatus {
+        reading: StatusReading,
+        last_updated: Instant,
+    },
+    /// Recomputed on every read from the progress bookkeeping.
+    Progress(ProgressEntry),
+}
+
+/// The bookkeeping of a `$/progress`-sourced readiness.
+#[derive(Debug, Clone)]
+struct ProgressEntry {
     last_updated: Instant,
     /// Progress tokens with an outstanding `begin` and no matching `end`
     /// yet, each paired with when its `begin` was accepted.
@@ -207,14 +227,12 @@ struct IndexingEntry {
     latched: bool,
 }
 
-impl IndexingEntry {
-    /// A freshly observed `Progress`-sourced entry, with no outstanding
-    /// `begin` yet -- `observe_progress` fills in `open`/`empty_since` right
-    /// after this returns.
-    fn fresh_progress() -> Self {
+impl ProgressEntry {
+    /// A freshly observed entry, with no outstanding `begin` yet --
+    /// `observe_progress` fills in `open`/`empty_since` right after this
+    /// returns.
+    fn new() -> Self {
         Self {
-            state: IndexingState::Unknown,
-            source: IndexingSignalSource::Progress,
             last_updated: Instant::now(),
             open: HashMap::new(),
             empty_since: None,
@@ -307,17 +325,39 @@ const PROGRESS_OPEN_CAP: usize = 64;
 /// A few hundred bytes is far more than any real progress token needs.
 const PROGRESS_TOKEN_MAX_LEN: usize = 256;
 
+/// Everything known about one server's indexing readiness, so no per-server
+/// fact can exist without the others.
+#[derive(Debug, Default)]
+struct ServerIndexing {
+    policy: IndexingPolicy,
+    /// The signal source the server last reported; survives
+    /// [`IndexingTracker::reset`] like `policy` and decides whether a
+    /// replacement is awaited ([`IndexingReset::AwaitReplacement`]).
+    seen: Option<IndexingSignalSource>,
+    tracked: Option<TrackedIndexing>,
+}
+
+impl ServerIndexing {
+    fn is_disabled(&self) -> bool {
+        self.policy == IndexingPolicy::Disabled
+    }
+
+    fn log_wait_ended(&self, server_id: &ServerId) {
+        if matches!(
+            self.tracked,
+            Some(TrackedIndexing::AwaitingFirstSignal { .. })
+        ) {
+            tracing::debug!(%server_id, "indexing signal ends the pre-signal wait");
+        }
+    }
+}
+
 /// Per-server workspace-indexing readiness state plus the escape-hatch
-/// policy map, owned by [`NotificationCache`](super::NotificationCache) and
+/// policy, owned by [`NotificationCache`](super::NotificationCache) and
 /// delegated to for every indexing-related call.
 #[derive(Debug, Default)]
 pub struct IndexingTracker {
-    entries: HashMap<ServerId, TrackedIndexing>,
-    policies: HashMap<ServerId, IndexingPolicy>,
-    /// The signal source each server last reported; survives [`Self::reset`]
-    /// like `policies` and decides whether a replacement is awaited
-    /// ([`IndexingReset::AwaitReplacement`]).
-    seen: HashMap<ServerId, IndexingSignalSource>,
+    servers: HashMap<ServerId, ServerIndexing>,
 }
 
 impl IndexingTracker {
@@ -331,11 +371,13 @@ impl IndexingTracker {
     /// registration from `LspServerConfig::indexing` before any signal for
     /// it can arrive.
     pub(crate) fn set_policy(&mut self, server_id: ServerId, policy: IndexingPolicy) {
-        self.policies.insert(server_id, policy);
+        self.servers.entry(server_id).or_default().policy = policy;
     }
 
     fn is_disabled(&self, server_id: &ServerId) -> bool {
-        self.policies.get(server_id) == Some(&IndexingPolicy::Disabled)
+        self.servers
+            .get(server_id)
+            .is_some_and(ServerIndexing::is_disabled)
     }
 
     /// Record a workspace-readiness signal from an unrecognized/custom LSP
@@ -346,7 +388,7 @@ impl IndexingTracker {
     /// [`IndexingState::Loading`], `true` marks it [`IndexingState::Ready`].
     /// Any other method, or a `serverStatus` payload missing/malformed the
     /// field, leaves the current entry entirely untouched -- including its
-    /// `source` -- rather than erroring: a malformed frame must not mark
+    /// source -- rather than erroring: a malformed frame must not mark
     /// this server `ServerStatus`-sourced and thereby permanently disable
     /// its `$/progress` path via [`Self::observe_progress`]'s stickiness
     /// check (N6).
@@ -374,34 +416,28 @@ impl IndexingTracker {
             return;
         };
 
+        let server = self.servers.entry(server_id.clone()).or_default();
         let sticky_ready = matches!(
-            self.entries.get(server_id),
-            Some(TrackedIndexing::Signalled(entry))
-                if entry.source == IndexingSignalSource::ServerStatus
-                    && entry.state == IndexingState::Ready
+            server.tracked,
+            Some(TrackedIndexing::Signalled(Signalled::ServerStatus {
+                reading: StatusReading::Ready,
+                ..
+            }))
         );
         if sticky_ready {
             return;
         }
 
-        self.seen
-            .insert(server_id.clone(), IndexingSignalSource::ServerStatus);
-        self.log_wait_ended(server_id);
-        self.entries.insert(
-            server_id.clone(),
-            TrackedIndexing::Signalled(IndexingEntry {
-                state: if quiescent {
-                    IndexingState::Ready
-                } else {
-                    IndexingState::Loading
-                },
-                source: IndexingSignalSource::ServerStatus,
-                last_updated: Instant::now(),
-                open: HashMap::new(),
-                empty_since: None,
-                latched: false,
-            }),
-        );
+        server.seen = Some(IndexingSignalSource::ServerStatus);
+        server.log_wait_ended(server_id);
+        server.tracked = Some(TrackedIndexing::Signalled(Signalled::ServerStatus {
+            reading: if quiescent {
+                StatusReading::Ready
+            } else {
+                StatusReading::Loading
+            },
+            last_updated: Instant::now(),
+        }));
     }
 
     /// Record a `$/progress` notification toward `server_id`'s readiness.
@@ -449,19 +485,17 @@ impl IndexingTracker {
         let Some(kind) = ProgressKind::from_value(&params.value) else {
             return;
         };
-        match self.entries.get(server_id) {
-            Some(TrackedIndexing::Signalled(entry))
-                if entry.source == IndexingSignalSource::ServerStatus =>
-            {
-                return;
+        if let Some(server) = self.servers.get(server_id) {
+            match &server.tracked {
+                Some(TrackedIndexing::Signalled(Signalled::ServerStatus { .. })) => return,
+                // Progress frames of a server that reports `serverStatus` are not the signal awaited.
+                Some(TrackedIndexing::AwaitingFirstSignal { .. })
+                    if server.seen != Some(IndexingSignalSource::Progress) =>
+                {
+                    return;
+                }
+                _ => {}
             }
-            // Progress frames of a server that reports `serverStatus` are not the signal awaited.
-            Some(TrackedIndexing::AwaitingFirstSignal { .. })
-                if self.seen.get(server_id) != Some(&IndexingSignalSource::Progress) =>
-            {
-                return;
-            }
-            _ => {}
         }
         if let ProgressToken::String(token) = &params.token
             && token.len() > PROGRESS_TOKEN_MAX_LEN
@@ -470,18 +504,16 @@ impl IndexingTracker {
             return;
         }
 
-        self.seen
-            .entry(server_id.clone())
-            .or_insert(IndexingSignalSource::Progress);
-        self.log_wait_ended(server_id);
-        let tracked = self
-            .entries
-            .entry(server_id.clone())
-            .or_insert_with(|| TrackedIndexing::Signalled(IndexingEntry::fresh_progress()));
+        let server = self.servers.entry(server_id.clone()).or_default();
+        server.seen.get_or_insert(IndexingSignalSource::Progress);
+        server.log_wait_ended(server_id);
+        let tracked = server.tracked.get_or_insert_with(|| {
+            TrackedIndexing::Signalled(Signalled::Progress(ProgressEntry::new()))
+        });
         if matches!(tracked, TrackedIndexing::AwaitingFirstSignal { .. }) {
-            *tracked = TrackedIndexing::Signalled(IndexingEntry::fresh_progress());
+            *tracked = TrackedIndexing::Signalled(Signalled::Progress(ProgressEntry::new()));
         }
-        let TrackedIndexing::Signalled(entry) = tracked else {
+        let TrackedIndexing::Signalled(Signalled::Progress(entry)) = tracked else {
             return;
         };
         if entry.latched {
@@ -489,7 +521,7 @@ impl IndexingTracker {
         }
 
         let now = Instant::now();
-        // Age out tokens whose `begin` never got a matching `end` (S1) -- see `IndexingEntry::open`'s doc.
+        // Age out tokens whose `begin` never got a matching `end` (S1) -- see `ProgressEntry::open`'s doc.
         entry
             .open
             .retain(|_, began| began.elapsed() < INDEXING_STALENESS_BOUND);
@@ -554,10 +586,13 @@ impl IndexingTracker {
     /// survive the entry-wide gate above), also reads `Unknown` rather than
     /// running the settle/latch logic meant for a genuinely-observed `end`.
     pub(crate) fn state(&self, server_id: &ServerId) -> IndexingState {
-        if self.is_disabled(server_id) {
+        let Some(server) = self.servers.get(server_id) else {
+            return IndexingState::Unknown;
+        };
+        if server.is_disabled() {
             return IndexingState::Unknown;
         }
-        match self.entries.get(server_id) {
+        match &server.tracked {
             None => IndexingState::Unknown,
             Some(TrackedIndexing::AwaitingFirstSignal { since, within }) => {
                 if since.elapsed() < *within {
@@ -566,49 +601,54 @@ impl IndexingTracker {
                     IndexingState::Unknown
                 }
             }
-            Some(TrackedIndexing::Signalled(entry)) => Self::signalled_state(entry),
+            Some(TrackedIndexing::Signalled(signalled)) => Self::signalled_state(signalled),
         }
     }
 
-    fn signalled_state(entry: &IndexingEntry) -> IndexingState {
-        match entry.source {
-            IndexingSignalSource::ServerStatus => {
-                if entry.state == IndexingState::Loading
-                    && entry.last_updated.elapsed() >= INDEXING_STALENESS_BOUND
+    fn signalled_state(signalled: &Signalled) -> IndexingState {
+        match signalled {
+            Signalled::ServerStatus {
+                reading,
+                last_updated,
+            } => {
+                if *reading == StatusReading::Loading
+                    && last_updated.elapsed() >= INDEXING_STALENESS_BOUND
                 {
                     IndexingState::Unknown
                 } else {
-                    entry.state
+                    (*reading).into()
                 }
             }
-            IndexingSignalSource::Progress => {
-                if entry.latched {
-                    return IndexingState::Ready;
-                }
-                if entry.last_updated.elapsed() >= INDEXING_STALENESS_BOUND {
-                    return IndexingState::Unknown;
-                }
-                if entry.open.len() >= PROGRESS_OPEN_CAP {
-                    return IndexingState::Unknown;
-                }
-                let has_live_open = entry
-                    .open
-                    .values()
-                    .any(|began| began.elapsed() < INDEXING_STALENESS_BOUND);
-                if has_live_open {
-                    return IndexingState::Loading;
-                }
-                if entry.open.is_empty() {
-                    match entry.empty_since {
-                        Some(since) if since.elapsed() < PROGRESS_SETTLE => IndexingState::Loading,
-                        Some(_) => IndexingState::Ready,
-                        // No transition has ever been observed to settle.
-                        None => IndexingState::Unknown,
-                    }
-                } else {
-                    IndexingState::Unknown
-                }
+            Signalled::Progress(entry) => Self::progress_state(entry),
+        }
+    }
+
+    fn progress_state(entry: &ProgressEntry) -> IndexingState {
+        if entry.latched {
+            return IndexingState::Ready;
+        }
+        if entry.last_updated.elapsed() >= INDEXING_STALENESS_BOUND {
+            return IndexingState::Unknown;
+        }
+        if entry.open.len() >= PROGRESS_OPEN_CAP {
+            return IndexingState::Unknown;
+        }
+        let has_live_open = entry
+            .open
+            .values()
+            .any(|began| began.elapsed() < INDEXING_STALENESS_BOUND);
+        if has_live_open {
+            return IndexingState::Loading;
+        }
+        if entry.open.is_empty() {
+            match entry.empty_since {
+                Some(since) if since.elapsed() < PROGRESS_SETTLE => IndexingState::Loading,
+                Some(_) => IndexingState::Ready,
+                // No transition has ever been observed to settle.
+                None => IndexingState::Unknown,
             }
+        } else {
+            IndexingState::Unknown
         }
     }
 
@@ -617,30 +657,21 @@ impl IndexingTracker {
     /// still honors whatever the static config said -- nor which signal
     /// source it has reported before.
     pub(crate) fn reset(&mut self, server_id: &ServerId, reset: IndexingReset) {
-        self.entries.remove(server_id);
+        let Some(server) = self.servers.get_mut(server_id) else {
+            return;
+        };
+        server.tracked = None;
         let IndexingReset::AwaitReplacement { within } = reset else {
             return;
         };
-        if self.is_disabled(server_id) || !self.seen.contains_key(server_id) {
+        if server.is_disabled() || server.seen.is_none() {
             return;
         }
         tracing::debug!(%server_id, ?within, "replacement awaits its first indexing signal");
-        self.entries.insert(
-            server_id.clone(),
-            TrackedIndexing::AwaitingFirstSignal {
-                since: Instant::now(),
-                within,
-            },
-        );
-    }
-
-    fn log_wait_ended(&self, server_id: &ServerId) {
-        if matches!(
-            self.entries.get(server_id),
-            Some(TrackedIndexing::AwaitingFirstSignal { .. })
-        ) {
-            tracing::debug!(%server_id, "indexing signal ends the pre-signal wait");
-        }
+        server.tracked = Some(TrackedIndexing::AwaitingFirstSignal {
+            since: Instant::now(),
+            within,
+        });
     }
 }
 

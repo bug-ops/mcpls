@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::LspErrorCodes;
+use lsp_types::{ErrorCodes, LspErrorCodes};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -17,14 +17,12 @@ use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
-    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LspNotification, RequestId,
+    InboundMessage, JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcOutcome,
+    JsonRpcReply, JsonRpcRequest, LspNotification, RequestId,
 };
+use crate::lsp::{DropLog, NotificationSink};
 use crate::redaction::{RedactedText, Redactions};
 use crate::util::WarnLimiter;
-
-/// JSON-RPC protocol version.
-const JSONRPC_VERSION: &str = "2.0";
 
 /// LSP error code returned when the server cancels a request and wants the client to retry.
 const SERVER_CANCELLED_CODE: i32 = -32802;
@@ -440,7 +438,7 @@ impl LspClient {
     pub(crate) fn from_transport_with_notifications(
         config: LspServerConfig,
         transport: (LspTransport, LspTransportReader),
-        notification_tx: mpsc::Sender<LspNotification>,
+        notification_tx: NotificationSink,
         lifecycle_tx: mpsc::Sender<LspNotification>,
         redactions: Arc<Redactions>,
     ) -> Self {
@@ -767,8 +765,16 @@ impl LspClient {
                     );
                     // continue loop for next attempt
                 }
-                Err(error @ Error::LspServerError { .. }) => {
-                    return Err(UnclassifiedError::server_response(error, method, id));
+                Err(Error::LspServerError {
+                    code,
+                    message,
+                    data,
+                }) => {
+                    return Err(UnclassifiedError::server_response(
+                        ServerErrorResponse::new(code, message, data),
+                        method,
+                        id,
+                    ));
                 }
                 Err(e) => return Err(UnclassifiedError::logged(e)),
             }
@@ -995,7 +1001,7 @@ impl LspClient {
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: Arc<Mutex<PendingRequests>>,
         pending_failure: Arc<StdMutex<PendingFailure>>,
-        notification_tx: Option<mpsc::Sender<LspNotification>>,
+        notification_tx: Option<NotificationSink>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
         redactions: Arc<Redactions>,
         settings: Option<Arc<LspSettings>>,
@@ -1111,7 +1117,7 @@ impl LspClient {
         msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &Arc<Mutex<PendingRequests>>,
-        notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        notification_tx: Option<&NotificationSink>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
         settings: Option<&LspSettings>,
@@ -1202,7 +1208,7 @@ impl LspClient {
         transport: &mut LspTransport,
         message: InboundMessage,
         pending_requests: &Arc<Mutex<PendingRequests>>,
-        notification_tx: Option<&mpsc::Sender<LspNotification>>,
+        notification_tx: Option<&NotificationSink>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
         settings: Option<&LspSettings>,
@@ -1269,17 +1275,14 @@ impl LspClient {
             }
             InboundMessage::UndecodableRequest { id } => {
                 debug!("Answering an undecodable server request with an error: id={id:?}");
-                let response = JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
+                let reply = JsonRpcReply::new(
                     id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32600,
-                        message: "Invalid Request: the request could not be decoded".to_owned(),
-                        data: None,
-                    }),
-                };
-                transport.send(&serde_json::to_value(&response)?).await?;
+                    JsonRpcOutcome::Error(JsonRpcError::new(
+                        ErrorCodes::InvalidRequest,
+                        "Invalid Request: the request could not be decoded",
+                    )),
+                );
+                transport.send(&serde_json::to_value(&reply)?).await?;
             }
             InboundMessage::UndecodableNotification | InboundMessage::UndecodableFrame => {}
             InboundMessage::Request(request) => {
@@ -1287,8 +1290,8 @@ impl LspClient {
                     "Received server request: {} (id={:?})",
                     request.method, request.id
                 );
-                let response = Self::server_request_response(request, settings);
-                let value = serde_json::to_value(&response)?;
+                let reply = Self::server_request_reply(request, settings);
+                let value = serde_json::to_value(&reply)?;
                 transport.send(&value).await?;
             }
             InboundMessage::Notification(notification) => {
@@ -1298,30 +1301,38 @@ impl LspClient {
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
                 Self::redact_notification(&mut typed, redactions);
 
-                let destination = Self::notification_lane(&typed, notification_tx, lifecycle_tx);
-
-                if let Some((lane, tx)) = destination {
-                    // Log diagnostics count since it's useful for debugging
-                    if let LspNotification::PublishDiagnostics(ref params) = typed {
+                // Diagnostics have their own delivery path: the mailbox coalesces
+                // per file and records what it cannot hold, so a burst is never
+                // dropped unrecorded.
+                let typed = match (typed, notification_tx) {
+                    (LspNotification::PublishDiagnostics(params), Some(sink)) => {
                         debug!(
                             "Forwarding diagnostics for {}: {} items",
                             params.uri.as_ref(),
                             params.diagnostics.len()
                         );
-                    } else if tracing::enabled!(tracing::Level::TRACE) {
+                        sink.publishes().publish(params);
+                        return Ok(());
+                    }
+                    (typed, _) => typed,
+                };
+
+                let destination = Self::notification_lane(
+                    &typed,
+                    notification_tx.map(NotificationSink::messages),
+                    lifecycle_tx,
+                );
+
+                if let Some((lane, tx)) = destination {
+                    if tracing::enabled!(tracing::Level::TRACE) {
                         trace!(
                             "Forwarding notification: {}",
                             redactions.apply(&format!("{typed:?}"))
                         );
                     }
 
-                    // Names lane and method -- the only diagnostic for a dropped frame.
                     if tx.try_send(typed).is_err() {
-                        warn!(
-                            "Dropping notification: lane={lane}, method={} \
-                             (channel full or closed)",
-                            notification.method
-                        );
+                        DropLog::of_lane(lane).record(&notification.method);
                     }
                 }
             }
@@ -1354,24 +1365,13 @@ impl LspClient {
         }
     }
 
-    fn server_request_response(
+    fn server_request_reply(
         request: JsonRpcRequest,
         settings: Option<&LspSettings>,
-    ) -> JsonRpcResponse {
-        match Self::server_request_result(&request.method, request.params.as_ref(), settings) {
-            Ok(result) => JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION.to_string(),
-                id: request.id,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => JsonRpcResponse {
-                jsonrpc: JSONRPC_VERSION.to_string(),
-                id: request.id,
-                result: None,
-                error: Some(error),
-            },
-        }
+    ) -> JsonRpcReply {
+        let outcome =
+            Self::server_request_result(&request.method, request.params.as_ref(), settings);
+        JsonRpcReply::new(request.id, outcome.into())
     }
 
     fn server_request_result(
@@ -1391,11 +1391,10 @@ impl LspClient {
             | "window/workDoneProgress/create" => Ok(Value::Null),
             "workspace/configuration" => Self::workspace_configuration_result(params, settings),
             "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
-            _ => Err(JsonRpcError {
-                code: -32601,
-                message: format!("Unhandled server request: {method}"),
-                data: None,
-            }),
+            _ => Err(JsonRpcError::new(
+                ErrorCodes::MethodNotFound,
+                format!("Unhandled server request: {method}"),
+            )),
         }
     }
 
@@ -1417,10 +1416,11 @@ impl LspClient {
         let Some(settings) = settings else {
             return Ok(Value::Array(vec![Value::Null; items.map_or(0, Vec::len)]));
         };
-        let items = items.ok_or_else(|| JsonRpcError {
-            code: -32602,
-            message: "Invalid params for workspace/configuration".to_owned(),
-            data: None,
+        let items = items.ok_or_else(|| {
+            JsonRpcError::new(
+                ErrorCodes::InvalidParams,
+                "Invalid params for workspace/configuration",
+            )
         })?;
         let sections = items
             .iter()
@@ -1456,13 +1456,43 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
 pub struct UnclassifiedError(Option<Box<Unclassified>>);
 
+/// An error response from the server, kept as the [`Error::LspServerError`] it
+/// becomes so a caller can classify it, and constructible from nothing else.
+#[derive(Debug)]
+struct ServerErrorResponse {
+    error: Error,
+    code: i32,
+}
+
+impl ServerErrorResponse {
+    const fn new(code: i32, message: String, data: Option<Value>) -> Self {
+        Self {
+            error: Error::LspServerError {
+                code,
+                message,
+                data,
+            },
+            code,
+        }
+    }
+
+    /// The code and message of the response.
+    const fn code_and_message(&self) -> (i32, &str) {
+        let message = match &self.error {
+            Error::LspServerError { message, .. } => message.as_str(),
+            _ => "",
+        };
+        (self.code, message)
+    }
+}
+
 /// The two states of an [`UnclassifiedError`]: a failure already logged where
 /// it happened, and a server error response nobody has logged yet.
 #[derive(Debug)]
 enum Unclassified {
     Logged(Error),
     ServerResponse {
-        error: Error,
+        response: ServerErrorResponse,
         method: String,
         id: RequestId,
     },
@@ -1471,23 +1501,28 @@ enum Unclassified {
 impl Unclassified {
     const fn error(&self) -> &Error {
         match self {
-            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
+            Self::Logged(error)
+            | Self::ServerResponse {
+                response: ServerErrorResponse { error, .. },
+                ..
+            } => error,
         }
     }
 
     /// Hands over the error, first passing an unlogged server error response
     /// to `report` as (method, id, code, message).
     fn finish(self, report: impl FnOnce(&str, &RequestId, i32, &str)) -> Error {
-        if let Self::ServerResponse {
-            error: Error::LspServerError { code, message, .. },
-            method,
-            id,
-        } = &self
-        {
-            report(method, id, *code, message);
-        }
         match self {
-            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
+            Self::Logged(error) => error,
+            Self::ServerResponse {
+                response,
+                method,
+                id,
+            } => {
+                let (code, message) = response.code_and_message();
+                report(&method, &id, code, message);
+                response.error
+            }
         }
     }
 }
@@ -1507,9 +1542,9 @@ impl UnclassifiedError {
         Self(Some(Box::new(Unclassified::Logged(error))))
     }
 
-    fn server_response(error: Error, method: &str, id: RequestId) -> Self {
+    fn server_response(response: ServerErrorResponse, method: &str, id: RequestId) -> Self {
         Self(Some(Box::new(Unclassified::ServerResponse {
-            error,
+            response,
             method: method.to_owned(),
             id,
         })))
@@ -1579,6 +1614,32 @@ mod tests {
 
     use super::*;
     use crate::config::TimeoutSecs;
+    use crate::lsp::types::JsonRpcResponse;
+
+    #[test]
+    fn test_unclassified_server_response_always_reports_code_and_message() {
+        let unclassified = UnclassifiedError::server_response(
+            ServerErrorResponse::new(-32001, "boom".to_owned(), None),
+            "textDocument/hover",
+            RequestId::Number(3),
+        );
+        let mut reported = None;
+
+        let error = unclassified.take().finish(|method, id, code, message| {
+            reported = Some((method.to_owned(), id.clone(), code, message.to_owned()));
+        });
+
+        assert_eq!(
+            reported,
+            Some((
+                "textDocument/hover".to_owned(),
+                RequestId::Number(3),
+                -32001,
+                "boom".to_owned()
+            ))
+        );
+        assert_matches!(error, Error::LspServerError { code: -32001, .. });
+    }
 
     /// The `trace!` of a forwarded notification must not print a configured
     /// secret that the server echoed into an unrecognized notification.
@@ -1655,7 +1716,7 @@ mod tests {
         )
         .await;
 
-        let forwarded = timeout(Duration::from_secs(2), lanes.notification_rx.recv())
+        let forwarded = timeout(Duration::from_secs(2), lanes.publishes.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1786,11 +1847,12 @@ mod tests {
             params: Some(serde_json::json!({ "registrations": [] })),
         };
 
-        let response = LspClient::server_request_response(request, None);
+        let reply = reply_json(request);
 
-        assert_eq!(response.id, RequestId::String("ts1".to_string()));
-        assert_eq!(response.result, Some(Value::Null));
-        assert!(response.error.is_none());
+        assert_eq!(reply["id"], serde_json::json!("ts1"));
+        assert_eq!(reply["jsonrpc"], serde_json::json!("2.0"));
+        assert_eq!(reply["result"], Value::Null);
+        assert!(reply.get("error").is_none());
     }
 
     #[test]
@@ -1967,10 +2029,10 @@ mod tests {
             params: Some(serde_json::json!({ "token": "indexing" })),
         };
 
-        let response = LspClient::server_request_response(request, None);
+        let reply = reply_json(request);
 
-        assert_eq!(response.result, Some(Value::Null));
-        assert!(response.error.is_none());
+        assert_eq!(reply["result"], Value::Null);
+        assert!(reply.get("error").is_none());
     }
 
     /// S3 (Fix 7): a `report`-kind `$/progress` frame must never be
@@ -2064,16 +2126,18 @@ mod tests {
             params: None,
         };
 
-        let response = LspClient::server_request_response(request, None);
+        let reply = reply_json(request);
 
-        assert!(response.result.is_none());
-        match response.error {
-            Some(error) => {
-                assert_eq!(error.code, -32601);
-                assert_eq!(error.message, "Unhandled server request: custom/request");
-            }
-            None => panic!("unknown request should return error"),
-        }
+        assert!(reply.get("result").is_none());
+        assert_eq!(reply["error"]["code"], serde_json::json!(-32601));
+        assert_eq!(
+            reply["error"]["message"],
+            serde_json::json!("Unhandled server request: custom/request")
+        );
+    }
+
+    fn reply_json(request: JsonRpcRequest) -> Value {
+        serde_json::to_value(LspClient::server_request_reply(request, None)).unwrap()
     }
 
     #[tokio::test]

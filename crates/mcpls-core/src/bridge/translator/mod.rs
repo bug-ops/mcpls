@@ -47,6 +47,7 @@ mod hierarchy;
 mod highlights;
 mod kind_filter;
 mod navigation;
+mod positioned;
 #[cfg(test)]
 mod prepare_range_tests;
 mod pull_support;
@@ -72,7 +73,8 @@ pub use enclosing::{
     EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
 };
 pub use kind_filter::{
-    CodeActionKindFilter, KindFilter, KindFilterInput, RejectedKindFilter, SymbolKindFilter,
+    CodeActionKindFilter, KindFilter, KindFilterField, KindFilterInput, RejectedKindFilter,
+    Rejection, SymbolKindFilter,
 };
 pub use restart::{
     DiagnosticsRole, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers,
@@ -1142,7 +1144,7 @@ mod tests {
         translator.settle_started(crate::lsp::fake_lsp_server_with_config(configs[0].clone()));
         translator.settle_failed(&ServerSpawnFailure {
             reason: StartupFailure::Spawn(std::sync::Arc::new(Error::ServerNotFound {
-                command: "b".to_string(),
+                command: crate::config::ServerCommand::from_static("b"),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
             ..spawn_failure(&configs[1])

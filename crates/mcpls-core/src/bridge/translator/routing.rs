@@ -2,6 +2,7 @@
 //! shared by every LSP-round-trip tool-call handler.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
@@ -88,24 +89,17 @@ pub(super) enum IndexingGate {
     /// definition, references, rename, completions, code actions, call
     /// hierarchy incoming/outgoing calls).
     Required,
-    /// This tool does not wait for the workspace index. Every ungated tool is
-    /// one of:
-    /// - file-local, so its answer is valid mid-index and carries no signal:
-    ///   document symbols (also used by name addressing and `enclosing_symbol`),
-    ///   folding ranges, selection ranges, document highlights, format
-    ///   document and format range;
-    /// - name-resolving but ungated by the #423 scope decision, which keeps
-    ///   `prepare_call_hierarchy` and `prepare_type_hierarchy` from stalling a
-    ///   cold start for up to the bounded wait (the follow-up incoming and
-    ///   outgoing calls are [`Self::Required`]); `get_signature_help` and
-    ///   `get_inlay_hints` are in the same class. Instead of gating, each
-    ///   reports `indexing_in_progress` (#668): mid-index it still degrades to
-    ///   an empty result, but the caller can tell that from a genuinely empty
-    ///   one and retry. The trade-off is that the caller must read the flag,
-    ///   in exchange for no added latency.
+    /// This tool's answer is file-local, so it is valid mid-index and carries
+    /// no signal: document symbols (also used by name addressing and
+    /// `enclosing_symbol`), folding ranges, selection ranges, document
+    /// highlights, format document and format range.
     ///
-    /// A new `NotRequired` site must say which of the two it is.
-    NotRequired,
+    /// Name-resolving tools that must not stall a cold start (signature help,
+    /// inlay hints, prepare call/type hierarchy; the #423 scope decision) are
+    /// not `FileLocal`: they open through `Translator::prepare_disclosed_document`, whose
+    /// `DisclosedDocument` can only answer with an `Indexed` result carrying
+    /// `indexing_in_progress` (#668).
+    FileLocal,
 }
 
 /// An LSP server capability mcpls gates a tool on before dispatching its request.
@@ -688,14 +682,12 @@ pub(super) fn check_capability(
     caps: Option<&lsp_types::ServerCapabilities>,
     capability: Capability,
 ) -> Result<()> {
-    if capability.is_available(caps) {
-        Ok(())
-    } else {
-        Err(Error::CapabilityNotSupported {
+    capability
+        .is_available(caps)
+        .ok_or_else(|| Error::CapabilityNotSupported {
             server_id: server_id.clone(),
             capability,
         })
-    }
 }
 
 impl Translator {
@@ -805,7 +797,7 @@ impl Translator {
                     Err(Error::NoServerForLanguage {
                         language,
                         file: FileKey::of(path),
-                        patterns: self.file_patterns.to_vec(),
+                        patterns: Arc::clone(&self.file_patterns),
                     })
                 }
             }
@@ -1363,7 +1355,7 @@ mod tests {
             language_id: LanguageId::new(language).unwrap(),
             command: ServerCommand::new(command).unwrap(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
-                command: command.to_string(),
+                command: ServerCommand::new(command).unwrap(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }
@@ -1378,7 +1370,7 @@ mod tests {
             language_id: LanguageId::new(language).unwrap(),
             command: ServerCommand::from_static("sh").into(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
@@ -1888,7 +1880,7 @@ mod tests {
         {
             assert_eq!(language, "plaintext");
             assert_eq!(file, FileKey::Extension(FileExtension::from_static("xyz")));
-            assert_eq!(patterns, ["**/*.rs"]);
+            assert_eq!(&*patterns, [FilePattern::from_static("**/*.rs")]);
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
         }
@@ -1939,7 +1931,7 @@ mod tests {
             language_id: LanguageId::from_static("typescriptreact"),
             command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![FilePattern::from_static("**/*.tsx")],
             initialization_options: None,
             settings: None,
@@ -2242,7 +2234,7 @@ mod tests {
             language_id: LanguageId::from_static("javascript"),
             command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![
                 FilePattern::from_static("**/*.js"),
                 FilePattern::from_static("**/*.jsx"),
@@ -2870,7 +2862,7 @@ mod tests {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,

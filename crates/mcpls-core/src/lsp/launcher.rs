@@ -9,10 +9,11 @@
 //! The rules are best-effort. They match the command's file stem and its
 //! arguments, unwrap `env` and `busybox`, and give up on what cannot be
 //! analyzed (an `env` option this list does not know, a `PATH=` assignment, a
-//! shell or interpreter given a command string). The trusted configuration is
-//! the boundary, not this list.
+//! shell or interpreter given a command string). The lists are closed, not
+//! exhaustive: a shell or interpreter missing from them is admitted. The
+//! trusted configuration is the boundary, not this list.
 
-use std::path::Path;
+use crate::config::CommandStem;
 
 /// How a launcher's use selects workspace code.
 #[derive(Debug, Clone, Copy)]
@@ -38,8 +39,21 @@ const RUNNERS: &[(&str, LaunchRule)] = &[
     ("rake", LaunchRule::Always),
     ("mvn", LaunchRule::Always),
     ("sbt", LaunchRule::Always),
+    ("xargs", LaunchRule::Always),
+    ("find", LaunchRule::Always),
+    ("awk", LaunchRule::Always),
+    ("script", LaunchRule::Always),
+    ("su", LaunchRule::Always),
+    ("flock", LaunchRule::Always),
+    ("watch", LaunchRule::Always),
+    ("gawk", LaunchRule::Always),
+    ("mawk", LaunchRule::Always),
+    ("nawk", LaunchRule::Always),
     ("bun", LaunchRule::Subcommands(&["x", "run"])),
-    ("deno", LaunchRule::Subcommands(&["run", "x", "task"])),
+    (
+        "deno",
+        LaunchRule::Subcommands(&["run", "x", "task", "eval", "repl"]),
+    ),
     ("cargo", LaunchRule::Subcommands(&["run"])),
     ("go", LaunchRule::Subcommands(&["run", "tool"])),
     ("uv", LaunchRule::Subcommands(&["run", "tool"])),
@@ -63,21 +77,104 @@ const SHELLS: &[&str] = &[
     "cmd",
     "powershell",
     "pwsh",
+    "ash",
+    "hush",
+    "mksh",
+    "oksh",
+    "yash",
+    "posh",
+    "elvish",
+    "nu",
+    "xonsh",
+];
+
+/// Programs that start the command given in their own arguments, with options
+/// of their own in between. A launch is refused when any argument starts a
+/// command the rules above refuse.
+const EXEC_WRAPPERS: &[&str] = &[
+    "time",
+    "nice",
+    "nohup",
+    "timeout",
+    "setsid",
+    "stdbuf",
+    "ionice",
+    "chrt",
+    "taskset",
+    "sudo",
+    "doas",
+    "arch",
+    "caffeinate",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "strace",
+    "systemd-run",
 ];
 
 /// Interpreters that run a program given on the command line, with the short
 /// flag letters and long flags that introduce it. A match is by stem prefix so
 /// `python3.12` counts as `python`.
-const INLINE_EVAL: &[(&str, &[char], &[&str])] = &[
-    ("node", &['e', 'p'], &["--eval", "--print"]),
-    ("nodejs", &['e', 'p'], &["--eval", "--print"]),
-    ("python", &['c'], &[]),
-    ("perl", &['e', 'E'], &[]),
-    ("ruby", &['e'], &[]),
-    ("php", &['r'], &[]),
+const INLINE_EVAL: &[InlineEval] = &[
+    InlineEval::new("node", &['e', 'p'], &['r', 'C'], &["--eval", "--print"]),
+    InlineEval::new("bun", &['e', 'p'], &['r', 'c'], &["--eval", "--print"]),
+    InlineEval::new("lua", &['e'], &['l'], &[]),
+    InlineEval::new("rscript", &['e'], &[], &[]),
+    InlineEval::new(
+        "julia",
+        &['e', 'E'],
+        &['L', 'J', 'C', 'O', 't', 'p', 'H'],
+        &["--eval", "--print"],
+    ),
+    InlineEval::new("osascript", &['e'], &['l', 's'], &[]),
+    InlineEval::new("nodejs", &['e', 'p'], &['r', 'C'], &["--eval", "--print"]),
+    InlineEval::new("python", &['c'], &['m', 'W', 'X', 'Q'], &[]),
+    InlineEval::new(
+        "perl",
+        &['e', 'E'],
+        &['I', 'M', 'm', 'x', 'i', 'l', '0', 'F', 'C', 'd', 'D'],
+        &[],
+    ),
+    InlineEval::new(
+        "ruby",
+        &['e'],
+        &['r', 'I', 'C', 'E', 'K', 'x', 'F', 'T'],
+        &[],
+    ),
+    InlineEval::new("php", &['r'], &['d', 'c', 'f', 'z'], &[]),
 ];
 
-const NPM_SPECIFIER_PREFIX: &str = "npm:";
+/// How an interpreter is given a program on its command line.
+struct InlineEval {
+    /// The interpreter's name; a stem prefix match, so `python3.12` counts.
+    name: &'static str,
+    /// Short flag letters that introduce the program.
+    program_letters: &'static [char],
+    /// Short flag letters that take another value (a module, a path): what
+    /// follows one in the same argument is that value, not more flags.
+    value_letters: &'static [char],
+    /// Long flags that introduce the program.
+    long: &'static [&'static str],
+}
+
+impl InlineEval {
+    const fn new(
+        name: &'static str,
+        program_letters: &'static [char],
+        value_letters: &'static [char],
+        long: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            program_letters,
+            value_letters,
+            long,
+        }
+    }
+}
+
+/// Prefix of an argument that names an npm package for a package runner.
+pub const NPM_SPECIFIER_PREFIX: &str = "npm:";
 
 /// Most `env` wrappers followed before the launch is treated as unanalyzable.
 const MAX_ENV_DEPTH: usize = 8;
@@ -99,21 +196,25 @@ pub fn launches_from_workspace(command: &str, args: &[String]) -> bool {
         || launch_selects_workspace_code(command, args, 0)
 }
 
-fn command_stem(command: &str) -> String {
-    Path::new(command)
-        .file_stem()
-        .map_or_default(|stem| stem.to_string_lossy().to_ascii_lowercase())
-}
-
 fn launch_selects_workspace_code(command: &str, args: &[String], env_depth: usize) -> bool {
-    let stem = command_stem(command);
-    if stem == "env" {
+    let stem = CommandStem::of(command);
+    if stem.is("env") {
         return env_wraps_workspace_launch(args, env_depth);
     }
-    if SHELLS.contains(&stem.as_str()) && args.iter().any(|arg| is_command_flag(&stem, arg)) {
+    if SHELLS
+        .iter()
+        .any(|shell| is_interpreter(stem.as_str(), shell))
+        && args.iter().any(|arg| is_command_flag(stem.as_str(), arg))
+    {
         return true;
     }
-    if stem == "busybox" {
+    if stem.is_any(&["sudo", "doas"]) && args.iter().any(|arg| sudo_runs_a_string(arg)) {
+        return true;
+    }
+    if stem.is_any(EXEC_WRAPPERS) {
+        return wrapped_command_selects_workspace_code(args, env_depth);
+    }
+    if stem.is("busybox") {
         return args.first().is_none_or(|applet| {
             env_depth >= MAX_ENV_DEPTH
                 || launch_selects_workspace_code(
@@ -123,18 +224,44 @@ fn launch_selects_workspace_code(command: &str, args: &[String], env_depth: usiz
                 )
         });
     }
-    if args.iter().any(|arg| is_inline_eval_flag(&stem, arg)) {
+    if args
+        .iter()
+        .any(|arg| is_inline_eval_flag(stem.as_str(), arg))
+    {
         return true;
     }
     RUNNERS
         .iter()
-        .find(|(name, _)| *name == stem)
+        .find(|(name, _)| stem.is(name))
         .is_some_and(|(_, rule)| match rule {
             LaunchRule::Always => true,
             LaunchRule::Subcommands(subcommands) => {
                 args.iter().any(|arg| subcommands.contains(&arg.as_str()))
             }
         })
+}
+
+/// Whether any argument of an exec wrapper starts a command the rules refuse.
+///
+/// The wrapper's own options and the command's position are not parsed:
+/// every suffix of the arguments is checked as a command. A nested wrapper is
+/// covered by the suffixes behind it, and its own rule (`sudo`/`doas` running
+/// a shell string or setting a variable) is applied where it appears. Chains
+/// deeper than [`MAX_ENV_DEPTH`] are refused.
+fn wrapped_command_selects_workspace_code(args: &[String], env_depth: usize) -> bool {
+    if env_depth >= MAX_ENV_DEPTH {
+        return true;
+    }
+    let inner_depth = env_depth.saturating_add(1);
+    args.iter().enumerate().any(|(index, command)| {
+        let rest = args.get(index.saturating_add(1)..).unwrap_or_default();
+        let stem = CommandStem::of(command);
+        if stem.is_any(EXEC_WRAPPERS) {
+            stem.is_any(&["sudo", "doas"]) && rest.iter().any(|arg| sudo_runs_a_string(arg))
+        } else {
+            launch_selects_workspace_code(command, rest, inner_depth)
+        }
+    })
 }
 
 /// Whether a shell argument introduces a command string, which cannot be
@@ -153,17 +280,46 @@ fn is_command_flag(shell: &str, arg: &str) -> bool {
                         .iter()
                         .any(|parameter| parameter.starts_with(name)))
         }),
-        _ => arg == "--command" || has_short_flag(&arg, &['c']),
+        _ => {
+            long_flag_matches(&arg, &["--command", "--commands"])
+                || has_short_flag(&arg, &['c'], &['o'])
+        }
     }
 }
 
-/// Whether `arg` is a single-dash cluster of letters holding one of `flags`.
-fn has_short_flag(arg: &str, flags: &[char]) -> bool {
+/// Whether `arg` is a single-dash argument whose flag letters reach one of
+/// `flags`: whatever follows such a letter is its value (`-c'code'`,
+/// `-ecode`), so the argument carries inline code. Letters are read in order
+/// and reading stops at the first one in `value_letters`, since the rest of the
+/// argument is then that option's value (`-mcoverage`, `-rbundler/setup`).
+fn has_short_flag(arg: &str, flags: &[char], value_letters: &[char]) -> bool {
     arg.strip_prefix('-').is_some_and(|cluster| {
         !cluster.starts_with('-')
-            && cluster.chars().all(char::is_alphabetic)
-            && cluster.chars().any(|letter| flags.contains(&letter))
+            && cluster
+                .chars()
+                .take_while(|letter| letter.is_alphabetic())
+                .find(|letter| flags.contains(letter) || value_letters.contains(letter))
+                .is_some_and(|letter| flags.contains(&letter))
     })
+}
+
+/// Whether `arg` is one of the long `flags`, bare or with an `=value`.
+fn long_flag_matches(arg: &str, flags: &[&str]) -> bool {
+    let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    flags.contains(&name)
+}
+
+/// Whether a `sudo`/`doas` argument runs a shell string or sets a variable
+/// for the command: `-s`, `-i`, `--shell`, `--login`, or `NAME=value`.
+fn sudo_runs_a_string(arg: &str) -> bool {
+    has_short_flag(
+        arg,
+        &['s', 'i'],
+        &['u', 'g', 'C', 'h', 'p', 'r', 't', 'T', 'U'],
+    ) || long_flag_matches(arg, &["--shell", "--login"])
+        || arg.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && !name.starts_with('-') && !name.contains('/')
+        })
 }
 
 /// Whether `stem` is the interpreter `name`, optionally followed by a version
@@ -178,8 +334,11 @@ fn is_interpreter(stem: &str, name: &str) -> bool {
 fn is_inline_eval_flag(stem: &str, arg: &str) -> bool {
     INLINE_EVAL
         .iter()
-        .filter(|(name, _, _)| is_interpreter(stem, name))
-        .any(|(_, letters, long)| has_short_flag(arg, letters) || long.contains(&arg))
+        .filter(|eval| is_interpreter(stem, eval.name))
+        .any(|eval| {
+            has_short_flag(arg, eval.program_letters, eval.value_letters)
+                || long_flag_matches(arg, eval.long)
+        })
 }
 
 /// Whether the command an `env` invocation starts, unwrapped, selects workspace
@@ -438,5 +597,160 @@ mod tests {
         assert!(launches("powershell", &["-Command", "server"]));
         assert!(!launches("sh", &["server.sh"]));
         assert!(!launches("bash", &["--norc", "server.sh"]));
+    }
+
+    #[test]
+    fn every_listed_shell_refuses_a_command_string() {
+        for shell in SHELLS {
+            let flag = if *shell == "cmd" { "/c" } else { "-c" };
+            assert!(launches(shell, &[flag, "x"]), "{shell}");
+            assert!(
+                launches(&format!("/opt/bin/{shell}"), &[flag, "x"]),
+                "{shell}"
+            );
+            assert!(!launches(shell, &["script"]), "{shell}");
+        }
+        assert!(launches("busybox", &["ash", "-c", "x"]));
+        assert!(launches("busybox", &["hush", "-c", "x"]));
+    }
+
+    #[test]
+    fn nu_refuses_both_command_spellings() {
+        assert!(launches("nu", &["--commands", "x"]));
+        assert!(launches("nu", &["--command", "x"]));
+        assert!(launches("nu", &["-c", "x"]));
+        assert!(!launches("nu", &["server.nu"]));
+    }
+
+    #[test]
+    fn deno_eval_and_bun_inline_programs_are_refused() {
+        assert!(launches("deno", &["eval", "code"]));
+        for flag in ["-e", "-p", "--eval", "--print"] {
+            assert!(launches("bun", &[flag, "code"]), "{flag}");
+        }
+        assert!(!launches("bun", &["server.ts"]));
+        assert!(!launches("bunyan", &["-e"]));
+    }
+
+    #[test]
+    fn other_inline_interpreters_are_refused() {
+        for (command, flag) in [
+            ("lua", "-e"),
+            ("Rscript", "-e"),
+            ("julia", "-e"),
+            ("osascript", "-e"),
+        ] {
+            assert!(launches(command, &[flag, "code"]), "{command}");
+            assert!(!launches(command, &["script"]), "{command}");
+        }
+    }
+
+    #[test]
+    fn programs_that_run_their_arguments_are_refused() {
+        for command in ["xargs", "find", "awk", "gawk", "mawk", "nawk"] {
+            assert!(launches(command, &["x"]), "{command}");
+        }
+    }
+
+    #[test]
+    fn exec_wrappers_refuse_when_the_wrapped_command_would_be_refused() {
+        for wrapper in EXEC_WRAPPERS {
+            assert!(launches(wrapper, &["sh", "-c", "x"]), "{wrapper}");
+            assert!(launches(wrapper, &["5", "npx", "srv"]), "{wrapper}");
+            assert!(
+                launches(wrapper, &["-n", "5", "ash", "-c", "x"]),
+                "{wrapper}"
+            );
+            assert!(!launches(wrapper, &["rust-analyzer"]), "{wrapper}");
+            assert!(!launches(wrapper, &[]), "{wrapper}");
+        }
+        assert!(launches("sudo", &["-u", "root", "env", "-S", "x"]));
+        assert!(!launches("timeout", &["5", "rust-analyzer", "--stdio"]));
+    }
+
+    #[test]
+    fn inline_code_glued_to_the_flag_or_given_with_equals_is_refused() {
+        for (command, arg) in [
+            ("python3", "-cprint(1)"),
+            ("perl", "-eprint 1"),
+            ("ruby", "-eputs 1"),
+            ("bun", "-econsole.log(1)"),
+            ("lua", "-eprint(1)"),
+            ("php", "-rphpinfo();"),
+            ("node", "--eval=console.log(1)"),
+            ("julia", "--eval=1"),
+            ("bun", "--print=1"),
+            ("fish", "-cmake"),
+            ("fish", "--command=make"),
+            ("bash", "-lcmake"),
+        ] {
+            assert!(launches(command, &[arg]), "{command} {arg}");
+        }
+        assert!(!launches("python3", &["-m", "pytest"]));
+        assert!(!launches("node", &["--max-old-space-size=4096"]));
+    }
+
+    #[test]
+    fn value_taking_letters_end_the_flag_scan() {
+        assert!(!launches("python3", &["-mcoverage", "run"]));
+        assert!(!launches("ruby", &["-rbundler/setup", "app.rb"]));
+        assert!(!launches("node", &["-rts-node/register", "server.js"]));
+        assert!(launches("python3", &["-Ic'import os'"]));
+        assert!(launches("ruby", &["-weputs 1"]));
+    }
+
+    #[test]
+    fn sudo_inside_another_wrapper_keeps_its_own_rules() {
+        assert!(launches("nice", &["sudo", "-s", "make"]));
+        assert!(launches("timeout", &["5", "sudo", "PATH=/ws/bin", "srv"]));
+        assert!(!launches("nice", &["sudo", "-u", "nobody", "gopls"]));
+    }
+
+    #[test]
+    fn deno_repl_and_shell_runners_are_refused() {
+        assert!(launches("deno", &["repl", "--eval=1"]));
+        for command in ["script", "su", "flock", "watch"] {
+            assert!(launches(command, &["-c", "x"]), "{command}");
+        }
+    }
+
+    #[test]
+    fn sudo_shell_and_assignments_are_refused() {
+        assert!(launches("sudo", &["-s", "make"]));
+        assert!(launches("sudo", &["-i"]));
+        assert!(launches("doas", &["--shell"]));
+        assert!(launches("sudo", &["PATH=/ws/bin", "srv"]));
+        assert!(!launches("sudo", &["-u", "nobody", "gopls"]));
+    }
+
+    #[test]
+    fn more_exec_wrappers_are_scanned_and_versioned_shells_are_shells() {
+        for wrapper in [
+            "arch",
+            "caffeinate",
+            "chroot",
+            "unshare",
+            "nsenter",
+            "strace",
+            "systemd-run",
+        ] {
+            assert!(launches(wrapper, &["sh", "-c", "x"]), "{wrapper}");
+        }
+        for shell in ["ksh93", "bash5", "zsh5.9"] {
+            assert!(launches(shell, &["-c", "x"]), "{shell}");
+        }
+        assert!(!launches("shellcheck", &["-c", "x"]));
+    }
+
+    #[test]
+    fn nested_wrappers_are_scanned_and_deep_chains_fail_closed() {
+        assert!(launches("nice", &["time", "nohup", "sh", "-c", "x"]));
+        assert!(launches("env", &["nice", "env", "time", "sh", "-c", "x"]));
+        let mut chain: Vec<&str> = Vec::new();
+        for _ in 0..MAX_ENV_DEPTH {
+            chain.extend(["env", "nice"]);
+        }
+        chain.push("rust-analyzer");
+        assert!(launches("env", &chain));
     }
 }

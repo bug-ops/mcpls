@@ -3,10 +3,7 @@
 
 use std::time::Duration;
 
-use lsp_types::{
-    HoverParams as LspHoverParams, PartialResultParams, ReferenceContext, ReferenceParams,
-    TextDocumentIdentifier, TextDocumentPositionParams, WorkDoneProgressParams,
-};
+use lsp_types::ReferenceContext;
 use tokio::time::Instant;
 
 use super::Translator;
@@ -16,6 +13,7 @@ use super::dto::{
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
+use super::positioned::{FromPosition, Positioned};
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
@@ -324,55 +322,6 @@ async fn goto_response_to_locations<R: GotoResponse>(
     lsp_locations_to_mcp(lsp_locs, ctx).await
 }
 
-/// Implemented once per go-to-X request params type so [`Translator::handle_goto`]
-/// can build request params generically instead of duplicating the
-/// `TextDocumentPositionParams` wiring per handler.
-trait GotoParams: Sized {
-    /// Build the request params from the resolved document position, filling
-    /// the remaining fields (work-done/partial-result progress) with defaults.
-    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self;
-}
-
-impl GotoParams for lsp_types::DefinitionParams {
-    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
-        Self {
-            text_document_position_params,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        }
-    }
-}
-
-impl GotoParams for lsp_types::ImplementationParams {
-    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
-        Self {
-            text_document_position_params,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        }
-    }
-}
-
-impl GotoParams for lsp_types::TypeDefinitionParams {
-    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
-        Self {
-            text_document_position_params,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        }
-    }
-}
-
-impl GotoParams for lsp_types::DeclarationParams {
-    fn from_position(text_document_position_params: TextDocumentPositionParams) -> Self {
-        Self {
-            text_document_position_params,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        }
-    }
-}
-
 /// Extracts hover contents as a plain string.
 ///
 /// `MarkedString` is `#[deprecated]` in favor of `MarkupContent`, but LSP
@@ -496,36 +445,26 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<HoverResult> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .position_request::<lsp_types::HoverRequest>(
                 &file_path,
+                position,
                 Capability::Hover,
                 IndexingGate::Required,
-                &[position],
+                (),
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-        let response_uri = uri.clone();
-
-        let params = LspHoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::HoverRequest>(params, client.request_timeout())
-            .await?;
+        let response_uri = doc.uri();
 
         let result = match response {
             Some(hover) => {
                 let contents = extract_hover_contents(hover.contents);
                 let range = match hover.range {
-                    Some(r) => Some(ctx.normalize_range(&response_uri, r).await),
+                    Some(r) => Some(ctx.normalize_range(response_uri, r).await),
                     None => None,
                 };
                 HoverResult {
@@ -574,23 +513,15 @@ impl Translator {
     ) -> Result<NormalizedLocations>
     where
         R: lsp_types::Request<Result = Option<T>>,
-        R::Params: GotoParams,
+        R::Params: FromPosition<Extra = ()>,
         T: GotoResponse,
     {
-        let doc = self
-            .prepare_positioned_document(file_path, capability, IndexingGate::Required, &[position])
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = R::Params::from_position(TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            position: lsp_position,
-        });
-
-        let response = client
-            .request_typed::<R>(params, client.request_timeout())
+        let Positioned {
+            result: response,
+            ctx,
+            doc: _doc,
+        } = self
+            .position_request::<R>(file_path, position, capability, IndexingGate::Required, ())
             .await?;
 
         Ok(goto_response_to_locations(response, &ctx).await)
@@ -647,32 +578,20 @@ impl Translator {
         include_declaration: bool,
         context: ResultContext,
     ) -> Result<ReferencesResult> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc: _doc,
+        } = self
+            .position_request::<lsp_types::ReferencesRequest>(
                 &file_path,
+                position,
                 Capability::References,
                 IndexingGate::Required,
-                &[position],
+                ReferenceContext {
+                    include_declaration,
+                },
             )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = ReferenceParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-            context: ReferenceContext {
-                include_declaration,
-            },
-        };
-
-        let response = client
-            .request_typed::<lsp_types::ReferencesRequest>(params, client.request_timeout())
             .await?;
 
         let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;

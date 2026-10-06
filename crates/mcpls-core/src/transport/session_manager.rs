@@ -365,40 +365,76 @@ pub(super) async fn run_idle_reaper(
     }
 }
 
-/// Delay before a panicked idle reaper is started again.
+/// Delay before a panicked idle reaper is started again the first time.
 const REAPER_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Longest delay between two restarts of a reaper that keeps panicking, and
+/// the period of its panic log line.
+const REAPER_RESTART_DELAY_MAX: std::time::Duration = std::time::Duration::from_mins(1);
+
 /// Keeps [`run_idle_reaper`] alive until `cancel` fires: a panic is logged at
-/// error level and the reaper restarted, because a dead reaper silently stops
-/// session expiry until the session cap fills and every client gets 429.
+/// error level and the reaper restarted with a growing delay, because a dead
+/// reaper silently stops session expiry until the session cap fills and every
+/// client gets 429.
 pub(super) async fn supervise_idle_reaper(
     manager: std::sync::Arc<CappedSessionManager>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     supervise(
+        "idle HTTP session reaper",
         || run_idle_reaper(std::sync::Arc::clone(&manager), cancel.clone()),
         &cancel,
-        REAPER_RESTART_DELAY,
+        RestartDelays {
+            first: REAPER_RESTART_DELAY,
+            max: REAPER_RESTART_DELAY_MAX,
+        },
     )
     .await;
 }
 
-/// Runs `run` to completion, rerunning it after `restart_delay` each time it
-/// panics, and stops once it returns or `cancel` fires during the delay.
+/// How long [`supervise`] waits before rerunning a task that panicked.
+#[derive(Debug, Clone, Copy)]
+struct RestartDelays {
+    /// Delay after the first panic; it doubles with each further one.
+    first: std::time::Duration,
+    /// Largest delay, also the period of the panic log line and the run time
+    /// after which the delay starts over.
+    max: std::time::Duration,
+}
+
+/// Runs `run` to completion, rerunning it each time it panics after a delay
+/// that doubles from `delays.first` up to `delays.max` (and starts over after a
+/// run that lasted `delays.max`), and stops once it returns or `cancel` fires
+/// during the delay. A panic is logged at error level at most once per
+/// `delays.max`, so a task that panics at once does not flood the log.
 async fn supervise<Fut: std::future::Future<Output = ()>>(
+    what: &'static str,
     mut run: impl FnMut() -> Fut,
     cancel: &tokio_util::sync::CancellationToken,
-    restart_delay: std::time::Duration,
+    delays: RestartDelays,
 ) {
-    while let Err(panicked) = catch_panic(run()).await {
-        tracing::error!(
-            error = %panicked,
-            "idle HTTP session reaper panicked; restarting it, sessions do not expire until it runs again"
-        );
+    let mut delay = delays.first;
+    let mut limiter = crate::util::WarnLimiter::default();
+    loop {
+        let started = tokio::time::Instant::now();
+        let Err(panicked) = catch_panic(run()).await else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        if now.saturating_duration_since(started) >= delays.max {
+            delay = delays.first;
+        }
+        if limiter.due(now.into_std(), delays.max) {
+            tracing::error!(
+                error = %panicked,
+                "{what} panicked; restarting it in {delay:?}, it is not running until then"
+            );
+        }
         tokio::select! {
             () = cancel.cancelled() => return,
-            () = tokio::time::sleep(restart_delay) => {}
+            () = tokio::time::sleep(delay) => {}
         }
+        delay = delay.saturating_mul(2).min(delays.max);
     }
 }
 
@@ -1378,6 +1414,48 @@ mod tests {
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    fn test_delays() -> RestartDelays {
+        RestartDelays {
+            first: REAPER_RESTART_DELAY,
+            max: REAPER_RESTART_DELAY_MAX,
+        }
+    }
+
+    /// A task that keeps panicking is restarted with doubling delays, not once
+    /// a second forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_supervise_backs_off_between_restarts_of_a_task_that_keeps_panicking() {
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let supervisor = {
+            let (runs, cancel) = (std::sync::Arc::clone(&runs), cancel.clone());
+            tokio::spawn(async move {
+                let counting = std::sync::Arc::clone(&runs);
+                supervise(
+                    "test task",
+                    move || {
+                        counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async { panic!("always") }
+                    },
+                    &cancel,
+                    test_delays(),
+                )
+                .await;
+            })
+        };
+
+        // Runs start at 0s, 1s, 3s, 7s, 15s: five by 20s where a fixed one
+        // second delay would have run twenty times.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_supervise_restarts_a_panicking_reaper_until_it_runs_and_ends_on_cancel() {
         let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1387,6 +1465,7 @@ mod tests {
             tokio::spawn(async move {
                 let waiting = cancel.clone();
                 supervise(
+                    "test task",
                     || {
                         let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let waiting = waiting.clone();
@@ -1396,13 +1475,13 @@ mod tests {
                         }
                     },
                     &cancel,
-                    REAPER_RESTART_DELAY,
+                    test_delays(),
                 )
                 .await;
             })
         };
 
-        tokio::time::sleep(REAPER_RESTART_DELAY * 3).await;
+        tokio::time::sleep(REAPER_RESTART_DELAY * 4).await;
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
 
         cancel.cancel();
@@ -1418,7 +1497,13 @@ mod tests {
         let supervisor = {
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                supervise(|| async { panic!("always") }, &cancel, REAPER_RESTART_DELAY).await;
+                supervise(
+                    "test task",
+                    || async { panic!("always") },
+                    &cancel,
+                    test_delays(),
+                )
+                .await;
             })
         };
         tokio::task::yield_now().await;

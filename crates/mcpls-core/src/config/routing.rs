@@ -15,12 +15,13 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::language_id::LanguageId;
-use super::server::LspServerConfig;
+use super::server::{LaunchCommand, LspServerConfig};
 use super::text_newtype::impl_text_newtype;
 use crate::error::{ConfigError, Result};
 
@@ -53,49 +54,7 @@ pub struct InvalidServerId;
 #[schemars(with = "String")]
 pub struct ServerId(Cow<'static, str>);
 
-impl ServerId {
-    /// Builds an id from a literal, checked at compile time when evaluated in
-    /// a `const` context.
-    ///
-    /// Accepts only ASCII, non-blank literals, a subset of what [`Self::new`]
-    /// accepts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `id` is blank or not ASCII.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use mcpls_core::config::ServerId;
-    ///
-    /// const RUST: ServerId = ServerId::from_static("rust");
-    /// assert_eq!(RUST.as_str(), "rust");
-    /// ```
-    #[must_use]
-    pub const fn from_static(id: &'static str) -> Self {
-        assert!(
-            id.is_ascii() && !id.trim_ascii().is_empty(),
-            "server id must be ASCII and not blank"
-        );
-        Self(Cow::Borrowed(id))
-    }
-
-    /// Builds an id from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidServerId`] if `id` is blank.
-    pub fn new(id: impl Into<String>) -> std::result::Result<Self, InvalidServerId> {
-        let id = id.into();
-        if id.trim().is_empty() {
-            return Err(InvalidServerId);
-        }
-        Ok(Self(Cow::Owned(id)))
-    }
-}
-
-impl_text_newtype!(ServerId, InvalidServerId);
+impl_text_newtype!(ServerId, InvalidServerId, non_blank, "server id");
 
 impl From<LanguageId> for ServerId {
     fn from(id: LanguageId) -> Self {
@@ -326,9 +285,9 @@ impl From<ToolSet> for Vec<ToolKind> {
     }
 }
 
-/// Describe a `[[lsp_servers]]` entry for use in error messages that must let
-/// a user tell apart two entries sharing the same [`ServerId`] — the id
-/// alone is useless there, since it's exactly what collided.
+/// Identifies a `[[lsp_servers]]` entry in error messages that must let a user
+/// tell apart two entries sharing the same [`ServerId`] — the id alone is
+/// useless there, since it's exactly what collided.
 ///
 /// Deliberately does not include a positional index: [`ToolRouter::from_configs`]
 /// only ever sees the post-heuristics *applicable* subset for a given
@@ -337,14 +296,50 @@ impl From<ToolSet> for Vec<ToolKind> {
 /// `command`/`args` distinguish the entries instead; when two entries are
 /// truly identical in every visible field, the description is the same for
 /// both halves, which is an honest reflection of the ambiguity.
-fn describe_entry(cfg: &LspServerConfig) -> String {
-    if cfg.args.is_empty() {
-        format!("language '{}', command '{}'", cfg.language_id, cfg.command)
-    } else {
-        format!(
-            "language '{}', command '{}', args {:?}",
-            cfg.language_id, cfg.command, cfg.args
-        )
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::{EntrySummary, LanguageId, LaunchCommand, ServerCommand};
+///
+/// let summary = EntrySummary {
+///     language: LanguageId::from_static("python"),
+///     command: LaunchCommand::from(ServerCommand::from_static("pyright")),
+///     args: vec![],
+/// };
+/// assert_eq!(summary.to_string(), "language 'python', command 'pyright'");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntrySummary {
+    /// Language the entry serves.
+    pub language: LanguageId,
+    /// Executable the entry launches.
+    pub command: LaunchCommand,
+    /// Arguments passed to the executable.
+    pub args: Vec<String>,
+}
+
+impl EntrySummary {
+    fn of(cfg: &LspServerConfig) -> Self {
+        Self {
+            language: cfg.language_id.clone(),
+            command: cfg.command.clone(),
+            args: cfg.args.clone(),
+        }
+    }
+}
+
+impl fmt::Display for EntrySummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "language '{}', command '{}'",
+            self.language, self.command
+        )?;
+        if !self.args.is_empty() {
+            write!(f, ", args {:?}", self.args)?;
+        }
+        Ok(())
     }
 }
 
@@ -437,20 +432,20 @@ impl ToolRouter {
     {
         let mut by_language: HashMap<LanguageId, LanguageRoutes> = HashMap::new();
         let mut order: Vec<ServerId> = Vec::new();
-        let mut seen_ids: HashMap<ServerId, String> = HashMap::new();
+        let mut seen_ids: HashMap<ServerId, &LspServerConfig> = HashMap::new();
 
         for cfg in cfgs {
             let id = cfg.id();
 
-            if let Some(prev_description) = seen_ids.get(&id) {
+            if let Some(previous) = seen_ids.get(&id) {
                 return Err(ConfigError::DuplicateServerId {
                     id,
-                    first: prev_description.clone(),
-                    second: describe_entry(cfg),
+                    first: Box::new(EntrySummary::of(previous)),
+                    second: Box::new(EntrySummary::of(cfg)),
                 }
                 .into());
             }
-            seen_ids.insert(id.clone(), describe_entry(cfg));
+            seen_ids.insert(id.clone(), cfg);
             order.push(id.clone());
 
             let routes = by_language.entry(cfg.language_id.clone()).or_default();
@@ -780,7 +775,7 @@ mod tests {
             language_id: LanguageId::new(language_id).unwrap(),
             command: ServerCommand::from_static("cmd").into(),
             args: vec![],
-            env: HashMap::new(),
+            env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
             settings: None,
@@ -872,7 +867,7 @@ mod tests {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("rust-analyzer").into(),
                 args: vec![],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
@@ -887,7 +882,7 @@ mod tests {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("rust-analyzer").into(),
                 args: vec!["--dummy-second-instance".to_string()],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,

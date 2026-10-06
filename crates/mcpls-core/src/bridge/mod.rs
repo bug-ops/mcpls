@@ -25,19 +25,20 @@ pub(crate) use indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, IndexingReset, PROGRESS_SETTLE,
 };
 pub use indexing::{IndexingPolicy, IndexingState};
-#[cfg(test)]
-pub(crate) use notifications::MAX_DIAGNOSTIC_ENTRIES;
+pub(crate) use notifications::{
+    BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES, PushWrite, diagnostics_cache_key,
+    on_lifecycle,
+};
 pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
     ServerMessage, apply_lifecycle_notification,
 };
-pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key, on_lifecycle};
 #[cfg(test)]
 pub(crate) use published_uri::resolve_one;
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use signals::{Indexed, IndexingSignal, RouteSignals};
-pub use state::{DocumentTracker, ResourceLimits, path_to_uri, uri_to_path};
-pub(crate) use state::{InFlightGuard, LinePresence, try_path_to_uri};
+pub use state::{DocumentTracker, DocumentVersion, ResourceLimits, path_to_uri, uri_to_path};
+pub(crate) use state::{InFlightGuard, LinePresence, Opening, try_path_to_uri};
 pub use translator::{
     AddressableTool, Addressed, BoundedRange, Capability, CheckedHierarchyItem,
     CodeActionKindFilter, Completion, CompletionsResult, Contextual, ContextualDiagnostic,
@@ -47,16 +48,16 @@ pub use translator::{
     DocumentHighlightsResult, DocumentSymbolsResult, DroppedEdits, EnclosingSymbol,
     EnclosingSymbolOutcome, EnrichmentSummary, FoldingKind, FoldingKindFilter, FoldingRangesResult,
     FoldingRegion, FormatDocumentResult, HierarchyItem, HoverResult, InvalidHierarchyItem,
-    InvalidPosition, InvalidRange, InvalidTabSize, KindFilter, KindFilterInput, Location,
-    MAX_COLLAPSED_TEXT_BYTES, MAX_POSITION_VALUE, MAX_RANGE_LINES, MAX_RESTART_SERVER_IDS,
-    MAX_SELECTION_CHAIN, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, MAX_TAB_SIZE,
-    NotComputedReason, Position, Position2D, PositionDegradation, PositionRange, PositionSource,
-    PrepareRenameOutcome, PrepareRenameResult, Range, ReferencesResult, RejectedKindFilter,
-    RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure, RestartOutcome,
-    RestartServerResult, RestartTarget, ResultContext, RouteSupport, SelectionRangesResult,
-    ServerIds, ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity, SymbolKindFilter,
-    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize, TextEdit, Translator,
-    TypeHierarchyResult, UnavailableReason,
+    InvalidPosition, InvalidRange, InvalidTabSize, KindFilter, KindFilterField, KindFilterInput,
+    Location, MAX_COLLAPSED_TEXT_BYTES, MAX_POSITION_VALUE, MAX_RANGE_LINES,
+    MAX_RESTART_SERVER_IDS, MAX_SELECTION_CHAIN, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES,
+    MAX_TAB_SIZE, NotComputedReason, Position, Position2D, PositionDegradation, PositionRange,
+    PositionSource, PrepareRenameOutcome, PrepareRenameResult, Range, ReferencesResult,
+    RejectedKindFilter, Rejection, RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure,
+    RestartOutcome, RestartServerResult, RestartTarget, ResultContext, RouteSupport,
+    SelectionRangesResult, ServerIds, ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity,
+    SymbolKindFilter, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize, TextEdit,
+    Translator, TypeHierarchyResult, UnavailableReason,
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,

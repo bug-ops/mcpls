@@ -2216,6 +2216,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     translator.register_client(ServerId::from_static("rust"), client);
     translator.install_wiring(Arc::new(PumpWiring::new(
         PumpShared {
+            roles: crate::runtime::pump::DiagnosticsRoles::default(),
             notification_cache: Arc::clone(&cache),
             subs: registry.clone(),
             workspace_roots: roots.clone(),

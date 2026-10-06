@@ -45,8 +45,8 @@ use crate::bridge::{
     DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
     DocumentHighlightsResult, DocumentSymbolsResult, FoldingRangesResult, FormatDocumentResult,
     HierarchyItem, HoverResult, IncomingCallsResult, Indexed, InlayHintsResult, KindFilter,
-    KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult, Position,
-    PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
+    KindFilterField, KindFilterInput, LocationsResult, NotificationCache, OutgoingCallsResult,
+    Position, PositionEncoding, PositionRange, PrepareRenameResult, ReferencesResult, RenameResult,
     RestartServerResult, RouteSignals, SelectionRangesResult, ServerLogsResult,
     ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator, TypeHierarchyResult,
     WorkspaceRoots, WorkspaceSymbolResult,
@@ -272,9 +272,10 @@ fn parse_position(line: u32, character: u32) -> Result<Position, McpError> {
 /// `-32602`.
 fn parse_kind_filter<K: KindFilter>(
     input: Option<KindFilterInput<K>>,
+    field: KindFilterField,
 ) -> Result<Option<K>, McpError> {
     input
-        .map(|input| input.into_known().map_err(map_bridge_error))
+        .map(|input| input.into_known(field).map_err(client_input_error))
         .transpose()
 }
 
@@ -425,7 +426,8 @@ struct DiagnosticsResponse {
     availability: DiagnosticsAvailability,
     /// `pull` when a `textDocument/diagnostic` request answered (merged with
     /// the push cache), `push_cache` when the server has no pull provider and
-    /// the push cache alone answered.
+    /// the push cache alone answered, `cache_after_failed_pull` when the pull
+    /// failed and the cache answered.
     origin: DiagnosticsOrigin,
     #[serde(flatten)]
     signals: RouteSignals,
@@ -459,20 +461,32 @@ struct ResourceDiagnosticsResponse {
 }
 
 impl ResourceDiagnosticsResponse {
-    fn new(tracked: bool, entry: Option<&DiagnosticInfo>, signals: RouteSignals) -> Self {
+    fn new(
+        tracked: bool,
+        entry: Option<&DiagnosticInfo>,
+        availability: DiagnosticsAvailability,
+        signals: RouteSignals,
+    ) -> Self {
         Self {
             tracked,
-            version: entry.and_then(|e| e.version),
+            version: entry
+                .and_then(|e| e.version)
+                .map(crate::bridge::DocumentVersion::get),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
-            // Refined from the cache's eviction history by `resource_diagnostics_response`.
-            availability: if entry.is_some() {
-                DiagnosticsAvailability::Published
-            } else {
-                DiagnosticsAvailability::Pending
-            },
+            availability,
             signals,
         }
     }
+}
+
+/// One read of the diagnostics cache for a file, taken under a single lock so
+/// the tool and the resource report the same state of the same file.
+struct DiagnosticsSnapshot {
+    sources: crate::bridge::DiagnosticSources,
+    availability: DiagnosticsAvailability,
+    signals: RouteSignals,
+    /// The server that published the cached diagnostics, if any.
+    owner: Option<crate::config::ServerId>,
 }
 
 /// Build `read_resource`'s response for a file. `tracked` is true when the
@@ -487,9 +501,15 @@ impl ResourceDiagnosticsResponse {
 fn build_resource_diagnostics_response(
     document_open: bool,
     entry: Option<&DiagnosticInfo>,
+    availability: DiagnosticsAvailability,
     signals: RouteSignals,
 ) -> ResourceDiagnosticsResponse {
-    ResourceDiagnosticsResponse::new(document_open || entry.is_some(), entry, signals)
+    ResourceDiagnosticsResponse::new(
+        document_open || entry.is_some(),
+        entry,
+        availability,
+        signals,
+    )
 }
 
 // Diagnostics were redacted when they entered the cache or the pull path.
@@ -763,7 +783,7 @@ impl McplsServer {
 
     /// Get diagnostics for a file.
     #[tool(
-        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `origin`: `pull`, or `push_cache` when the server has no pull provider. ", availability_note!(), " `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
+        description = concat!("Diagnostics for a file. Returns errors, warnings, and hints with severity and location. `origin`: `pull`, `push_cache` when the server has no pull provider, or `cache_after_failed_pull` when the pull failed and the cache answered. ", availability_note!(), " `indexing_in_progress: true` means the routed server was indexing at some point during this read, so results may be incomplete. `push_notifications_degraded: true` means the routed server crashed and was restarted, so push-only diagnostics (e.g. flycheck) are missing. ", positions_note_response!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
         title = "Diagnostics"
     )]
     async fn get_diagnostics(
@@ -931,7 +951,7 @@ impl McplsServer {
             limit,
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<WorkspaceSymbolResult>, McpError> {
-        let kind_filter = parse_kind_filter(kind_filter)?;
+        let kind_filter = parse_kind_filter(kind_filter, KindFilterField::KindFilter)?;
         self.structured_result(
             self.context
                 .translator
@@ -956,7 +976,7 @@ impl McplsServer {
         }): Parameters<CodeActionsParams>,
     ) -> Result<Json<CodeActionsResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        let kind_filter = parse_kind_filter(kind_filter)?;
+        let kind_filter = parse_kind_filter(kind_filter, KindFilterField::KindFilter)?;
         self.structured_result(
             self.context
                 .translator
@@ -1157,6 +1177,7 @@ impl McplsServer {
         Parameters(FoldingRangesParams { file_path, kind }): Parameters<FoldingRangesParams>,
     ) -> Result<Json<FoldingRangesResult>, McpError> {
         let file_path = parse_client_path(file_path)?;
+        let kind = parse_kind_filter(Some(kind), KindFilterField::Kind)?.unwrap_or_default();
         self.structured_result(
             self.context
                 .translator
@@ -1205,35 +1226,16 @@ impl McplsServer {
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        // The route is resolved independently of the cache lookup below: a
-        // respawn clears `diagnostics_owner` for this server's entries along
-        // with its stale diagnostics (#359), so the degraded flag can't be
-        // keyed on ownership -- the routing identity is what stays stable
-        // across a respawn. A server that failed to start is an error here,
-        // not an empty list (#535).
-        let resolved =
-            Translator::cached_diagnostics_path_and_uri(&self.context.workspace_roots, &file_path)
-                .await
-                .and_then(|(validated_path, uri)| {
-                    let route_id = self
-                        .context
-                        .translator
-                        .diagnostics_route_for_path(validated_path.as_path())
-                        .into_read_result()?;
-                    Ok((route_id, uri))
-                });
-        let result = match resolved {
-            Ok((route_id, uri)) => {
-                // Lock only long enough for the map lookup + clone: no
-                // canonicalize() or Vec mapping while `notification_cache`
-                // is held, since `diagnostics_pump` needs the same lock.
-                let (sources, owner, availability, signals) = {
-                    let cache = self.context.notification_cache.lock().await;
-                    let owner = cache.diagnostics_owner(&uri).cloned();
-                    let availability = cache.availability(&uri, route_id.as_ref());
-                    let signals = RouteSignals::sample(&cache, route_id.as_ref());
-                    (cache.diagnostic_sources(&uri), owner, availability, signals)
-                };
+        let result = match self.diagnostics_snapshot(&file_path).await {
+            Ok((
+                _,
+                DiagnosticsSnapshot {
+                    sources,
+                    availability,
+                    signals,
+                    owner,
+                },
+            )) => {
                 let diag_info = sources.merge();
                 let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
                     self.context.translator.position_encoding_for(&server_id)
@@ -1486,50 +1488,56 @@ impl McplsServer {
         &self,
         path: &ClientPath,
     ) -> Result<ResourceDiagnosticsResponse, McpError> {
-        // Enforce workspace-root containment — mirrors the guard in every LSP tool.
-        // Validated against a lock-free snapshot of workspace_roots (fixed at
-        // startup) so this cache-only read never needs to touch `translator` at all.
-        let validated_path = self
-            .context
-            .workspace_roots
-            .validate(path)
+        let (validated_path, snapshot) = self
+            .diagnostics_snapshot(path)
             .await
             .map_err(|e| self.render_error(e))?;
-
-        // Build the URI from the canonicalized path (not the raw input path):
-        // it must match what `diagnostics_pump` stores from LSP notifications,
-        // which are always keyed by the canonical form.
-        let lsp_uri = crate::bridge::path_to_uri(validated_path.as_path())
-            .map_err(|e| self.render_error(e))?;
-
-        let route_id = self
-            .context
-            .translator
-            .diagnostics_route_for_path(validated_path.as_path())
-            .into_read_result()
-            .map_err(|e| self.render_error(e))?;
-
-        // Only the snapshot is taken under the cache lock: merging the sources
-        // (dedupe, sort, size cap) runs after it is released, since
-        // `diagnostics_pump` needs the same lock.
-        let (sources, availability, signals) = {
-            let cache = self.context.notification_cache.lock().await;
-            (
-                cache.diagnostic_sources(&lsp_uri),
-                cache.availability(&lsp_uri, route_id.as_ref()),
-                RouteSignals::sample(&cache, route_id.as_ref()),
-            )
-        };
-        let diag_info = sources.merge();
-        let mut response = build_resource_diagnostics_response(
+        // Merging the sources (dedupe, sort, size cap) runs after the cache
+        // lock is released, since `diagnostics_pump` needs the same lock.
+        let diag_info = snapshot.sources.merge();
+        Ok(build_resource_diagnostics_response(
             self.context
                 .translator
                 .is_document_open(validated_path.as_path()),
             diag_info.as_ref(),
-            signals,
-        );
-        response.availability = availability;
-        Ok(response)
+            snapshot.availability,
+            snapshot.signals,
+        ))
+    }
+
+    /// Validates `file_path` against the workspace roots and reads the cache
+    /// for it, for the cache-only reads (`get_cached_diagnostics` and the
+    /// diagnostics resource).
+    ///
+    /// The validation is lock-free (the roots are fixed at startup) and the
+    /// URI is built from the canonicalized path, since that is how
+    /// `diagnostics_pump` keys what it stores. The route is resolved
+    /// independently of the cache lookup: a respawn clears
+    /// `diagnostics_owner` for the server's entries along with its stale
+    /// diagnostics (#359), so the degraded flag can't be keyed on ownership --
+    /// the routing identity is what stays stable across a respawn. A server
+    /// that failed to start is an error, not an empty list (#535).
+    async fn diagnostics_snapshot(
+        &self,
+        file_path: &ClientPath,
+    ) -> crate::error::Result<(crate::bridge::WorkspacePath, DiagnosticsSnapshot)> {
+        let (validated_path, uri) =
+            Translator::cached_diagnostics_path_and_uri(&self.context.workspace_roots, file_path)
+                .await?;
+        let route_id = self
+            .context
+            .translator
+            .diagnostics_route_for_path(validated_path.as_path())
+            .into_read_result()?;
+        let cache = self.context.notification_cache.lock().await;
+        let snapshot = DiagnosticsSnapshot {
+            owner: cache.diagnostics_owner(&uri).cloned(),
+            availability: cache.availability(&uri, route_id.as_ref()),
+            signals: RouteSignals::sample(&cache, route_id.as_ref()),
+            sources: cache.diagnostic_sources(&uri),
+        };
+        drop(cache);
+        Ok((validated_path, snapshot))
     }
 
     /// Body of `read_resource`, kept separate so it can run under
@@ -2188,7 +2196,7 @@ mod tests {
         let err = crate::error::Error::NoServerForLanguage {
             language: LanguageId::from_static("python"),
             file: crate::config::FileKey::Unmappable,
-            patterns: vec![],
+            patterns: std::sync::Arc::default(),
         };
         let mcp_err = map_bridge_error(err);
 
@@ -2208,10 +2216,10 @@ mod tests {
             crate::error::Error::NotARegularFile(PathBuf::from("/dev/null")),
             crate::error::Error::NoResolvableListenUris,
             crate::error::Error::DocumentNotFound(PathBuf::from("/missing.rs")),
-            crate::error::Error::FileSizeLimitExceeded {
+            crate::error::Error::FileSizeLimitExceeded(crate::util::SizeExceeded {
                 size: 100,
                 max: std::num::NonZeroU64::new(10).unwrap(),
-            },
+            }),
             crate::error::Error::InvalidClientPath(crate::bridge::InvalidClientPath::Empty),
         ];
 
@@ -2598,6 +2606,71 @@ mod tests {
         assert!(symbols(serde_json::json!(true)).is_err());
     }
 
+    /// #700: `symbol_kind`, `kind` of `get_folding_ranges` and an over-long
+    /// `kind_filter` fail as `-32602` like every other kind filter, in any
+    /// case, with a bounded message.
+    #[tokio::test]
+    async fn test_every_kind_filter_input_fails_the_same_way() {
+        let server = create_test_server();
+        let file = std::env::temp_dir().join("a.rs");
+        let references = |kind: &str| {
+            serde_json::from_value::<ReferencesParams>(serde_json::json!({
+                "file_path": file, "symbol_name": "f", "symbol_kind": kind,
+            }))
+            .unwrap()
+        };
+        let folding = |kind: &str| {
+            serde_json::from_value::<FoldingRangesParams>(
+                serde_json::json!({"file_path": file, "kind": kind}),
+            )
+            .unwrap()
+        };
+        let long = "x".repeat(10_000);
+
+        let mut errors = Vec::new();
+        for kind in ["NotAKind", long.as_str()] {
+            errors.push(
+                server
+                    .get_references(Parameters(references(kind)))
+                    .await
+                    .map(|_| ()),
+            );
+            errors.push(
+                server
+                    .get_folding_ranges(Parameters(folding(kind)))
+                    .await
+                    .map(|_| ()),
+            );
+        }
+        let long_symbols = serde_json::from_value::<WorkspaceSymbolParams>(
+            serde_json::json!({"query": "x", "kind_filter": long}),
+        )
+        .unwrap();
+        errors.push(
+            server
+                .workspace_symbol_search(Parameters(long_symbols))
+                .await
+                .map(|_| ()),
+        );
+        for error in errors {
+            let error = error.unwrap_err();
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "{error:?}");
+            assert!(error.message.len() < 1_000, "{} bytes", error.message.len());
+        }
+
+        for accepted in ["Imports", "IMPORTS", "all"] {
+            let outcome = server
+                .get_folding_ranges(Parameters(folding(accepted)))
+                .await
+                .map(|_| ());
+            assert_ne!(
+                outcome.unwrap_err().code,
+                ErrorCode::INVALID_PARAMS,
+                "{accepted}"
+            );
+        }
+    }
+
     /// The diagnostics responses carry `availability`, and `get_diagnostics`
     /// also `origin`, beside the route signals.
     #[test]
@@ -2620,6 +2693,7 @@ mod tests {
         let resource = serde_json::to_value(build_resource_diagnostics_response(
             true,
             None,
+            DiagnosticsAvailability::Pending,
             RouteSignals::default(),
         ))
         .unwrap();
@@ -2753,7 +2827,7 @@ mod tests {
                 command: ServerCommand::from_static("rust-analyzer"),
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::ServerNotFound {
-                        command: "rust-analyzer".to_string(),
+                        command: crate::config::ServerCommand::from_static("rust-analyzer"),
                         source: std::io::Error::from(std::io::ErrorKind::NotFound),
                     },
                 )),
@@ -3546,8 +3620,13 @@ mod tests {
             signals,
         })
         .unwrap();
-        let resource =
-            serde_json::to_value(build_resource_diagnostics_response(true, None, signals)).unwrap();
+        let resource = serde_json::to_value(build_resource_diagnostics_response(
+            true,
+            None,
+            DiagnosticsAvailability::Pending,
+            signals,
+        ))
+        .unwrap();
         assert_value_keys_snake_case(&pulled, &[]);
         assert_value_keys_snake_case(&cached, &[]);
         assert_value_keys_snake_case(&resource, &["diagnostics"]);
@@ -3900,6 +3979,73 @@ mod tests {
         let diagnostics = parsed.get("diagnostics").unwrap().as_array().unwrap();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].get("message").unwrap(), "cached error");
+    }
+
+    /// #695: the cache tool and the resource read one snapshot, so for the same
+    /// file they report the same diagnostics, availability and signals, for a
+    /// cached file and for one nothing was published for.
+    #[tokio::test]
+    async fn test_cached_tool_and_resource_share_one_snapshot() {
+        use std::fs;
+
+        use tempfile::TempDir;
+        use url::Url;
+
+        let temp_dir = TempDir::new().unwrap();
+        let cached = temp_dir.path().join("cached.rs");
+        let silent = temp_dir.path().join("silent.rs");
+        fs::write(&cached, "fn main() {}").unwrap();
+        fs::write(&silent, "fn main() {}").unwrap();
+        let server = create_test_server_with_workspace_roots(
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
+        );
+        let uri: lsp_types::Uri = lsp_types::Uri::from(
+            Url::from_file_path(cached.canonicalize().unwrap())
+                .unwrap()
+                .as_str(),
+        );
+        server
+            .context
+            .notification_cache
+            .lock()
+            .await
+            .store_diagnostics(
+                &crate::config::ServerId::from_static("rust"),
+                &uri,
+                Some(1),
+                vec![lsp_types::Diagnostic {
+                    message: "cached error".to_owned().into(),
+                    ..lsp_types::Diagnostic::default()
+                }],
+            );
+
+        for file in [&cached, &silent] {
+            let tool = server
+                .get_cached_diagnostics(Parameters(CachedDiagnosticsParams {
+                    file_path: file.clone(),
+                }))
+                .await
+                .unwrap();
+            let tool = serde_json::to_value(&tool.0).unwrap();
+            let resource = server
+                .resource_diagnostics_response(&client_path(file))
+                .await
+                .unwrap();
+            let resource = serde_json::to_value(&resource).unwrap();
+
+            assert_eq!(tool["availability"], resource["availability"], "{file:?}");
+            assert_eq!(
+                tool["diagnostics"].as_array().map(Vec::len),
+                resource["diagnostics"].as_array().map(Vec::len),
+                "{file:?}"
+            );
+            assert_eq!(
+                tool["push_notifications_degraded"],
+                resource["push_notifications_degraded"]
+            );
+        }
     }
 
     /// #571 RT-010: a root loaded from a config file stays addressable by its
@@ -4458,7 +4604,7 @@ sleep 0.3
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("sh").into(),
                 args: vec![script_path.to_string_lossy().to_string()],
-                env: HashMap::new(),
+                env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
                 settings: None,
@@ -4610,7 +4756,7 @@ sleep 0.3
             language_id: LanguageId::from_static("rust"),
             command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
-                command: "rust-analyzer".to_string(),
+                command: crate::config::ServerCommand::from_static("rust-analyzer"),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }]);
@@ -5106,14 +5252,19 @@ sleep 0.3
             lsp_types::Uri::from(Url::parse("file:///sample.rs").unwrap().as_str());
         DiagnosticInfo {
             uri,
-            version: Some(1),
+            version: Some(crate::bridge::DocumentVersion::FIRST),
             diagnostics,
         }
     }
 
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
-        let response = ResourceDiagnosticsResponse::new(false, None, RouteSignals::default());
+        let response = ResourceDiagnosticsResponse::new(
+            false,
+            None,
+            DiagnosticsAvailability::Pending,
+            RouteSignals::default(),
+        );
         assert!(!response.tracked);
         assert!(response.version.is_none());
         assert_eq!(response.diagnostics.len(), 0);
@@ -5127,7 +5278,12 @@ sleep 0.3
 
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
-        let response = ResourceDiagnosticsResponse::new(true, None, RouteSignals::default());
+        let response = ResourceDiagnosticsResponse::new(
+            true,
+            None,
+            DiagnosticsAvailability::Pending,
+            RouteSignals::default(),
+        );
         assert!(response.tracked);
         assert!(response.version.is_none());
         assert_eq!(response.diagnostics.len(), 0);
@@ -5160,8 +5316,12 @@ sleep 0.3
             tags: None,
             data: None,
         }]);
-        let response =
-            ResourceDiagnosticsResponse::new(true, Some(&entry), RouteSignals::default());
+        let response = ResourceDiagnosticsResponse::new(
+            true,
+            Some(&entry),
+            DiagnosticsAvailability::Published,
+            RouteSignals::default(),
+        );
         assert!(response.tracked);
         assert_eq!(response.version, Some(1));
         assert_eq!(response.diagnostics.len(), 1);
@@ -5187,14 +5347,24 @@ sleep 0.3
 
     #[test]
     fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
-        let response = build_resource_diagnostics_response(false, None, RouteSignals::default());
+        let response = build_resource_diagnostics_response(
+            false,
+            None,
+            DiagnosticsAvailability::Pending,
+            RouteSignals::default(),
+        );
         assert!(!response.tracked);
         assert_eq!(response.diagnostics.len(), 0);
     }
 
     #[test]
     fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
-        let response = build_resource_diagnostics_response(true, None, RouteSignals::default());
+        let response = build_resource_diagnostics_response(
+            true,
+            None,
+            DiagnosticsAvailability::Pending,
+            RouteSignals::default(),
+        );
         assert!(response.tracked);
         assert_eq!(response.diagnostics.len(), 0);
     }
@@ -5228,8 +5398,12 @@ sleep 0.3
             data: None,
         }]);
 
-        let response =
-            build_resource_diagnostics_response(false, Some(&entry), RouteSignals::default());
+        let response = build_resource_diagnostics_response(
+            false,
+            Some(&entry),
+            DiagnosticsAvailability::Published,
+            RouteSignals::default(),
+        );
         assert!(
             response.tracked,
             "a cached diagnostics entry must make the response tracked, \
@@ -5246,6 +5420,7 @@ sleep 0.3
         let response = build_resource_diagnostics_response(
             false,
             None,
+            DiagnosticsAvailability::Pending,
             RouteSignals {
                 push_notifications_degraded: true,
                 indexing: IndexingSignal::default(),
@@ -5265,6 +5440,7 @@ sleep 0.3
         let response = build_resource_diagnostics_response(
             false,
             None,
+            DiagnosticsAvailability::Pending,
             RouteSignals {
                 push_notifications_degraded: false,
                 indexing: IndexingSignal {
@@ -5407,13 +5583,22 @@ sleep 0.3
         assert_eq!(map_bridge_error(err).code, ErrorCode::INVALID_PARAMS);
     }
 
-    /// Serves `server` over an in-memory duplex pipe, performs the MCP
-    /// handshake as a raw JSON-RPC client and returns the response to one
-    /// `tools/call get_hover` with `arguments`, so parameter parsing and error
-    /// mapping run exactly as in production.
+    /// [`tools_call_over_the_wire`] for `get_hover` with `arguments`.
     async fn hover_over_the_wire(
         server: McplsServer,
         arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let params = serde_json::json!({"name": "get_hover", "arguments": arguments});
+        tools_call_over_the_wire(server, params).await
+    }
+
+    /// Serves `server` over an in-memory duplex pipe, performs the MCP
+    /// handshake as a raw JSON-RPC client and returns the response to one
+    /// `tools/call` with `params`, so parameter parsing and error mapping run
+    /// exactly as in production.
+    async fn tools_call_over_the_wire(
+        server: McplsServer,
+        params: serde_json::Value,
     ) -> serde_json::Value {
         use rmcp::ServiceExt as _;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -5450,7 +5635,7 @@ sleep 0.3
             .unwrap();
         let call = send(serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "get_hover", "arguments": arguments},
+            "params": params,
         }));
         client_write.write_all(call.as_bytes()).await.unwrap();
 
@@ -5497,6 +5682,118 @@ sleep 0.3
 
             assert_eq!(response["error"]["code"], -32602, "{bad:?}: {response}");
         }
+    }
+
+    fn server_over(workspace: &Path) -> McplsServer {
+        let roots = WorkspaceRoots::from_paths(&[workspace.to_path_buf()]).unwrap();
+        let mut translator = Translator::new();
+        translator.set_workspace_roots(roots.clone());
+        McplsServer::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            roots,
+            SubscriptionRegistry::new(),
+            ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+        )
+    }
+
+    /// #705: an argument name the tool does not declare is a parameter error
+    /// (a tool-result error, like every parameter deserialization failure)
+    /// naming the field and the accepted ones, before any handler runs, for
+    /// each reproduction of the issue and for a nested item input.
+    #[tokio::test]
+    async fn test_unknown_tool_arguments_are_rejected_naming_the_field() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file = temp_dir.path().join("main.rs").display().to_string();
+        let item = serde_json::json!({
+            "name": "f", "kind": 12, "uri": "file:///a.rs",
+            "range": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 2}},
+            "selectionRange": {"start": {"line": 1, "character": 1}, "end": {"line": 1, "character": 2}},
+        });
+        let mut nested = item.clone();
+        nested["extra"] = true.into();
+        let range = |extra: (&str, serde_json::Value)| {
+            let mut arguments = serde_json::json!({
+                "file_path": file, "start_line": 1, "start_character": 1,
+                "end_line": 1, "end_character": 2,
+            });
+            arguments[extra.0] = extra.1;
+            arguments
+        };
+        let cases = [
+            (
+                "get_code_actions",
+                range(("kinds", serde_json::json!(["quickfix"]))),
+                "kinds",
+                "kind_filter",
+            ),
+            (
+                "workspace_symbol_search",
+                serde_json::json!({"query": "x", "kind": "function"}),
+                "kind",
+                "kind_filter",
+            ),
+            (
+                "restart_server",
+                serde_json::json!({"server_ids": ["rust"]}),
+                "server_ids",
+                "servers",
+            ),
+            (
+                "get_hover",
+                serde_json::json!({"file_path": file, "line": 1, "character": 1, "extra": 1}),
+                "extra",
+                "character",
+            ),
+            (
+                "get_references",
+                serde_json::json!({"file_path": file, "line": 1, "character": 1, "include": true}),
+                "include",
+                "include_declaration",
+            ),
+            (
+                "get_incoming_calls",
+                serde_json::json!({"item": nested}),
+                "extra",
+                "selectionRange",
+            ),
+        ];
+        for (tool, arguments, unknown, accepted) in cases {
+            let server = server_over(temp_dir.path());
+            let params = serde_json::json!({"name": tool, "arguments": arguments});
+
+            let response = tools_call_over_the_wire(server, params).await;
+
+            assert_eq!(response["result"]["isError"], true, "{tool}: {response}");
+            let message = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("`{unknown}`")),
+                "{tool}: {message}"
+            );
+            assert!(
+                message.contains(&format!("`{accepted}`")),
+                "{tool}: {message}"
+            );
+        }
+    }
+
+    /// #705: `_meta` and the other request-level fields sit beside `arguments`
+    /// in `params`, so the strict argument types never see them.
+    #[tokio::test]
+    async fn test_request_meta_is_not_an_unknown_argument() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file = temp_dir.path().join("main.rs").display().to_string();
+        let params = serde_json::json!({
+            "name": "get_hover",
+            "arguments": {"file_path": file, "line": 1, "character": 1},
+            "_meta": {"progressToken": "t"},
+        });
+
+        let response = tools_call_over_the_wire(server_over(temp_dir.path()), params).await;
+
+        let message = response.to_string();
+        assert!(!message.contains("unknown field"), "{message}");
     }
 
     /// #496 site 2 regression: a `SubscriptionError::LimitReached`, routed
@@ -5869,7 +6166,7 @@ sleep 0.3
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("rust-analyzer"),
                     reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
-                        command: "rust-analyzer".to_string(),
+                        command: crate::config::ServerCommand::from_static("rust-analyzer"),
                         source: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
@@ -6430,7 +6727,7 @@ sleep 0.3
             McpTool::GetFoldingRanges => server
                 .get_folding_ranges(Parameters(FoldingRangesParams {
                     file_path: PathBuf::from(file_path.clone()),
-                    kind: crate::bridge::FoldingKindFilter::All,
+                    kind: KindFilterInput::default(),
                 }))
                 .await
                 .map(|_| ()),

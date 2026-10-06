@@ -1,15 +1,11 @@
 //! Document highlights handler.
 
-use lsp_types::{
-    DocumentHighlightParams, PartialResultParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, WorkDoneProgressParams,
-};
-
 use super::Translator;
 use super::dto::{
     DocumentHighlightEntry, DocumentHighlightKind, DocumentHighlightsResult, Position,
 };
 use super::navigation::ItemBudget;
+use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
@@ -41,38 +37,27 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<DocumentHighlightsResult> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .position_request::<lsp_types::DocumentHighlightRequest>(
                 &file_path,
+                position,
                 Capability::DocumentHighlights,
-                IndexingGate::NotRequired,
-                &[position],
+                IndexingGate::FileLocal,
+                (),
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = DocumentHighlightParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: lsp_position,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::DocumentHighlightRequest>(params, client.request_timeout())
-            .await?;
+        let response_uri = doc.uri();
 
         let mut budget = ItemBudget::new();
         let lsp_highlights = budget.admit(response.unwrap_or_default());
         let mut highlights = Vec::with_capacity(lsp_highlights.len());
         for highlight in lsp_highlights {
             highlights.push(DocumentHighlightEntry {
-                range: ctx.normalize_range(&response_uri, highlight.range).await,
+                range: ctx.normalize_range(response_uri, highlight.range).await,
                 kind: highlight_kind(highlight.kind),
             });
         }

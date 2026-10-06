@@ -6,19 +6,117 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, InvalidPosition, KindFilter,
-    KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES,
-    Position, RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
+    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, KindFilterField, KindFilterInput,
+    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, Position, Position2D, Range,
+    RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
     SymbolTarget, TabSize,
 };
+use crate::error::Error;
 
 /// Schema description of the opt-in `context` input shared by every tool that
 /// can attach enclosing symbols.
 const CONTEXT_DESCRIPTION: &str = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call.";
 
+/// Declares a wire struct whose first fields are a file path and a 1-based
+/// position, followed by the tool's own fields.
+///
+/// Wire structs deny unknown fields, which rules out `#[serde(flatten)]`, so
+/// each tool spells out the shared fields through these macros instead.
+macro_rules! position_wire {
+    ($(#[$meta:meta])* $name:ident { $($extra:tt)* }) => {
+        #[derive(Debug, Clone, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        $(#[$meta])*
+        struct $name {
+            #[schemars(description = "Absolute path to the file.")]
+            file_path: PathBuf,
+            #[schemars(description = "Line number (1-based).")]
+            line: u32,
+            #[schemars(description = "Character/column number (1-based).")]
+            character: u32,
+            $($extra)*
+        }
+    };
+}
+
+/// Declares a wire struct whose first fields are a file path and a 1-based
+/// range, followed by the tool's own fields.
+macro_rules! range_wire {
+    ($(#[$meta:meta])* $name:ident { $($extra:tt)* }) => {
+        #[derive(Debug, Clone, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        $(#[$meta])*
+        struct $name {
+            #[schemars(description = "Absolute path to the file.")]
+            file_path: PathBuf,
+            #[schemars(description = "Start line (1-based).")]
+            start_line: u32,
+            #[schemars(description = "Start character (1-based).")]
+            start_character: u32,
+            #[schemars(description = "End line (1-based).")]
+            end_line: u32,
+            #[schemars(description = "End character (1-based).")]
+            end_character: u32,
+            $($extra)*
+        }
+
+        impl $name {
+            const fn range(&self) -> RangeParams {
+                RangeParams {
+                    start_line: self.start_line,
+                    start_character: self.start_character,
+                    end_line: self.end_line,
+                    end_character: self.end_character,
+                }
+            }
+        }
+    };
+}
+
+/// Declares a wire struct whose first fields address a symbol in a file, by
+/// position or by name, followed by the tool's own fields.
+macro_rules! target_wire {
+    ($(#[$meta:meta])* $name:ident { $($extra:tt)* }) => {
+        #[derive(Debug, Clone, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        $(#[$meta])*
+        struct $name {
+            #[schemars(description = "Absolute path to the file.")]
+            file_path: PathBuf,
+            #[schemars(
+                description = "Line number (1-based). Give with `character`, instead of `symbol_name`."
+            )]
+            #[serde(default)]
+            line: Option<u32>,
+            #[schemars(
+                description = "Character/column number (1-based). Give with `line`, instead of `symbol_name`."
+            )]
+            #[serde(default)]
+            character: Option<u32>,
+            #[schemars(
+                description = "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them."
+            )]
+            #[serde(default)]
+            symbol_name: Option<String>,
+            #[schemars(
+                description = "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value."
+            )]
+            #[serde(default)]
+            symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
+            #[schemars(
+                description = "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name."
+            )]
+            #[serde(default)]
+            container: Option<String>,
+            $($extra)*
+        }
+    };
+}
+
 /// Shared position parameters (file path plus 1-based line/character) used by
 /// every tool that operates at a single point in a file.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PositionParams {
     /// Absolute path to the file.
     #[schemars(description = "Absolute path to the file.")]
@@ -33,62 +131,25 @@ pub struct PositionParams {
 
 /// Shared range parameters (1-based start/end line and character) used by
 /// every tool that operates over a range in a file.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone)]
 pub struct RangeParams {
     /// Start line (1-based).
-    #[schemars(description = "Start line (1-based).")]
     pub start_line: u32,
     /// Start character (1-based).
-    #[schemars(description = "Start character (1-based).")]
     pub start_character: u32,
     /// End line (1-based).
-    #[schemars(description = "End line (1-based).")]
     pub end_line: u32,
     /// End character (1-based).
-    #[schemars(description = "End character (1-based).")]
     pub end_character: u32,
 }
 
-/// Wire form of [`SymbolTargetParams`]: a file plus either a position or a
-/// symbol name.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(
-    description = "A file plus the symbol to act on: give either `line` and `character`, or `symbol_name`."
-)]
-struct SymbolTargetWire {
-    /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
-    file_path: PathBuf,
-    /// Line number (1-based); give with `character`, instead of `symbol_name`.
+target_wire! {
+    /// Wire form of [`SymbolTargetParams`]: a file plus either a position or a
+    /// symbol name.
     #[schemars(
-        description = "Line number (1-based). Give with `character`, instead of `symbol_name`."
+        description = "A file plus the symbol to act on: give either `line` and `character`, or `symbol_name`."
     )]
-    #[serde(default)]
-    line: Option<u32>,
-    /// Character/column number (1-based); give with `line`.
-    #[schemars(
-        description = "Character/column number (1-based). Give with `line`, instead of `symbol_name`."
-    )]
-    #[serde(default)]
-    character: Option<u32>,
-    /// Name of a symbol defined in the file, instead of a position.
-    #[schemars(
-        description = "Name of a symbol defined in this file, instead of `line`/`character`. May be qualified (`Type::method`, `Type.method`). If it matches several symbols the call fails and lists them."
-    )]
-    #[serde(default)]
-    symbol_name: Option<String>,
-    /// Narrow `symbol_name` to this kind.
-    #[schemars(
-        description = "With `symbol_name`: keep only symbols of this kind, by name (function, method, class, struct, ...) or numeric LSP SymbolKind value."
-    )]
-    #[serde(default)]
-    symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
-    /// Narrow `symbol_name` to symbols inside this container.
-    #[schemars(
-        description = "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name."
-    )]
-    #[serde(default)]
-    container: Option<String>,
+    SymbolTargetWire {}
 }
 
 /// A file and the symbol in it a tool acts on, addressed by position or by
@@ -107,9 +168,10 @@ pub struct SymbolTargetParams {
 
 /// A symbol addressed by position or by name, before the position is checked.
 ///
-/// The position stays raw so a bad value is rejected as invalid parameters
-/// (JSON-RPC `-32602`) by [`Self::into_target`] in the tool method, not as a
-/// deserialization failure, which MCP reports as a tool-result error.
+/// The position and the kind filter stay raw so a bad value is rejected as
+/// invalid parameters (JSON-RPC `-32602`) by [`Self::into_target`] in the tool
+/// method, not as a deserialization failure, which MCP reports as a
+/// tool-result error.
 #[derive(Debug, Clone)]
 pub enum SymbolTargetInput {
     /// A 1-based position, unchecked.
@@ -120,69 +182,82 @@ pub enum SymbolTargetInput {
         character: u32,
     },
     /// A symbol name with optional qualifiers.
-    Name(SymbolQuery),
+    Name {
+        /// The symbol's name, optionally qualified.
+        name: SymbolName,
+        /// Keep only symbols of this kind, unchecked.
+        kind: Option<KindFilterInput<SymbolKindFilter>>,
+        /// Keep only symbols directly inside a container of this name.
+        container: Option<SymbolName>,
+    },
 }
 
 impl SymbolTargetInput {
-    /// Checks the position and yields the typed target.
+    /// Checks the position or the kind filter and yields the typed target.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidPosition`] for a position below 1 or above
-    /// [`MAX_POSITION_VALUE`](crate::bridge::MAX_POSITION_VALUE).
-    pub fn into_target(self) -> Result<SymbolTarget, InvalidPosition> {
+    /// Returns [`Error::InvalidPositionInput`] for a position below 1 or above
+    /// [`MAX_POSITION_VALUE`](crate::bridge::MAX_POSITION_VALUE), and
+    /// [`Error::InvalidToolParams`] for a `symbol_kind` that names no kind.
+    pub fn into_target(self) -> Result<SymbolTarget, Error> {
         match self {
-            Self::Position { line, character } => {
-                Position::from_client(line, character).map(SymbolTarget::Position)
-            }
-            Self::Name(query) => Ok(SymbolTarget::Name(query)),
+            Self::Position { line, character } => Ok(SymbolTarget::Position(
+                Position::from_client(line, character)?,
+            )),
+            Self::Name {
+                name,
+                kind,
+                container,
+            } => Ok(SymbolTarget::Name(SymbolQuery {
+                name,
+                kind: kind
+                    .map(|kind| kind.into_known(KindFilterField::SymbolKind))
+                    .transpose()?
+                    .map(SymbolKindFilter::kind),
+                container,
+            })),
         }
     }
 }
 
-impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
-    type Error = String;
-
-    fn try_from(wire: SymbolTargetWire) -> Result<Self, Self::Error> {
-        let target = match (wire.line, wire.character, wire.symbol_name) {
-            (Some(line), Some(character), None) => {
-                if wire.symbol_kind.is_some() || wire.container.is_some() {
+impl SymbolTargetParams {
+    /// Builds the target from the addressing fields of a tool call.
+    ///
+    /// # Errors
+    ///
+    /// A message when the fields do not address exactly one symbol, or when a
+    /// symbol name or container is blank or too long.
+    fn from_parts(
+        file_path: PathBuf,
+        position: (Option<u32>, Option<u32>),
+        symbol_name: Option<String>,
+        symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
+        container: Option<String>,
+    ) -> Result<Self, String> {
+        let target = match (position, symbol_name) {
+            ((Some(line), Some(character)), None) => {
+                if symbol_kind.is_some() || container.is_some() {
                     return Err(
                         "`symbol_kind` and `container` apply only with `symbol_name`".to_string(),
                     );
                 }
                 SymbolTargetInput::Position { line, character }
             }
-            (None, None, Some(name)) => {
-                let kind = wire
-                    .symbol_kind
-                    .map(|kind| match kind {
-                        KindFilterInput::Known(kind) => Ok(kind.kind()),
-                        KindFilterInput::Rejected(rejected) => {
-                            Err(if rejected.as_str().len() > MAX_SYMBOL_NAME_BYTES {
-                                "`symbol_kind` is too long".to_string()
-                            } else {
-                                SymbolKindFilter::rejection_message(rejected.as_str())
-                            })
-                        }
-                    })
-                    .transpose()?;
-                SymbolTargetInput::Name(SymbolQuery {
-                    name: SymbolName::try_new(name).map_err(|e| e.to_string())?,
-                    kind,
-                    container: wire
-                        .container
-                        .map(SymbolName::try_new)
-                        .transpose()
-                        .map_err(|e| e.to_string())?,
-                })
-            }
-            (Some(_), Some(_), Some(_)) => {
+            ((None, None), Some(name)) => SymbolTargetInput::Name {
+                name: SymbolName::try_new(name).map_err(|e| e.to_string())?,
+                kind: symbol_kind,
+                container: container
+                    .map(SymbolName::try_new)
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+            },
+            ((Some(_), Some(_)), Some(_)) => {
                 return Err(
                     "give either `line` and `character`, or `symbol_name`, not both".to_string(),
                 );
             }
-            (None, None, None) => {
+            ((None, None), None) => {
                 return Err("give `line` and `character`, or `symbol_name`".to_string());
             }
             _ => {
@@ -192,10 +267,21 @@ impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
                 );
             }
         };
-        Ok(Self {
-            file_path: wire.file_path,
-            target,
-        })
+        Ok(Self { file_path, target })
+    }
+}
+
+impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
+    type Error = String;
+
+    fn try_from(wire: SymbolTargetWire) -> Result<Self, Self::Error> {
+        Self::from_parts(
+            wire.file_path,
+            (wire.line, wire.character),
+            wire.symbol_name,
+            wire.symbol_kind,
+            wire.container,
+        )
     }
 }
 
@@ -212,35 +298,87 @@ impl From<PositionParams> for SymbolTargetParams {
     }
 }
 
+target_wire! {
+    /// Wire form of [`ReferencesParams`].
+    #[schemars(description = "Parameters for finding all references to a symbol.")]
+    ReferencesWire {
+        #[schemars(description = "Whether to include the declaration in the results.")]
+        #[serde(default)]
+        include_declaration: bool,
+        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[serde(default)]
+        context: ResultContext,
+    }
+}
+
 /// Parameters for the `get_references` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for finding all references to a symbol.")]
+#[serde(try_from = "ReferencesWire")]
+#[schemars(with = "ReferencesWire")]
 pub struct ReferencesParams {
     /// The symbol to find references to.
-    #[serde(flatten)]
     pub target: SymbolTargetParams,
     /// Whether to include the declaration in the results.
-    #[schemars(description = "Whether to include the declaration in the results.")]
-    #[serde(default)]
     pub include_declaration: bool,
     /// Optional extra context for each returned item.
-    #[schemars(description = CONTEXT_DESCRIPTION)]
-    #[serde(default)]
     pub context: ResultContext,
+}
+
+impl TryFrom<ReferencesWire> for ReferencesParams {
+    type Error = String;
+
+    fn try_from(wire: ReferencesWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: SymbolTargetParams::from_parts(
+                wire.file_path,
+                (wire.line, wire.character),
+                wire.symbol_name,
+                wire.symbol_kind,
+                wire.container,
+            )?,
+            include_declaration: wire.include_declaration,
+            context: wire.context,
+        })
+    }
+}
+
+target_wire! {
+    /// Wire form of [`NavigationParams`].
+    #[schemars(description = "Parameters for navigating from a symbol to related locations.")]
+    NavigationWire {
+        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[serde(default)]
+        context: ResultContext,
+    }
 }
 
 /// Parameters for the `get_definition`, `go_to_implementation` and
 /// `go_to_type_definition` tools.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for navigating from a symbol to related locations.")]
+#[serde(try_from = "NavigationWire")]
+#[schemars(with = "NavigationWire")]
 pub struct NavigationParams {
     /// The symbol to navigate from.
-    #[serde(flatten)]
     pub target: SymbolTargetParams,
     /// Optional extra context for each returned item.
-    #[schemars(description = CONTEXT_DESCRIPTION)]
-    #[serde(default)]
     pub context: ResultContext,
+}
+
+impl TryFrom<NavigationWire> for NavigationParams {
+    type Error = String;
+
+    fn try_from(wire: NavigationWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: SymbolTargetParams::from_parts(
+                wire.file_path,
+                (wire.line, wire.character),
+                wire.symbol_name,
+                wire.symbol_kind,
+                wire.container,
+            )?,
+            context: wire.context,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -253,17 +391,38 @@ impl From<PositionParams> for NavigationParams {
     }
 }
 
+position_wire! {
+    /// Wire form of [`DeclarationParams`].
+    #[schemars(description = "Parameters for navigating from a position to its declaration.")]
+    DeclarationWire {
+        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[serde(default)]
+        context: ResultContext,
+    }
+}
+
 /// Parameters for the `go_to_declaration` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for navigating from a position to its declaration.")]
+#[serde(from = "DeclarationWire")]
+#[schemars(with = "DeclarationWire")]
 pub struct DeclarationParams {
     /// The position to navigate from.
-    #[serde(flatten)]
     pub position: PositionParams,
     /// Optional extra context for each returned item.
-    #[schemars(description = CONTEXT_DESCRIPTION)]
-    #[serde(default)]
     pub context: ResultContext,
+}
+
+impl From<DeclarationWire> for DeclarationParams {
+    fn from(wire: DeclarationWire) -> Self {
+        Self {
+            position: PositionParams {
+                file_path: wire.file_path,
+                line: wire.line,
+                character: wire.character,
+            },
+            context: wire.context,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +437,7 @@ impl From<PositionParams> for DeclarationParams {
 
 /// Parameters for the `get_diagnostics` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for getting diagnostics (errors, warnings) for a file.")]
 pub struct DiagnosticsParams {
     /// Absolute path to the file.
@@ -289,32 +449,79 @@ pub struct DiagnosticsParams {
     pub context: ResultContext,
 }
 
+target_wire! {
+    /// Wire form of [`RenameParams`].
+    #[schemars(description = "Parameters for renaming a symbol across the workspace.")]
+    RenameWire {
+        #[schemars(description = "New name for the symbol.")]
+        new_name: String,
+    }
+}
+
 /// Parameters for the `rename_symbol` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for renaming a symbol across the workspace.")]
+#[serde(try_from = "RenameWire")]
+#[schemars(with = "RenameWire")]
 pub struct RenameParams {
     /// The symbol to rename.
-    #[serde(flatten)]
     pub target: SymbolTargetParams,
     /// New name for the symbol.
-    #[schemars(description = "New name for the symbol.")]
     pub new_name: String,
 }
 
+impl TryFrom<RenameWire> for RenameParams {
+    type Error = String;
+
+    fn try_from(wire: RenameWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: SymbolTargetParams::from_parts(
+                wire.file_path,
+                (wire.line, wire.character),
+                wire.symbol_name,
+                wire.symbol_kind,
+                wire.container,
+            )?,
+            new_name: wire.new_name,
+        })
+    }
+}
+
+position_wire! {
+    /// Wire form of [`CompletionsParams`].
+    #[schemars(description = "Parameters for getting code completion suggestions.")]
+    CompletionsWire {
+        #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
+        trigger: Option<String>,
+    }
+}
+
 /// Parameters for the `get_completions` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting code completion suggestions.")]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "CompletionsWire")]
+#[schemars(with = "CompletionsWire")]
 pub struct CompletionsParams {
     /// Position in the file to operate on.
-    #[serde(flatten)]
     pub position: PositionParams,
     /// Optional trigger character (e.g., '.', ':', '->').
-    #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
     pub trigger: Option<String>,
+}
+
+impl From<CompletionsWire> for CompletionsParams {
+    fn from(wire: CompletionsWire) -> Self {
+        Self {
+            position: PositionParams {
+                file_path: wire.file_path,
+                line: wire.line,
+                character: wire.character,
+            },
+            trigger: wire.trigger,
+        }
+    }
 }
 
 /// Parameters for the `get_folding_ranges` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for getting the foldable regions of a file.")]
 pub struct FoldingRangesParams {
     /// Absolute path to the file.
@@ -324,12 +531,14 @@ pub struct FoldingRangesParams {
     #[schemars(
         description = "`all` (default), `comment`, `imports` or `region`; regions without a kind match only `all`."
     )]
+    #[schemars(with = "FoldingKindFilter", transform = without_default)]
     #[serde(default)]
-    pub kind: FoldingKindFilter,
+    pub kind: KindFilterInput<FoldingKindFilter>,
 }
 
 /// Parameters for the `get_document_symbols` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for getting all symbols in a document.")]
 pub struct DocumentSymbolsParams {
     /// Absolute path to the file.
@@ -339,6 +548,7 @@ pub struct DocumentSymbolsParams {
 
 /// Parameters for the `format_document` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for formatting a document.")]
 pub struct FormatDocumentParams {
     /// Absolute path to the file.
@@ -360,6 +570,7 @@ const fn default_insert_spaces() -> bool {
 
 /// Parameters for the `workspace_symbol_search` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for searching symbols across the workspace.")]
 pub struct WorkspaceSymbolParams {
     /// Search query for symbol names (supports partial matching).
@@ -390,74 +601,246 @@ const fn default_max_results() -> u32 {
     100
 }
 
+range_wire! {
+    /// Wire form of [`CodeActionsParams`].
+    #[schemars(
+        description = "Parameters for getting available code actions (quick fixes, refactorings) for a range."
+    )]
+    CodeActionsWire {
+        #[schemars(
+            description = "Optional filter by action kind, in any case; sent to the server in its canonical spelling."
+        )]
+        kind_filter: Option<KindFilterInput<CodeActionKindFilter>>,
+    }
+}
+
 /// Parameters for the `get_code_actions` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(
-    description = "Parameters for getting available code actions (quick fixes, refactorings) for a range."
-)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "CodeActionsWire")]
+#[schemars(with = "CodeActionsWire")]
 pub struct CodeActionsParams {
     /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
     /// Range in the file to operate on.
-    #[serde(flatten)]
     pub range: RangeParams,
     /// Optional filter by action kind (quickfix, refactor, source, etc.).
-    #[schemars(
-        description = "Optional filter by action kind, in any case; sent to the server in its canonical spelling."
-    )]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_filter: Option<KindFilterInput<CodeActionKindFilter>>,
 }
 
-/// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+impl From<CodeActionsWire> for CodeActionsParams {
+    fn from(wire: CodeActionsWire) -> Self {
+        let range = wire.range();
+        Self {
+            file_path: wire.file_path,
+            range,
+            kind_filter: wire.kind_filter,
+        }
+    }
+}
+
+/// Drops the `default` annotation, which the advertised schema of an input
+/// that echoes a result field does not carry.
+fn without_default(schema: &mut schemars::Schema) {
+    schema.remove("default");
+}
+
+/// Input form of [`Position2D`]: the same schema under the same name, closed
+/// to unknown fields. The output type stays open for compatible additions.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    rename = "Position2D",
+    description = "Position in a document (1-based for MCP)."
+)]
+struct Position2DInput {
+    /// Line number (1-based).
+    line: u32,
+    /// Character offset (1-based).
+    character: u32,
+}
+
+/// Input form of [`Range`]: the same schema under the same name, closed to
+/// unknown fields.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    rename = "Range",
+    description = "Range in a document (1-based for MCP)."
+)]
+struct RangeInput {
+    /// Start position.
+    start: Position2DInput,
+    /// End position.
+    end: Position2DInput,
+}
+
+/// Input form of [`HierarchyItem`]: the same schema under the same name,
+/// closed to unknown fields except `data`, which is opaque by contract.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    rename = "HierarchyItem",
+    description = "A call or type hierarchy item."
+)]
+struct HierarchyItemInput {
+    /// Name of the symbol.
+    name: String,
+    /// LSP numeric symbol kind (e.g. 12 for Function, 5 for Class).
+    kind: u32,
+    /// More detail for this item.
+    detail: Option<String>,
+    /// URI of the document.
+    uri: String,
+    /// Range of the symbol.
+    range: RangeInput,
+    /// Selection range (identifier location).
+    #[serde(rename = "selectionRange")]
+    selection_range: RangeInput,
+    /// Opaque data to pass back unchanged.
+    data: Option<serde_json::Value>,
+    /// Whether this item is not provably inside any configured workspace
+    /// root. Ignored on input.
+    #[serde(default)]
+    #[schemars(transform = without_default)]
+    out_of_workspace: bool,
+}
+
+impl From<Position2DInput> for Position2D {
+    fn from(position: Position2DInput) -> Self {
+        Self {
+            line: position.line,
+            character: position.character,
+        }
+    }
+}
+
+impl From<RangeInput> for Range {
+    fn from(range: RangeInput) -> Self {
+        Self {
+            start: range.start.into(),
+            end: range.end.into(),
+        }
+    }
+}
+
+impl From<HierarchyItemInput> for HierarchyItem {
+    fn from(item: HierarchyItemInput) -> Self {
+        Self {
+            name: item.name,
+            kind: item.kind,
+            detail: item.detail,
+            uri: item.uri,
+            range: item.range.into(),
+            selection_range: item.selection_range.into(),
+            data: item.data,
+            out_of_workspace: item.out_of_workspace,
+        }
+    }
+}
+
+/// Wire form of [`CallHierarchyCallsParams`].
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "Parameters for getting incoming or outgoing calls for a call hierarchy item."
 )]
-pub struct CallHierarchyCallsParams {
-    /// The call hierarchy item to get calls for (from prepare response).
+struct CallHierarchyCallsWire {
     #[schemars(
         description = "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
     )]
-    pub item: HierarchyItem,
+    item: HierarchyItemInput,
 }
 
-/// Parameters for the `get_supertypes` and `get_subtypes` tools.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Wire form of [`TypeHierarchyWalkParams`].
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "Parameters for getting the supertypes or subtypes of a type hierarchy item."
 )]
-pub struct TypeHierarchyWalkParams {
-    /// The type hierarchy item to walk from (from a prepare, supertypes or subtypes response).
+struct TypeHierarchyWalkWire {
     #[schemars(
         description = "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
     )]
+    item: HierarchyItemInput,
+}
+
+/// Parameters for the `get_incoming_calls` and `get_outgoing_calls` tools.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "CallHierarchyCallsWire")]
+#[schemars(with = "CallHierarchyCallsWire")]
+pub struct CallHierarchyCallsParams {
+    /// The call hierarchy item to get calls for (from prepare response).
     pub item: HierarchyItem,
 }
 
+impl From<CallHierarchyCallsWire> for CallHierarchyCallsParams {
+    fn from(wire: CallHierarchyCallsWire) -> Self {
+        Self {
+            item: wire.item.into(),
+        }
+    }
+}
+
+/// Parameters for the `get_supertypes` and `get_subtypes` tools.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "TypeHierarchyWalkWire")]
+#[schemars(with = "TypeHierarchyWalkWire")]
+pub struct TypeHierarchyWalkParams {
+    /// The type hierarchy item to walk from (from a prepare, supertypes or subtypes response).
+    pub item: HierarchyItem,
+}
+
+impl From<TypeHierarchyWalkWire> for TypeHierarchyWalkParams {
+    fn from(wire: TypeHierarchyWalkWire) -> Self {
+        Self {
+            item: wire.item.into(),
+        }
+    }
+}
+
+range_wire! {
+    /// Wire form of [`FormatRangeParams`].
+    #[schemars(description = "Parameters for formatting a range of a document.")]
+    FormatRangeWire {
+        #[schemars(description = "Tab size for formatting (1 to 32, default: 4).")]
+        #[serde(default)]
+        tab_size: TabSize,
+        #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
+        #[serde(default = "default_insert_spaces")]
+        insert_spaces: bool,
+    }
+}
+
 /// Parameters for the `format_range` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for formatting a range of a document.")]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "FormatRangeWire")]
+#[schemars(with = "FormatRangeWire")]
 pub struct FormatRangeParams {
     /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
     /// Range in the file to format.
-    #[serde(flatten)]
     pub range: RangeParams,
     /// Tab size for formatting (1 to 32, default: 4).
-    #[schemars(description = "Tab size for formatting (1 to 32, default: 4).")]
-    #[serde(default)]
     pub tab_size: TabSize,
     /// Whether to use spaces instead of tabs (default: true).
-    #[schemars(description = "Whether to use spaces instead of tabs (default: true).")]
-    #[serde(default = "default_insert_spaces")]
     pub insert_spaces: bool,
+}
+
+impl From<FormatRangeWire> for FormatRangeParams {
+    fn from(wire: FormatRangeWire) -> Self {
+        let range = wire.range();
+        Self {
+            file_path: wire.file_path,
+            range,
+            tab_size: wire.tab_size,
+            insert_spaces: wire.insert_spaces,
+        }
+    }
 }
 
 /// Parameters for the `get_cached_diagnostics` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "Parameters for getting cached diagnostics from LSP server notifications."
 )]
@@ -469,6 +852,7 @@ pub struct CachedDiagnosticsParams {
 
 /// Parameters for the `get_server_logs` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for getting recent LSP server log messages.")]
 pub struct ServerLogsParams {
     /// Maximum number of log entries to return (default: 50).
@@ -487,6 +871,7 @@ const fn default_log_limit() -> usize {
 
 /// Parameters for the `get_server_messages` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "Parameters for getting recent LSP server messages (showMessage notifications)."
 )]
@@ -503,6 +888,7 @@ const fn default_message_limit() -> usize {
 
 /// Parameters for the `get_tool_support` tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for reporting which tools are usable for which languages.")]
 pub struct ToolSupportParams {
     /// Restrict the report to the language of this file.
@@ -514,6 +900,7 @@ pub struct ToolSupportParams {
 /// Wire form of [`RestartServerParams`]: exactly one of the two fields selects
 /// the servers.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "Parameters for restarting LSP servers. Give exactly one of `servers` or `all`."
 )]
@@ -562,16 +949,31 @@ impl TryFrom<RestartServerWire> for RestartServerParams {
     }
 }
 
+range_wire! {
+    /// Wire form of [`InlayHintsParams`].
+    #[schemars(description = "Parameters for getting inlay hints in a range.")]
+    InlayHintsWire {}
+}
+
 /// Parameters for the `get_inlay_hints` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Parameters for getting inlay hints in a range.")]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(from = "InlayHintsWire")]
+#[schemars(with = "InlayHintsWire")]
 pub struct InlayHintsParams {
     /// Absolute path to the file.
-    #[schemars(description = "Absolute path to the file.")]
     pub file_path: PathBuf,
     /// Range in the file to operate on.
-    #[serde(flatten)]
     pub range: RangeParams,
+}
+
+impl From<InlayHintsWire> for InlayHintsParams {
+    fn from(wire: InlayHintsWire) -> Self {
+        let range = wire.range();
+        Self {
+            file_path: wire.file_path,
+            range,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -580,44 +982,6 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-
-    /// `#[serde(flatten)]` must keep `PositionParams`/`RangeParams` fields at
-    /// the top level of the wire format, since MCP clients send flat JSON
-    /// objects with no knowledge of the Rust-side nesting.
-    #[test]
-    fn flattened_params_serialize_to_flat_json() {
-        let position = PositionParams {
-            file_path: PathBuf::from("/a.rs"),
-            line: 1,
-            character: 2,
-        };
-        let json = serde_json::to_value(&position).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2})
-        );
-
-        let inlay = InlayHintsParams {
-            file_path: PathBuf::from("/b.rs"),
-            range: RangeParams {
-                start_line: 1,
-                start_character: 2,
-                end_line: 3,
-                end_character: 4,
-            },
-        };
-        let json = serde_json::to_value(&inlay).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "file_path": "/b.rs",
-                "start_line": 1,
-                "start_character": 2,
-                "end_line": 3,
-                "end_character": 4,
-            })
-        );
-    }
 
     #[test]
     fn restart_params_accept_servers_or_all() {
@@ -670,7 +1034,7 @@ mod tests {
     }
 
     /// A flat JSON object (what an MCP client actually sends) must deserialize
-    /// into the nested Rust shape produced by `#[serde(flatten)]`.
+    /// into the nested Rust shape.
     #[test]
     fn flat_json_deserializes_into_flattened_params() {
         let json = serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 2});
@@ -694,7 +1058,7 @@ mod tests {
         });
         let references: ReferencesParams = serde_json::from_value(json).unwrap();
         assert!(references.include_declaration);
-        let SymbolTargetInput::Name(query) = references.target.target else {
+        let SymbolTarget::Name(query) = references.target.target.into_target().unwrap() else {
             panic!("expected a name target");
         };
         assert_eq!(query.name.as_str(), "parse");
@@ -717,7 +1081,6 @@ mod tests {
             serde_json::json!({"file_path": "/a.rs", "line": 1, "symbol_name": "f"}),
             serde_json::json!({"file_path": "/a.rs", "line": 1, "character": 1, "container": "T"}),
             serde_json::json!({"file_path": "/a.rs", "symbol_name": " "}),
-            serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "symbol_kind": "nope"}),
             serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "container": ""}),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
@@ -730,7 +1093,7 @@ mod tests {
             let json =
                 serde_json::json!({"file_path": "/a.rs", "symbol_name": "f", "symbol_kind": value});
             let params: SymbolTargetParams = serde_json::from_value(json).unwrap();
-            let SymbolTargetInput::Name(query) = params.target else {
+            let SymbolTarget::Name(query) = params.target.into_target().unwrap() else {
                 panic!("expected a name target");
             };
             query.kind
@@ -807,13 +1170,37 @@ mod tests {
             }
             serde_json::from_value::<FoldingRangesParams>(json)
         };
-        assert_eq!(params(None).unwrap().kind, FoldingKindFilter::All);
-        assert_eq!(
-            params(Some("imports")).unwrap().kind,
-            FoldingKindFilter::Imports
+        let known = |kind: Option<&str>| {
+            params(kind)
+                .unwrap()
+                .kind
+                .into_known(KindFilterField::Kind)
+                .unwrap()
+        };
+        assert_eq!(known(None), FoldingKindFilter::All);
+        assert_eq!(known(Some("imports")), FoldingKindFilter::Imports);
+        assert_eq!(known(Some("Imports")), FoldingKindFilter::Imports);
+        let rejected = params(Some("unspecified"))
+            .unwrap()
+            .kind
+            .into_known(KindFilterField::Kind)
+            .unwrap_err();
+        assert!(
+            rejected.to_string().contains("Invalid kind: 'unspecified'"),
+            "{rejected}"
         );
-        assert!(params(Some("unspecified")).is_err());
-        assert!(params(Some("Imports")).is_err());
+    }
+
+    #[test]
+    fn a_rejected_symbol_kind_is_invalid_params_not_a_deserialization_error() {
+        let json = serde_json::json!({
+            "file_path": "/a.rs",
+            "symbol_name": "f",
+            "symbol_kind": "nope",
+        });
+        let params: SymbolTargetParams = serde_json::from_value(json).unwrap();
+        let error = params.target.into_target().unwrap_err();
+        assert_matches!(&error, Error::InvalidToolParams(message) if message.contains("Invalid symbol_kind: 'nope'"));
     }
 
     #[test]

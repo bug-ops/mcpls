@@ -304,6 +304,29 @@ async fn test_failed_pull_of_an_unseen_file_is_still_an_error() {
     assert!(fx.wiring.changed().is_empty());
 }
 
+/// #688: a failed pull answered from the cache is not reported as a pull.
+#[tokio::test]
+async fn test_failed_pull_answered_from_the_cache_reports_its_origin() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let pull = fx.spawn_pull();
+    answer(
+        &mut wire,
+        &mut server.read_half_stdin,
+        full_report(json!([error_item(0, "E0308")])),
+    )
+    .await;
+    drop(Fixture::finish(pull).await.unwrap());
+
+    let second = fx.spawn_answer();
+    let request = next_pull_request(&mut wire).await;
+    write_error_response(&mut server.read_half_stdin, &request["id"], -32603, "no").await;
+    let answer = Fixture::finish_answer(second).await;
+
+    assert_eq!(answer.origin, DiagnosticsOrigin::CacheAfterFailedPull);
+    assert_eq!(shown(&answer.result), ["E0308"]);
+}
+
 impl Fixture {
     fn spawn_answer(&self) -> JoinHandle<Result<DiagnosticsAnswer>> {
         let (translator, cache) = (Arc::clone(&self.translator), Arc::clone(&self.cache));

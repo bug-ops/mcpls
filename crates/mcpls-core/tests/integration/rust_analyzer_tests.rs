@@ -16,8 +16,8 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
-    ClientPath, IndexingState, KindFilterInput, NotificationCache, Position, SymbolKindFilter,
-    TabSize, Translator, WorkspaceRoots, apply_lifecycle_notification,
+    ClientPath, IndexingState, KindFilterField, KindFilterInput, NotificationCache, Position,
+    SymbolKindFilter, TabSize, Translator, WorkspaceRoots, apply_lifecycle_notification,
 };
 use mcpls_core::config::{
     FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
@@ -34,7 +34,7 @@ static INIT_TRACING: Once = Once::new();
 
 fn symbol_kind_filter(name: &str) -> SymbolKindFilter {
     KindFilterInput::<SymbolKindFilter>::from(name.to_owned())
-        .into_known()
+        .into_known(KindFilterField::KindFilter)
         .unwrap()
 }
 
@@ -118,7 +118,7 @@ async fn spawn_rust_analyzer() -> LspServer {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::from_static("rust-analyzer").into(),
         args: vec![],
-        env: std::collections::HashMap::new(),
+        env: mcpls_core::config::ServerEnv::default(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,
@@ -1097,7 +1097,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::from_static("rust-analyzer").into(),
         args: vec![],
-        env: std::collections::HashMap::new(),
+        env: mcpls_core::config::ServerEnv::default(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
         settings: None,

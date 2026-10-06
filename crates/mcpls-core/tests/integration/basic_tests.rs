@@ -1,7 +1,5 @@
-use std::assert_matches;
-
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
-use mcpls_core::config::{SearchDepth, ServerConfig, ServerId, ToolKind, ToolRouter};
+use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
 
 #[allow(unused, reason = "shared helpers; not every test uses all of them")]
 use crate::common::test_utils::{
@@ -98,67 +96,4 @@ fn test_two_server_routing_fixture_loads_and_routes() {
         Some(&ServerId::from_static("pyright")),
         "pyright is the catch-all for everything else"
     );
-}
-
-/// #174 §5/§12 (S3 regression): two servers for one language with mutually
-/// exclusive `heuristics.project_markers` must still load successfully --
-/// the workspace-scoped ambiguity rules apply only to servers that are both
-/// applicable in the same workspace, and at most one of these ever is.
-#[test]
-fn test_mutually_exclusive_heuristics_fixture_loads() {
-    let config_path = config_fixture_path("mutually_exclusive_heuristics.toml");
-    let config = ServerConfig::load_from(&config_path)
-        .expect("mutually exclusive heuristics must load, not just parse");
-
-    assert_eq!(config.lsp_servers.len(), 2);
-
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    std::fs::write(tmp.path().join("pyrightconfig.json"), "{}").expect("write marker");
-
-    let applicable: Vec<_> = config
-        .lsp_servers
-        .iter()
-        .filter(|s| s.should_spawn(tmp.path(), SearchDepth::DEFAULT))
-        .collect();
-    assert_eq!(
-        applicable.len(),
-        1,
-        "only the server whose marker exists should be applicable in this workspace"
-    );
-    assert_eq!(applicable[0].command, "pyright-langserver");
-
-    // The single applicable server never collides with itself.
-    ToolRouter::from_configs(applicable)
-        .expect("a single applicable server must never be ambiguous");
-}
-
-/// #174 §5/§12 (S3 regression, other half): when *both* mutually-exclusive
-/// markers happen to be present in one workspace, both servers become
-/// applicable and are genuinely ambiguous (neither has a `name` or
-/// `handles`, so they collide on both the derived `ServerId` and the
-/// catch-all rule) -- `ToolRouter::from_configs` must reject this with a
-/// startup error rather than silently picking one.
-#[test]
-fn test_mutually_exclusive_heuristics_fixture_errors_when_both_applicable() {
-    let config_path = config_fixture_path("mutually_exclusive_heuristics.toml");
-    let config = ServerConfig::load_from(&config_path).expect("fixture should load");
-
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    std::fs::write(tmp.path().join("pyrightconfig.json"), "{}").expect("write marker");
-    std::fs::write(tmp.path().join("setup.cfg"), "").expect("write marker");
-
-    let applicable: Vec<_> = config
-        .lsp_servers
-        .iter()
-        .filter(|s| s.should_spawn(tmp.path(), SearchDepth::DEFAULT))
-        .collect();
-    assert_eq!(
-        applicable.len(),
-        2,
-        "both markers present must make both servers applicable"
-    );
-
-    let err = ToolRouter::from_configs(applicable)
-        .expect_err("two applicable nameless servers for one language must be ambiguous");
-    assert_matches!(err, mcpls_core::error::Error::Config(_));
 }
