@@ -368,6 +368,9 @@ pub struct WarnLimiter {
 }
 
 impl WarnLimiter {
+    /// The period most warnings use between two lines.
+    pub const DEFAULT_PERIOD: Duration = Duration::from_mins(1);
+
     /// Whether a warning is due at `now`; when it is, `now` becomes the new
     /// reference point.
     pub fn due(&mut self, now: Instant, every: Duration) -> bool {

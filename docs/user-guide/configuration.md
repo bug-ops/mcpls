@@ -1101,10 +1101,11 @@ args = ["--stdio"]
 file_patterns = ["**/*.py"]
 ```
 
-mcpls routes a file by its extension, or by its bare name when it has none, so `file_patterns` cannot limit a server to
-one directory of a monorepo: the directory part of an extension pattern (`**/backend/`) is ignored, and two
-servers claiming the same extension both route every file with it. Scope a server by
-project instead (workspace roots and `heuristics.project_markers`).
+mcpls routes a file by its extension, or by its bare name when it has none, so
+`file_patterns` cannot limit a server to one directory of a monorepo: the directory
+part of an extension pattern (`**/backend/`) is ignored, and two servers claiming the
+same extension both route every file with it. Scope a server by project instead
+(workspace roots and `heuristics.project_markers`).
 
 ### C/C++ Project
 

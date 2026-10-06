@@ -432,7 +432,11 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
-        let sent_with = self.pull_probe_of(server_id);
+        let sent_with = if support == PullSupport::Probing {
+            self.pull_probe_of(server_id)
+        } else {
+            PullProbe::default()
+        };
         let response = client
             .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
             .await;

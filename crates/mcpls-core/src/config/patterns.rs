@@ -337,6 +337,7 @@ pub enum PatternTarget {
 /// assert!(FilePattern::parse("**/*.{cpp,h}").is_err());
 /// assert!(FilePattern::parse("src/main.rs").is_err());
 /// assert!(FilePattern::parse("docs/Makefile").is_err());
+/// assert!(FilePattern::parse("/Makefile").is_err());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(into = "String")]

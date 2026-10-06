@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -97,9 +97,6 @@ pub struct LspTransportReader {
     redactions: Arc<Redactions>,
     malformed_header_warn: WarnLimiter,
 }
-
-/// Shortest time between two `warn` lines about malformed headers.
-const MALFORMED_HEADER_WARN_EVERY: Duration = Duration::from_mins(1);
 
 impl fmt::Debug for LspTransportReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -303,7 +300,7 @@ impl LspTransportReader {
                     crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES);
                 if self
                     .malformed_header_warn
-                    .due(Instant::now(), MALFORMED_HEADER_WARN_EVERY)
+                    .due(Instant::now(), WarnLimiter::DEFAULT_PERIOD)
                 {
                     warn!("Malformed header: {shown}");
                 } else {

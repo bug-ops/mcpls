@@ -192,6 +192,7 @@ THEN they list the supported form, say how to cover several extensions, and agre
 | `**/*.{cpp,h}` | Rejected at load (FR-002, FR-003); list `**/*.cpp` and `**/*.h` instead |
 | `Makefile`, `**/Makefile` | Accepted (FR-014): maps the extensionless file named `Makefile` to the server's language |
 | `docs/Makefile` | Reported: a name pattern admits no directory part but `**/` (FR-014) |
+| `/Makefile` | Reported: a root-anchored name pattern is no bare name and not `**/NAME` (FR-014) |
 | `**/Makefile.am`, `**/.eslintrc` | Reported: the name has a dot, so it is neither a name nor `*.EXT` |
 | `src/**` or `**/*` | Reported: no extension |
 | `**/*.[ch]` | Reported: character class |

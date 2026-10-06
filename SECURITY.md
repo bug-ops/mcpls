@@ -92,10 +92,9 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   `node <package>\bin\tsc --lsp --stdio`, never through `cmd.exe`. That `node` is the
   first `node.exe` on the server's effective `PATH` and passes the same check: if it
   or the `PATH` directory it was found in lies inside a workspace root, the
-  TypeScript language server is kept instead. The
-  native server loads no tsconfig plugins (checked live). This
-  does not make an untrusted workspace safe. Remove `selection` to run `command` as
-  written.
+  TypeScript language server is kept instead. The native server loads no tsconfig
+  plugins (checked live). This does not make an untrusted workspace safe. Remove
+  `selection` to run `command` as written.
 
 - **Explicitly configured workspace binaries.** A server `command` you configure,
   for example a TypeScript 7 `tsc` for the native server (`tsc --lsp --stdio`),

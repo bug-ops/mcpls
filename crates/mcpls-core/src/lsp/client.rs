@@ -195,9 +195,6 @@ fn spawn_reader_task(
     (handle, rx)
 }
 
-/// Shortest time between two `warn` lines about dropped undecodable frames.
-const UNDECODABLE_WARN_EVERY: Duration = Duration::from_mins(1);
-
 /// The current run of consecutive undecodable inbound frames.
 #[derive(Debug, Default)]
 struct UndecodableRun {
@@ -236,7 +233,7 @@ impl UndecodableRun {
                 "too many consecutive undecodable messages",
             )));
         }
-        if self.warn.due(now, UNDECODABLE_WARN_EVERY) {
+        if self.warn.due(now, WarnLimiter::DEFAULT_PERIOD) {
             warn!(
                 "Dropped an undecodable LSP message ({} others dropped since the last warning); \
                  further ones are logged at debug for a minute",
