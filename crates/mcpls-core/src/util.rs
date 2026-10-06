@@ -8,6 +8,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::string::FromUtf8Error;
 use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
 use tokio::task::JoinHandle;
@@ -356,6 +357,30 @@ pub async fn catch_panic<T>(fut: impl Future<Output = T>) -> Result<T, TaskPanic
         .map_err(|payload| TaskPanicked::from_payload(payload.as_ref()))
 }
 
+/// Decides when a repeating condition may be logged at `warn` again.
+///
+/// The first occurrence is due at once, later ones only once `every` has
+/// passed since the last one that was due, so a source that repeats cannot
+/// flood the log.
+#[derive(Debug, Default)]
+pub struct WarnLimiter {
+    last: Option<Instant>,
+}
+
+impl WarnLimiter {
+    /// Whether a warning is due at `now`; when it is, `now` becomes the new
+    /// reference point.
+    pub fn due(&mut self, now: Instant, every: Duration) -> bool {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) > every);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
 /// Locks a `std::sync::Mutex`, recovering the guard if a previous holder
 /// panicked while holding it.
 ///
@@ -373,6 +398,18 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn warn_limiter_is_due_at_first_and_then_once_per_interval() {
+        let every = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut limiter = WarnLimiter::default();
+        assert!(limiter.due(start, every));
+        assert!(!limiter.due(start + Duration::from_secs(1), every));
+        assert!(!limiter.due(start + every, every));
+        assert!(limiter.due(start + every + Duration::from_millis(1), every));
+        assert!(!limiter.due(start + every + Duration::from_secs(2), every));
+    }
 
     #[tokio::test]
     async fn catch_panic_passes_value_through() {

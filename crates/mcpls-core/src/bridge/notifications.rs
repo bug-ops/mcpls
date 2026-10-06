@@ -15,7 +15,7 @@ use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, Inde
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{DiagnosticsAvailability, DocumentTracker, uri_to_path};
 use crate::config::ServerId;
-use crate::util::truncate_string;
+use crate::util::{WarnLimiter, truncate_string};
 
 mod bounds;
 mod pulled_index;
@@ -361,7 +361,7 @@ const EVICTION_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_mi
 struct EvictionRecord {
     at: HashMap<DiagnosticsKey, std::time::Instant>,
     order: VecDeque<(DiagnosticsKey, std::time::Instant)>,
-    overflow_warned_at: Option<std::time::Instant>,
+    overflow_warn: WarnLimiter,
 }
 
 impl EvictionRecord {
@@ -410,11 +410,7 @@ impl EvictionRecord {
     }
 
     fn warn_overflow(&mut self, now: std::time::Instant) {
-        let due = self
-            .overflow_warned_at
-            .is_none_or(|at| now.saturating_duration_since(at) > EVICTION_REPLAY_WINDOW);
-        if due {
-            self.overflow_warned_at = Some(now);
+        if self.overflow_warn.due(now, EVICTION_REPLAY_WINDOW) {
             warn!(
                 "more than {MAX_RECENT_EVICTIONS} diagnostics clears evicted within {}s, \
                  forgetting the oldest; a re-attaching listen may miss them",
