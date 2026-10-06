@@ -8,7 +8,7 @@ use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser};
 use mcpls_core::WorkspaceTrust;
 use mcpls_core::config::{ConfigOrigin, ServerId};
 
-use crate::logging::LogFilter;
+use crate::logging::{LogFilter, LogFormat};
 
 /// Parses a boolean flag/env value, accepting common truthy and falsy
 /// spellings beyond the strict `"true"`/`"false"` that `str::parse::<bool>`
@@ -23,15 +23,18 @@ use crate::logging::LogFilter;
 /// `Environment=MCPLS_LOG_JSON=` (systemd) or `-e MCPLS_LOG_JSON=` (Docker)
 /// with no value after the `=`, which hard-fails startup rather than being
 /// treated as unset.
-pub fn parse_bool_flag(s: &str) -> Result<bool, String> {
+pub fn parse_bool_flag(s: &str) -> Result<bool, InvalidBoolFlag> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "y" | "on" => Ok(true),
         "0" | "false" | "no" | "n" | "off" => Ok(false),
-        other => Err(format!(
-            "invalid boolean value '{other}' (expected one of: 1, 0, true, false, yes, no, y, n, on, off)"
-        )),
+        other => Err(InvalidBoolFlag(other.to_owned())),
     }
 }
+
+/// A boolean flag or environment value that is not a recognised spelling.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid boolean value '{0}' (expected one of: 1, 0, true, false, yes, no, y, n, on, off)")]
+pub struct InvalidBoolFlag(String);
 
 /// Liveness probing of HTTP GET (SSE) streams, selected by
 /// `--http-stream-liveness`.
@@ -74,13 +77,14 @@ fn config_origin(matches: &ArgMatches) -> ConfigOrigin {
 
 /// Parses one `--allow-server` id; an empty one is rejected so a stray `--allow-server ""`
 /// cannot read as consent.
-fn parse_server_id(value: &str) -> Result<ServerId, String> {
-    if value.trim().is_empty() {
-        Err("a server id cannot be empty".to_string())
-    } else {
-        Ok(ServerId::from(value))
-    }
+fn parse_server_id(value: &str) -> Result<ServerId, EmptyAllowServer> {
+    ServerId::new(value).map_err(|_| EmptyAllowServer)
 }
+
+/// An `--allow-server` value that is empty or whitespace only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a server id cannot be empty")]
+pub struct EmptyAllowServer;
 
 /// Universal MCP to LSP Bridge
 ///
@@ -205,7 +209,7 @@ pub struct Args {
         value_name = "ORIGIN",
         env = "MCPLS_HTTP_ALLOWED_ORIGINS",
         value_delimiter = ',',
-        value_parser = parse_allowed_origin
+        value_parser = parse_optional::<mcpls_core::AllowedOrigin>
     )]
     http_allowed_origins: Vec<Option<mcpls_core::AllowedOrigin>>,
 
@@ -228,7 +232,7 @@ pub struct Args {
         value_name = "HOST",
         env = "MCPLS_HTTP_ALLOWED_HOSTS",
         value_delimiter = ',',
-        value_parser = parse_allowed_host
+        value_parser = parse_optional::<mcpls_core::AllowedHost>
     )]
     http_allowed_hosts: Vec<Option<mcpls_core::AllowedHost>>,
 }
@@ -242,6 +246,15 @@ impl Args {
         let matches = Self::command().get_matches();
         let args = Self::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
         (args, config_origin(&matches))
+    }
+
+    /// The log output format the command line selects.
+    pub const fn log_format(&self) -> LogFormat {
+        if self.log_json {
+            LogFormat::Json
+        } else {
+            LogFormat::Text
+        }
     }
 
     /// The workspace trust the command line selects.
@@ -294,25 +307,10 @@ impl Args {
     }
 }
 
-/// Parses one `--http-allowed-origin` value; a blank one is `None`, so
-/// `MCPLS_HTTP_ALLOWED_ORIGINS=` and a trailing comma are no-ops.
+/// Parses one comma-separated list item; a blank one is `None`, so an empty
+/// variable (`MCPLS_HTTP_ALLOWED_ORIGINS=`) and a trailing comma are no-ops.
 #[cfg(feature = "transport-http")]
-fn parse_allowed_origin(
-    value: &str,
-) -> Result<Option<mcpls_core::AllowedOrigin>, mcpls_core::InvalidAllowedOrigin> {
-    if value.trim().is_empty() {
-        Ok(None)
-    } else {
-        value.parse().map(Some)
-    }
-}
-
-/// Parses one `--http-allowed-host` value; a blank one is `None`, so
-/// `MCPLS_HTTP_ALLOWED_HOSTS=` and a trailing comma are no-ops.
-#[cfg(feature = "transport-http")]
-fn parse_allowed_host(
-    value: &str,
-) -> Result<Option<mcpls_core::AllowedHost>, mcpls_core::InvalidAllowedHost> {
+fn parse_optional<T: FromStr>(value: &str) -> Result<Option<T>, T::Err> {
     if value.trim().is_empty() {
         Ok(None)
     } else {
@@ -354,6 +352,36 @@ mod tests {
                 "expected {value:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_bool_flag_error_names_the_lowercased_input() {
+        let err = parse_bool_flag("MAYBE").unwrap_err();
+        assert_eq!(err, InvalidBoolFlag("maybe".to_owned()));
+        assert!(err.to_string().contains("'maybe'"));
+    }
+
+    #[test]
+    fn test_parse_server_id_rejects_blank_only() {
+        assert_eq!(parse_server_id("  "), Err(EmptyAllowServer));
+        assert_eq!(parse_server_id("rust").unwrap(), ServerId::from("rust"));
+    }
+
+    #[test]
+    fn test_log_format_follows_the_log_json_flag() {
+        assert_eq!(Args::parse_from(["mcpls"]).log_format(), LogFormat::Text);
+        assert_eq!(
+            Args::parse_from(["mcpls", "--log-json"]).log_format(),
+            LogFormat::Json
+        );
+    }
+
+    #[cfg(feature = "transport-http")]
+    #[test]
+    fn test_parse_optional_maps_blank_to_none() {
+        assert_eq!(parse_optional::<u16>(" "), Ok(None));
+        assert_eq!(parse_optional::<u16>("8080"), Ok(Some(8080)));
+        assert!(parse_optional::<u16>("x").is_err());
     }
 
     #[test]

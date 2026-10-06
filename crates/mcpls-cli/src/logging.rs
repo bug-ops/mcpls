@@ -34,7 +34,7 @@ const SESSION_ID_LOG_CAPS: [&str; 2] = [
 pub struct LogFilter(String);
 
 /// Why a log filter string was rejected.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Error)]
 pub enum InvalidLogFilter {
     /// The string is empty.
     #[error("log filter must not be empty")]
@@ -46,7 +46,7 @@ pub enum InvalidLogFilter {
     NotALevel(String),
     /// The `tracing` filter syntax is malformed.
     #[error("invalid log filter: {0}")]
-    Syntax(String),
+    Syntax(#[source] tracing_subscriber::filter::ParseError),
 }
 
 impl LogFilter {
@@ -65,7 +65,7 @@ impl FromStr for LogFilter {
         }
         EnvFilter::builder()
             .parse(s)
-            .map_err(|err| InvalidLogFilter::Syntax(err.to_string()))?;
+            .map_err(InvalidLogFilter::Syntax)?;
         let bare_non_level = s.split(',').map(str::trim).find(|directive| {
             !directive.contains(['=', '[', ']', '{', '}'])
                 && directive.parse::<LevelFilter>().is_err()
@@ -222,11 +222,19 @@ fn json_format() -> fmt::format::Format<fmt::format::Json> {
         .with_line_number(false)
 }
 
+/// How log events are rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// Compact human-readable lines.
+    Text,
+    /// Newline-delimited JSON, for structured-logging pipelines.
+    Json,
+}
+
 /// Initialize the logging subsystem.
 ///
-/// When `log_json` is `true`, log events are emitted as newline-delimited
-/// JSON instead of the default compact human-readable format, for
-/// consumption by structured-logging pipelines.
+/// [`LogFormat::Json`] emits newline-delimited JSON instead of the compact
+/// human-readable format.
 ///
 /// rmcp's session-id-bearing log targets are capped regardless of `level`; a
 /// more specific directive (for example `rmcp::...::session::local=info`)
@@ -236,24 +244,22 @@ fn json_format() -> fmt::format::Format<fmt::format::Json> {
 ///
 /// Returns an error if the filter or one of the built-in session-id caps fails
 /// to parse.
-pub fn init(level: &LogFilter, log_json: bool) -> Result<()> {
+pub fn init(level: &LogFilter, format: LogFormat) -> Result<()> {
     let filter = build_filter(level)?;
 
     // Use stderr for logs so stdout remains clean for MCP protocol
     let registry = tracing_subscriber::registry().with(filter);
 
-    if log_json {
-        registry
+    match format {
+        LogFormat::Json => registry
             .with(
                 fmt::layer()
                     .with_writer(std::io::stderr)
                     .json()
                     .event_format(EscapingJson(json_format())),
             )
-            .try_init()
-            .ok(); // Ignore if already initialized
-    } else {
-        registry
+            .try_init(),
+        LogFormat::Text => registry
             .with(
                 fmt::layer()
                     .with_writer(std::io::stderr)
@@ -264,9 +270,9 @@ pub fn init(level: &LogFilter, log_json: bool) -> Result<()> {
                     .fmt_fields(EscapingFields)
                     .compact(),
             )
-            .try_init()
-            .ok(); // Ignore if already initialized
+            .try_init(),
     }
+    .ok(); // Ignore if already initialized
 
     Ok(())
 }
@@ -493,15 +499,15 @@ mod tests {
 
     #[test]
     fn test_log_filter_rejects_misspelt_level_and_empty() {
-        assert_eq!(
+        assert_matches!(
             "debgu".parse::<LogFilter>(),
-            Err(InvalidLogFilter::NotALevel("debgu".into()))
+            Err(InvalidLogFilter::NotALevel(word)) if word == "debgu"
         );
-        assert_eq!(
+        assert_matches!(
             "mcpls=debug,warnn".parse::<LogFilter>(),
-            Err(InvalidLogFilter::NotALevel("warnn".into()))
+            Err(InvalidLogFilter::NotALevel(word)) if word == "warnn"
         );
-        assert_eq!("".parse::<LogFilter>(), Err(InvalidLogFilter::Empty));
+        assert_matches!("".parse::<LogFilter>(), Err(InvalidLogFilter::Empty));
         assert_matches!(
             "foo=bar=baz".parse::<LogFilter>(),
             Err(InvalidLogFilter::Syntax(_))
@@ -524,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_init_with_crate_specific_filter() {
-        let result = init(&filter("mcpls=debug,info"), false);
+        let result = init(&filter("mcpls=debug,info"), LogFormat::Text);
         assert!(
             result.is_ok(),
             "Should support crate-specific filter syntax"
@@ -533,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_init_with_module_specific_filter() {
-        let result = init(&filter("mcpls::logging=trace"), false);
+        let result = init(&filter("mcpls::logging=trace"), LogFormat::Text);
         assert!(
             result.is_ok(),
             "Should support module-specific filter syntax"
@@ -542,10 +548,10 @@ mod tests {
 
     #[test]
     fn test_init_idempotent() {
-        let result1 = init(&filter("debug"), false);
+        let result1 = init(&filter("debug"), LogFormat::Text);
         assert!(result1.is_ok(), "First initialization should succeed");
 
-        let result2 = init(&filter("info"), false);
+        let result2 = init(&filter("info"), LogFormat::Text);
         assert!(
             result2.is_ok(),
             "Second initialization should succeed (ignored)"
@@ -555,13 +561,13 @@ mod tests {
     #[test]
     fn test_init_accepts_every_level_spelling() {
         for level in ["trace", "debug", "info", "warn", "error", "DEBUG", "3"] {
-            assert!(init(&filter(level), false).is_ok(), "{level}");
+            assert!(init(&filter(level), LogFormat::Text).is_ok(), "{level}");
         }
     }
 
     #[test]
     fn test_init_with_log_json_enabled() {
-        let result = init(&filter("info"), true);
+        let result = init(&filter("info"), LogFormat::Json);
         assert!(
             result.is_ok(),
             "Should initialize successfully with JSON logging enabled"
