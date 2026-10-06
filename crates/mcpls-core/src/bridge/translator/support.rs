@@ -22,7 +22,7 @@ use super::routing::{
     lookup_workspace_route,
 };
 use crate::bridge::ClientPath;
-use crate::config::{LanguageId, ServerId, ToolKind, ToolRouter};
+use crate::config::{LanguageId, LanguageMap, ServerId, ToolKind, ToolRouter};
 use crate::error::Result;
 use crate::util::lock_std;
 
@@ -89,6 +89,7 @@ impl CapabilitySet {
 /// `require_capability`; see `Translator::require_capability`.
 #[derive(Debug)]
 pub struct ToolSupportSnapshot {
+    language_map: Arc<LanguageMap>,
     router: Arc<ToolRouter>,
     expected: HashSet<ServerId>,
     capabilities: HashMap<ServerId, CapabilitySet>,
@@ -97,9 +98,25 @@ pub struct ToolSupportSnapshot {
 }
 
 impl ToolSupportSnapshot {
-    /// Every configured language, sorted.
+    /// Every language a file can be detected as that reaches a configured
+    /// route, sorted: a mapped language counts when it, or its React base
+    /// language, has a server. A configured language no extension or name maps
+    /// to is not listed, since no file can be routed to it.
     pub(crate) fn languages(&self) -> Vec<LanguageId> {
-        self.router.configured_languages()
+        let configured = self.router.configured_languages();
+        let mut languages: Vec<LanguageId> = self
+            .language_map
+            .languages()
+            .filter(|language| {
+                LanguageCandidates::new((*language).clone())
+                    .iter()
+                    .any(|candidate| configured.contains(candidate))
+            })
+            .cloned()
+            .collect();
+        languages.sort_unstable();
+        languages.dedup();
+        languages
     }
 
     /// Support for a per-document `tool` on files of `language`, gated on the
@@ -227,6 +244,7 @@ impl Translator {
         // moves routes toward servers that are already registered or expected.
         let router = self.router_snapshot();
         ToolSupportSnapshot {
+            language_map: Arc::clone(&self.language_map),
             router,
             expected,
             capabilities,
@@ -255,7 +273,15 @@ mod tests {
 
     use super::super::testing::translator_with_capabilities;
     use super::*;
+    use crate::config::FileExtension;
     use crate::test_lsp::client_path;
+
+    fn rust_language_map() -> Arc<LanguageMap> {
+        Arc::new(LanguageMap::from(HashMap::from([(
+            FileExtension::from_static("rs"),
+            LanguageId::from_static("rust"),
+        )])))
+    }
 
     fn rust_caps(hover: bool) -> ServerCapabilities {
         ServerCapabilities {
@@ -271,6 +297,7 @@ mod tests {
     ) -> ToolSupportSnapshot {
         let ids = |names: &[&str]| names.iter().map(|n| ServerId::new(*n).unwrap()).collect();
         ToolSupportSnapshot {
+            language_map: rust_language_map(),
             router: Arc::new(ToolRouter::catch_all([(
                 ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
@@ -402,6 +429,7 @@ mod tests {
 
     fn snapshot_with_pull(pull: PullSupport) -> ToolSupportSnapshot {
         ToolSupportSnapshot {
+            language_map: rust_language_map(),
             pull_support: HashMap::from([(ServerId::from_static("rust"), pull)]),
             ..snapshot(&["rust"], &[], &[("rust", rust_caps(true))])
         }
@@ -532,6 +560,7 @@ mod tests {
         )]);
         router.rebind_to_registered(&HashSet::new());
         let snap = ToolSupportSnapshot {
+            language_map: rust_language_map(),
             router: Arc::new(router),
             expected: HashSet::new(),
             capabilities: HashMap::new(),
@@ -546,8 +575,53 @@ mod tests {
     }
 
     #[test]
+    fn languages_list_mapped_languages_with_a_route_including_the_react_base() {
+        let mut language_map = LanguageMap::from(HashMap::from([
+            (
+                FileExtension::from_static("ts"),
+                LanguageId::from_static("typescript"),
+            ),
+            (
+                FileExtension::from_static("tsx"),
+                LanguageId::from_static("typescriptreact"),
+            ),
+            (
+                FileExtension::from_static("py"),
+                LanguageId::from_static("python"),
+            ),
+        ]));
+        language_map.insert(
+            crate::config::PatternTarget::Name(crate::config::FileName::from_static("Makefile")),
+            LanguageId::from_static("make"),
+        );
+        let snap = ToolSupportSnapshot {
+            language_map: Arc::new(language_map),
+            router: Arc::new(ToolRouter::catch_all([
+                (
+                    ServerId::from_static("ts"),
+                    LanguageId::from_static("typescript"),
+                ),
+                (
+                    ServerId::from_static("make-lsp"),
+                    LanguageId::from_static("make"),
+                ),
+                (
+                    ServerId::from_static("unmapped"),
+                    LanguageId::from_static("zig"),
+                ),
+            ])),
+            expected: HashSet::new(),
+            capabilities: HashMap::new(),
+            pull_support: HashMap::new(),
+            registered: HashSet::new(),
+        };
+        assert_eq!(snap.languages(), ["make", "typescript", "typescriptreact"]);
+    }
+
+    #[test]
     fn nothing_configured_workspace_support_is_no_server() {
         let snap = ToolSupportSnapshot {
+            language_map: rust_language_map(),
             router: Arc::new(ToolRouter::default()),
             expected: HashSet::new(),
             capabilities: HashMap::new(),

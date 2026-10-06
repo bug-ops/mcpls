@@ -6226,16 +6226,26 @@ sleep 0.3
                     )
                 },
             )))
-            .with_extensions(std::collections::HashMap::from([
-                (
-                    FileExtension::from_static("rs"),
-                    LanguageId::from_static("rust"),
-                ),
-                (
-                    FileExtension::from_static("py"),
-                    LanguageId::from_static("python"),
-                ),
-            ]));
+            .with_extensions(
+                std::collections::HashMap::from([
+                    (
+                        FileExtension::from_static("rs"),
+                        LanguageId::from_static("rust"),
+                    ),
+                    (
+                        FileExtension::from_static("py"),
+                        LanguageId::from_static("python"),
+                    ),
+                ])
+                .into_iter()
+                .chain(servers.iter().map(|(_, language, _)| {
+                    (
+                        FileExtension::new(*language).unwrap(),
+                        LanguageId::new(*language).unwrap(),
+                    )
+                }))
+                .collect::<std::collections::HashMap<_, _>>(),
+            );
         translator
             .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let mut fake_servers = Vec::new();
@@ -6802,10 +6812,15 @@ sleep 0.3
 
         use crate::config::{ServerId, ToolRouter};
 
-        let translator = Translator::new().with_router(ToolRouter::catch_all([(
-            ServerId::from_static("rust"),
-            LanguageId::from_static("rust"),
-        )]));
+        let translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                ServerId::from_static("rust"),
+                LanguageId::from_static("rust"),
+            )]))
+            .with_extensions(std::collections::HashMap::from([(
+                FileExtension::from_static("rs"),
+                LanguageId::from_static("rust"),
+            )]));
         translator.set_expected_servers(HashSet::from([ServerId::from_static("rust")]));
         let server = McplsServer::new(
             Arc::new(translator),
