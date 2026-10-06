@@ -8,7 +8,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,10 +15,16 @@ use tracing::info;
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::{
-    BuiltinServer, LspServerConfig, ServerCommand, ServerConfig, WorkspaceTrust, login_home_dir,
+    BuiltinServer, LspServerConfig, MarkerScan, ServerCommand, ServerConfig, WorkspaceTrust,
+    login_home_dir,
 };
-use crate::error::{HomeVariable, ServerSpawnFailure, StartupFailure, UntrustedRefusal};
-use crate::lsp::{self, ServerInitConfig};
+use crate::error::{
+    HomeVariable, ResolvedItem, ServerSpawnFailure, StartupFailure, UntrustedRefusal,
+};
+use crate::lsp::{
+    self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
+    tsserver_pin,
+};
 use crate::redaction::Redactions;
 
 /// A server untrusted-workspace mode kept from starting, with the config it
@@ -46,13 +51,51 @@ pub struct StartPlan {
 }
 
 impl StartPlan {
-    /// The recorded refusals, in configuration order.
+    /// Splits the plan into the admitted servers, the configs of the refused
+    /// ones (for routing) and the recorded refusals, in configuration order.
     #[must_use]
-    pub fn failures(&self) -> Vec<ServerSpawnFailure> {
-        self.refused
-            .iter()
-            .map(|refused| refused.failure.clone())
-            .collect()
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<ServerInitConfig>,
+        Vec<LspServerConfig>,
+        Vec<ServerSpawnFailure>,
+    ) {
+        let (configs, failures) = self
+            .refused
+            .into_iter()
+            .map(|refused| (refused.config, refused.failure))
+            .unzip();
+        (self.admitted, configs, failures)
+    }
+}
+
+/// How the host spells environment variable names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvKeyCase {
+    Sensitive,
+    Insensitive,
+}
+
+/// The host operating system, as far as untrusted-mode hardening differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostOs {
+    Windows,
+    Other,
+}
+
+impl HostOs {
+    const CURRENT: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Other
+    };
+
+    const fn env_key_case(self) -> EnvKeyCase {
+        match self {
+            Self::Windows => EnvKeyCase::Insensitive,
+            Self::Other => EnvKeyCase::Sensitive,
+        }
     }
 }
 
@@ -69,6 +112,16 @@ fn allowlist_refusal(
     })
 }
 
+/// Refuses `configured` when its launcher lets the workspace choose the
+/// program that runs (a package runner, task runner or toolchain wrapper).
+fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
+    launcher::launches_from_workspace(configured.command.as_str(), &configured.args).then(|| {
+        UntrustedRefusal::ProjectLauncher {
+            command: configured.command.to_string(),
+        }
+    })
+}
+
 /// `effective` pinned to what untrusted mode vetted: the executable resolved
 /// to an absolute path, and a `PATH` without workspace, relative or empty
 /// entries.
@@ -76,7 +129,9 @@ fn allowlist_refusal(
 /// Spawning the resolved path, rather than the bare name, closes the window
 /// between the check and a spawn (restart, respawn) in which a workspace
 /// could add a binary. The sanitized `PATH` is what a `#!/usr/bin/env`
-/// interpreter and the tools the server itself starts are looked up on.
+/// interpreter and the tools the server itself starts are looked up on. On
+/// Windows the server is also told not to search the current directory for
+/// executables it starts by name.
 ///
 /// Refuses when the executable is not found, or lies inside `boundary`;
 /// naming the server in `--allow-server` is not consent to a binary the
@@ -85,15 +140,16 @@ fn harden_for_untrusted(
     effective: Cow<'_, LspServerConfig>,
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
-    parent_env: &dyn Fn(&str) -> Option<OsString>,
+    host: HostOs,
+    parent_env: &dyn ParentEnv,
 ) -> Result<LspServerConfig, UntrustedRefusal> {
     let mut effective = effective.into_owned();
-    normalize_env_keys(&mut effective.env, cfg!(windows));
-    let unresolved = |command: &str| UntrustedRefusal::UnresolvedExecutable {
-        command: command.to_owned(),
+    normalize_env_keys(&mut effective.env, host.env_key_case());
+    let unresolved = || UntrustedRefusal::UnresolvedExecutable {
+        command: effective.command.to_string(),
     };
-    let resolved = lsp::command_path::resolve_command(&effective, parent_env)
-        .ok_or_else(|| unresolved(effective.command.as_str()))?;
+    let resolved =
+        lsp::command_path::resolve_command(&effective, parent_env).ok_or_else(unresolved)?;
     if boundary.contains_canonical(&resolved.canonical) {
         return Err(UntrustedRefusal::WorkspaceExecutable {
             executable: resolved.canonical,
@@ -103,40 +159,55 @@ fn harden_for_untrusted(
         .spawn
         .parent()
         .is_none_or(|dir| boundary.contains_resolved_prefix(dir));
-    let command = if in_workspace {
-        &resolved.canonical
+    let executable = if in_workspace {
+        resolved.canonical
     } else {
-        &resolved.spawn
-    }
-    .to_str()
-    .ok_or_else(|| unresolved(effective.command.as_str()))?
-    .to_owned();
-    let path = lsp::child_env_var(&effective, "PATH", parent_env).unwrap_or_default();
+        resolved.spawn
+    };
+    let command = executable.into_os_string().into_string().map_err(|path| {
+        UntrustedRefusal::NonUtf8Path {
+            what: ResolvedItem::Executable,
+            path: PathBuf::from(path),
+        }
+    })?;
+    let path =
+        lsp::child_env_var(&effective, ManagedEnvVar::Path.name(), parent_env).unwrap_or_default();
     let path = lsp::command_path::or_system_path(lsp::command_path::path_outside(&path, boundary))
         .into_string()
-        .map_err(|_| unresolved(&command))?;
+        .map_err(|path| UntrustedRefusal::NonUtf8Path {
+            what: ResolvedItem::SearchPath,
+            path: PathBuf::from(path),
+        })?;
     let home_env = home_overrides(&effective, boundary, login_home, parent_env)?;
-    effective.command =
-        ServerCommand::new(command).map_err(|_| unresolved(effective.command.as_str()))?;
-    effective.env.insert("PATH".to_owned(), path);
+    effective.command = ServerCommand::new(command).map_err(|_| unresolved())?;
+    effective
+        .env
+        .insert(ManagedEnvVar::Path.name().to_owned(), path);
     effective.env.extend(home_env);
+    if host == HostOs::Windows {
+        effective.env.insert(
+            ManagedEnvVar::NoDefaultCurrentDirectoryInExePath
+                .name()
+                .to_owned(),
+            "1".to_owned(),
+        );
+    }
     Ok(effective)
 }
-
-/// The environment variables untrusted mode manages for a server.
-const MANAGED_ENV: [&str; 3] = ["PATH", "HOME", "USERPROFILE"];
 
 /// Gives each managed variable in `env` one exact spelling.
 ///
 /// Environment names are case-insensitive on Windows, so a server's `Path` and
 /// the `PATH` this mode sets would otherwise be two keys, and which one the
-/// child sees is undefined. With `case_insensitive` a differently spelled key
-/// is renamed to the canonical one (an existing canonical key wins).
-fn normalize_env_keys(env: &mut HashMap<String, String>, case_insensitive: bool) {
-    if !case_insensitive {
+/// child sees is undefined. With [`EnvKeyCase::Insensitive`] a differently
+/// spelled key is renamed to the canonical one (an existing canonical key
+/// wins).
+fn normalize_env_keys(env: &mut HashMap<String, String>, case: EnvKeyCase) {
+    if case == EnvKeyCase::Sensitive {
         return;
     }
-    for name in MANAGED_ENV {
+    for managed in ManagedEnvVar::ALL {
+        let name = managed.name();
         let aliases: Vec<String> = env
             .keys()
             .filter(|key| key.as_str() != name && key.eq_ignore_ascii_case(name))
@@ -163,7 +234,7 @@ fn home_overrides(
     effective: &LspServerConfig,
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
-    parent_env: &dyn Fn(&str) -> Option<OsString>,
+    parent_env: &dyn ParentEnv,
 ) -> Result<Vec<(String, String)>, UntrustedRefusal> {
     let unset = HomeVariable::ALL
         .into_iter()
@@ -191,32 +262,52 @@ fn home_overrides(
     Ok(Vec::new())
 }
 
+/// Where an untrusted server starts: the login home, else the temporary
+/// directory, whichever lies outside `boundary`.
+///
+/// The server learns the workspace from `workspaceFolders`, not from its working
+/// directory; starting in the checkout would let a name lookup or a relative
+/// path resolve into it.
+fn untrusted_working_dir(
+    boundary: &WorkspaceRoots,
+    login_home: Option<&Path>,
+) -> Result<ChildWorkingDir, UntrustedRefusal> {
+    login_home
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(dunce::canonicalize(std::env::temp_dir()).ok())
+        .find(|dir| !boundary.contains_resolved_prefix(dir))
+        .map(ChildWorkingDir::Fixed)
+        .ok_or(UntrustedRefusal::NoSafeWorkingDirectory)
+}
+
 /// Splits the configured servers into the ones worth starting for this run
 /// and the ones untrusted-workspace mode refuses.
 ///
 /// A server is applicable when its project markers are found under at least
 /// one workspace root. A refused server gets no TypeScript selection and no
-/// pin: nothing about it is inspected beyond the allowlist, except the
-/// executable checks of an allowed one.
+/// pin: nothing about it is inspected beyond the allowlist and its launcher,
+/// except the executable checks of an allowed one.
+///
+/// Walks the file system, so async callers run it on the blocking pool.
 pub fn plan_server_starts(
     config: &ServerConfig,
     roots: &WorkspaceRoots,
     redactions: &Arc<Redactions>,
 ) -> StartPlan {
-    let max_depth = config.workspace.heuristics_max_depth;
     let untrusted = matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_));
     let login_home = untrusted.then(login_home_dir).flatten();
     let boundary = untrusted.then(|| {
         roots.untrusted_boundary(!config.workspace.roots.is_empty(), login_home.as_deref())
     });
+    let markers = MarkerScan::collect(
+        roots.canonical(),
+        &config.lsp_servers,
+        config.workspace.heuristics_max_depth,
+    );
     let mut plan = StartPlan::default();
     for lsp_config in &config.lsp_servers {
-        let should_spawn = roots
-            .canonical()
-            .iter()
-            .any(|root| lsp_config.should_spawn(root, max_depth));
-
-        if !should_spawn {
+        if !markers.applies_to(lsp_config) {
             info!(
                 "Skipping LSP server '{}' ({}): no project markers found",
                 lsp_config.language_id, lsp_config.command
@@ -224,58 +315,84 @@ pub fn plan_server_starts(
             continue;
         }
 
-        if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
-            plan.refused
-                .push(refused(lsp_config, lsp_config.command.as_str(), refusal));
-            continue;
+        let admitted = admit(
+            config,
+            lsp_config,
+            roots,
+            boundary.as_ref(),
+            login_home.as_deref(),
+            redactions,
+        );
+        match admitted {
+            Ok(init) => plan.admitted.push(init),
+            Err((command, refusal)) => plan.refused.push(refused(lsp_config, &command, refusal)),
         }
-
-        let selected =
-            lsp::tsserver_pin::with_selected_typescript_server(lsp_config, roots, |key| {
-                std::env::var_os(key)
-            });
-        let effective = match &boundary {
-            None => selected.into_owned(),
-            Some(boundary) => {
-                match harden_for_untrusted(selected, boundary, login_home.as_deref(), &|key| {
-                    std::env::var_os(key)
-                }) {
-                    Ok(hardened) => hardened,
-                    Err(refusal) => {
-                        plan.refused.push(refused(
-                            lsp_config,
-                            lsp_config.command.as_str(),
-                            refusal,
-                        ));
-                        continue;
-                    }
-                }
-            }
-        };
-        let workspace_tsserver = boundary.as_ref().and_then(|boundary| {
-            lsp::tsserver_pin::pinned_inside_workspace(&effective, boundary, |key| {
-                std::env::var_os(key)
-            })
-        });
-        if let Some(tsserver) = workspace_tsserver {
-            let refusal = UntrustedRefusal::WorkspaceTsserver { tsserver };
-            plan.refused
-                .push(refused(lsp_config, effective.command.as_str(), refusal));
-            continue;
-        }
-        let mut server_config = effective;
-        server_config.initialization_options =
-            lsp::tsserver_pin::pinned_initialization_options(&server_config, roots, |key| {
-                std::env::var_os(key)
-            });
-        plan.admitted.push(ServerInitConfig::new(
-            server_config,
-            roots.clone(),
-            config.workspace.position_encodings.clone(),
-            Arc::clone(redactions),
-        ));
     }
     plan
+}
+
+/// The init config for `lsp_config`, or the refusal and the command it names.
+///
+/// `boundary` is `Some` exactly in untrusted mode.
+fn admit(
+    config: &ServerConfig,
+    lsp_config: &LspServerConfig,
+    roots: &WorkspaceRoots,
+    boundary: Option<&WorkspaceRoots>,
+    login_home: Option<&Path>,
+    redactions: &Arc<Redactions>,
+) -> Result<ServerInitConfig, (String, UntrustedRefusal)> {
+    let configured = |refusal| (lsp_config.command.to_string(), refusal);
+    if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
+        return Err(configured(refusal));
+    }
+    if boundary.is_some()
+        && let Some(refusal) = launcher_refusal(lsp_config)
+    {
+        return Err(configured(refusal));
+    }
+
+    let selected = tsserver_pin::with_selected_typescript_server(lsp_config, roots, process_env);
+    let (effective, working_dir) = match boundary {
+        None => (selected.into_owned(), ChildWorkingDir::Inherit),
+        Some(boundary) => {
+            let hardened = harden_for_untrusted(
+                selected,
+                boundary,
+                login_home,
+                HostOs::CURRENT,
+                &process_env,
+            )
+            .map_err(configured)?;
+            let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
+            (hardened, working_dir)
+        }
+    };
+    let command = effective.command.to_string();
+    let plan = tsserver_pin::plan_typescript(effective, process_env);
+    if let Some(boundary) = boundary {
+        if let Some(tsserver) = plan.pin_inside(boundary) {
+            return Err((command, UntrustedRefusal::WorkspaceTsserver { tsserver }));
+        }
+        if plan.has_unpinnable_launcher() {
+            let refusal = UntrustedRefusal::UnpinnedTypescriptLauncher {
+                command: lsp_config.command.to_string(),
+            };
+            return Err((command, refusal));
+        }
+    }
+    let (server_config, pinned) = plan.apply(roots);
+    let init = ServerInitConfig::new(
+        server_config,
+        roots.clone(),
+        config.workspace.position_encodings.clone(),
+        Arc::clone(redactions),
+    )
+    .with_child_working_dir(working_dir);
+    Ok(match pinned {
+        Some(tsserver) => init.with_auto_pin(tsserver, boundary.cloned()),
+        None => init,
+    })
 }
 
 /// A refusal of `configured`. The failure names `command`, the command that
@@ -301,6 +418,7 @@ fn refused(
 mod plan_tests {
     use super::*;
     use crate::config::{ServerCommand, ServerId};
+    use crate::error::Error;
 
     fn rust_workspace() -> (tempfile::TempDir, WorkspaceRoots) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -354,7 +472,7 @@ mod plan_tests {
             ("Other".to_owned(), "x".to_owned()),
         ]);
 
-        normalize_env_keys(&mut env, true);
+        normalize_env_keys(&mut env, EnvKeyCase::Insensitive);
 
         assert_eq!(env.get("PATH").map(String::as_str), Some("/a"));
         assert_eq!(env.get("HOME").map(String::as_str), Some("/h"));
@@ -370,10 +488,10 @@ mod plan_tests {
         ]);
         let untouched = env.clone();
 
-        normalize_env_keys(&mut env, false);
+        normalize_env_keys(&mut env, EnvKeyCase::Sensitive);
         assert_eq!(env, untouched);
 
-        normalize_env_keys(&mut env, true);
+        normalize_env_keys(&mut env, EnvKeyCase::Insensitive);
         assert_eq!(env.len(), 1);
         assert_eq!(env.get("PATH").map(String::as_str), Some("/exact"));
     }
@@ -813,6 +931,7 @@ mod plan_tests {
                 Cow::Owned(rust_with(exe.to_str().unwrap())),
                 &boundary,
                 login_home,
+                HostOs::CURRENT,
                 &parent_env,
             )
         }
@@ -1104,6 +1223,468 @@ mod plan_tests {
                 "trusted mode keeps pinning with a warning"
             );
         }
+
+        fn harden_on(
+            host: HostOs,
+            fx: &Fixture,
+            env: &[(&str, &Path)],
+        ) -> Result<LspServerConfig, UntrustedRefusal> {
+            let exe = fx.outside.join("rust-analyzer");
+            executable(&exe);
+            let env: Vec<(String, std::ffi::OsString)> = env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.as_os_str().to_owned()))
+                .collect();
+            let parent_env = move |key: &str| {
+                env.iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            };
+            let boundary =
+                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            harden_for_untrusted(
+                Cow::Owned(rust_with(exe.to_str().unwrap())),
+                &boundary,
+                Some(&fx.outside),
+                host,
+                &parent_env,
+            )
+        }
+
+        #[test]
+        fn harden_on_windows_forbids_the_current_directory_in_executable_lookups() {
+            let fx = fixture();
+            let name = ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.name();
+
+            let windows = harden_on(HostOs::Windows, &fx, &[]).unwrap();
+            let other = harden_on(HostOs::Other, &fx, &[]).unwrap();
+
+            assert_eq!(windows.env.get(name).map(String::as_str), Some("1"));
+            assert!(!other.env.contains_key(name));
+        }
+
+        #[test]
+        fn harden_on_windows_overrides_a_configured_current_directory_setting() {
+            let fx = fixture();
+            let exe = fx.outside.join("rust-analyzer");
+            executable(&exe);
+            let boundary =
+                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+            let mut config = rust_with(exe.to_str().unwrap());
+            config.env.insert(
+                "nodefaultcurrentdirectoryinexepath".to_owned(),
+                "0".to_owned(),
+            );
+
+            let hardened = harden_for_untrusted(
+                Cow::Owned(config),
+                &boundary,
+                Some(&fx.outside),
+                HostOs::Windows,
+                &|_: &str| -> Option<std::ffi::OsString> { None },
+            )
+            .unwrap();
+
+            let name = ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.name();
+            assert_eq!(hardened.env.get(name).map(String::as_str), Some("1"));
+            assert_eq!(
+                hardened
+                    .env
+                    .keys()
+                    .filter(|key| key.eq_ignore_ascii_case(name))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn harden_refuses_a_search_path_that_is_not_utf8() {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let fx = fixture();
+            let exe = fx.outside.join("rust-analyzer");
+            executable(&exe);
+            let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nonexistent/\xff"));
+            let path = std::env::join_paths([fx.outside.clone(), non_utf8]).unwrap();
+            let boundary =
+                WorkspaceRoots::from_configured(std::slice::from_ref(&fx.workspace)).unwrap();
+
+            let refused = harden_for_untrusted(
+                Cow::Owned(rust_with("rust-analyzer")),
+                &boundary,
+                Some(&fx.outside),
+                HostOs::Other,
+                &|key: &str| (key == "PATH").then(|| path.clone()),
+            )
+            .unwrap_err();
+
+            std::assert_matches!(
+                refused,
+                UntrustedRefusal::NonUtf8Path { what: ResolvedItem::SearchPath, path }
+                    if path.as_os_str().as_bytes().ends_with(b"\xff")
+            );
+        }
+
+        #[test]
+        fn working_dir_is_outside_the_boundary_and_prefers_the_login_home() {
+            let fx = fixture();
+            let home = fx.outside.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+
+            let with_home = untrusted_working_dir(&fx.roots, Some(&home)).unwrap();
+            let without_home = untrusted_working_dir(&fx.roots, None).unwrap();
+
+            assert_eq!(with_home, ChildWorkingDir::Fixed(home));
+            let ChildWorkingDir::Fixed(temp) = without_home else {
+                panic!("expected a fixed directory");
+            };
+            assert!(!fx.roots.contains_resolved_prefix(&temp), "{temp:?}");
+        }
+
+        #[test]
+        fn working_dir_falls_back_to_the_temp_dir_when_the_login_home_is_inside() {
+            let fx = fixture();
+            let home = fx.workspace.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+
+            let dir = untrusted_working_dir(&fx.roots, Some(&home)).unwrap();
+
+            assert_ne!(dir, ChildWorkingDir::Fixed(home));
+        }
+
+        #[test]
+        fn working_dir_is_refused_when_nothing_lies_outside_the_boundary() {
+            let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+            let boundary = WorkspaceRoots::from_configured(&[temp]).unwrap();
+
+            let refused = untrusted_working_dir(&boundary, None).unwrap_err();
+
+            assert_eq!(refused, UntrustedRefusal::NoSafeWorkingDirectory);
+        }
+
+        #[test]
+        fn plan_starts_an_untrusted_server_outside_the_workspace_only() {
+            let fx = fixture();
+            let exe = fx.outside.join("rust-analyzer");
+            executable(&exe);
+            let config = rust_with(exe.to_str().unwrap());
+
+            let untrusted = plan_allowing_rust(config.clone(), &fx);
+            let trusted = plan(
+                &config_with(vec![config], WorkspaceTrust::Trusted),
+                &fx.roots,
+            );
+
+            let ChildWorkingDir::Fixed(dir) = untrusted.admitted[0].child_working_dir() else {
+                panic!("an untrusted server must have a fixed working directory");
+            };
+            assert!(!fx.roots.contains_resolved_prefix(dir), "{dir:?}");
+            assert_eq!(
+                trusted.admitted[0].child_working_dir(),
+                &ChildWorkingDir::Inherit
+            );
+        }
+
+        fn refusal_of(plan: &StartPlan) -> Option<&UntrustedRefusal> {
+            match &plan.refused.first()?.failure.reason {
+                StartupFailure::RefusedUntrustedWorkspace(refusal) => Some(refusal),
+                _ => None,
+            }
+        }
+
+        fn rust_launched_by(command: &str, args: &[&str]) -> LspServerConfig {
+            let mut config = rust_with(command);
+            config.args = args.iter().map(ToString::to_string).collect();
+            config
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_launchers_that_choose_the_server_from_the_workspace() {
+            let fx = fixture();
+            for (command, args) in [
+                ("npx", &["rust-analyzer"][..]),
+                ("make", &[][..]),
+                ("cargo", &["run", "--bin", "server"][..]),
+                ("env", &["FOO=1", "npx", "rust-analyzer"][..]),
+                ("env", &["-S", "rust-analyzer --flag"][..]),
+                ("sh", &["-c", "rust-analyzer"][..]),
+                ("deno", &["run", "npm:rust-analyzer"][..]),
+            ] {
+                let plan = plan_allowing_rust(rust_launched_by(command, args), &fx);
+
+                assert!(plan.admitted.is_empty(), "{command} {args:?}");
+                assert_eq!(
+                    refusal_of(&plan),
+                    Some(&UntrustedRefusal::ProjectLauncher {
+                        command: command.to_owned()
+                    }),
+                    "{command} {args:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn plan_trusted_admits_launchers_that_choose_the_server_from_the_workspace() {
+            let fx = fixture();
+
+            let plan = plan(
+                &config_with(
+                    vec![rust_launched_by("npx", &["rust-analyzer"])],
+                    WorkspaceTrust::Trusted,
+                ),
+                &fx.roots,
+            );
+
+            assert_eq!(admitted_ids(&plan), [ServerId::from("rust")]);
+        }
+
+        #[test]
+        fn plan_untrusted_admits_deno_lsp_and_a_direct_server() {
+            let fx = fixture();
+            for (name, args) in [("deno", &["lsp"][..]), ("rust-analyzer", &[][..])] {
+                let exe = fx.outside.join(name);
+                executable(&exe);
+
+                let plan = plan_allowing_rust(rust_launched_by(exe.to_str().unwrap(), args), &fx);
+
+                assert_eq!(admitted_ids(&plan), [ServerId::from("rust")], "{name}");
+            }
+        }
+
+        fn typescript_shim(fx: &Fixture, dir: &str) -> LspServerConfig {
+            let shim = fx.outside.join(dir).join("typescript-language-server");
+            std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+            executable(&shim);
+            let mut config = LspServerConfig::typescript();
+            config.command = ServerCommand::new(shim.to_str().unwrap().to_owned()).unwrap();
+            config
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_typescript_shim_it_cannot_pin() {
+            let fx = fixture();
+            typescript_workspace(&fx);
+            let mut with_user_pin = typescript_shim(&fx, ".volta/bin");
+            with_user_pin.initialization_options =
+                Some(serde_json::json!({"tsserver": {"path": "/opt/ts/tsserver.js"}}));
+            for config in [typescript_shim(&fx, ".volta/bin"), with_user_pin] {
+                let command = config.command.to_string();
+
+                let plan = plan(
+                    &config_with(vec![config], untrusted_allowing_typescript()),
+                    &fx.roots,
+                );
+
+                assert!(plan.admitted.is_empty());
+                assert_eq!(
+                    refusal_of(&plan),
+                    Some(&UntrustedRefusal::UnpinnedTypescriptLauncher { command })
+                );
+            }
+        }
+
+        #[test]
+        fn plan_trusted_admits_a_typescript_shim_it_cannot_pin() {
+            let fx = fixture();
+            typescript_workspace(&fx);
+
+            let plan = plan(
+                &config_with(
+                    vec![typescript_shim(&fx, ".volta/bin")],
+                    WorkspaceTrust::Trusted,
+                ),
+                &fx.roots,
+            );
+
+            assert_eq!(admitted_ids(&plan), [ServerId::from("typescript")]);
+            assert_eq!(plan.admitted[0].pinned_tsserver(), None);
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_typescript_script_named_by_a_relative_path() {
+            let fx = fixture();
+            typescript_workspace(&fx);
+            let node = fx.outside.join("node");
+            executable(&node);
+            let mut config = LspServerConfig::typescript();
+            config.command = ServerCommand::new(node.to_str().unwrap().to_owned()).unwrap();
+            config.args = vec!["node_modules/typescript-language-server/lib/cli.mjs".to_owned()];
+
+            let plan = plan(
+                &config_with(vec![config], untrusted_allowing_typescript()),
+                &fx.roots,
+            );
+
+            std::assert_matches!(
+                refusal_of(&plan),
+                Some(UntrustedRefusal::UnpinnedTypescriptLauncher { .. })
+            );
+        }
+
+        #[test]
+        fn plan_pins_the_canonical_path_it_checked() {
+            let fx = fixture();
+            typescript_workspace(&fx);
+            let real = fx.outside.join("real-typescript");
+            std::fs::create_dir_all(real.join("lib")).unwrap();
+            std::fs::write(real.join("lib/tsserver.js"), "").unwrap();
+            std::fs::write(real.join("package.json"), r#"{"version": "5.4.0"}"#).unwrap();
+            let install = typescript_package(&fx.outside, Some(&real), "", true);
+            for trust in [WorkspaceTrust::Trusted, untrusted_allowing_typescript()] {
+                let plan = plan(
+                    &config_with(vec![typescript_with_path(&install)], trust),
+                    &fx.roots,
+                );
+
+                assert_eq!(
+                    plan.admitted[0].pinned_tsserver(),
+                    Some(real.join("lib/tsserver.js"))
+                );
+            }
+        }
+
+        struct Respawnable {
+            fx: Fixture,
+            modules: PathBuf,
+            init: ServerInitConfig,
+        }
+
+        fn planned_typescript(trust: WorkspaceTrust) -> Respawnable {
+            let fx = fixture();
+            typescript_workspace(&fx);
+            let install = typescript_package(&fx.outside, None, "5.4.0", true);
+            let plan = plan(
+                &config_with(vec![typescript_with_path(&install)], trust),
+                &fx.roots,
+            );
+            let init = plan.admitted.into_iter().next().unwrap();
+            let modules = fx.outside.join("prefix/lib/node_modules");
+            Respawnable { fx, modules, init }
+        }
+
+        fn typescript_install_at(dir: &Path) {
+            std::fs::create_dir_all(dir.join("lib")).unwrap();
+            std::fs::write(dir.join("lib/tsserver.js"), "").unwrap();
+            std::fs::write(dir.join("package.json"), r#"{"version": "5.5.0"}"#).unwrap();
+        }
+
+        #[test]
+        fn respawn_keeps_a_pin_that_still_exists() {
+            let case = planned_typescript(WorkspaceTrust::Trusted);
+
+            let respawn = case.init.for_respawn().unwrap();
+
+            assert_eq!(respawn.pinned_tsserver(), case.init.pinned_tsserver());
+        }
+
+        #[test]
+        fn respawn_resolves_a_vanished_pin_again() {
+            let case = planned_typescript(WorkspaceTrust::Trusted);
+            std::fs::remove_dir_all(case.modules.join("typescript")).unwrap();
+            let moved = case.fx.outside.join("prefix/node_modules/typescript");
+            typescript_install_at(&moved);
+
+            let respawn = case.init.for_respawn().unwrap();
+
+            assert_eq!(
+                respawn.pinned_tsserver(),
+                Some(dunce::canonicalize(moved.join("lib/tsserver.js")).unwrap())
+            );
+        }
+
+        #[test]
+        fn respawn_drops_a_vanished_pin_nothing_replaces() {
+            let case = planned_typescript(WorkspaceTrust::Trusted);
+            std::fs::remove_dir_all(case.modules.join("typescript")).unwrap();
+
+            let respawn = case.init.for_respawn().unwrap();
+
+            assert_eq!(respawn.pinned_tsserver(), None);
+        }
+
+        #[test]
+        fn respawn_never_second_guesses_a_pin_the_user_configured() {
+            let fx = fixture();
+            typescript_workspace(&fx);
+            let install = typescript_package(&fx.outside, None, "5.4.0", true);
+            let mut config = typescript_with_path(&install);
+            let missing = fx.outside.join("gone/tsserver.js");
+            config.initialization_options =
+                Some(serde_json::json!({"tsserver": {"path": missing}}));
+            let init = plan(
+                &config_with(vec![config], WorkspaceTrust::Trusted),
+                &fx.roots,
+            )
+            .admitted
+            .into_iter()
+            .next()
+            .unwrap();
+
+            let respawn = init.for_respawn().unwrap();
+
+            assert_eq!(respawn.pinned_tsserver(), Some(missing));
+        }
+
+        #[test]
+        fn respawn_untrusted_refuses_a_pin_that_now_lies_inside_the_workspace() {
+            let case = planned_typescript(untrusted_allowing_typescript());
+            let inside = case.fx.workspace.join("ts");
+            typescript_install_at(&inside);
+            let typescript = case.modules.join("typescript");
+            std::fs::remove_dir_all(&typescript).unwrap();
+            std::os::unix::fs::symlink(&inside, &typescript).unwrap();
+
+            let refused = case.init.for_respawn().unwrap_err();
+
+            let Error::ServerFailedToStart(failure) = refused else {
+                panic!("expected a refusal, got {refused:?}");
+            };
+            std::assert_matches!(
+                failure.reason,
+                StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal::WorkspaceTsserver {
+                    ref tsserver
+                }) if tsserver.ends_with("ts/lib/tsserver.js")
+            );
+        }
+
+        #[test]
+        fn respawn_trusted_accepts_a_pin_that_now_lies_inside_the_workspace() {
+            let case = planned_typescript(WorkspaceTrust::Trusted);
+            let inside = case.fx.workspace.join("ts");
+            typescript_install_at(&inside);
+            let typescript = case.modules.join("typescript");
+            std::fs::remove_dir_all(&typescript).unwrap();
+            std::os::unix::fs::symlink(&inside, &typescript).unwrap();
+
+            let respawn = case.init.for_respawn().unwrap();
+
+            assert!(respawn.pinned_tsserver().is_some());
+        }
+
+        #[test]
+        fn into_parts_keeps_configuration_order() {
+            let fx = fixture();
+            let config = config_with(
+                vec![LspServerConfig::rust_analyzer(), LspServerConfig::gopls()],
+                WorkspaceTrust::untrusted([ServerId::from("rust")]),
+            );
+            let exe = fx.outside.join("rust-analyzer");
+            executable(&exe);
+            let mut config = config;
+            config.lsp_servers[0].command =
+                ServerCommand::new(exe.to_str().unwrap().to_owned()).unwrap();
+            std::fs::write(fx.workspace.join("go.mod"), "").unwrap();
+
+            let (admitted, refused, failures) = plan(&config, &fx.roots).into_parts();
+
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(
+                refused.iter().map(LspServerConfig::id).collect::<Vec<_>>(),
+                [ServerId::from("go")]
+            );
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].server_id, ServerId::from("go"));
+        }
     }
 }
 
@@ -1187,14 +1768,13 @@ mod refusal_spawn_tests {
             lsp::current_environment(),
         ));
         let plan = plan_server_starts(&case.config, &case.roots, &redactions);
-        let refusals = plan.failures();
-        let StartPlan { admitted, refused } = plan;
+        let (admitted, refused, refusals) = plan.into_parts();
         let (admitted_count, refused_count) = (admitted.len(), refused.len());
         let router = ToolRouter::from_configs(
             admitted
                 .iter()
                 .map(ServerInitConfig::server_config)
-                .chain(refused.iter().map(|r| &r.config)),
+                .chain(&refused),
         )
         .unwrap();
         let translator = Arc::new(Translator::new().with_router(router));
@@ -1320,5 +1900,69 @@ mod refusal_spawn_tests {
 
         assert!(started, "the server outside the workspace must start");
         assert!(!interpreter_ran, "the workspace interpreter was run");
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_spawn_tests {
+    use super::*;
+    use crate::config::ServerId;
+    use crate::lsp::LspServer;
+
+    /// A `.cmd` server outside the workspace records the working directory
+    /// and the current-directory lookup switch it was started with.
+    #[tokio::test]
+    async fn untrusted_server_starts_outside_the_workspace_with_the_lookup_switch_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let (workspace, outside) = (base.join("ws"), base.join("outside"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "").unwrap();
+        let record = base.join("record.txt");
+        let script = outside.join("server.cmd");
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\necho %CD%> \"{0}\"\r\necho %NoDefaultCurrentDirectoryInExePath%>> \"{0}\"\r\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        let mut server = LspServerConfig::rust_analyzer();
+        server.command = ServerCommand::new(script.to_string_lossy().into_owned()).unwrap();
+        let config = ServerConfig {
+            lsp_servers: vec![server],
+            workspace_trust: WorkspaceTrust::untrusted([ServerId::from("rust")]),
+            ..ServerConfig::default()
+        };
+        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+        let redactions = Arc::new(Redactions::for_servers(
+            &config.lsp_servers,
+            lsp::current_environment(),
+        ));
+        let init = plan_server_starts(&config, &roots, &redactions)
+            .admitted
+            .into_iter()
+            .next()
+            .expect("the server is admitted");
+        let ChildWorkingDir::Fixed(expected) = init.child_working_dir().clone() else {
+            panic!("an untrusted server must have a fixed working directory");
+        };
+
+        let spawned = LspServer::spawn(init).await;
+
+        assert!(spawned.is_err(), "the script never answers initialize");
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let mut lines = recorded.lines().map(str::trim);
+        let cwd = lines.next().unwrap();
+        assert!(
+            cwd.eq_ignore_ascii_case(&expected.to_string_lossy()),
+            "{cwd} != {}",
+            expected.display()
+        );
+        assert!(!roots.contains_resolved_prefix(Path::new(cwd)), "{cwd}");
+        assert_eq!(lines.next(), Some("1"));
     }
 }

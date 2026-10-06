@@ -3,7 +3,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -114,41 +115,130 @@ impl ServerHeuristics {
 
     /// Search recursively for any marker file.
     fn find_any_marker_recursive(&self, workspace_root: &Path, max_depth: SearchDepth) -> bool {
-        let mut builder = WalkBuilder::new(workspace_root);
-        // `standard_filters(false)` (bulk setter, last-write-wins) must run first or it
-        // undoes the overrides below; `.git_ignore(true)` itself is then a no-op outside
-        // an actual git repo (`require_git` defaults true).
-        builder
-            .standard_filters(false)
-            .max_depth(Some(max_depth.get()))
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(false)
-            .follow_links(false)
-            .filter_entry(|entry| {
-                // Skip excluded directories entirely (prevents descending into them)
-                if entry.file_type().is_some_and(|ft| ft.is_dir())
-                    && let Some(name) = entry.file_name().to_str()
-                    && EXCLUDED_DIRECTORIES.contains(&name)
-                {
-                    return false;
-                }
-                true
-            });
+        walk_names(workspace_root, max_depth, |name| {
+            if self.project_markers.iter().any(|m| m == name) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    }
+}
 
-        for entry in builder.build().flatten() {
-            let path = entry.path();
-
-            // Check if this entry matches any marker
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                && self.project_markers.iter().any(|m| m == file_name)
+/// Calls `visit` with the name of every entry under `workspace_root`, within
+/// `max_depth`, skipping well-known generated directories and gitignored ones,
+/// until it breaks.
+fn walk_names(
+    workspace_root: &Path,
+    max_depth: SearchDepth,
+    mut visit: impl FnMut(&str) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    let mut builder = WalkBuilder::new(workspace_root);
+    // `standard_filters(false)` (bulk setter, last-write-wins) must run first or it
+    // undoes the overrides below; `.git_ignore(true)` itself is then a no-op outside
+    // an actual git repo (`require_git` defaults true).
+    builder
+        .standard_filters(false)
+        .max_depth(Some(max_depth.get()))
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            // Skip excluded directories entirely (prevents descending into them)
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && let Some(name) = entry.file_name().to_str()
+                && EXCLUDED_DIRECTORIES.contains(&name)
             {
-                return true;
+                return false;
+            }
+            true
+        });
+
+    for entry in builder.build().flatten() {
+        if let Some(name) = entry.path().file_name().and_then(OsStr::to_str) {
+            visit(name)?;
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+/// The project markers found under the workspace roots, collected with one
+/// tree walk per root however many servers are configured.
+///
+/// A server whose markers exist nowhere would otherwise cost a full walk of
+/// its own. Blocking: run it off the async workers.
+#[derive(Debug, Clone, Default)]
+pub struct MarkerScan {
+    found: Vec<ProjectMarker>,
+}
+
+impl MarkerScan {
+    /// Looks for every marker any of `servers` asks for under `roots`: the
+    /// roots themselves first, then one walk per root while a marker is still
+    /// missing, stopping as soon as all are found.
+    #[must_use]
+    pub fn collect<'a>(
+        roots: &[PathBuf],
+        servers: impl IntoIterator<Item = &'a LspServerConfig>,
+        max_depth: SearchDepth,
+    ) -> Self {
+        let mut missing: Vec<&ProjectMarker> = Vec::new();
+        for marker in servers
+            .into_iter()
+            .filter_map(|server| server.heuristics.as_ref())
+            .flat_map(|heuristics| &heuristics.project_markers)
+        {
+            if !missing.contains(&marker) {
+                missing.push(marker);
             }
         }
+        let mut found = Vec::new();
+        for root in roots {
+            if missing.is_empty() {
+                break;
+            }
+            missing.retain(|marker| {
+                let present = root.join(marker.as_str()).exists();
+                if present {
+                    found.push((*marker).clone());
+                }
+                !present
+            });
+            if missing.is_empty() {
+                break;
+            }
+            let all_found = walk_names(root, max_depth, |name| {
+                if let Some(index) = missing.iter().position(|marker| *marker == name) {
+                    found.push(missing.swap_remove(index).clone());
+                }
+                if missing.is_empty() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break();
+            if all_found {
+                break;
+            }
+        }
+        Self { found }
+    }
 
-        false
+    /// Whether `server` applies to the scanned workspace: it has no markers,
+    /// or at least one was found.
+    #[must_use]
+    pub fn applies_to(&self, server: &LspServerConfig) -> bool {
+        server.heuristics.as_ref().is_none_or(|heuristics| {
+            heuristics.project_markers.is_empty()
+                || heuristics
+                    .project_markers
+                    .iter()
+                    .any(|marker| self.found.contains(marker))
+        })
     }
 }
 
@@ -1393,6 +1483,116 @@ mod tests {
         assert!(!config.should_spawn(tmp.path(), SearchDepth::new(2).unwrap()));
         // Default depth should find it
         assert!(config.should_spawn(tmp.path(), SearchDepth::DEFAULT));
+    }
+
+    fn scan(roots: &[&Path], servers: &[LspServerConfig], depth: SearchDepth) -> MarkerScan {
+        let roots: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+        MarkerScan::collect(&roots, servers, depth)
+    }
+
+    fn all_builtins() -> Vec<LspServerConfig> {
+        vec![
+            LspServerConfig::rust_analyzer(),
+            LspServerConfig::pyright(),
+            LspServerConfig::typescript(),
+            LspServerConfig::gopls(),
+            LspServerConfig::clangd(),
+            LspServerConfig::zls(),
+        ]
+    }
+
+    #[test]
+    fn test_marker_scan_finds_the_markers_of_every_server_in_one_pass() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        let python = tmp.path().join("bindings").join("python");
+        std::fs::create_dir_all(&python).unwrap();
+        std::fs::write(python.join("pyproject.toml"), "").unwrap();
+        let servers = all_builtins();
+
+        let found = scan(&[tmp.path()], &servers, SearchDepth::DEFAULT);
+
+        let applying: Vec<_> = servers
+            .iter()
+            .filter(|server| found.applies_to(server))
+            .map(|server| server.language_id.as_str())
+            .collect();
+        assert_eq!(applying, ["rust", "python"]);
+    }
+
+    #[test]
+    fn test_marker_scan_agrees_with_should_spawn() {
+        let tmp = TempDir::new().unwrap();
+        for (dir, file) in [
+            ("a/b", "go.mod"),
+            ("c", "package.json"),
+            ("node_modules/x", "Cargo.toml"),
+            ("d/e/f/g/h/i/j/k/l/m/n", "build.zig"),
+        ] {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join(file), "").unwrap();
+        }
+        let servers = all_builtins();
+        let found = scan(&[tmp.path()], &servers, SearchDepth::DEFAULT);
+
+        for server in &servers {
+            assert_eq!(
+                found.applies_to(server),
+                server.should_spawn(tmp.path(), SearchDepth::DEFAULT),
+                "{}",
+                server.language_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_marker_scan_unions_the_roots() {
+        let (first, second) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        std::fs::write(first.path().join("Cargo.toml"), "").unwrap();
+        let nested = second.path().join("svc");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("go.mod"), "").unwrap();
+        let servers = all_builtins();
+
+        let found = scan(
+            &[first.path(), second.path()],
+            &servers,
+            SearchDepth::DEFAULT,
+        );
+
+        assert!(found.applies_to(&LspServerConfig::rust_analyzer()));
+        assert!(found.applies_to(&LspServerConfig::gopls()));
+        assert!(!found.applies_to(&LspServerConfig::zls()));
+    }
+
+    #[test]
+    fn test_marker_scan_honours_the_depth_limit() {
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Cargo.toml"), "").unwrap();
+        let servers = [LspServerConfig::rust_analyzer()];
+
+        let shallow = scan(&[tmp.path()], &servers, SearchDepth::new(2).unwrap());
+        let default = scan(&[tmp.path()], &servers, SearchDepth::DEFAULT);
+
+        assert!(!shallow.applies_to(&servers[0]));
+        assert!(default.applies_to(&servers[0]));
+    }
+
+    #[test]
+    fn test_marker_scan_applies_a_server_without_markers_everywhere() {
+        let tmp = TempDir::new().unwrap();
+        let mut no_markers = LspServerConfig::rust_analyzer();
+        no_markers.heuristics = None;
+        let mut empty_markers = LspServerConfig::rust_analyzer();
+        empty_markers.heuristics = Some(ServerHeuristics::default());
+
+        let found = scan(&[tmp.path()], &[], SearchDepth::DEFAULT);
+
+        assert!(found.applies_to(&no_markers));
+        assert!(found.applies_to(&empty_markers));
+        assert!(!found.applies_to(&LspServerConfig::rust_analyzer()));
     }
 
     #[test]

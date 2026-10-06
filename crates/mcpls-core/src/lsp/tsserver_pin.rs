@@ -25,7 +25,7 @@
 //! TypeScript 7 install outside every workspace root ([`select_typescript_server`]).
 
 use std::borrow::Cow;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::WorkspaceRoots;
 use crate::config::{BuiltinServer, LspServerConfig, ServerCommand};
 use crate::error::InitFailureHint;
-use crate::lsp::command_path::{find_executable, is_executable_file};
-use crate::lsp::{LspNotification, child_env_var};
+use crate::lsp::command_path::{is_executable_file, resolve_named};
+use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
 const SERVER_STEM: &str = "typescript-language-server";
@@ -401,7 +401,7 @@ impl ResolvedServer {
 fn server_package_dir(
     config: &LspServerConfig,
     launch: Launch<'_>,
-    parent_env: impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
 ) -> Result<PathBuf, UnresolvedReason> {
     let unsupported = UnresolvedReason::UnsupportedLauncher;
     match launch {
@@ -409,18 +409,14 @@ fn server_package_dir(
         Launch::UnknownWrapper => Err(unsupported),
         Launch::Script(script) => package_dir_of(script).ok_or(unsupported),
         Launch::Server(command) => {
-            let path_var = child_env_var(config, "PATH", parent_env);
-            let executable = find_executable(command, path_var.as_ref())
+            let executable = resolve_named(command, config, parent_env)
                 .ok_or(UnresolvedReason::ServerNotOnPath)?;
-            locate_package(&executable).ok_or(unsupported)
+            locate_package(&executable.spawn).ok_or(unsupported)
         }
     }
 }
 
-fn inspect(
-    config: &LspServerConfig,
-    parent_env: impl Fn(&str) -> Option<OsString>,
-) -> Option<ResolvedServer> {
+fn inspect(config: &LspServerConfig, parent_env: impl ParentEnv) -> Option<ResolvedServer> {
     let launch = classify(config)?;
     let package_dir = match server_package_dir(config, launch, parent_env) {
         Ok(dir) => dir,
@@ -454,10 +450,7 @@ fn inspect(
 ///
 /// `PATH` is read as the child sees it: the config's `env` override, else
 /// `parent_env`.
-pub fn resolve(
-    config: &LspServerConfig,
-    parent_env: impl Fn(&str) -> Option<OsString>,
-) -> Option<TsserverResolution> {
+pub fn resolve(config: &LspServerConfig, parent_env: impl ParentEnv) -> Option<TsserverResolution> {
     inspect(config, parent_env).map(|resolved| resolved.resolution)
 }
 
@@ -468,7 +461,6 @@ pub fn resolve(
 /// auto-selection candidate passes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTsc {
-    path: PathBuf,
     command: ServerCommand,
 }
 
@@ -542,16 +534,13 @@ impl NativeTsc {
         }
         let command = canonical.to_str().ok_or(CandidateRejected::NonUtf8Path)?;
         let command = ServerCommand::new(command).map_err(|_| CandidateRejected::NotExecutable)?;
-        Ok(Self {
-            path: canonical,
-            command,
-        })
+        Ok(Self { command })
     }
 
     /// The canonical path of the native `tsc`.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        Path::new(&self.command)
     }
 
     fn command(&self) -> ServerCommand {
@@ -626,11 +615,10 @@ pub enum TypescriptServerChoice {
 /// `binary` as the child would find it on its effective `PATH`.
 fn find_on_child_path(
     config: &LspServerConfig,
-    parent_env: &impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
     binary: &str,
 ) -> Option<PathBuf> {
-    let path_var = child_env_var(config, "PATH", parent_env);
-    find_executable(Path::new(binary), path_var.as_ref())
+    resolve_named(Path::new(binary), config, parent_env).map(|resolved| resolved.spawn)
 }
 
 /// Chooses the server flavor for `config`, or `None` when the entry is
@@ -644,13 +632,13 @@ fn find_on_child_path(
 pub fn select_typescript_server(
     config: &LspServerConfig,
     roots: &WorkspaceRoots,
-    parent_env: impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
 ) -> Option<TypescriptServerChoice> {
     if config.selection.is_explicit() {
         return None;
     }
     let kept = |reason| Some(TypescriptServerChoice::Tsserver(reason));
-    if configured_tsserver_path(config.initialization_options.as_ref()).is_some() {
+    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
         return kept(TsserverKept::UserTsserverPath);
     }
     // TODO(#646): auto-select native tsc on Windows (.cmd shims)
@@ -711,7 +699,7 @@ fn needs_node(tsc: &Path) -> bool {
 pub fn with_selected_typescript_server<'a>(
     config: &'a LspServerConfig,
     roots: &WorkspaceRoots,
-    parent_env: impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
 ) -> Cow<'a, LspServerConfig> {
     match select_typescript_server(config, roots, parent_env) {
         Some(TypescriptServerChoice::Native(tsc)) => {
@@ -751,9 +739,9 @@ pub fn with_selected_typescript_server<'a>(
 pub fn init_failure_hint(
     config: &LspServerConfig,
     workspace_roots: &WorkspaceRoots,
-    parent_env: impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
 ) -> Option<InitFailureHint> {
-    if configured_tsserver_path(config.initialization_options.as_ref()).is_some() {
+    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
         return None;
     }
     let native = match resolve(config, parent_env)? {
@@ -774,94 +762,176 @@ pub fn init_failure_hint(
     native.then_some(InitFailureHint::NativeTypescriptOnly)
 }
 
-fn has_user_tsserver_path(options: &serde_json::Value) -> bool {
-    options.pointer("/tsserver/path").is_some()
+/// JSON pointer to the tsserver path inside `initialization_options`.
+const TSSERVER_PATH_POINTER: &str = "/tsserver/path";
+
+/// What `initialization_options.tsserver.path` says, read in one place for
+/// selection, pinning and the untrusted-mode check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTsserverPath {
+    /// The options carry no `tsserver.path`.
+    Absent,
+    /// The user pinned a tsserver, which always wins.
+    Path(PathBuf),
+    /// `tsserver.path` is present but not a string; it counts as user-set, so
+    /// nothing is pinned or selected over it.
+    Invalid,
 }
 
-/// The `initialization_options` to send for `config`, with the bundled
-/// tsserver pinned when `config` launches typescript-language-server.
-///
-/// A user-supplied `tsserver.path` always wins. User options without one are
-/// left untouched, because merging would silently change their meaning; the
-/// skipped pin is logged. Failure to resolve a tsserver never prevents the
-/// server from starting.
-pub fn pinned_initialization_options(
-    config: &LspServerConfig,
-    workspace_roots: &WorkspaceRoots,
-    parent_env: impl Fn(&str) -> Option<OsString>,
-) -> Option<serde_json::Value> {
-    let user = config.initialization_options.clone();
-    if user.as_ref().is_some_and(has_user_tsserver_path) {
-        return user;
-    }
-    let Some(resolution) = resolve(config, parent_env) else {
-        return user;
-    };
-    if user.is_some() {
-        tracing::warn!(
-            server = %config.language_id,
-            "tsserver pin skipped: initialization_options set without tsserver.path, \
-             so a workspace-supplied tsserver may run"
-        );
-        return user;
-    }
-    match resolution {
-        TsserverResolution::Pinned(tsserver) => {
-            let canonical = dunce::canonicalize(&tsserver).unwrap_or_else(|_| tsserver.clone());
-            if workspace_roots.contains_canonical(&canonical) {
-                tracing::warn!(
-                    server = %config.language_id,
-                    tsserver = %tsserver.display(),
-                    "typescript-language-server is installed inside the workspace; \
-                     pinning it does not make the workspace trusted"
-                );
-            }
-            serde_json::to_value(TsserverInitOptions {
-                tsserver: TsserverPath { path: &tsserver },
+impl UserTsserverPath {
+    /// Reads `tsserver.path` out of `options`.
+    #[must_use]
+    pub fn of(options: Option<&serde_json::Value>) -> Self {
+        options
+            .and_then(|options| options.pointer(TSSERVER_PATH_POINTER))
+            .map_or(Self::Absent, |value| {
+                value
+                    .as_str()
+                    .map_or(Self::Invalid, |path| Self::Path(PathBuf::from(path)))
             })
-            .inspect_err(|err| tracing::warn!(%err, "tsserver pin could not be serialized"))
-            .ok()
-        }
-        TsserverResolution::Unresolved(reason) => {
-            tracing::warn!(
-                server = %config.language_id,
-                "tsserver not pinned: {reason}; a workspace-supplied tsserver may run"
-            );
-            None
-        }
     }
-}
 
-/// The canonical tsserver `config` would be pinned to, when it lies inside
-/// `roots`: the pin then names workspace code, which untrusted mode refuses.
-///
-/// `None` when a user-set `tsserver.path` wins, when nothing is pinned, or
-/// when the pin lies outside `roots`.
-pub fn pinned_inside_workspace(
-    config: &LspServerConfig,
-    roots: &WorkspaceRoots,
-    parent_env: impl Fn(&str) -> Option<OsString>,
-) -> Option<PathBuf> {
-    if config
-        .initialization_options
-        .as_ref()
-        .is_some_and(has_user_tsserver_path)
-    {
-        return None;
+    /// The configured path, when it is a valid one.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Path(path) => Some(path),
+            Self::Absent | Self::Invalid => None,
+        }
     }
-    let TsserverResolution::Pinned(tsserver) = resolve(config, parent_env)? else {
-        return None;
-    };
-    let canonical = dunce::canonicalize(&tsserver).ok()?;
-    roots.contains_canonical(&canonical).then_some(canonical)
 }
 
 /// The `tsserver.path` configured in `options`, if any.
+#[must_use]
 pub fn configured_tsserver_path(options: Option<&serde_json::Value>) -> Option<PathBuf> {
-    options?
-        .pointer("/tsserver/path")?
-        .as_str()
-        .map(PathBuf::from)
+    UserTsserverPath::of(options).path().map(Path::to_path_buf)
+}
+
+/// The tsserver decision for one server, resolved once.
+///
+/// The path untrusted mode checks against the workspace is, by construction,
+/// the canonical path [`Self::apply`] sends, so a filesystem change between the
+/// check and the pin cannot put an unchecked path on the wire.
+#[derive(Debug)]
+pub struct TypescriptPlan {
+    config: LspServerConfig,
+    user: UserTsserverPath,
+    resolution: Option<TsserverResolution>,
+}
+
+/// Plans the tsserver for `config`, which is the config that will be spawned
+/// (after any native-server selection and untrusted hardening).
+///
+/// The launch is always resolved, even when the user pinned a tsserver, so
+/// untrusted mode can still tell that a launcher is unpinnable. `PATH` is
+/// read as the child sees it.
+#[must_use]
+pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> TypescriptPlan {
+    let user = UserTsserverPath::of(config.initialization_options.as_ref());
+    let resolution = resolve(&config, parent_env).map(|resolution| match resolution {
+        TsserverResolution::Pinned(tsserver) => dunce::canonicalize(&tsserver).map_or(
+            TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer),
+            TsserverResolution::Pinned,
+        ),
+        unresolved @ TsserverResolution::Unresolved(_) => unresolved,
+    });
+    TypescriptPlan {
+        config,
+        user,
+        resolution,
+    }
+}
+
+impl TypescriptPlan {
+    /// The canonical tsserver that would be pinned, when it lies inside
+    /// `boundary`: the pin then names workspace code, which untrusted mode
+    /// refuses.
+    ///
+    /// `None` when a user-set `tsserver.path` wins, when nothing is pinned, or
+    /// when the pin lies outside `boundary`.
+    #[must_use]
+    pub fn pin_inside(&self, boundary: &WorkspaceRoots) -> Option<PathBuf> {
+        if self.user != UserTsserverPath::Absent {
+            return None;
+        }
+        let Some(TsserverResolution::Pinned(tsserver)) = &self.resolution else {
+            return None;
+        };
+        boundary
+            .contains_canonical(tsserver)
+            .then(|| tsserver.clone())
+    }
+
+    /// Whether the server is launched in a way no tsserver can be pinned for:
+    /// a package runner, or a wrapper or version-manager shim that hides the
+    /// install. A user-set `tsserver.path` does not make the launcher itself
+    /// vetted.
+    #[must_use]
+    pub const fn has_unpinnable_launcher(&self) -> bool {
+        matches!(
+            self.resolution,
+            Some(TsserverResolution::Unresolved(
+                UnresolvedReason::UnsupportedLauncher | UnresolvedReason::PackageRunner
+            ))
+        )
+    }
+
+    /// The config to spawn, with the bundled tsserver pinned when this plan
+    /// launches typescript-language-server, and the pinned path.
+    ///
+    /// A user-supplied `tsserver.path` always wins. User options without one are
+    /// left untouched, because merging would silently change their meaning; the
+    /// skipped pin is logged. Failure to resolve a tsserver never prevents the
+    /// server from starting.
+    #[must_use]
+    pub fn apply(self, roots: &WorkspaceRoots) -> (LspServerConfig, Option<PathBuf>) {
+        let Self {
+            mut config,
+            user,
+            resolution,
+        } = self;
+        let server = &config.language_id;
+        if user == UserTsserverPath::Invalid {
+            tracing::warn!(%server, "initialization_options.tsserver.path is not a string");
+        }
+        let Some(resolution) = resolution.filter(|_| user == UserTsserverPath::Absent) else {
+            return (config, None);
+        };
+        if config.initialization_options.is_some() {
+            tracing::warn!(
+                %server,
+                "tsserver pin skipped: initialization_options set without tsserver.path, \
+                 so a workspace-supplied tsserver may run"
+            );
+            return (config, None);
+        }
+        let tsserver = match resolution {
+            TsserverResolution::Pinned(tsserver) => tsserver,
+            TsserverResolution::Unresolved(reason) => {
+                tracing::warn!(
+                    %server,
+                    "tsserver not pinned: {reason}; a workspace-supplied tsserver may run"
+                );
+                return (config, None);
+            }
+        };
+        if roots.contains_canonical(&tsserver) {
+            tracing::warn!(
+                %server,
+                tsserver = %tsserver.display(),
+                "typescript-language-server is installed inside the workspace; \
+                 pinning it does not make the workspace trusted"
+            );
+        }
+        let options = serde_json::to_value(TsserverInitOptions {
+            tsserver: TsserverPath { path: &tsserver },
+        })
+        .inspect_err(|err| tracing::warn!(%err, "tsserver pin could not be serialized"))
+        .ok();
+        let pinned = options.is_some().then_some(tsserver);
+        config.initialization_options = options;
+        (config, pinned)
+    }
 }
 
 /// Warns when a server configured with a tsserver path reports another source
@@ -892,6 +962,18 @@ pub fn warn_if_pin_ignored(configured: Option<&Path>, notif: &LspNotification, s
 fn pin_ignored(params: Option<&serde_json::Value>) -> Option<TypescriptVersionParams> {
     let parsed = serde_json::from_value::<TypescriptVersionParams>(params?.clone()).ok()?;
     (parsed.source != TsserverSource::UserSetting).then_some(parsed)
+}
+
+#[cfg(test)]
+fn pinned_initialization_options(
+    config: &LspServerConfig,
+    roots: &WorkspaceRoots,
+    parent_env: impl ParentEnv,
+) -> Option<serde_json::Value> {
+    plan_typescript(config.clone(), parent_env)
+        .apply(roots)
+        .0
+        .initialization_options
 }
 
 #[cfg(test)]
@@ -969,7 +1051,7 @@ mod launch_tests {
         config
     }
 
-    fn env_with_path(dir: &Path) -> impl Fn(&str) -> Option<OsString> {
+    fn env_with_path(dir: &Path) -> impl ParentEnv {
         let path = std::env::join_paths([dir]).unwrap();
         move |key| (key == "PATH").then(|| path.clone())
     }
@@ -1340,7 +1422,7 @@ mod tests {
         config
     }
 
-    fn env_with_path(path: &Path) -> impl Fn(&str) -> Option<OsString> {
+    fn env_with_path(path: &Path) -> impl ParentEnv {
         let path = path.as_os_str().to_owned();
         move |key| (key == "PATH").then(|| path.clone())
     }
@@ -1386,7 +1468,7 @@ mod tests {
         config
             .env
             .insert("PATH".into(), layout.bin.to_str().unwrap().into());
-        let resolved = resolve(&config, |_| Some(OsString::from("/nonexistent")));
+        let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }
 
@@ -1926,7 +2008,6 @@ mod tests {
 
     fn native_tsc(path: &Path) -> NativeTsc {
         NativeTsc {
-            path: path.to_path_buf(),
             command: ServerCommand::new(path.to_str().unwrap()).unwrap(),
         }
     }
@@ -2207,5 +2288,114 @@ mod tests {
             select_typescript_server(&rust, &WorkspaceRoots::default(), |_| None),
             None
         );
+    }
+
+    #[test]
+    fn test_user_tsserver_path_distinguishes_absent_path_and_invalid() {
+        let of = |value: serde_json::Value| UserTsserverPath::of(Some(&value));
+
+        assert_eq!(UserTsserverPath::of(None), UserTsserverPath::Absent);
+        assert_eq!(of(serde_json::json!({})), UserTsserverPath::Absent);
+        assert_eq!(
+            of(serde_json::json!({"tsserver": {"path": "/ts/tsserver.js"}})),
+            UserTsserverPath::Path(PathBuf::from("/ts/tsserver.js"))
+        );
+        assert_eq!(
+            of(serde_json::json!({"tsserver": {"path": 42}})),
+            UserTsserverPath::Invalid
+        );
+    }
+
+    #[test]
+    fn test_invalid_tsserver_path_blocks_native_selection_and_pinning() {
+        let layout = global_install(true);
+        let mut auto = config(SERVER_STEM);
+        auto.selection = crate::config::ServerSelection::Auto;
+        auto.initialization_options = Some(serde_json::json!({"tsserver": {"path": 42}}));
+
+        let choice = select_typescript_server(
+            &auto,
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        );
+        let pinned = pinned_initialization_options(
+            &auto,
+            &WorkspaceRoots::default(),
+            env_with_path(&layout.bin),
+        );
+
+        assert_eq!(
+            choice,
+            Some(TypescriptServerChoice::Tsserver(
+                TsserverKept::UserTsserverPath
+            ))
+        );
+        assert_eq!(pinned, auto.initialization_options);
+    }
+
+    #[test]
+    fn test_plan_pins_the_canonical_path_and_checks_the_same_one() {
+        let layout = global_install(true);
+        let roots = WorkspaceRoots::default();
+        let plan = plan_typescript(config(SERVER_STEM), env_with_path(&layout.bin));
+        let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&layout.base)).unwrap();
+
+        assert_eq!(plan.pin_inside(&boundary), Some(layout.tsserver.clone()));
+        let (applied, pinned) = plan.apply(&roots);
+
+        assert_eq!(pinned.as_deref(), Some(layout.tsserver.as_path()));
+        assert_eq!(
+            configured_tsserver_path(applied.initialization_options.as_ref()),
+            Some(layout.tsserver)
+        );
+    }
+
+    #[test]
+    fn test_plan_flags_a_version_manager_shim_as_an_unpinnable_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dunce::canonicalize(dir.path()).unwrap().join(".volta/bin");
+        fs::create_dir_all(&shims).unwrap();
+        let shim = shims.join(SERVER_STEM);
+        fs::write(&shim, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let plan = plan_typescript(config(SERVER_STEM), env_with_path(&shims));
+
+        assert!(plan.has_unpinnable_launcher());
+        assert_eq!(
+            plan.apply(&WorkspaceRoots::default())
+                .0
+                .initialization_options,
+            None
+        );
+    }
+
+    #[test]
+    fn test_plan_of_a_pinnable_install_has_a_pinnable_launcher() {
+        let layout = global_install(true);
+
+        let plan = plan_typescript(config(SERVER_STEM), env_with_path(&layout.bin));
+
+        assert!(!plan.has_unpinnable_launcher());
+    }
+
+    #[test]
+    fn test_plan_flags_a_package_runner_as_an_unpinnable_launcher() {
+        let mut runner = config("npx");
+        runner.args = vec![SERVER_STEM.to_owned()];
+
+        let plan = plan_typescript(runner, |_| None);
+
+        assert!(plan.has_unpinnable_launcher());
+    }
+
+    #[test]
+    fn test_plan_ignores_servers_that_are_not_typescript() {
+        let rust = LspServerConfig::rust_analyzer();
+
+        let plan = plan_typescript(rust, |_| None);
+
+        assert!(!plan.has_unpinnable_launcher());
+        assert_eq!(plan.pin_inside(&WorkspaceRoots::default()), None);
     }
 }

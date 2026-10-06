@@ -36,6 +36,7 @@ pub use routing::{
     ToolRouter, ToolSet,
 };
 use serde::{Deserialize, Serialize};
+pub(crate) use server::MarkerScan;
 pub use server::{
     BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, InvalidServerCommand, LspServerConfig,
     MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, ServerCommand, ServerHeuristics, ServerSelection,

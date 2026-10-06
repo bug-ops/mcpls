@@ -27,7 +27,7 @@ use crate::bridge::{WorkspaceRoots, try_path_to_uri};
 use crate::config::{LspServerConfig, LspSettings, PositionEncodings};
 use crate::error::{
     BackgroundTask, Error, InitFailureHint, InitPhase, Result, ServerSpawnFailure, StartupFailure,
-    StdioStream,
+    StdioStream, UntrustedRefusal,
 };
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
@@ -36,7 +36,9 @@ use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
-use crate::lsp::{CONTENT_MODIFIED_RETRY_METHODS, tsserver_pin};
+use crate::lsp::{
+    CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, ParentEnv, process_env, tsserver_pin,
+};
 use crate::redaction::Redactions;
 
 /// Environment variables passed through to a spawned LSP server even though
@@ -51,7 +53,14 @@ use crate::redaction::Redactions;
 /// `SSH_AUTH_SOCK`, which changes every login session) have no way through
 /// today. See [`LspServerConfig::env`] for the config-level override/addition
 /// mechanism this list feeds into.
-const ENV_PASSTHROUGH: &[&str] = &["PATH", "HOME", "USERPROFILE", "TMPDIR", "TEMP", "TMP"];
+const ENV_PASSTHROUGH: &[&str] = &[
+    ManagedEnvVar::Path.name(),
+    ManagedEnvVar::Home.name(),
+    ManagedEnvVar::UserProfile.name(),
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+];
 
 /// Upper bound [`LspServer::shutdown`] waits for the child process to exit on
 /// its own after sending the LSP `exit` notification, before falling back to
@@ -141,8 +150,12 @@ pub const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
 /// loader itself; `APPDATA`/`LOCALAPPDATA` are read by the Node-based default
 /// servers (pyright, typescript-language-server) for global config and
 /// cache; the rest are conventionally expected by Windows child processes.
+/// `NoDefaultCurrentDirectoryInExePath` passes through so a user who set it to
+/// keep the current directory out of executable lookups is not overridden by
+/// the environment clearing.
 #[cfg(windows)]
 const ENV_PASSTHROUGH_WINDOWS: &[&str] = &[
+    ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.name(),
     "SystemRoot",
     "SystemDrive",
     "windir",
@@ -198,6 +211,17 @@ pub enum ChildWorkingDir {
     Fixed(PathBuf),
 }
 
+/// A tsserver pin mcpls chose, as opposed to one the user configured.
+///
+/// Remembered so a respawn can tell a pin that went stale (the install moved)
+/// from the user's own `tsserver.path`, which is never second-guessed.
+#[derive(Debug, Clone)]
+struct AutoPin {
+    tsserver: PathBuf,
+    /// The untrusted-mode boundary the pin was vetted against, if any.
+    untrusted_boundary: Option<WorkspaceRoots>,
+}
+
 /// Configuration for LSP server initialization.
 ///
 /// Built by [`Self::new`]; the fields are private so the effective
@@ -210,6 +234,7 @@ pub struct ServerInitConfig {
     position_encodings: PositionEncodings,
     redactions: Arc<Redactions>,
     child_working_dir: ChildWorkingDir,
+    auto_pin: Option<AutoPin>,
 }
 
 impl ServerInitConfig {
@@ -241,7 +266,23 @@ impl ServerInitConfig {
             position_encodings,
             redactions,
             child_working_dir: ChildWorkingDir::Inherit,
+            auto_pin: None,
         }
+    }
+
+    /// This config with `tsserver` recorded as the pin mcpls chose, vetted
+    /// against `untrusted_boundary` in untrusted-workspace mode.
+    #[must_use]
+    pub(crate) fn with_auto_pin(
+        mut self,
+        tsserver: PathBuf,
+        untrusted_boundary: Option<WorkspaceRoots>,
+    ) -> Self {
+        self.auto_pin = Some(AutoPin {
+            tsserver,
+            untrusted_boundary,
+        });
+        self
     }
 
     /// This config with the child started in `dir`.
@@ -295,18 +336,51 @@ impl ServerInitConfig {
 
     /// The config a respawn of this server spawns from.
     ///
-    /// Called by every respawn right before it spawns, so a rule that depends
-    /// on the machine's state at respawn time has one place to apply.
+    /// Called by every respawn right before it spawns. A tsserver pin mcpls
+    /// chose whose canonical path changed (the install was upgraded, moved or
+    /// retargeted through a symlink) is resolved again and, in untrusted mode,
+    /// checked against the boundary it was first vetted against. A pin the
+    /// user configured is kept as is.
     ///
     /// # Errors
     ///
-    /// Returns the reason the respawn must not proceed; never fails today.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the respawn hook is fallible by contract; the identity implementation never fails"
-    )]
+    /// [`Error::ServerFailedToStart`] with an untrusted-mode refusal when the
+    /// tsserver now resolves inside the workspace.
     pub(crate) fn for_respawn(&self) -> Result<Self> {
-        Ok(self.clone())
+        let Some(pin) = self
+            .auto_pin
+            .as_ref()
+            .filter(|pin| dunce::canonicalize(&pin.tsserver).ok().as_ref() != Some(&pin.tsserver))
+        else {
+            return Ok(self.clone());
+        };
+        let mut unpinned = self.server_config.clone();
+        unpinned.initialization_options = None;
+        let plan = tsserver_pin::plan_typescript(unpinned, process_env);
+        if let Some(boundary) = &pin.untrusted_boundary
+            && let Some(tsserver) = plan.pin_inside(boundary)
+        {
+            return Err(self.refusal(UntrustedRefusal::WorkspaceTsserver { tsserver }));
+        }
+        let (server_config, tsserver) = plan.apply(&self.workspace_roots);
+        let auto_pin = tsserver.map(|tsserver| AutoPin {
+            tsserver,
+            untrusted_boundary: pin.untrusted_boundary.clone(),
+        });
+        Ok(Self {
+            server_config,
+            auto_pin,
+            ..self.clone()
+        })
+    }
+
+    fn refusal(&self, refusal: UntrustedRefusal) -> Error {
+        Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
+            server_id: self.server_config.id(),
+            language_id: self.server_config.language_id.clone(),
+            command: self.server_config.command.to_string(),
+            reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
+        }))
     }
 }
 
@@ -380,7 +454,7 @@ impl std::fmt::Debug for LspServer {
 pub fn child_env_var(
     config: &LspServerConfig,
     key: &str,
-    parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    parent_env: impl ParentEnv,
 ) -> Option<std::ffi::OsString> {
     config
         .env
@@ -446,10 +520,11 @@ impl LspServer {
         let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));
         Self::log_spawn(config.server_config(), &redactions);
 
-        let command =
-            Self::build_command(config.server_config(), config.child_working_dir(), |key| {
-                std::env::var_os(key)
-            });
+        let command = Self::build_command(
+            config.server_config(),
+            config.child_working_dir(),
+            process_env,
+        );
 
         // Log allowlist presence and an override count only — never the
         // configured keys themselves, since `config.server_config.env` may
@@ -583,9 +658,11 @@ impl LspServer {
     ///
     /// Runs on the failure path only and reads nothing but package manifests.
     fn init_failure_hint(config: &ServerInitConfig) -> Option<InitFailureHint> {
-        tsserver_pin::init_failure_hint(config.server_config(), config.workspace_roots(), |key| {
-            std::env::var_os(key)
-        })
+        tsserver_pin::init_failure_hint(
+            config.server_config(),
+            config.workspace_roots(),
+            process_env,
+        )
     }
 
     /// Logs the command and argument count at `info`, and the argument values
@@ -618,7 +695,7 @@ impl LspServer {
     fn build_command(
         config: &LspServerConfig,
         working_dir: &ChildWorkingDir,
-        parent_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+        parent_env: impl ParentEnv,
     ) -> Command {
         let mut command = Command::new(&config.command);
         command.args(&config.args).env_clear();

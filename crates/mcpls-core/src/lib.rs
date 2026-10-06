@@ -109,6 +109,25 @@ pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     serve_with(config, Transport::Stdio).await
 }
 
+/// Plans the server starts on the blocking pool, since it walks the workspace.
+///
+/// `initialize` still waits for the plan: it is needed to build the router the
+/// MCP server answers from. Only the runtime workers stay free.
+async fn plan_off_runtime(
+    config: &ServerConfig,
+    roots: &WorkspaceRoots,
+    redactions: &Arc<redaction::Redactions>,
+) -> StartPlan {
+    let (config, roots, redactions) = (config.clone(), roots.clone(), Arc::clone(redactions));
+    match tokio::task::spawn_blocking(move || plan_server_starts(&config, &roots, &redactions))
+        .await
+    {
+        Ok(plan) => plan,
+        // The pool does not cancel a running blocking task, so a failed join is a panic in the plan.
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
 /// Start the MCPLS server with an explicit transport.
 ///
 /// Performs all shared setup (workspace discovery, LSP spawning, translator
@@ -181,20 +200,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // through by value rather than re-registered later.
     let shutdown_signal = ShutdownSignal::new();
 
-    // `ServerConfig::load`/`load_from` already validate the TOML-loading
-    // path; this covers the other one -- a caller building `ServerConfig`
-    // programmatically (e.g. a library embedder) previously hit no
-    // diagnosable error here, only silent clamping at accessor level (e.g.
-    // `LspClient::request_timeout`). `serve` delegates to this function, so
-    // one call site here covers both public entry points (`serve` and
-    // `serve_with`); note this does mean a config loaded via the CLI's
-    // `load_from` -> `serve` path is validated twice (harmless -- `validate`
-    // is a pure check with no side effects beyond a `tracing::warn!` for a
-    // non-fatal duplicate-name case, which will simply log twice).
-    //
-    // Considered wrapping this in a `Validated<ServerConfig>` marker type to
-    // make "already validated" a compile-time guarantee instead of a runtime
-    // check here; rejected as unnecessary ceremony for a pre-1.0 API (#282).
+    // A programmatic `ServerConfig` skips the validation `load`/`load_from` run.
     config.validate()?;
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
@@ -204,12 +210,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         &config.lsp_servers,
         lsp::current_environment(),
     ));
-    let plan = plan_server_starts(&config, &workspace_roots, &startup_redactions);
-    let refusals = plan.failures();
-    let StartPlan {
-        admitted: applicable_configs,
-        refused,
-    } = plan;
+    let plan = plan_off_runtime(&config, &workspace_roots, &startup_redactions).await;
+    let (applicable_configs, refused, refusals) = plan.into_parts();
 
     info!(
         "Attempting to spawn {} applicable LSP server(s)...",
@@ -224,7 +226,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         applicable_configs
             .iter()
             .map(lsp::ServerInitConfig::server_config)
-            .chain(refused.iter().map(|r| &r.config)),
+            .chain(&refused),
     )?;
 
     // Built here (rather than alongside `subscription_registry` below) so

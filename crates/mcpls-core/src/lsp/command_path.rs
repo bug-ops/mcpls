@@ -1,26 +1,17 @@
-//! Executable lookup shared by the tsserver pin and native server selection.
+//! Executable lookup shared by untrusted-mode planning, the tsserver pin and
+//! native server selection.
 //!
 //! Mirrors how the standard library finds a spawned command: a command with
 //! more than one path component is used as given, a bare name is searched on
-//! the `PATH` the child would see.
+//! the `PATH` the child would see. This is the only `PATH` walker, so the file
+//! untrusted mode checks is the file the pin and selection inspect.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::LspServerConfig;
-use crate::lsp::child_env_var;
-
-/// The first executable regular file named `command`, as given or on
-/// `path_var`; a file without the execute bit is skipped, as spawn skips it.
-pub fn find_executable(command: &Path, path_var: Option<&OsString>) -> Option<PathBuf> {
-    if command.components().count() > 1 {
-        return is_executable_file(command).then(|| command.to_path_buf());
-    }
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join(command))
-        .find(|candidate| is_executable_file(candidate))
-}
+use crate::lsp::{ManagedEnvVar, ParentEnv, child_env_var};
 
 /// Whether `path` is a regular file the process may execute.
 #[cfg(unix)]
@@ -66,20 +57,28 @@ pub struct ResolvedCommand {
 /// or `None` when none is found.
 ///
 /// A command with more than one path component resolves against the process
-/// working directory, since the child is given no `current_dir`; a bare name
-/// walks the child's `PATH` in order, relative entries again resolving against
-/// the process working directory. `PATH` is read as the child sees it: the
-/// config's `env` override, else `parent_env`.
+/// working directory; a bare name walks the child's `PATH` in order, relative
+/// entries again resolving against the process working directory. `PATH` is
+/// read as the child sees it: the config's `env` override, else `parent_env`.
 pub fn resolve_command(
     config: &LspServerConfig,
-    parent_env: impl Fn(&str) -> Option<OsString>,
+    parent_env: impl ParentEnv,
 ) -> Option<ResolvedCommand> {
-    let command = Path::new(&config.command);
-    let found = if command.components().count() > 1 {
-        spawn_target(command)
+    resolve_named(Path::new(&config.command), config, parent_env)
+}
+
+/// [`resolve_command`] for `name`: a program the child would look up on its own
+/// `PATH`, such as `node` or `tsc`, or a command given as a path.
+pub fn resolve_named(
+    name: &Path,
+    config: &LspServerConfig,
+    parent_env: impl ParentEnv,
+) -> Option<ResolvedCommand> {
+    let found = if name.components().count() > 1 {
+        spawn_target(name)
     } else {
-        let path_var = child_env_var(config, "PATH", parent_env)?;
-        std::env::split_paths(&path_var).find_map(|dir| spawn_target(&dir.join(command)))
+        let path_var = child_env_var(config, ManagedEnvVar::Path.name(), parent_env)?;
+        std::env::split_paths(&path_var).find_map(|dir| spawn_target(&dir.join(name)))
     }?;
     let canonical = dunce::canonicalize(&found).ok()?;
     let spawn = std::path::absolute(&found).ok()?;
@@ -130,51 +129,6 @@ mod tests {
         let kept = OsString::from("/opt/tools");
         assert_eq!(or_system_path(kept.clone()), kept);
         assert!(!or_system_path(OsString::new()).is_empty());
-    }
-
-    #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
-
-    #[cfg(unix)]
-    #[test]
-    fn test_find_executable_skips_files_without_the_execute_bit() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = dir.path().join("tool");
-        std::fs::write(&tool, "").unwrap();
-        let path_var = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(find_executable(Path::new("tool"), Some(&path_var)), None);
-        assert_eq!(find_executable(&tool, None), None);
-    }
-
-    #[test]
-    fn test_find_executable_searches_path_for_bare_names() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = dir.path().join("tool");
-        std::fs::write(&tool, "").unwrap();
-        make_executable(&tool);
-        let path_var = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(
-            find_executable(Path::new("tool"), Some(&path_var)),
-            Some(tool)
-        );
-        assert_eq!(find_executable(Path::new("missing"), Some(&path_var)), None);
-        assert_eq!(find_executable(Path::new("tool"), None), None);
-    }
-
-    #[test]
-    fn test_find_executable_uses_multi_component_command_as_given() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = dir.path().join("tool");
-        std::fs::write(&tool, "").unwrap();
-        make_executable(&tool);
-        assert_eq!(find_executable(&tool, None), Some(tool.clone()));
-        assert_eq!(find_executable(&dir.path().join("none"), None), None);
     }
 
     #[test]
@@ -235,7 +189,7 @@ mod tests {
             config
         }
 
-        fn path_env(dir: &Path) -> impl Fn(&str) -> Option<OsString> {
+        fn path_env(dir: &Path) -> impl ParentEnv {
             let path = std::env::join_paths([dir]).unwrap();
             move |key| (key == "PATH").then(|| path.clone())
         }
@@ -300,6 +254,19 @@ mod tests {
             executable(&root.join("x.sh"));
             let resolved = resolve_command(&config(root.join("x.sh").to_str().unwrap()), |_| None);
             assert_eq!(resolved.map(|r| r.canonical), Some(root.join("x.sh")));
+        }
+
+        #[test]
+        fn test_resolve_named_finds_a_program_other_than_the_command() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            executable(&root.join("bin/node"));
+            let resolved = resolve_named(
+                Path::new("node"),
+                &config("rust-analyzer"),
+                path_env(&root.join("bin")),
+            );
+            assert_eq!(resolved.map(|r| r.spawn), Some(root.join("bin/node")));
         }
 
         #[test]
