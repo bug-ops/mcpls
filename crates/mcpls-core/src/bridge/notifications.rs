@@ -1775,6 +1775,23 @@ pub fn apply_lifecycle_notification(
     }
 }
 
+/// Handles one lifecycle-lane notification of `server_id`: warns when a pinned
+/// `tsserver` was ignored, then applies it to `cache` when there is one.
+///
+/// Every consumer of the lifecycle lane goes through here, so no consumer can
+/// skip a step (#658).
+pub async fn on_lifecycle(
+    cache: Option<&tokio::sync::Mutex<NotificationCache>>,
+    server_id: &ServerId,
+    pinned_tsserver: Option<&std::path::Path>,
+    notif: crate::lsp::LspNotification,
+) {
+    crate::lsp::tsserver_pin::warn_if_pin_ignored(pinned_tsserver, &notif, server_id.as_str());
+    if let Some(cache) = cache {
+        apply_lifecycle_notification(&mut *cache.lock().await, server_id, notif);
+    }
+}
+
 #[cfg(test)]
 mod pull_tests;
 

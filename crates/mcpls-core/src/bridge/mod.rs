@@ -29,7 +29,7 @@ pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
     ServerMessage, apply_lifecycle_notification,
 };
-pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key};
+pub(crate) use notifications::{DiagnosticsKey, diagnostics_cache_key, on_lifecycle};
 #[cfg(test)]
 pub(crate) use published_uri::resolve_one;
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};

@@ -13,11 +13,10 @@ use tokio::time::Duration;
 use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
 use super::servers::Backend;
-use crate::bridge::DiagnosticsRole;
 use crate::bridge::indexing::IndexingReset;
+use crate::bridge::{DiagnosticsRole, on_lifecycle};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::tsserver_pin::warn_if_pin_ignored;
 use crate::lsp::{LspClient, LspServer, ServerInitConfig};
 use crate::util::lock_std;
 
@@ -462,14 +461,13 @@ impl Translator {
         let lifecycle_id = id.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(notif) = lifecycle.recv().await {
-                warn_if_pin_ignored(pinned_tsserver.as_deref(), &notif, lifecycle_id.as_str());
-                if let Some(cache) = &cache {
-                    crate::bridge::apply_lifecycle_notification(
-                        &mut *cache.lock().await,
-                        &lifecycle_id,
-                        notif,
-                    );
-                }
+                on_lifecycle(
+                    cache.as_deref(),
+                    &lifecycle_id,
+                    pinned_tsserver.as_deref(),
+                    notif,
+                )
+                .await;
             }
         });
         forwarder.abort_handle()

@@ -11,8 +11,10 @@ use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
-use super::pump::{PumpShared, PumpWiring, degrade_after_pump_panic, diagnostics_pump};
-use crate::bridge::{DiagnosticsRole, NotificationCache, Translator, WorkspaceRoots};
+use super::pump::{PumpShared, PumpWiring, supervised_pump};
+use crate::bridge::{
+    DiagnosticsRole, NotificationCache, NotificationReceivers, Translator, WorkspaceRoots,
+};
 use crate::config::{LanguageId, ServerId, ServerStartConcurrency};
 use crate::error::ServerSpawnFailure;
 use crate::lsp::{LspServer, ServerInitConfig, ServerStartOutcome};
@@ -186,7 +188,6 @@ async fn init_lsp_servers(
             .collect(),
         roles: HashMap::new(),
         pumps: JoinSet::new(),
-        pump_servers: HashMap::new(),
         tally: StartupTally::default(),
     };
 
@@ -216,8 +217,9 @@ async fn init_lsp_servers(
                     }
                 }
             }
-            Some(joined) = settler.pumps.join_next_with_id(), if !settler.pumps.is_empty() => {
-                handle_pump_exit(joined, &settler.pump_servers, &settler.notification_cache).await;
+            // A pump contains its own panic (`supervised_pump`); the set only owns the tasks.
+            Some(finished) = settler.pumps.join_next(), if !settler.pumps.is_empty() => {
+                drop(finished);
             }
         }
     }
@@ -255,7 +257,6 @@ struct StartupSettler<'a> {
     configured: Vec<(ServerId, LanguageId)>,
     roles: HashMap<ServerId, (LanguageId, tokio::sync::watch::Sender<DiagnosticsRole>)>,
     pumps: JoinSet<()>,
-    pump_servers: HashMap<tokio::task::Id, ServerId>,
     tally: StartupTally,
 }
 
@@ -296,18 +297,19 @@ impl StartupSettler<'_> {
         let (role_tx, role_rx) = tokio::sync::watch::channel(self.diagnostics_role(&language, &id));
         self.roles.insert(id.clone(), (language, role_tx));
         self.recompute_roles().await;
-        let pump = self.pumps.spawn(diagnostics_pump(
+        let pump = self.pumps.spawn(supervised_pump(
             id.clone(),
-            notification_rx,
-            lifecycle_rx,
+            NotificationReceivers {
+                notifications: notification_rx,
+                lifecycle: lifecycle_rx,
+                pinned_tsserver,
+            },
             self.cancel_rx.clone(),
             role_rx,
-            pinned_tsserver,
             self.pump_shared.clone(),
         ));
-        self.translator.set_notification_task(&id, pump.clone());
+        self.translator.set_notification_task(&id, pump);
         drop(serialized);
-        self.pump_servers.insert(pump.id(), id.clone());
         self.tally.registered = self.tally.registered.saturating_add(1);
         self.publish_routes_served_by(&id).await;
     }
@@ -362,23 +364,6 @@ impl StartupSettler<'_> {
     }
 }
 
-/// A panicked pump stops caching its server's pushes: mark it push-degraded.
-async fn handle_pump_exit(
-    joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
-    pump_servers: &HashMap<tokio::task::Id, ServerId>,
-    notification_cache: &Mutex<NotificationCache>,
-) {
-    let Err(join_error) = joined else { return };
-    if !join_error.is_panic() {
-        return;
-    }
-    let Some(server_id) = pump_servers.get(&join_error.id()) else {
-        return;
-    };
-    error!("Diagnostics pump for LSP server '{server_id}' panicked: {join_error}");
-    degrade_after_pump_panic(notification_cache, server_id).await;
-}
-
 #[cfg(test)]
 mod settler_tests {
     use super::*;
@@ -408,7 +393,6 @@ mod settler_tests {
                 .collect(),
             roles: HashMap::new(),
             pumps: JoinSet::new(),
-            pump_servers: HashMap::new(),
             tally: StartupTally::default(),
         }
     }
@@ -1037,42 +1021,5 @@ mod init_supervision_tests {
         assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
         drop(guard);
         assert!(translator.startup_failure(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_drain_pumps_degrades_server_of_panicked_pump() {
-        let cache = Mutex::new(NotificationCache::new());
-        let id = ServerId::from("rust");
-        mark_ready(&mut *cache.lock().await, &id);
-
-        let mut pumps = JoinSet::new();
-        let pump = pumps.spawn(async {
-            panic!("pump boom");
-        });
-        let pump_servers = HashMap::from([(pump.id(), id.clone())]);
-
-        while let Some(joined) = pumps.join_next_with_id().await {
-            handle_pump_exit(joined, &pump_servers, &cache).await;
-        }
-
-        let guard = cache.lock().await;
-        assert!(guard.is_push_degraded(&id));
-        assert_eq!(guard.indexing_state(&id), IndexingState::Unknown);
-    }
-
-    #[tokio::test]
-    async fn test_drain_pumps_ignores_pump_that_finished_normally() {
-        let cache = Mutex::new(NotificationCache::new());
-        let id = ServerId::from("rust");
-
-        let mut pumps = JoinSet::new();
-        let pump = pumps.spawn(async {});
-        let pump_servers = HashMap::from([(pump.id(), id.clone())]);
-
-        while let Some(joined) = pumps.join_next_with_id().await {
-            handle_pump_exit(joined, &pump_servers, &cache).await;
-        }
-
-        assert!(!cache.lock().await.is_push_degraded(&id));
     }
 }

@@ -1912,10 +1912,7 @@ mod tests {
                 },
                 "{result:?}"
             );
-            fx.translator
-                .wait_for_indexing_ready(&fx.id)
-                .await
-                .unwrap();
+            fx.translator.wait_for_indexing_ready(&fx.id).await.unwrap();
         }
     }
 }
