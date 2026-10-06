@@ -299,17 +299,15 @@ fn working_dir_in(
 
 /// Whether neither the group nor others can write to `dir`. Every Windows
 /// temporary directory is per-user, so only Unix is checked.
+#[cfg(unix)]
 fn is_private_dir(dir: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o022 == 0)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        true
-    }
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o022 == 0)
+}
+
+#[cfg(not(unix))]
+const fn is_private_dir(_dir: &Path) -> bool {
+    true
 }
 
 /// Splits the configured servers into the ones worth starting for this run
