@@ -93,7 +93,7 @@ related:
   walker. A respawn calls `ServerInitConfig::for_respawn`: a pin mcpls chose (remembered with its
   untrusted boundary) whose canonical path changed (install upgraded, moved or retargeted through a
   symlink) is resolved again and checked against the boundary it was vetted against, a refusal being
-  `Error::ServerFailedToStart`; a user pin is never re-resolved. Opt-in `selection = "auto"` runs its own
+  `Error::ServerFailedToStart`; a user pin is never re-resolved. That filesystem work runs on the blocking pool (`BackgroundTask::ServerPlanning` on a join failure) and only for a server mcpls pinned (#679). Opt-in `selection = "auto"` runs its own
   resolution first because native selection must precede hardening.
 - **Launchers (#652).** In untrusted mode an allowed server whose launch lets the workspace choose the
   program is refused: `UntrustedRefusal::ProjectLauncher` for package runners (`npm`, `npx`, `bunx`,

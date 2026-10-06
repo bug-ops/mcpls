@@ -908,16 +908,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("lib.rs");
         std::fs::write(&file, "fn main() {}").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
         translator.set_workspace_roots(roots.clone());
         let (client, fake_lsp) = crate::test_lsp::fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
         let server = McplsServer::new(
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),

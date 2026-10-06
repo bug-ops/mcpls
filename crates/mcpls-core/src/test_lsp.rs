@@ -19,6 +19,7 @@
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 use crate::ServerId;
@@ -349,7 +350,7 @@ pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> Server
     let script = dir.join("server.sh");
     std::fs::write(&script, script_body).unwrap();
     let mut server_config = LspServerConfig::rust_analyzer();
-    server_config.command = ServerCommand::from_static("sh");
+    server_config.command = ServerCommand::from_static("sh").into();
     server_config.args = vec![script.to_string_lossy().to_string()];
     init_config_for(server_config)
 }
@@ -386,7 +387,7 @@ pub fn named_sh_init_config(
     let sub = dir.join(name);
     std::fs::create_dir_all(&sub).unwrap();
     let mut config = sh_script_init_config(&sub, script_body);
-    config.server_config_mut().name = Some(ServerId::from(name));
+    config.server_config_mut().name = Some(ServerId::new(name).unwrap());
     config.server_config_mut().language_id = LanguageId::new(language).unwrap();
     config.server_config_mut().timeout_seconds = TimeoutSecs::new(10).unwrap();
     config
@@ -413,14 +414,13 @@ pub fn with_read_preamble(body: &str) -> String {
 }
 
 /// Spawns a real [`crate::runtime::pump::diagnostics_pump`] over `subs` and returns the
-/// sender feeding it plus the cancel sender (keep it alive: dropping it stops
-/// the pump).
+/// sender feeding it plus the cancel token.
 pub fn spawn_test_pump(
     subs: crate::mcp::SubscriptionRegistry,
     workspace_roots: WorkspaceRoots,
 ) -> (
     tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
-    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
 ) {
     let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
         crate::bridge::NotificationCache::new(),
@@ -436,12 +436,12 @@ pub fn spawn_test_pump_with_cache(
     notification_cache: std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
 ) -> (
     tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
-    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
     // Held so the lifecycle lane stays open for the pump's lifetime.
-    let (_cache, cancel_tx) = spawn_pump(
+    let (_cache, cancel) = spawn_pump(
         rx,
         lifecycle_rx,
         lifecycle_tx,
@@ -450,20 +450,20 @@ pub fn spawn_test_pump_with_cache(
         notification_cache,
         None,
     );
-    (tx, cancel_tx)
+    (tx, cancel)
 }
 
 /// A pump for a server configured with `tsserver.path = pinned`, plus the
-/// sender of its lifecycle lane and the cancel sender (keep it alive).
+/// sender of its lifecycle lane and the cancel token.
 pub fn spawn_test_pump_with_tsserver_pin(
     pinned: std::path::PathBuf,
 ) -> (
     tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
-    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
 ) {
     let (notification_tx, rx) = tokio::sync::mpsc::channel(32);
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
-    let (_cache, cancel_tx) = spawn_pump(
+    let (_cache, cancel) = spawn_pump(
         rx,
         lifecycle_rx,
         notification_tx,
@@ -474,17 +474,17 @@ pub fn spawn_test_pump_with_tsserver_pin(
         )),
         Some(pinned),
     );
-    (lifecycle_tx, cancel_tx)
+    (lifecycle_tx, cancel)
 }
 
 /// As [`spawn_test_pump`], but over a client's own [`FakeLanes`]; returns the
 /// pump's notification cache (for asserting on indexing state) and the
-/// cancel sender (keep it alive: dropping it stops the pump).
+/// cancel token.
 pub fn spawn_test_pump_over_lanes(
     lanes: FakeLanes,
 ) -> (
     std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
-    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
 ) {
     spawn_pump(
         lanes.notification_rx,
@@ -509,28 +509,29 @@ fn spawn_pump<K: Send + 'static>(
     pinned_tsserver: Option<std::path::PathBuf>,
 ) -> (
     std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
-    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
 ) {
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cancel = CancellationToken::new();
     let shared = crate::runtime::pump::PumpShared {
         notification_cache: std::sync::Arc::clone(&notification_cache),
         subs,
         workspace_roots,
     };
+    let pump_cancel = cancel.clone();
     tokio::spawn(async move {
         let _keep_alive = keep_alive;
         crate::runtime::pump::diagnostics_pump(
-            crate::config::ServerId::from("rust"),
+            crate::config::ServerId::from_static("rust"),
             rx,
             lifecycle_rx,
-            cancel_rx,
+            pump_cancel,
             tokio::sync::watch::channel(crate::bridge::DiagnosticsRole::Authoritative).1,
             pinned_tsserver,
             shared,
         )
         .await;
     });
-    (notification_cache, cancel_tx)
+    (notification_cache, cancel)
 }
 
 /// A temp workspace holding `main.rs`: the guard, the canonical root and the file.

@@ -109,40 +109,47 @@ const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 /// produce.
 const LIFECYCLE_CHANNEL_CAPACITY: usize = 128;
 
-/// Every symbol kind defined by LSP 3.17 and understood by mcpls.
+/// Every symbol kind defined by LSP 3.17 and understood by mcpls, with the
+/// lowercase name a `workspace/symbol` `kind_filter` accepts for it.
 ///
-/// Single source of truth for both the `initialize` request's
-/// `value_set` and the `workspace/symbol` `kind_filter` validation in
-/// [`crate::bridge::translator::symbols`] — the latter derives its accepted
-/// string names from this array via `format!("{:?}", kind)`.
-pub const SUPPORTED_SYMBOL_KINDS: [SymbolKind; 26] = [
-    SymbolKind::File,
-    SymbolKind::Module,
-    SymbolKind::Namespace,
-    SymbolKind::Package,
-    SymbolKind::Class,
-    SymbolKind::Method,
-    SymbolKind::Property,
-    SymbolKind::Field,
-    SymbolKind::Constructor,
-    SymbolKind::Enum,
-    SymbolKind::Interface,
-    SymbolKind::Function,
-    SymbolKind::Variable,
-    SymbolKind::Constant,
-    SymbolKind::String,
-    SymbolKind::Number,
-    SymbolKind::Boolean,
-    SymbolKind::Array,
-    SymbolKind::Object,
-    SymbolKind::Key,
-    SymbolKind::Null,
-    SymbolKind::EnumMember,
-    SymbolKind::Struct,
-    SymbolKind::Event,
-    SymbolKind::Operator,
-    SymbolKind::TypeParameter,
+/// Single source of truth for both the `initialize` request's `value_set`
+/// and the `kind_filter` validation in [`crate::bridge::translator::symbols`].
+pub const SUPPORTED_SYMBOL_KINDS: [(SymbolKind, &str); 26] = [
+    (SymbolKind::File, "file"),
+    (SymbolKind::Module, "module"),
+    (SymbolKind::Namespace, "namespace"),
+    (SymbolKind::Package, "package"),
+    (SymbolKind::Class, "class"),
+    (SymbolKind::Method, "method"),
+    (SymbolKind::Property, "property"),
+    (SymbolKind::Field, "field"),
+    (SymbolKind::Constructor, "constructor"),
+    (SymbolKind::Enum, "enum"),
+    (SymbolKind::Interface, "interface"),
+    (SymbolKind::Function, "function"),
+    (SymbolKind::Variable, "variable"),
+    (SymbolKind::Constant, "constant"),
+    (SymbolKind::String, "string"),
+    (SymbolKind::Number, "number"),
+    (SymbolKind::Boolean, "boolean"),
+    (SymbolKind::Array, "array"),
+    (SymbolKind::Object, "object"),
+    (SymbolKind::Key, "key"),
+    (SymbolKind::Null, "null"),
+    (SymbolKind::EnumMember, "enummember"),
+    (SymbolKind::Struct, "struct"),
+    (SymbolKind::Event, "event"),
+    (SymbolKind::Operator, "operator"),
+    (SymbolKind::TypeParameter, "typeparameter"),
 ];
+
+/// The kinds of [`SUPPORTED_SYMBOL_KINDS`] as the `initialize` request lists them.
+fn advertised_symbol_kinds() -> Vec<SymbolKind> {
+    SUPPORTED_SYMBOL_KINDS
+        .iter()
+        .map(|&(kind, _)| kind)
+        .collect()
+}
 
 /// Windows-only additions to [`ENV_PASSTHROUGH`].
 ///
@@ -387,7 +394,8 @@ impl ServerInitConfig {
 
     /// The config a respawn of this server spawns from.
     ///
-    /// Called by every respawn right before it spawns. A tsserver pin mcpls
+    /// Called by every respawn right before it spawns; the filesystem work
+    /// runs on the blocking pool and only for an auto-pinned server. A tsserver pin mcpls
     /// chose whose canonical path changed (the install was upgraded, moved or
     /// retargeted through a symlink) is resolved again and, in untrusted mode,
     /// checked against the boundary it was first vetted against. A pin the
@@ -399,7 +407,22 @@ impl ServerInitConfig {
     /// tsserver now resolves inside the workspace, or the server is now
     /// launched in a way no tsserver can be pinned for (the same two checks
     /// startup makes).
-    pub(crate) fn for_respawn(&self) -> Result<Self> {
+    pub(crate) async fn for_respawn(&self) -> Result<Self> {
+        if self.auto_pin.is_none() {
+            return Ok(self.clone());
+        }
+        let config = self.clone();
+        crate::on_blocking_pool(move || config.plan_respawn())
+            .await
+            .map_err(|source| Error::TaskFailed {
+                task: crate::error::BackgroundTask::ServerPlanning,
+                source,
+            })?
+    }
+
+    /// The blocking half of [`Self::for_respawn`]: canonicalizes the pin and
+    /// re-plans the tsserver, so it runs on the blocking pool.
+    pub(crate) fn plan_respawn(&self) -> Result<Self> {
         let Some(pin) = self
             .auto_pin
             .as_ref()
@@ -416,7 +439,7 @@ impl ServerInitConfig {
             }
             if plan.has_unpinnable_launcher() {
                 return Err(self.refusal(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                    command: self.server_config.command.to_string(),
+                    command: self.server_config.command.server_command().clone(),
                 }));
             }
         }
@@ -436,7 +459,7 @@ impl ServerInitConfig {
         Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
             server_id: self.server_config.id(),
             language_id: self.server_config.language_id.clone(),
-            command: self.server_config.command.to_string(),
+            command: self.server_config.command.server_command().clone(),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         }))
     }
@@ -844,7 +867,7 @@ impl LspServer {
                 document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
                     dynamic_registration: Some(false),
                     symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
-                        value_set: Some(SUPPORTED_SYMBOL_KINDS.to_vec()),
+                        value_set: Some(advertised_symbol_kinds()),
                     }),
                     hierarchical_document_symbol_support: Some(true),
                     ..Default::default()
@@ -1253,7 +1276,7 @@ async fn contain(
 ) -> ServerStartOutcome {
     let server_id = config.server_config.id();
     let language_id = config.server_config.language_id.clone();
-    let command = config.server_config.command.clone();
+    let command = config.server_config.command.server_command().clone();
     let started = Instant::now();
 
     let reason = match crate::util::catch_panic(start).await {
@@ -1290,7 +1313,7 @@ async fn contain(
     ServerStartOutcome::Failed(ServerSpawnFailure {
         server_id,
         language_id,
-        command: command.to_string(),
+        command,
         reason,
     })
 }
@@ -1729,7 +1752,7 @@ mod tests {
         let config = ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pyright-langserver"),
+                command: ServerCommand::from_static("pyright-langserver").into(),
                 args: vec!["--stdio".to_string()],
                 env,
                 file_patterns: vec![FilePattern::from_static("**/*.py")],
@@ -1741,7 +1764,6 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             WorkspaceRoots::for_test(vec![PathBuf::from("/workspace")], vec![]),
             PositionEncodings::DEFAULT,
@@ -1926,7 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_nonexistent_command_is_server_not_found() {
         let mut server_config = LspServerConfig::rust_analyzer();
-        server_config.command = ServerCommand::from_static("nonexistent-lsp-cmd-xyz");
+        server_config.command = ServerCommand::from_static("nonexistent-lsp-cmd-xyz").into();
         let config = ServerInitConfig::new(
             server_config,
             WorkspaceRoots::default(),
@@ -2645,7 +2667,7 @@ sleep 5
             );
             assert_eq!(
                 document_symbol.symbol_kind.unwrap().value_set,
-                Some(SUPPORTED_SYMBOL_KINDS.to_vec())
+                Some(advertised_symbol_kinds())
             );
 
             write_success_response(
@@ -2663,7 +2685,7 @@ sleep 5
             let temp_dir = TempDir::new().unwrap();
             let base = dunce::canonicalize(temp_dir.path()).unwrap();
             let workspace_roots =
-                crate::bridge::WorkspaceRoots::from_configured_with(&[PathBuf::from(".")], || {
+                crate::bridge::WorkspaceRoots::from_paths_with(&[PathBuf::from(".")], || {
                     Ok(crate::bridge::ProcessCwd::new(base.clone(), None))
                 })
                 .unwrap()
@@ -2706,7 +2728,7 @@ sleep 5
     fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
-            command: ServerCommand::from_static("irrelevant-for-build-command"),
+            command: ServerCommand::from_static("irrelevant-for-build-command").into(),
             args: vec![],
             env,
             file_patterns: vec![],
@@ -2718,7 +2740,6 @@ sleep 5
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -2819,8 +2840,8 @@ sleep 5
         );
     }
 
-    #[test]
-    fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
+    #[tokio::test]
+    async fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
         let mut server_config = LspServerConfig::typescript();
         server_config.initialization_options =
             Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
@@ -2835,12 +2856,33 @@ sleep 5
             Some(PathBuf::from("/pin/tsserver.js"))
         );
 
-        let respawn = config.for_respawn().unwrap();
+        let respawn = config.for_respawn().await.unwrap();
         assert_eq!(
             respawn.server_config().initialization_options,
             config.server_config().initialization_options
         );
         assert_eq!(respawn.pinned_tsserver(), config.pinned_tsserver());
+    }
+
+    /// An auto-pinned server is re-planned on the blocking pool and the result
+    /// keeps the entry's identity; a pin that no longer resolves is dropped.
+    #[tokio::test]
+    async fn test_for_respawn_replans_an_auto_pinned_server_off_the_runtime() {
+        let mut server_config = LspServerConfig::typescript();
+        server_config.initialization_options =
+            Some(serde_json::json!({"tsserver": {"path": "/mcpls-test/stale/tsserver.js"}}));
+        let config = ServerInitConfig::new(
+            server_config,
+            WorkspaceRoots::default(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        )
+        .with_auto_pin(PathBuf::from("/mcpls-test/stale/tsserver.js"), None);
+
+        let respawn = config.for_respawn().await.unwrap();
+
+        assert_eq!(respawn.server_config().id(), config.server_config().id());
+        assert_ne!(respawn.pinned_tsserver(), config.pinned_tsserver());
     }
 
     /// Regression test for #247: `LspServerConfig::env` entries must reach
@@ -2894,11 +2936,11 @@ sleep 5
         use crate::bridge::Translator;
         use crate::config::{ServerId, ToolKind, ToolRouter};
 
-        let pylsp_id = ServerId::from("pylsp");
+        let pylsp_id = ServerId::from_static("pylsp");
         let configs = vec![
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pyright-langserver"),
+                command: ServerCommand::from_static("pyright-langserver").into(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2907,14 +2949,13 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from("pyright-diag")),
+                name: Some(ServerId::from_static("pyright-diag")),
                 handles: Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap()),
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
-                command: ServerCommand::from_static("pylsp"),
+                command: ServerCommand::from_static("pylsp").into(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
                 file_patterns: vec![],
@@ -2923,24 +2964,23 @@ sleep 5
                 timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
                 heuristics: None,
-                name: Some(ServerId::from("pylsp")),
+                name: Some(ServerId::from_static("pylsp")),
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             },
         ];
         let router = ToolRouter::from_configs(&configs).unwrap();
         let translator = Translator::new().with_router(router);
         translator.set_expected_servers(
-            [ServerId::from("pyright-diag"), pylsp_id.clone()]
+            [ServerId::from_static("pyright-diag"), pylsp_id.clone()]
                 .into_iter()
                 .collect(),
         );
 
         translator.settle_failed(&ServerSpawnFailure {
-            server_id: ServerId::from("pyright-diag"),
+            server_id: ServerId::from_static("pyright-diag"),
             language_id: LanguageId::from_static("python"),
-            command: "pyright-langserver".to_string(),
+            command: ServerCommand::from_static("pyright-langserver"),
             reason: StartupFailure::InitTaskPanicked,
         });
         translator.settle_started(fake_lsp_server_with_config(configs[1].clone()));

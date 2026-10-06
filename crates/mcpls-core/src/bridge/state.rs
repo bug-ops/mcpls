@@ -3,7 +3,7 @@
 //! Tracks open documents and their versions for LSP synchronization.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -21,7 +21,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
-use crate::config::{DocumentLimit, FileExtension, LanguageId, ServerId, SizeLimit};
+use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
 use crate::util::{
@@ -100,6 +100,9 @@ pub(super) struct DocumentText {
     stride: usize,
     /// `checkpoints[k]` is the byte offset where line `k * stride` starts.
     checkpoints: Box<[usize]>,
+    /// Number of lines, saturating at `u32::MAX`; at least 1, since empty
+    /// content has line 0.
+    line_count: NonZeroU32,
 }
 
 impl std::fmt::Debug for DocumentText {
@@ -131,10 +134,16 @@ impl DocumentText {
                 checkpoints.push(start);
             }
         }
+        let line_count = u32::try_from(line)
+            .ok()
+            .and_then(|last| last.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .unwrap_or(NonZeroU32::MAX);
         Self {
             content,
             stride,
             checkpoints: checkpoints.into_boxed_slice(),
+            line_count,
         }
     }
 
@@ -152,6 +161,11 @@ impl DocumentText {
     /// The full text.
     pub(super) fn as_str(&self) -> &str {
         &self.content
+    }
+
+    /// The 1-based number of the last line, which is also the line count.
+    pub(super) const fn last_line(&self) -> NonZeroU32 {
+        self.line_count
     }
 
     /// The 0-based `n`'th line without its terminator, or `None` if there is
@@ -515,7 +529,10 @@ pub enum LinePresence {
     /// The document has the line.
     Present,
     /// The document is tracked and ends before the line.
-    Beyond,
+    Beyond {
+        /// The 1-based number of the document's last line.
+        last_line: NonZeroU32,
+    },
 }
 
 /// Tracks document state across the workspace.
@@ -552,8 +569,8 @@ pub struct DocumentTracker {
     generations: StdMutex<HashMap<ServerId, u64>>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
-    /// Custom file extension to language ID mappings.
-    extension_map: HashMap<FileExtension, LanguageId>,
+    /// File extension and name to language ID mappings.
+    language_map: LanguageMap,
     /// `didClose` notifications owed after `Self::open`'s LRU eviction (#495),
     /// per path and server. See [`PendingClose`].
     ///
@@ -566,16 +583,16 @@ pub struct DocumentTracker {
 }
 
 impl DocumentTracker {
-    /// Create a new document tracker with custom limits and extension mappings.
+    /// Create a new document tracker with custom limits and language mappings.
     #[must_use]
-    pub fn new(limits: ResourceLimits, extension_map: HashMap<FileExtension, LanguageId>) -> Self {
+    pub fn new(limits: ResourceLimits, language_map: impl Into<LanguageMap>) -> Self {
         Self {
             documents: StdMutex::new(HashMap::new()),
             path_locks: StdMutex::new(HashMap::new()),
             in_flight: Arc::default(),
             generations: StdMutex::new(HashMap::new()),
             limits,
-            extension_map,
+            language_map: language_map.into(),
             pending_closes: StdMutex::new(HashMap::new()),
             next_opening: AtomicU64::new(0),
         }
@@ -668,7 +685,9 @@ impl DocumentTracker {
         match lock_std(&self.documents).get(path) {
             None => LinePresence::Untracked,
             Some(document) if document.text.line(line).is_some() => LinePresence::Present,
-            Some(_) => LinePresence::Beyond,
+            Some(document) => LinePresence::Beyond {
+                last_line: document.text.last_line(),
+            },
         }
     }
 
@@ -755,7 +774,7 @@ impl DocumentTracker {
         self.check_file_size(text.as_str().len() as u64)?;
 
         let uri = path_to_uri(&path)?;
-        let language_id = detect_language(&path, &self.extension_map);
+        let language_id = self.language_map.detect(&path);
 
         let opened = self.next_opening.fetch_add(1, Ordering::Relaxed);
         let state = DocumentState::new(uri.clone(), language_id, text, opened);
@@ -845,10 +864,7 @@ impl DocumentTracker {
         if let Some(max) = self.limits.max_file_size.get()
             && size > max.get()
         {
-            return Err(Error::FileSizeLimitExceeded {
-                size,
-                max: max.get(),
-            });
+            return Err(Error::FileSizeLimitExceeded { size, max });
         }
         Ok(())
     }
@@ -1290,10 +1306,7 @@ impl DocumentTracker {
             .await
             .map_err(io_err)?;
         check_bounded_utf8(buf, max).map_err(|e| match e {
-            BoundedUtf8Error::TooLarge { size } => Error::FileSizeLimitExceeded {
-                size,
-                max: max.get().map_or(0, NonZeroU64::get),
-            },
+            BoundedUtf8Error::TooLarge { size, max } => Error::FileSizeLimitExceeded { size, max },
             BoundedUtf8Error::InvalidUtf8(e) => {
                 io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             }
@@ -1813,28 +1826,19 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     url.to_file_path().ok()
 }
 
-/// Detect the language ID from a file path.
-///
-/// Consults the extension map to determine the language ID for a file.
-/// If the extension is not found in the map, returns [`LanguageId::PLAINTEXT`].
-#[must_use]
-pub fn detect_language(
-    path: &Path,
-    extension_map: &HashMap<FileExtension, LanguageId>,
-) -> LanguageId {
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    extension_map
-        .get(extension)
-        .cloned()
-        .unwrap_or(LanguageId::PLAINTEXT)
-}
-
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::FileExtension;
+
+    fn detect_language(
+        path: &Path,
+        extension_map: &HashMap<FileExtension, LanguageId>,
+    ) -> LanguageId {
+        LanguageMap::from(extension_map.clone()).detect(path)
+    }
 
     #[test]
     fn test_detect_language() {
@@ -1899,8 +1903,8 @@ mod tests {
             .open(path.clone(), "fn main() {}".to_string())
             .unwrap();
 
-        let respawned = ServerId::from("rust-respawned");
-        let untouched = ServerId::from("rust-diagnostics");
+        let respawned = ServerId::from_static("rust-respawned");
+        let untouched = ServerId::from_static("rust-diagnostics");
         lock_std(&tracker.documents)
             .get_mut(&path)
             .unwrap()
@@ -1937,7 +1941,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         let generation_before_respawn = 0; // fresh tracker: generation starts at 0
 
         // A respawn happens "concurrently" with the in-flight call that
@@ -1977,7 +1981,7 @@ mod tests {
         std::fs::write(&path, "fn main() {}").unwrap();
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         let (client, _guard) = fake_lsp_client();
 
         tracker.ensure_open(&path, &server, &client).await.unwrap();
@@ -2092,7 +2096,7 @@ mod tests {
         set_mtime(&path, settled_past());
         let (client, _server) = fake_lsp_client();
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         path
@@ -2127,7 +2131,7 @@ mod tests {
         assert_eq!(tracker.pending_close_paths(), vec![path_a.clone()]);
         assert_eq!(
             pending_servers(&tracker, &path_a),
-            HashSet::from([ServerId::from("rust")])
+            HashSet::from([ServerId::from_static("rust")])
         );
     }
 
@@ -2224,7 +2228,7 @@ mod tests {
         };
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         tracker
             .ensure_open(&path_a, &server_id, &client)
@@ -2378,13 +2382,21 @@ mod tests {
         assert_eq!(tracker.line_presence(&path, 0), LinePresence::Present);
         assert_eq!(tracker.line_presence(&path, 1), LinePresence::Present);
         assert_eq!(tracker.line_presence(&path, 2), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&path, 3), LinePresence::Beyond);
-        assert_eq!(tracker.line_presence(&path, u32::MAX), LinePresence::Beyond);
+        let beyond = LinePresence::Beyond {
+            last_line: NonZeroU32::new(3).unwrap(),
+        };
+        assert_eq!(tracker.line_presence(&path, 3), beyond);
+        assert_eq!(tracker.line_presence(&path, u32::MAX), beyond);
 
         let empty = PathBuf::from("/test/empty.rs");
         tracker.open(empty.clone(), String::new()).unwrap();
         assert_eq!(tracker.line_presence(&empty, 0), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&empty, 1), LinePresence::Beyond);
+        assert_eq!(
+            tracker.line_presence(&empty, 1),
+            LinePresence::Beyond {
+                last_line: NonZeroU32::MIN
+            }
+        );
     }
 
     #[test]
@@ -3179,13 +3191,13 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         let uri1 = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
         let uri2 = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(uri1, uri2);
@@ -3203,7 +3215,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3211,7 +3223,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3229,7 +3241,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3242,7 +3254,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3264,7 +3276,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3278,7 +3290,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3296,7 +3308,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3304,7 +3316,7 @@ mod tests {
         // immediately, proving the debounce never gates the stat itself.
         std::fs::write(&path, "BBBBBBBB").unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3323,7 +3335,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3333,14 +3345,14 @@ mod tests {
 
         // Inside the debounce window: the re-read is gated, cache wins.
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version(), 1);
 
         tokio::time::advance(Duration::from_millis(300)).await;
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3358,14 +3370,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
         std::fs::remove_file(&path).unwrap();
 
         let result = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
         assert!(tracker.is_open(&path));
@@ -3387,14 +3399,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
         std::fs::write(&path, "x".repeat(100)).unwrap();
 
         let result = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
         assert_eq!(tracker.get(&path).unwrap().content(), "small");
@@ -3415,14 +3427,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.len(), 1);
 
         std::fs::write(&path, "BBBBBBBB").unwrap();
         let result = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert!(
             result.is_ok(),
@@ -3449,7 +3461,7 @@ mod tests {
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let result = tracker
-            .ensure_open(&path, &ServerId::from("rust"), &notify_will_fail)
+            .ensure_open(&path, &ServerId::from_static("rust"), &notify_will_fail)
             .await;
 
         assert!(result.is_err(), "notify failure must propagate as an error");
@@ -3470,7 +3482,7 @@ mod tests {
         let (client, mut server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3481,7 +3493,7 @@ mod tests {
         std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
         set_mtime(&path, settled_past());
         tracker
-            .ensure_open(&path, &ServerId::from("rust"), &client)
+            .ensure_open(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3516,8 +3528,8 @@ mod tests {
         let (client_b, mut server_b) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
-        let id_a = ServerId::from("server-a");
-        let id_b = ServerId::from("server-b");
+        let id_a = ServerId::from_static("server-a");
+        let id_b = ServerId::from_static("server-b");
 
         tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
         let mut wire_a = BufReader::new(&mut server_a.write_stdout);
@@ -3550,7 +3562,7 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         tracker
-            .ensure_open(&path, &ServerId::from("server-a"), &client_a)
+            .ensure_open(&path, &ServerId::from_static("server-a"), &client_a)
             .await
             .unwrap();
 
@@ -3559,7 +3571,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from("server-b"), &client_b)
+            .ensure_open(&path, &ServerId::from_static("server-b"), &client_b)
             .await
             .unwrap();
         let mut wire_b = BufReader::new(&mut server_b.write_stdout);
@@ -3582,7 +3594,7 @@ mod tests {
 
         let (client, mut server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
 
         tracker.ensure_open(&path, &id, &client).await.unwrap();
         tracker.ensure_open(&path, &id, &client).await.unwrap();
@@ -3610,8 +3622,8 @@ mod tests {
         let (client_a, _server_a) = fake_lsp_client();
         let (client_b, _server_b) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
-        let id_a = ServerId::from("server-a");
-        let id_b = ServerId::from("server-b");
+        let id_a = ServerId::from_static("server-a");
+        let id_b = ServerId::from_static("server-b");
 
         tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
         tracker.ensure_open(&path, &id_b, &client_b).await.unwrap();
@@ -3699,7 +3711,11 @@ mod tests {
         let path_a_for_task = path_a.clone();
         let handle_a = tokio::spawn(async move {
             tracker_for_a
-                .ensure_open(&path_a_for_task, &ServerId::from("server-a"), &client_a)
+                .ensure_open(
+                    &path_a_for_task,
+                    &ServerId::from_static("server-a"),
+                    &client_a,
+                )
                 .await
         });
 
@@ -3711,7 +3727,7 @@ mod tests {
         // ensure_open -- the exact regression #227 fixes.
         tokio::time::timeout(
             Duration::from_secs(5),
-            tracker.ensure_open(&path_b, &ServerId::from("server-b"), &client_b),
+            tracker.ensure_open(&path_b, &ServerId::from_static("server-b"), &client_b),
         )
         .await
         .unwrap()
@@ -3740,7 +3756,7 @@ mod tests {
             ResourceLimits::default(),
             HashMap::new(),
         ));
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -3795,7 +3811,7 @@ mod tests {
             ResourceLimits::default(),
             HashMap::new(),
         ));
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
 
         let mut handles = Vec::new();
         let mut servers = Vec::new();
@@ -3900,7 +3916,7 @@ mod tests {
         let result = tracker.read_to_string_checked(&path).await;
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { size: 11, max: 10 })
+            Err(Error::FileSizeLimitExceeded { size: 11, max }) if max.get() == 10
         );
     }
 
@@ -4469,7 +4485,7 @@ mod tests {
         let mut out = Vec::new();
         for server in servers {
             let (client, fake) = fake_lsp_client();
-            let id = ServerId::from(*server);
+            let id = ServerId::new(*server).unwrap();
             tracker.ensure_open(&path, &id, &client).await.unwrap();
             out.push((id, client, fake));
         }
@@ -4483,7 +4499,7 @@ mod tests {
         set_mtime(&path, settled_past());
         let (client, _fake) = fake_lsp_client();
         tracker
-            .ensure_open(&path, &ServerId::from("other"), &client)
+            .ensure_open(&path, &ServerId::from_static("other"), &client)
             .await
             .unwrap();
     }
@@ -4508,7 +4524,7 @@ mod tests {
         evict_by_opening(&tracker, &dir, "q.rs").await;
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("a"), ServerId::from("d")])
+            HashSet::from([ServerId::from_static("a"), ServerId::from_static("d")])
         );
 
         let (id_a, client_a, mut fake_a) = servers.remove(0);
@@ -4530,10 +4546,10 @@ mod tests {
 
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("d")])
+            HashSet::from([ServerId::from_static("d")])
         );
         let claim = tracker.try_claim_pending_close(&path).unwrap();
-        assert_eq!(claim.servers, vec![ServerId::from("d")]);
+        assert_eq!(claim.servers, vec![ServerId::from_static("d")]);
     }
 
     /// #515: evict then flush hands out every owed close exactly once.
@@ -4549,7 +4565,10 @@ mod tests {
         assert_eq!(claim.path, path);
         let mut claimed = claim.servers.clone();
         claimed.sort_by_key(ToString::to_string);
-        assert_eq!(claimed, vec![ServerId::from("a"), ServerId::from("d")]);
+        assert_eq!(
+            claimed,
+            vec![ServerId::from_static("a"), ServerId::from_static("d")]
+        );
         drop(claim);
 
         assert!(tracker.pending_close_paths().is_empty());
@@ -4568,7 +4587,7 @@ mod tests {
         assert!(tracker.try_claim_pending_close(&path).is_none());
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("a")]),
+            HashSet::from([ServerId::from_static("a")]),
             "a deferred claim must leave the debt pending"
         );
         drop(busy);
@@ -4595,7 +4614,7 @@ mod tests {
             let path = path.clone();
             tokio::spawn(async move {
                 tracker
-                    .ensure_open(&path, &ServerId::from("b"), &client)
+                    .ensure_open(&path, &ServerId::from_static("b"), &client)
                     .await
             })
         };
@@ -4619,7 +4638,7 @@ mod tests {
 
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("a"), ServerId::from("d")])
+            HashSet::from([ServerId::from_static("a"), ServerId::from_static("d")])
         );
         assert_eq!(tracker.pending_close_paths().len(), 2);
     }
@@ -4632,7 +4651,7 @@ mod tests {
         let tracker = one_document_tracker();
         let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
         evict_by_opening(&tracker, &dir, "q.rs").await;
-        let server = ServerId::from("a");
+        let server = ServerId::from_static("a");
         let uri = path_to_uri(&path).unwrap();
 
         let generation = tracker.generation(&server);
@@ -4654,12 +4673,12 @@ mod tests {
         let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
         evict_by_opening(&tracker, &dir, "q.rs").await;
 
-        tracker.forget_server(&ServerId::from("a"));
+        tracker.forget_server(&ServerId::from_static("a"));
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("d")])
+            HashSet::from([ServerId::from_static("d")])
         );
-        tracker.forget_server(&ServerId::from("d"));
+        tracker.forget_server(&ServerId::from_static("d"));
         assert!(!lock_std(&tracker.pending_closes).contains_key(&path));
     }
 
@@ -4677,7 +4696,7 @@ mod tests {
         assert!(tracker.ensure_open(&path, &id_a, &will_fail).await.is_err());
         assert_eq!(
             pending_servers(&tracker, &path),
-            HashSet::from([ServerId::from("a")])
+            HashSet::from([ServerId::from_static("a")])
         );
     }
 }

@@ -5,10 +5,9 @@ use std::path::{Path, PathBuf};
 
 use super::Translator;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
-use crate::bridge::state::detect_language;
 use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath};
 use crate::config::{
-    FileExtension, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
+    FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
@@ -805,10 +804,7 @@ impl Translator {
                 } else {
                     Err(Error::NoServerForLanguage {
                         language,
-                        extension: path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .and_then(|ext| FileExtension::new(ext).ok()),
+                        file: FileKey::of(path),
                         patterns: self.file_patterns.to_vec(),
                     })
                 }
@@ -818,7 +814,7 @@ impl Translator {
 
     /// The detected language of `path` plus its React base-language fallback.
     pub(super) fn language_candidates(&self, path: &Path) -> LanguageCandidates {
-        LanguageCandidates::new(detect_language(path, &self.extension_map))
+        LanguageCandidates::new(self.language_map.detect(path))
     }
 
     /// The startup failure of the server the pre-rebind routing table would
@@ -1022,7 +1018,9 @@ impl Translator {
             .line_presence(doc.path(), line.get().saturating_sub(1))
         {
             LinePresence::Present => Ok(()),
-            LinePresence::Beyond => Err(Error::PositionBeyondDocument { line }),
+            LinePresence::Beyond { last_line } => {
+                Err(Error::PositionBeyondDocument { line, last_line })
+            }
             LinePresence::Untracked => {
                 tracing::debug!(
                     line = line.get(),
@@ -1311,8 +1309,8 @@ mod tests {
     use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
         DocumentLimit, FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId,
-        LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit, TimeoutSecs,
-        ToolRouter, ToolSet,
+        LanguageMap, LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit,
+        TimeoutSecs, ToolRouter, ToolSet,
     };
     use crate::error::Error;
     use crate::lsp::LspServer;
@@ -1326,7 +1324,7 @@ mod tests {
         // yet (large solution still loading via OmniSharp) must surface
         // ServerInitializing — "wait and retry" — not NoServerForLanguage.
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &HashMap::new());
+        let lang = LanguageMap::default().detect(&path);
         let id = ServerId::from(lang.clone());
 
         let translator = Translator::new().with_router(ToolRouter::catch_all([(
@@ -1349,7 +1347,7 @@ mod tests {
         // stays NoServerForLanguage.
         let translator = Translator::new();
         let path = PathBuf::from("/ws/Assets/Scripts/Player.cs");
-        let lang = detect_language(&path, &translator.extension_map);
+        let lang = translator.language_map.detect(&path);
 
         let err = translator
             .client_for_file(&path, ToolKind::Hover)
@@ -1363,7 +1361,7 @@ mod tests {
         ServerSpawnFailure {
             server_id: id.clone(),
             language_id: LanguageId::new(language).unwrap(),
-            command: command.to_string(),
+            command: ServerCommand::new(command).unwrap(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                 command: command.to_string(),
                 source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1378,7 +1376,7 @@ mod tests {
     ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::new(language).unwrap(),
-            command: ServerCommand::from_static("sh"),
+            command: ServerCommand::from_static("sh").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -1387,10 +1385,9 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(5).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(5).unwrap(),
             heuristics: None,
-            name: Some(ServerId::from(name)),
+            name: Some(ServerId::new(name).unwrap()),
             handles: handles.map(|tools| ToolSet::new(tools).unwrap()),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         }
     }
 
@@ -1399,7 +1396,7 @@ mod tests {
     /// "no LSP server configured".
     #[test]
     fn test_client_for_file_reports_startup_failure_of_sole_server() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -1427,7 +1424,7 @@ mod tests {
 
     #[test]
     fn test_client_for_file_ignores_startup_failure_of_other_language() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -1454,8 +1451,8 @@ mod tests {
             router_config("rust", "catch-all", None),
         ];
         let router = ToolRouter::from_configs(configs.iter()).unwrap();
-        let hover_id = ServerId::from("hover-only");
-        let live_id = ServerId::from("catch-all");
+        let hover_id = ServerId::from_static("hover-only");
+        let live_id = ServerId::from_static("catch-all");
 
         let translator = Translator::new()
             .with_extensions(test_extensions())
@@ -1482,8 +1479,8 @@ mod tests {
             router_config("rust", "catch-all", None),
         ];
         let router = ToolRouter::from_configs(configs.iter()).unwrap();
-        let hover_id = ServerId::from("hover-only");
-        let failed_id = ServerId::from("catch-all");
+        let hover_id = ServerId::from_static("hover-only");
+        let failed_id = ServerId::from_static("catch-all");
 
         let translator = Translator::new()
             .with_extensions(test_extensions())
@@ -1507,7 +1504,7 @@ mod tests {
     /// of the `typescript` server is reported for it too.
     #[test]
     fn test_client_for_file_reports_startup_failure_through_react_base_language() {
-        let id = ServerId::from("typescript");
+        let id = ServerId::from_static("typescript");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -1548,7 +1545,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().to_path_buf();
-        translator.set_workspace_roots(WorkspaceRoots::from_configured(&[workspace_root]).unwrap());
+        translator.set_workspace_roots(WorkspaceRoots::from_paths(&[workspace_root]).unwrap());
 
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1565,7 +1562,7 @@ mod tests {
 
         // Set workspace root to temp_dir1
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir1.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir1.path().to_path_buf()]).unwrap(),
         );
 
         // Create file in temp_dir2 (outside workspace)
@@ -1582,7 +1579,7 @@ mod tests {
     fn test_validate_path_nonexistent_outside_path_is_outside_workspace() {
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(outside.path().join("missing.rs")))
@@ -1594,7 +1591,7 @@ mod tests {
     #[test]
     fn test_validate_path_dotdot_escape_is_outside_workspace() {
         let root = TempDir::new().unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("../escape.rs")))
@@ -1608,7 +1605,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         fs::create_dir(root.path().join("a")).unwrap();
         fs::write(root.path().join("b.rs"), "").unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("./a/../b.rs")))
@@ -1710,7 +1707,7 @@ mod tests {
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.rs"), "").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let roots = WorkspaceRoots::from_configured(&[root.path().to_path_buf()]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root.path().to_path_buf()]).unwrap();
 
         let result = roots
             .validate_blocking(&client_path(root.path().join("link/secret.rs")))
@@ -1734,7 +1731,7 @@ mod tests {
     async fn test_handle_hover_blocked_when_path_outside_workspace() {
         let workspace_dir = TempDir::new().unwrap();
         let outside_dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &workspace_dir,
             &server_id,
@@ -1770,7 +1767,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("test.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1791,7 +1788,7 @@ mod tests {
         let mut translator = Translator::new();
         let temp_dir = TempDir::new().unwrap();
         translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
         );
         let test_file = temp_dir.path().join("my file café.rs");
         fs::write(&test_file, "fn main() {}").unwrap();
@@ -1834,17 +1831,34 @@ mod tests {
         let result = translator.client_for_file(&test_file, ToolKind::Hover);
 
         assert!(result.is_err());
-        if let Err(Error::NoServerForLanguage {
-            language,
-            extension,
-            ..
-        }) = result
-        {
+        if let Err(Error::NoServerForLanguage { language, file, .. }) = result {
             assert_eq!(language, "nushell");
-            assert_eq!(extension, Some(FileExtension::from_static("nu")));
+            assert_eq!(file, FileKey::Extension(FileExtension::from_static("nu")));
         } else {
             panic!("Expected NoServerForLanguage(nushell) error");
         }
+    }
+
+    #[test]
+    fn test_client_for_file_reports_an_extensionless_name() {
+        let mut language_map = LanguageMap::default();
+        language_map.insert(
+            crate::config::PatternTarget::Name(crate::config::FileName::from_static("Makefile")),
+            LanguageId::from_static("make"),
+        );
+        let translator = Translator::new().with_extensions(language_map);
+
+        let result = translator.client_for_file(Path::new("/ws/Makefile"), ToolKind::Hover);
+        assert_matches!(
+            result,
+            Err(Error::NoServerForLanguage { language, .. }) if language == "make"
+        );
+
+        let result = translator.client_for_file(Path::new("/ws/Dockerfile"), ToolKind::Hover);
+        assert_matches!(
+            result,
+            Err(Error::NoServerForLanguage { file: FileKey::Name(name), .. }) if name == "Dockerfile"
+        );
     }
 
     #[test]
@@ -1868,12 +1882,12 @@ mod tests {
         assert!(result.is_err());
         if let Err(Error::NoServerForLanguage {
             language,
-            extension,
+            file,
             patterns,
         }) = result
         {
             assert_eq!(language, "plaintext");
-            assert_eq!(extension, Some(FileExtension::from_static("xyz")));
+            assert_eq!(file, FileKey::Extension(FileExtension::from_static("xyz")));
             assert_eq!(patterns, ["**/*.rs"]);
         } else {
             panic!("Expected NoServerForLanguage(plaintext) error");
@@ -1895,11 +1909,11 @@ mod tests {
         let translator = Translator::new()
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("typescript"),
+                ServerId::from_static("typescript"),
                 LanguageId::from_static("typescript"),
             )]));
         translator.register_client(
-            "typescript".to_string(),
+            ServerId::from_static("typescript"),
             LspClient::new(crate::config::LspServerConfig::typescript()),
         );
 
@@ -1923,7 +1937,7 @@ mod tests {
 
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
-            command: ServerCommand::from_static("typescript-language-server"),
+            command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec![FilePattern::from_static("**/*.tsx")],
@@ -1935,27 +1949,26 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
 
         let translator = Translator::new()
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([
                 (
-                    ServerId::from("typescript"),
+                    ServerId::from_static("typescript"),
                     LanguageId::from_static("typescript"),
                 ),
                 (
-                    ServerId::from("typescriptreact"),
+                    ServerId::from_static("typescriptreact"),
                     LanguageId::from_static("typescriptreact"),
                 ),
             ]));
         translator.register_client(
-            "typescript".to_string(),
+            ServerId::from_static("typescript"),
             LspClient::new(crate::config::LspServerConfig::typescript()),
         );
         translator.register_client(
-            LanguageId::from_static("typescriptreact"),
+            ServerId::from(LanguageId::from_static("typescriptreact")),
             LspClient::new(typescript_react_config),
         );
 
@@ -1970,7 +1983,7 @@ mod tests {
     /// client behind the id without unregistering it.
     #[test]
     fn test_diagnostics_route_for_path_live_when_registered() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -1995,7 +2008,7 @@ mod tests {
     /// retryable "still starting", not as an empty cache.
     #[test]
     fn test_diagnostics_route_for_path_initializing_while_expected() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -2019,7 +2032,7 @@ mod tests {
     /// #535: a server that failed to start is reported, not read as empty.
     #[test]
     fn test_diagnostics_route_for_path_failed_to_start() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -2044,7 +2057,7 @@ mod tests {
     /// unrelated language's server does not leak into it.
     #[test]
     fn test_diagnostics_route_for_path_unrouted_reads_empty() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -2065,7 +2078,7 @@ mod tests {
     /// is logged and treated as unrouted.
     #[test]
     fn test_diagnostics_route_for_path_dangling_is_unrouted() {
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -2087,8 +2100,8 @@ mod tests {
             router_config("rust", "catch-all", None),
         ];
         let router = ToolRouter::from_configs(configs.iter()).unwrap();
-        let failed_id = ServerId::from("diag-only");
-        let live_id = ServerId::from("catch-all");
+        let failed_id = ServerId::from_static("diag-only");
+        let live_id = ServerId::from_static("catch-all");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(router);
@@ -2108,7 +2121,7 @@ mod tests {
     /// The failure is found through the React base language, like routing.
     #[test]
     fn test_diagnostics_route_for_path_reports_failure_through_react_base_language() {
-        let id = ServerId::from("typescript");
+        let id = ServerId::from_static("typescript");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
@@ -2140,7 +2153,7 @@ mod tests {
             Some(vec![ToolKind::Hover]),
         )];
         let router = ToolRouter::from_configs(configs.iter()).unwrap();
-        let failed = ServerId::from("hover-only");
+        let failed = ServerId::from_static("hover-only");
         let translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(router);
@@ -2159,16 +2172,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = dunce::canonicalize(dir.path()).unwrap().join("main.rs");
         fs::write(&file, "fn main() {}").unwrap();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let mut translator = Translator::new()
             .with_extensions(test_extensions())
             .with_router(ToolRouter::catch_all([(
                 id.clone(),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         translator.record_startup_failures(&[not_found_failure(&id, "rust", "sh")]);
         translator.rebind_router(&HashSet::new());
         translator.clear_expected_servers();
@@ -2205,7 +2217,7 @@ mod tests {
         fs::create_dir(&real).unwrap();
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let roots = WorkspaceRoots::from_configured(std::slice::from_ref(&alias)).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&alias)).unwrap();
         AliasFixture {
             dir,
             real,
@@ -2228,7 +2240,7 @@ mod tests {
 
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
-            command: ServerCommand::from_static("typescript-language-server"),
+            command: ServerCommand::from_static("typescript-language-server").into(),
             args: vec!["--stdio".to_string()],
             env: HashMap::new(),
             file_patterns: vec![
@@ -2243,15 +2255,17 @@ mod tests {
             name: None,
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
         let translator = Translator::new()
             .with_extensions(extension_map)
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("javascript"),
+                ServerId::from_static("javascript"),
                 LanguageId::from_static("javascript"),
             )]));
-        translator.register_client("javascript".to_string(), LspClient::new(javascript_config));
+        translator.register_client(
+            ServerId::from_static("javascript"),
+            LspClient::new(javascript_config),
+        );
 
         let (_id, client) = translator
             .client_for_file(&test_file, ToolKind::Hover)
@@ -2277,7 +2291,7 @@ mod tests {
         let config = crate::config::ServerConfig {
             mcp: crate::config::McpConfig::default(),
             workspace: WorkspaceConfig {
-                roots: vec![PathBuf::from("/tmp/test-workspace")],
+                roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                 position_encodings: PositionEncodings::DEFAULT,
                 language_extensions: language_extensions.clone(),
                 heuristics_max_depth: SearchDepth::DEFAULT,
@@ -2291,15 +2305,9 @@ mod tests {
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let extension_map = config.build_effective_extension_map();
-        assert_eq!(
-            extension_map.get("nu"),
-            Some(&LanguageId::from_static("nushell"))
-        );
-        assert_eq!(
-            extension_map.get("rs"),
-            Some(&LanguageId::from_static("rust"))
-        );
+        let language_map = config.build_effective_language_map();
+        assert_eq!(language_map.detect(Path::new("a.nu")), "nushell");
+        assert_eq!(language_map.detect(Path::new("a.rs")), "rust");
 
         // serve() starts in protocol-only mode when no LSP servers are configured;
         // it may return a transport error but must not report a startup failure.
@@ -2336,17 +2344,22 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([
-                    (ServerId::from("lang_a"), LanguageId::from_static("lang_a")),
-                    (ServerId::from("lang_b"), LanguageId::from_static("lang_b")),
+                    (
+                        ServerId::from_static("lang_a"),
+                        LanguageId::from_static("lang_a"),
+                    ),
+                    (
+                        ServerId::from_static("lang_b"),
+                        LanguageId::from_static("lang_b"),
+                    ),
                 ]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_a, mut server_a) = fake_lsp_client();
         let (client_b, mut server_b) = fake_lsp_client();
-        translator.register_client("lang_a".to_string(), client_a);
-        translator.register_client("lang_b".to_string(), client_b);
+        translator.register_client(ServerId::from_static("lang_a"), client_a);
+        translator.register_client(ServerId::from_static("lang_b"), client_b);
 
         let path_a = dir.path().join("file.aa");
         let path_b = dir.path().join("file.bb");
@@ -2429,15 +2442,14 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("lang_a"),
+                    ServerId::from_static("lang_a"),
                     LanguageId::from_static("lang_a"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("lang_a".to_string(), client);
+        translator.register_client(ServerId::from_static("lang_a"), client);
 
         let path = dir.path().join("file.aa");
         fs::write(&path, "content").unwrap();
@@ -2495,19 +2507,18 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("lang_a"),
+                ServerId::from_static("lang_a"),
                 LanguageId::from_static("lang_a"),
             )]))
             .with_resource_limits(ResourceLimits {
                 max_documents: DocumentLimit::new(1),
                 max_file_size: SizeLimit::UNLIMITED,
             });
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, server) = fake_lsp_client();
-        translator.register_client("lang_a".to_string(), client);
+        translator.register_client(ServerId::from_static("lang_a"), client);
         (translator, server)
     }
 
@@ -2525,22 +2536,22 @@ mod tests {
         let other = dir.path().join("q.aa");
         std::fs::write(&other, "q").unwrap();
         let client_a = lock_std(&translator.servers)
-            .client(&ServerId::from("lang_a"))
+            .client(&ServerId::from_static("lang_a"))
             .unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from("lang_a"), &client_a)
+            .ensure_open(&path, &ServerId::from_static("lang_a"), &client_a)
             .await
             .unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from("lang_d"), &client_d)
+            .ensure_open(&path, &ServerId::from_static("lang_d"), &client_d)
             .await
             .unwrap();
         tracker
-            .ensure_open(&other, &ServerId::from("lang_a"), &client_a)
+            .ensure_open(&other, &ServerId::from_static("lang_a"), &client_a)
             .await
             .unwrap();
 
-        translator.register_client("lang_d".to_string(), client_d.clone());
+        translator.register_client(ServerId::from_static("lang_d"), client_d.clone());
         client_d.shutdown().await.unwrap();
 
         translator.flush_pending_closes().await;
@@ -2722,15 +2733,14 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("lang_b"),
+                    ServerId::from_static("lang_b"),
                     LanguageId::from_static("lang_b"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, _server) = fake_lsp_client();
-        translator.register_client("lang_b".to_string(), client.clone());
+        translator.register_client(ServerId::from_static("lang_b"), client.clone());
 
         let path_b = dir.path().join("b.bb");
         fs::write(&path_b, "content b").unwrap();
@@ -2775,21 +2785,26 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(ToolRouter::catch_all([
-                (ServerId::from("lang_a"), LanguageId::from_static("lang_a")),
-                (ServerId::from("lang_b"), LanguageId::from_static("lang_b")),
+                (
+                    ServerId::from_static("lang_a"),
+                    LanguageId::from_static("lang_a"),
+                ),
+                (
+                    ServerId::from_static("lang_b"),
+                    LanguageId::from_static("lang_b"),
+                ),
             ]))
             .with_resource_limits(ResourceLimits {
                 max_documents: DocumentLimit::new(1),
                 max_file_size: SizeLimit::UNLIMITED,
             });
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_a, mut server_a) = fake_lsp_client();
-        translator.register_client("lang_a".to_string(), client_a);
+        translator.register_client(ServerId::from_static("lang_a"), client_a);
         let (client_b, _server_b) = fake_lsp_client();
-        translator.register_client("lang_b".to_string(), client_b.clone());
+        translator.register_client(ServerId::from_static("lang_b"), client_b.clone());
 
         let path_a = dir.path().join("a.aa");
         fs::write(&path_a, "content a").unwrap();
@@ -2849,11 +2864,11 @@ mod tests {
             LanguageId::from_static("python"),
         );
 
-        let pyright_id = ServerId::from("pyright");
-        let pylsp_id = ServerId::from("pylsp");
+        let pyright_id = ServerId::from_static("pyright");
+        let pylsp_id = ServerId::from_static("pylsp");
         let pyright = LspServerConfig {
             language_id: LanguageId::from_static("python"),
-            command: ServerCommand::from_static("pyright-langserver"),
+            command: ServerCommand::from_static("pyright-langserver").into(),
             args: vec![],
             env: HashMap::new(),
             file_patterns: vec![],
@@ -2862,14 +2877,13 @@ mod tests {
             timeout_seconds: TimeoutSecs::new(30).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
             heuristics: None,
-            name: Some(ServerId::from("pyright")),
+            name: Some(ServerId::from_static("pyright")),
             handles: Some(ToolSet::single(ToolKind::Hover)),
             indexing: crate::bridge::IndexingPolicy::Auto,
-            selection: crate::config::ServerSelection::Explicit,
         };
         let pylsp = LspServerConfig {
-            command: ServerCommand::from_static("pylsp"),
-            name: Some(ServerId::from("pylsp")),
+            command: ServerCommand::from_static("pylsp").into(),
+            name: Some(ServerId::from_static("pylsp")),
             handles: Some(ToolSet::single(ToolKind::Diagnostics)),
             ..pyright.clone()
         };
@@ -2879,9 +2893,8 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(extensions)
             .with_router(router);
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client_pyright, mut server_pyright) = fake_lsp_client();
         let (client_pylsp, mut server_pylsp) = fake_lsp_client();
@@ -2958,14 +2971,15 @@ mod tests {
     #[test]
     fn test_require_capability_ok_when_server_not_registered() {
         let translator = Translator::new();
-        let result = translator.require_capability(&ServerId::from("rust"), Capability::Rename);
+        let result =
+            translator.require_capability(&ServerId::from_static("rust"), Capability::Rename);
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_require_capability_ok_when_capability_present() {
         let translator = Translator::new();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()
@@ -2979,7 +2993,7 @@ mod tests {
     #[tokio::test]
     async fn test_require_capability_err_when_capability_absent() {
         let translator = Translator::new();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities::default();
         translator.register_server(server_id.clone(), LspServer::new_for_test(caps));
 
@@ -3010,7 +3024,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_rename_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3040,7 +3054,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_code_actions_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3070,7 +3084,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_signature_help_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3102,7 +3116,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_incoming_calls_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3143,7 +3157,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_outgoing_calls_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3184,7 +3198,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_format_document_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3214,7 +3228,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_call_hierarchy_prepare_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3243,7 +3257,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3272,7 +3286,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_hover_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3301,7 +3315,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3331,7 +3345,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3376,7 +3390,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_completions_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3406,7 +3420,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_document_symbols_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3432,7 +3446,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_workspace_symbol_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3455,7 +3469,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_implementation_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3485,7 +3499,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_type_definition_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3515,7 +3529,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, _server) = translator_with_capabilities(
             &dir,
             &server_id,
@@ -3548,7 +3562,7 @@ mod tests {
     #[tokio::test]
     async fn test_require_capability_err_when_capability_explicitly_false() {
         let translator = Translator::new();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(false)),
             ..Default::default()
@@ -3573,7 +3587,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_rename_proceeds_when_capability_supported() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             rename_provider: Some(lsp_types::RenameProvider::Bool(true)),
             ..Default::default()

@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::Translator;
@@ -122,12 +123,12 @@ async fn await_lsp_init_handle_within(
 /// [`Translator::shutdown_servers`]'s "Limitations" section) — an explicit
 /// trade the operator is asking for, not a case this fix silently regresses.
 pub async fn shutdown(
-    cancel_tx: &tokio::sync::watch::Sender<bool>,
+    cancel: &CancellationToken,
     translator: &Translator,
     lsp_init_handle: Option<JoinHandle<()>>,
 ) {
     translator.begin_shutdown();
-    let _ = cancel_tx.send(true);
+    cancel.cancel();
 
     let mut cleanup_signal = ShutdownSignal::new();
     let force_exit_on_signal = tokio::spawn(async move {
@@ -154,7 +155,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tokio_util::sync::CancellationToken;
+
     use crate::bridge::Translator;
+    use crate::config::ServerId;
 
     /// #241: `serve_with`'s post-transport shutdown sequence must drain
     /// registered LSP servers rather than orphaning them. Exercises
@@ -167,14 +171,17 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_drains_registered_lsp_server() {
         let translator = Translator::new();
-        translator.register_server("fake-server", crate::lsp::fake_lsp_server());
+        translator.register_server(
+            ServerId::from_static("fake-server"),
+            crate::lsp::fake_lsp_server(),
+        );
         assert_eq!(translator.registered_server_count(), 1);
 
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            super::shutdown(&cancel_tx, &translator, None),
+            super::shutdown(&cancel, &translator, None),
         )
         .await;
 
@@ -188,7 +195,7 @@ mod tests {
             "shutdown must drain every registered LSP server"
         );
         assert!(
-            *cancel_rx.borrow(),
+            cancel.is_cancelled(),
             "shutdown must signal background pump tasks to exit"
         );
     }
@@ -201,7 +208,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let translator = Translator::new();
-        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
 
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = Arc::clone(&completed);
@@ -211,7 +218,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::shutdown(&cancel_tx, &translator, Some(handle)),
+            super::shutdown(&cancel, &translator, Some(handle)),
         )
         .await;
 

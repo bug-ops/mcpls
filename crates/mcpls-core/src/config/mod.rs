@@ -6,6 +6,7 @@
 mod bounded_secs;
 mod language;
 mod language_id;
+mod language_map;
 mod limits;
 mod patterns;
 mod position_encodings;
@@ -14,6 +15,7 @@ mod server;
 mod settings;
 mod text_newtype;
 mod trust;
+mod workspace_root;
 
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -22,13 +24,14 @@ use std::path::{Component, Path, PathBuf};
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
 pub use language::{base_language_id, react_variant_language_id};
 pub use language_id::{InvalidLanguageId, LanguageId};
+pub use language_map::{FileKey, LanguageMap};
 pub use limits::{
     BoundedText, DocumentLimit, InvalidBoundedText, InvalidSearchDepth, InvalidSizeLimit,
     MAX_FILE_SIZE_LIMIT, SearchDepth, SizeLimit,
 };
 pub use patterns::{
-    FileExtension, FilePattern, InvalidFileExtension, InvalidProjectMarker, ProjectMarker,
-    UnsupportedFilePattern,
+    FileExtension, FileName, FilePattern, InvalidFileExtension, InvalidFileName,
+    InvalidProjectMarker, PatternTarget, ProjectMarker, UnsupportedFilePattern,
 };
 pub use position_encodings::{InvalidPositionEncodings, PositionEncodings};
 pub use routing::{
@@ -38,14 +41,16 @@ pub use routing::{
 use serde::{Deserialize, Serialize};
 pub(crate) use server::MarkerScan;
 pub use server::{
-    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, InvalidServerCommand, LspServerConfig,
-    MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, ServerCommand, ServerHeuristics, ServerSelection,
+    BuiltinServer, DEFAULT_HEURISTICS_MAX_DEPTH, InvalidAutoSelection, InvalidServerCommand,
+    LaunchCommand, LspServerConfig, MAX_HEURISTICS_DEPTH, MAX_TIMEOUT_SECONDS, ServerCommand,
+    ServerHeuristics, ServerSelection,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
 pub(crate) use trust::login_home_dir;
 pub use trust::{ServerAllowlist, WorkspaceTrust};
+pub use workspace_root::{ConfiguredRoot, InvalidWorkspaceRoot};
 
-use crate::bridge::{ResourceLimits, WorkspaceRoots, join_relative_root, probe_root};
+use crate::bridge::{ResourceLimits, WorkspaceRoots, probe_root};
 use crate::error::{ConfigError, Error, Result};
 use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
 
@@ -343,7 +348,7 @@ pub struct WorkspaceConfig {
     /// [`crate::bridge::WorkspaceRoots::from_configured`] derives the
     /// canonical roots and the accepted alternative spellings from them.
     #[serde(default)]
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<ConfiguredRoot>,
 
     /// Position encoding preference order, offered to each spawned LSP
     /// server as `capabilities.general.positionEncodings` during the
@@ -527,12 +532,17 @@ impl WorkspaceConfig {
     }
 }
 
-fn language_id_for_pattern_extension(
+fn language_id_for_pattern_target(
     server_language_id: &LanguageId,
-    extension: &FileExtension,
+    target: &PatternTarget,
 ) -> LanguageId {
-    react_variant_language_id(server_language_id, extension.as_str())
-        .unwrap_or_else(|| server_language_id.clone())
+    match target {
+        PatternTarget::Extension(extension) => {
+            react_variant_language_id(server_language_id, extension.as_str())
+                .unwrap_or_else(|| server_language_id.clone())
+        }
+        PatternTarget::Name(_) => server_language_id.clone(),
+    }
 }
 
 /// Build default language extension mappings.
@@ -812,25 +822,25 @@ const MAX_CONFIG_FILE_BYTES: NonZeroU64 =
 /// config path absolute, so a removed cwd does not fail an absolute config
 /// (#348 case 4).
 fn rebase_relative_roots(
-    roots: &mut [PathBuf],
+    roots: &mut [ConfiguredRoot],
     config_path: &Path,
     base: RelativeRootBase,
 ) -> Result<()> {
-    if !roots.iter().any(|root| root.is_relative()) {
+    if !roots.iter().any(|root| root.as_path().is_relative()) {
         return Ok(());
     }
     let config_dir = match base {
         RelativeRootBase::Cwd => None,
         RelativeRootBase::ConfigDir => Some(config_dir_as_given(config_path)?),
     };
-    for root in roots.iter_mut().filter(|root| root.is_relative()) {
+    for root in roots.iter_mut().filter(|root| root.as_path().is_relative()) {
         if let Some(dir) = config_dir.as_deref() {
-            let rebased = join_relative_root(dir, root);
-            probe_root(root, as_base_display(dir), &rebased)?;
+            let rebased = root.join_onto(dir);
+            probe_root(root.as_path(), as_base_display(dir), rebased.as_path())?;
             *root = rebased;
         } else {
             let cwd = std::env::current_dir().map_err(Error::Io)?;
-            probe_root(root, &cwd, &join_relative_root(&cwd, root))?;
+            probe_root(root.as_path(), &cwd, root.join_onto(&cwd).as_path())?;
         }
     }
     Ok(())
@@ -875,19 +885,20 @@ enum RelativeRootBase {
 }
 
 impl ServerConfig {
-    /// Build the effective extension map used for language detection.
+    /// Build the effective language map used for language detection.
     ///
     /// Starts with workspace mappings and overlays mappings inferred from
-    /// configured LSP server `file_patterns`.
+    /// configured LSP server `file_patterns`: `*.EXT` patterns map extensions
+    /// and bare `NAME` patterns map extensionless file names.
     #[must_use]
-    pub fn build_effective_extension_map(&self) -> HashMap<FileExtension, LanguageId> {
-        let mut map = self.workspace.build_extension_map();
+    pub fn build_effective_language_map(&self) -> LanguageMap {
+        let mut map = LanguageMap::from(self.workspace.build_extension_map());
 
         for server in &self.lsp_servers {
             for pattern in &server.file_patterns {
-                let ext = pattern.extension();
-                let language_id = language_id_for_pattern_extension(&server.language_id, ext);
-                map.insert(ext.clone(), language_id);
+                let target = pattern.target().clone();
+                let language_id = language_id_for_pattern_target(&server.language_id, &target);
+                map.insert(target, language_id);
             }
         }
 
@@ -1225,24 +1236,8 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         self.validate_workspace_trust()?;
 
-        // `Path::is_relative()` is `true` for an empty path, and joining it
-        // onto a base directory silently yields that base directory
-        // unchanged rather than the empty string the user presumably meant
-        // to be an accident -- reject it explicitly instead of letting it
-        // pass through workspace-root resolution unnoticed (#348 M4).
-        if self.workspace.roots.iter().any(|root| root.is_empty()) {
-            return Err(ConfigError::EmptyWorkspaceRoot.into());
-        }
         let mut seen_names: HashMap<&str, &LanguageId> = HashMap::new();
         for server in &self.lsp_servers {
-            if server.selection == ServerSelection::Auto
-                && !BuiltinServer::TypescriptLanguageServer.matches_command(server.command.as_str())
-            {
-                return Err(ConfigError::SelectionAutoOnNonTypescript {
-                    language: server.language_id.clone(),
-                }
-                .into());
-            }
             if let Some(name) = &server.name
                 && let Some(prev_language) = seen_names.insert(name.as_str(), &server.language_id)
             {
@@ -1436,7 +1431,10 @@ mod tests {
         fs::write(&config_path, &toml_content).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.roots, vec![workspace_root]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![ConfiguredRoot::new(workspace_root).unwrap()]
+        );
         assert_eq!(
             config.workspace.position_encodings.as_slice(),
             [PositionEncoding::Utf8]
@@ -1463,7 +1461,13 @@ mod tests {
 
         let config = ServerConfig::load_from(&config_path).unwrap();
 
-        assert!(config.workspace.roots.iter().all(|root| root.is_absolute()));
+        assert!(
+            config
+                .workspace
+                .roots
+                .iter()
+                .all(|root| root.as_path().is_absolute())
+        );
         let roots = WorkspaceRoots::from_configured(&config.workspace.roots).unwrap();
         assert_eq!(roots.canonical(), [config_dir, project_root]);
     }
@@ -1494,7 +1498,10 @@ mod tests {
             ServerConfig::load_from_with_root_base(&config_path, RelativeRootBase::Cwd).unwrap()
         };
 
-        assert_eq!(config.workspace.roots, vec![PathBuf::from("relative-root")]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![ConfiguredRoot::new("relative-root").unwrap()]
+        );
         let roots = {
             let _guard = CwdGuard::enter(&cwd);
             WorkspaceRoots::from_configured(&config.workspace.roots).unwrap()
@@ -1566,7 +1573,10 @@ mod tests {
         fs::write(&config_path, format!("[workspace]\nroots = [{literal}]\n")).unwrap();
 
         let config = ServerConfig::load_from(&config_path).unwrap();
-        assert_eq!(config.workspace.roots, vec![tree.link.clone()]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![ConfiguredRoot::new(tree.link.clone()).unwrap()]
+        );
         let roots = WorkspaceRoots::from_configured(&config.workspace.roots).unwrap();
 
         let via_link = roots
@@ -1641,7 +1651,13 @@ mod tests {
             let _guard = CwdGuard::enter(&tree.real);
             ServerConfig::load_from(Path::new("mcpls.toml")).unwrap()
         };
-        assert!(config.workspace.roots.iter().all(|root| root.is_relative()));
+        assert!(
+            config
+                .workspace
+                .roots
+                .iter()
+                .all(|root| root.as_path().is_relative())
+        );
 
         let roots = WorkspaceRoots::from_configured_with(&config.workspace.roots, || {
             Ok(ProcessCwd::new(
@@ -1674,7 +1690,10 @@ mod tests {
             ServerConfig::load_from(&config_path).unwrap()
         };
 
-        assert_eq!(config.workspace.roots, vec![tree.base.join("proj")]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![ConfiguredRoot::new(tree.base.join("proj")).unwrap()]
+        );
     }
 
     /// #571 S2: `..` after a symlinked config directory must not admit the
@@ -1974,7 +1993,7 @@ mod tests {
     fn test_load_rejects_empty_language_id() {
         assert_toml_rejected(
             "[[lsp_servers]]\nlanguage_id = \"\"\ncommand = \"x\"\n",
-            &["language_id cannot be empty"],
+            &["language_id cannot be blank"],
         );
     }
 
@@ -2026,7 +2045,12 @@ mod tests {
             } else {
                 ServerSelection::Explicit
             };
-            assert_eq!(server.selection, expected, "{}", server.language_id);
+            assert_eq!(
+                server.command.selection(),
+                expected,
+                "{}",
+                server.language_id
+            );
         }
     }
 
@@ -2040,18 +2064,22 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.lsp_servers[0].selection, ServerSelection::Explicit);
+        assert_eq!(
+            config.lsp_servers[0].command.selection(),
+            ServerSelection::Explicit
+        );
     }
 
     #[test]
-    fn test_validate_accepts_auto_selection_for_tsls_command_spellings() {
+    fn test_auto_selection_accepts_tsls_command_spellings() {
         for command in [
             "typescript-language-server",
             "/opt/node/bin/typescript-language-server",
             "typescript-language-server.cmd",
         ] {
             let mut typescript = LspServerConfig::typescript();
-            typescript.command = ServerCommand::new(command.to_string()).unwrap();
+            typescript.command =
+                LaunchCommand::auto(ServerCommand::new(command.to_string()).unwrap()).unwrap();
             let config = ServerConfig {
                 lsp_servers: vec![typescript],
                 ..ServerConfig::default()
@@ -2061,18 +2089,23 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_auto_selection_on_other_servers() {
-        let mut rust = LspServerConfig::rust_analyzer();
-        rust.selection = ServerSelection::Auto;
-        let config = ServerConfig {
-            lsp_servers: vec![rust],
-            ..ServerConfig::default()
-        };
-        assert_matches!(
-            config.validate(),
-            Err(Error::Config(
-                ConfigError::SelectionAutoOnNonTypescript { .. }
-            ))
+    fn test_auto_selection_is_unrepresentable_on_other_servers() {
+        let rust = LspServerConfig::rust_analyzer();
+        assert!(LaunchCommand::auto(rust.command.server_command().clone()).is_err());
+
+        let err = toml::from_str::<ServerConfig>(
+            r#"
+            [[lsp_servers]]
+            language_id = "rust"
+            command = "rust-analyzer"
+            selection = "auto"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message()
+                .contains("selection = \"auto\" is only valid for typescript-language-server"),
+            "{err}"
         );
     }
 
@@ -2115,7 +2148,7 @@ mod tests {
         let result = ServerConfig::load_from(&config_path);
         assert_matches!(
             result,
-            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES.get()
+            Err(Error::FileSizeLimitExceeded { max, .. }) if max == MAX_CONFIG_FILE_BYTES
         );
     }
 
@@ -2261,9 +2294,9 @@ mod tests {
     /// #348 M4: `roots = [""]` previously reached workspace-root resolution
     /// (an empty path is `is_relative() == true`) and silently resolved to
     /// `base_dir` unchanged -- almost certainly not what an empty string in
-    /// config was meant to express. `validate()` now rejects it outright.
+    /// config was meant to express. Deserialization now rejects it outright.
     #[test]
-    fn test_validate_rejects_empty_workspace_root_entry() {
+    fn test_load_rejects_empty_workspace_root_entry() {
         let tmp_dir = TempDir::new().unwrap();
         let config_path = tmp_dir.path().join("config.toml");
 
@@ -2275,7 +2308,10 @@ mod tests {
         fs::write(&config_path, toml_content).unwrap();
 
         let result = ServerConfig::load_from(&config_path);
-        assert_matches!(result, Err(Error::Config(ConfigError::EmptyWorkspaceRoot)));
+        assert_matches!(
+            result,
+            Err(Error::TomlDe(ref e)) if e.message().contains("workspace.roots entries cannot be empty")
+        );
     }
 
     #[test]
@@ -2470,13 +2506,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_effective_extension_map_overrides_with_file_patterns() {
+    fn test_build_effective_language_map_overrides_with_file_patterns() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("cpp"),
-                command: ServerCommand::from_static("clangd"),
+                command: ServerCommand::from_static("clangd").into(),
                 args: vec![],
                 env: HashMap::new(),
                 file_patterns: vec![
@@ -2491,25 +2527,24 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("c"), Some(&LanguageId::from_static("cpp")));
-        assert_eq!(map.get("h"), Some(&LanguageId::from_static("cpp")));
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.c")), "cpp");
+        assert_eq!(map.detect(Path::new("x.h")), "cpp");
     }
 
     #[test]
-    fn test_build_effective_extension_map_derives_tsx_language_id() {
+    fn test_build_effective_language_map_derives_tsx_language_id() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("typescript"),
-                command: ServerCommand::from_static("tsgo"),
+                command: ServerCommand::from_static("tsgo").into(),
                 args: vec!["--lsp".to_string(), "--stdio".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![
@@ -2524,28 +2559,24 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("ts"), Some(&LanguageId::from_static("typescript")));
-        assert_eq!(
-            map.get("tsx"),
-            Some(&LanguageId::from_static("typescriptreact"))
-        );
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.ts")), "typescript");
+        assert_eq!(map.detect(Path::new("x.tsx")), "typescriptreact");
     }
 
     #[test]
-    fn test_build_effective_extension_map_derives_jsx_language_id() {
+    fn test_build_effective_language_map_derives_jsx_language_id() {
         let config = ServerConfig {
             mcp: McpConfig::default(),
             workspace: WorkspaceConfig::default(),
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("javascript"),
-                command: ServerCommand::from_static("typescript-language-server"),
+                command: ServerCommand::from_static("typescript-language-server").into(),
                 args: vec!["--stdio".to_string()],
                 env: HashMap::new(),
                 file_patterns: vec![
@@ -2560,18 +2591,26 @@ mod tests {
                 name: None,
                 handles: None,
                 indexing: crate::bridge::IndexingPolicy::Auto,
-                selection: crate::config::ServerSelection::Explicit,
             }],
             project_config_status: ProjectConfigStatus::NotIgnored,
             workspace_trust: crate::config::WorkspaceTrust::default(),
         };
 
-        let map = config.build_effective_extension_map();
-        assert_eq!(map.get("js"), Some(&LanguageId::from_static("javascript")));
-        assert_eq!(
-            map.get("jsx"),
-            Some(&LanguageId::from_static("javascriptreact"))
-        );
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("x.js")), "javascript");
+        assert_eq!(map.detect(Path::new("x.jsx")), "javascriptreact");
+    }
+
+    #[test]
+    fn test_build_effective_language_map_maps_name_patterns() {
+        let toml = "[[lsp_servers]]\nlanguage_id = \"make\"\ncommand = \"make-lsp\"\n\
+                    file_patterns = [\"**/Makefile\", \"GNUmakefile\", \"**/*.mk\"]\n";
+        let config = toml::from_str::<ServerConfig>(toml).unwrap();
+        let map = config.build_effective_language_map();
+        assert_eq!(map.detect(Path::new("sub/Makefile")), "make");
+        assert_eq!(map.detect(Path::new("GNUmakefile")), "make");
+        assert_eq!(map.detect(Path::new("rules.mk")), "make");
+        assert_eq!(map.detect(Path::new("Dockerfile")), LanguageId::PLAINTEXT);
     }
 
     #[test]
@@ -2755,7 +2794,7 @@ mod tests {
             !config
                 .workspace
                 .roots
-                .contains(&PathBuf::from("/should-never-load-attacker-path"))
+                .contains(&ConfiguredRoot::new("/should-never-load-attacker-path").unwrap())
         );
         assert!(
             !config
@@ -2791,7 +2830,10 @@ mod tests {
             ServerConfig::load_with_trust(ProjectConfigTrust::Trusted).unwrap()
         };
 
-        assert_eq!(config.workspace.roots, vec![custom_root]);
+        assert_eq!(
+            config.workspace.roots,
+            vec![ConfiguredRoot::new(custom_root).unwrap()]
+        );
         assert_eq!(config.lsp_servers.len(), 1);
         assert_eq!(config.lsp_servers[0].language_id, "python");
     }
@@ -2823,7 +2865,7 @@ mod tests {
             !config
                 .workspace
                 .roots
-                .contains(&PathBuf::from("/attacker/controlled"))
+                .contains(&ConfiguredRoot::new("/attacker/controlled").unwrap())
         );
         assert_ne!(config.workspace.heuristics_max_depth.get(), 999_999);
         assert!(!config.lsp_servers.iter().any(|s| s.language_id == "evil"));
@@ -3095,7 +3137,7 @@ mod tests {
     #[test]
     fn test_workspace_config_toml_round_trip() {
         let original = WorkspaceConfig {
-            roots: vec![PathBuf::from("/tmp/round-trip")],
+            roots: vec![ConfiguredRoot::new("/tmp/round-trip").unwrap()],
             position_encodings: PositionEncodings::new(vec![PositionEncoding::Utf8]).unwrap(),
             language_extensions: vec![LanguageExtensionMapping {
                 extensions: vec![FileExtension::from_static("nu")],
@@ -3552,13 +3594,15 @@ mod tests {
 
         #[test]
         fn test_validate_accepts_allowed_ids_of_configured_servers() {
-            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rust")]));
+            let config =
+                config_with_servers(WorkspaceTrust::untrusted([ServerId::from_static("rust")]));
             assert!(config.validate().is_ok());
         }
 
         #[test]
         fn test_validate_rejects_an_allowed_id_that_names_no_configured_server() {
-            let config = config_with_servers(WorkspaceTrust::untrusted([ServerId::from("rsut")]));
+            let config =
+                config_with_servers(WorkspaceTrust::untrusted([ServerId::from_static("rsut")]));
             let err = config.validate().unwrap_err();
             let text = err.to_string();
             assert_matches!(
@@ -3589,7 +3633,7 @@ mod tests {
 
         fn temp_roots_config(root: &Path) -> ServerConfig {
             let mut config = ServerConfig::default();
-            config.workspace.roots = vec![root.to_path_buf()];
+            config.workspace.roots = vec![ConfiguredRoot::new(root).unwrap()];
             config
         }
 

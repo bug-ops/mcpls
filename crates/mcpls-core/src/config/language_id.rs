@@ -7,9 +7,9 @@ use std::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
-/// A language identifier was empty.
+/// A language identifier was empty or whitespace-only.
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error("language_id cannot be empty")]
+#[error("language_id cannot be blank")]
 pub struct InvalidLanguageId;
 
 /// A non-empty LSP language identifier such as `"rust"` or `"typescript"`.
@@ -38,7 +38,8 @@ impl LanguageId {
     ///
     /// # Panics
     ///
-    /// Panics if `id` is empty.
+    /// Panics if `id` is blank or not ASCII. A literal that passes is also
+    /// accepted by [`Self::new`], which additionally allows non-ASCII text.
     ///
     /// # Examples
     ///
@@ -50,7 +51,10 @@ impl LanguageId {
     /// ```
     #[must_use]
     pub const fn from_static(id: &'static str) -> Self {
-        assert!(!id.is_empty(), "language_id cannot be empty");
+        assert!(
+            id.is_ascii() && !id.trim_ascii().is_empty(),
+            "language_id must be ASCII and not blank"
+        );
         Self(Cow::Borrowed(id))
     }
 
@@ -58,10 +62,10 @@ impl LanguageId {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidLanguageId`] if `id` is empty.
+    /// Returns [`InvalidLanguageId`] if `id` is blank.
     pub fn new(id: impl Into<String>) -> Result<Self, InvalidLanguageId> {
         let id = id.into();
-        if id.is_empty() {
+        if id.trim().is_empty() {
             return Err(InvalidLanguageId);
         }
         Ok(Self(Cow::Owned(id)))
@@ -156,9 +160,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "language_id cannot be empty")]
+    #[should_panic(expected = "language_id must be ASCII and not blank")]
     fn test_from_static_panics_on_empty() {
         let _ = LanguageId::from_static("");
+    }
+
+    #[test]
+    #[should_panic(expected = "language_id must be ASCII and not blank")]
+    fn test_from_static_panics_on_non_ascii_blank() {
+        let _ = LanguageId::from_static("\u{a0}");
+    }
+
+    #[test]
+    fn test_rejects_whitespace_only() {
+        assert_eq!(LanguageId::new("  \u{a0}"), Err(InvalidLanguageId));
     }
 
     #[test]

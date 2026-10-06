@@ -506,7 +506,7 @@ mod tests {
     use crate::test_lsp::client_path;
 
     fn roots_of(root: &Path) -> WorkspaceRoots {
-        WorkspaceRoots::from_configured(&[root.to_path_buf()]).unwrap()
+        WorkspaceRoots::from_paths(&[root.to_path_buf()]).unwrap()
     }
 
     // ------------------------------------------------------------------
@@ -650,7 +650,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "file:///tmp/main.rs",
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         )
         .unwrap_err();
         assert_matches!(err, crate::Error::ResourceUri(_), "got {err:?}");
@@ -661,7 +661,7 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let err = DiagnosticsResourceUri::resolve(
             "lsp-diagnostics://host/main.rs",
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         )
         .unwrap_err();
         assert_matches!(err, crate::Error::ResourceUri(_), "got {err:?}");
@@ -705,11 +705,8 @@ mod tests {
         let (_other_dir, _other_root, other_file) = workspace();
         let raw = make_uri(&other_file).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(
-                &raw,
-                &WorkspaceRoots::from_configured(&[root]).unwrap()
-            )
-            .is_err()
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::from_paths(&[root]).unwrap())
+                .is_err()
         );
     }
 
@@ -718,11 +715,8 @@ mod tests {
         let (_dir, root, _file) = workspace();
         let raw = make_uri(&root.join("missing.rs")).unwrap();
         assert!(
-            DiagnosticsResourceUri::resolve(
-                &raw,
-                &WorkspaceRoots::from_configured(&[root]).unwrap()
-            )
-            .is_err()
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::from_paths(&[root]).unwrap())
+                .is_err()
         );
     }
 
@@ -730,11 +724,9 @@ mod tests {
     fn test_resolve_yields_canonical_path_and_uri() {
         let (_dir, root, file) = workspace();
         let raw = make_uri(&file).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(
-            &raw,
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
-        )
-        .unwrap();
+        let resolved =
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::from_paths(&[root]).unwrap())
+                .unwrap();
         assert_eq!(resolved.path, file);
         assert_eq!(resolved.uri.as_str(), raw);
     }
@@ -746,18 +738,16 @@ mod tests {
         let link = root.join("link.rs");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let raw = make_uri(&link).unwrap();
-        let resolved = DiagnosticsResourceUri::resolve(
-            &raw,
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
-        )
-        .unwrap();
+        let resolved =
+            DiagnosticsResourceUri::resolve(&raw, &WorkspaceRoots::from_paths(&[root]).unwrap())
+                .unwrap();
         assert_eq!(resolved.uri.as_str(), make_uri(&file).unwrap());
     }
 
     #[tokio::test]
     async fn test_for_published_matches_resolve_for_same_file() {
         let (_dir, root, file) = workspace();
-        let roots = WorkspaceRoots::from_configured(&[root]).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[root]).unwrap();
         let resolved = DiagnosticsResourceUri::resolve(&make_uri(&file).unwrap(), &roots).unwrap();
         let published = crate::bridge::path_to_uri(&file).unwrap();
         let published = resolve_one(&published, &roots).await.unwrap();

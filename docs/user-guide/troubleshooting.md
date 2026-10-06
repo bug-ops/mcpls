@@ -302,6 +302,28 @@ checkOnSave.enable = false
 roots = ["/Users/username/active-project"]
 ```
 
+### "Queries wait the full indexing timeout after restart_server"
+
+**Problem**: After `restart_server` (or an automatic respawn), whole-workspace queries such as hover and references wait for `workspace.indexing_ready_timeout_seconds` (30 s by default) before answering.
+
+**Cause**: mcpls waits for a replaced server to report readiness again if it reported it before. For a server whose only readiness history is generic `$/progress` frames (it has no purpose-built status notification like rust-analyzer's `experimental/serverStatus`), the wait ends on its first `$/progress` frame. A replacement that sends none, for example a server that only reports progress during a cold start, is waited for the whole timeout.
+
+**Solutions**:
+
+1. Lower the timeout (it must stay above 3 and below 60 seconds):
+```toml
+[workspace]
+indexing_ready_timeout_seconds = 5
+```
+
+2. Or opt that server out of readiness gating:
+```toml
+[[lsp_servers]]
+language_id = "go"
+command = "gopls"
+indexing = "disabled"
+```
+
 ### "LSP server crashed"
 
 **Problem**: Language server process died unexpectedly

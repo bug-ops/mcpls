@@ -1011,7 +1011,7 @@ mod resolver_tests {
         target: SymbolTarget,
     ) -> Result<ResolvedTarget> {
         let dir = TempDir::new().unwrap();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         let (translator, mut server) = translator_with_capabilities(&dir, &id, caps(true));
         let path = dir.path().join("main.rs");
         fs::write(&path, source).unwrap();
@@ -1388,7 +1388,7 @@ mod resolver_tests {
     async fn test_a_position_target_passes_through_without_any_request() {
         let dir = TempDir::new().unwrap();
         let (translator, _server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps(false));
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps(false));
 
         let resolved = translator
             .resolve_symbol_target(
@@ -1407,7 +1407,7 @@ mod resolver_tests {
     async fn test_a_missing_tool_capability_fails_before_any_symbol_request() {
         let dir = TempDir::new().unwrap();
         let (translator, _server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps(false));
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps(false));
         let path = dir.path().join("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
 
@@ -1435,7 +1435,7 @@ mod resolver_tests {
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let (translator, _server) =
-            translator_with_capabilities(&dir, &ServerId::from("rust"), caps(true));
+            translator_with_capabilities(&dir, &ServerId::from_static("rust"), caps(true));
         let path = outside.path().join("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
 

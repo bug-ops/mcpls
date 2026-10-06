@@ -11,7 +11,6 @@ use crate::bridge::{
     Position, RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
     SymbolTarget, TabSize,
 };
-use crate::config::ServerId;
 
 /// Schema description of the opt-in `context` input shared by every tool that
 /// can attach enclosing symbols.
@@ -556,8 +555,7 @@ impl TryFrom<RestartServerWire> for RestartServerParams {
             }
             (None, true) => RestartTarget::All,
             (Some(ids), false) => {
-                let ids = ids.into_iter().map(ServerId::from).collect();
-                RestartTarget::Servers(ServerIds::try_new(ids).map_err(|e| e.to_string())?)
+                RestartTarget::Servers(ServerIds::parse(ids).map_err(|e| e.to_string())?)
             }
         };
         Ok(Self { target })

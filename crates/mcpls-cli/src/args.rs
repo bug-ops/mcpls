@@ -364,7 +364,10 @@ mod tests {
     #[test]
     fn test_parse_server_id_rejects_blank_only() {
         assert_eq!(parse_server_id("  "), Err(EmptyAllowServer));
-        assert_eq!(parse_server_id("rust").unwrap(), ServerId::from("rust"));
+        assert_eq!(
+            parse_server_id("rust").unwrap(),
+            ServerId::from_static("rust")
+        );
     }
 
     #[test]
@@ -431,7 +434,7 @@ mod tests {
         ]);
         assert_eq!(
             args.workspace_trust().unwrap(),
-            WorkspaceTrust::untrusted(["rust", "python"].map(ServerId::from))
+            WorkspaceTrust::untrusted(["rust", "python"].map(ServerId::from_static))
         );
     }
 

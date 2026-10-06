@@ -10,7 +10,7 @@ use super::pulled_index::*;
 use super::*;
 
 fn server() -> ServerId {
-    ServerId::from("rust")
+    ServerId::from_static("rust")
 }
 
 fn file() -> Uri {
@@ -360,7 +360,7 @@ fn test_a_clear_between_issue_and_store_discards_the_pull() {
 fn test_a_clear_of_another_server_keeps_the_pull() {
     let mut cache = NotificationCache::new();
     let stamp = cache.begin_pull(&server(), 1);
-    cache.clear_server_diagnostics(&ServerId::from("other"));
+    cache.clear_server_diagnostics(&ServerId::from_static("other"));
 
     let write = cache.store_pulled_diagnostics(
         &server(),
@@ -526,7 +526,7 @@ fn test_clearing_a_server_removes_its_pulled_slots() {
 #[test]
 fn test_pulling_many_files_stays_within_the_entry_budget() {
     let mut cache = NotificationCache::new();
-    let quiet = ServerId::from("quiet");
+    let quiet = ServerId::from_static("quiet");
     cache.set_diagnostics_route_count(2);
     for n in 0..10 {
         cache.store_diagnostics(

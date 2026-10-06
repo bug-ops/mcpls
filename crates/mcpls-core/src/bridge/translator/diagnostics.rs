@@ -8,7 +8,7 @@ use lsp_types::{
     WorkDoneProgressParams,
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::Translator;
 use super::availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
@@ -31,6 +31,7 @@ use crate::bridge::{
 };
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::lock_std;
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
@@ -136,6 +137,47 @@ fn is_method_not_found(error: &Error) -> bool {
         Error::LspServerError { code, .. }
             if lsp_types::ErrorCodes::from(*code) == lsp_types::ErrorCodes::MethodNotFound
     )
+}
+
+/// Whether a server answered a request with an LSP code that says the result
+/// is not available right now, not that it never will be.
+fn is_transient_server_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LspServerError { code, .. }
+            if matches!(
+                lsp_types::LspErrorCodes::from(*code),
+                lsp_types::LspErrorCodes::RequestCancelled
+                    | lsp_types::LspErrorCodes::ContentModified
+                    | lsp_types::LspErrorCodes::ServerCancelled
+            )
+    )
+}
+
+/// How a failed probe pull moves the probe of its server.
+enum ProbeOutcome {
+    /// The server does not know the method: refused at once.
+    Refuse,
+    /// The request timed out.
+    TimedOut,
+    /// The server could not answer right now; nothing is learned.
+    Transient,
+}
+
+impl ProbeOutcome {
+    /// The finding in `error`, or `None` when it is no probe finding and
+    /// surfaces as it would for any pull.
+    fn of(error: &Error) -> Option<Self> {
+        if is_method_not_found(error) {
+            Some(Self::Refuse)
+        } else if matches!(error, Error::Timeout(_)) {
+            Some(Self::TimedOut)
+        } else if is_transient_server_error(error) {
+            Some(Self::Transient)
+        } else {
+            None
+        }
+    }
 }
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
@@ -375,8 +417,9 @@ impl Translator {
 
     /// Sends the pull request `support` calls for, and learns from how it
     /// ends: a server advertising no provider that answers is pulled from now
-    /// on, one that refuses with `-32601` is not pulled again (until it is
-    /// replaced) and its refusal is logged at DEBUG, not ERROR.
+    /// on, one that refuses with `-32601` or times out twice in a row is not
+    /// pulled again (until it is replaced) and its refusal is logged at DEBUG
+    /// or INFO, not ERROR.
     async fn request_pull(&self, doc: &PreparedDocument, support: PullSupport) -> PullAttempt {
         if !support.sends_pull() {
             return PullAttempt::PushOnly;
@@ -389,13 +432,20 @@ impl Translator {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
+        let sent_with = if support == PullSupport::Probing {
+            self.pull_probe_of(server_id)
+        } else {
+            PullProbe::default()
+        };
         let response = client
             .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
             .await;
         match response {
             Ok(response) => {
                 if support == PullSupport::Probing {
-                    self.record_pull_probe(server_id, PullProbe::Answered);
+                    self.record_pull_probe(server_id, client.connection_id(), |_| {
+                        PullProbe::Answered
+                    });
                 }
                 PullAttempt::Answered(match PullReport::from(response) {
                     PullReport::Full(mut items) => {
@@ -410,20 +460,62 @@ impl Translator {
                     PullReport::NotStored => None,
                 })
             }
-            Err(unclassified)
-                if support == PullSupport::Probing && is_method_not_found(unclassified.error()) =>
-            {
-                debug!(
-                    %server_id,
-                    error = %unclassified.handled(),
-                    "server advertises no diagnostic provider and refused a pull; \
-                     answering from the push cache"
-                );
-                self.record_pull_probe(server_id, PullProbe::Refused);
-                PullAttempt::PushOnly
+            Err(unclassified) if support == PullSupport::Probing => {
+                self.conclude_probe(server_id, client.connection_id(), sent_with, unclassified)
             }
             Err(unclassified) => PullAttempt::Failed(unclassified.surface()),
         }
+    }
+
+    /// Learns from a pull request that failed while the server was still being
+    /// probed. A server that refuses, or times out on a pull sent after an
+    /// earlier timeout, is answered from the push cache from now on, and so is
+    /// this call when the failure says nothing about the server; any other
+    /// failure surfaces. `sent_with` is the probe when the failed request was
+    /// sent.
+    fn conclude_probe(
+        &self,
+        server_id: &ServerId,
+        conn: ConnectionId,
+        sent_with: PullProbe,
+        unclassified: UnclassifiedError,
+    ) -> PullAttempt {
+        let Some(outcome) = ProbeOutcome::of(unclassified.error()) else {
+            return PullAttempt::Failed(unclassified.surface());
+        };
+        let error = unclassified.handled();
+        match outcome {
+            ProbeOutcome::Refuse => {
+                debug!(
+                    %server_id,
+                    %error,
+                    "server advertises no diagnostic provider and refused a pull; \
+                     answering from the push cache"
+                );
+                self.record_pull_probe(server_id, conn, |_| PullProbe::Refused);
+            }
+            ProbeOutcome::TimedOut => {
+                let probe =
+                    self.record_pull_probe(server_id, conn, |now| now.after_timeout(sent_with));
+                if probe == Some(PullProbe::Refused) {
+                    info!(
+                        %server_id,
+                        %error,
+                        "server advertises no diagnostic provider and timed out on two pulls \
+                         in a row; answering from the push cache until it is replaced \
+                         (restart_server)"
+                    );
+                } else {
+                    debug!(%server_id, %error, "probe pull timed out; answering from the push cache");
+                }
+            }
+            ProbeOutcome::Transient => debug!(
+                %server_id,
+                %error,
+                "probe pull could not be answered right now; answering from the push cache"
+            ),
+        }
+        PullAttempt::PushOnly
     }
 
     /// What is known about `id` answering `textDocument/diagnostic`.
@@ -435,8 +527,17 @@ impl Translator {
         PullSupport::of(advertised, servers.pull_probe(id))
     }
 
-    fn record_pull_probe(&self, id: &ServerId, probe: PullProbe) {
-        lock_std(&self.servers).set_pull_probe(id, probe);
+    fn pull_probe_of(&self, id: &ServerId) -> PullProbe {
+        lock_std(&self.servers).pull_probe(id)
+    }
+
+    fn record_pull_probe(
+        &self,
+        id: &ServerId,
+        conn: ConnectionId,
+        next: impl FnOnce(PullProbe) -> PullProbe,
+    ) -> Option<PullProbe> {
+        lock_std(&self.servers).update_pull_probe(id, conn, next)
     }
 
     /// Meets a settled pull with the cache, under the caller's lock: stores
@@ -626,7 +727,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -726,10 +827,15 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(
+            &ServerId::from_static("rust"),
+            &uri,
+            Some(1),
+            vec![diagnostic],
+        );
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -846,10 +952,10 @@ mod tests {
             },
         ];
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), diagnostics);
+        cache.store_diagnostics(&ServerId::from_static("rust"), &uri, Some(1), diagnostics);
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -902,10 +1008,15 @@ mod tests {
             data: None,
         };
 
-        cache.store_diagnostics(&ServerId::from("rust"), &uri, Some(1), vec![diagnostic]);
+        cache.store_diagnostics(
+            &ServerId::from_static("rust"),
+            &uri,
+            Some(1),
+            vec![diagnostic],
+        );
 
         let cache_key = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[temp_dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[temp_dir.path().to_path_buf()]).unwrap(),
             &client_path(&test_file),
         )
         .await
@@ -926,7 +1037,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let missing = dir.path().join("nonexistent/path/file.rs");
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+            &WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             &client_path(&missing),
         )
         .await;
@@ -1098,7 +1209,7 @@ mod tests {
         fs::write(&test_file, "fn main() {}").unwrap();
 
         let result = Translator::cached_diagnostics_uri(
-            &WorkspaceRoots::from_configured(&workspace_roots).unwrap(),
+            &WorkspaceRoots::from_paths(&workspace_roots).unwrap(),
             &client_path(&test_file),
         )
         .await;
@@ -1113,19 +1224,18 @@ mod tests {
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let redactions = crate::redaction::Redactions::new([(
             "API_TOKEN".to_owned(),
             "SuperSecretValue123".to_owned(),
         )]);
         let (client, mut server, _lanes) =
             crate::test_lsp::fake_lsp_client_with_redactions(redactions);
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1133,7 +1243,7 @@ mod tests {
         let uri = path_to_uri(&path.canonicalize().unwrap()).unwrap();
         let notification_cache = Mutex::new(NotificationCache::new());
         notification_cache.lock().await.store_diagnostics(
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             &uri,
             Some(1),
             vec![lsp_diag(
@@ -1215,15 +1325,14 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1238,7 +1347,7 @@ mod tests {
         {
             let mut cache = notification_cache.lock().await;
             cache.store_diagnostics(
-                &ServerId::from("rust"),
+                &ServerId::from_static("rust"),
                 &uri,
                 Some(1),
                 vec![lsp_diag(
@@ -1312,15 +1421,14 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();
@@ -1385,15 +1493,14 @@ mod tests {
             Translator::new()
                 .with_extensions(extensions)
                 .with_router(ToolRouter::catch_all([(
-                    ServerId::from("rust"),
+                    ServerId::from_static("rust"),
                     LanguageId::from_static("rust"),
                 )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
 
         let (client, mut server) = fake_lsp_client();
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
 
         let path = dir.path().join("lib.rs");
         fs::write(&path, "fn main() {}").unwrap();

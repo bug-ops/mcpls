@@ -148,12 +148,12 @@ THEN they list the supported form, say how to cover several extensions, and agre
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place (`FilePattern::parse`): a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of letters, digits, `_`, `-` and `+` (a valid `FileExtension`), optionally preceded by any directory part such as `**/`; the directory part is ignored for routing | must |
+| FR-001 | THE SYSTEM SHALL define the supported `file_patterns` forms in one place (`FilePattern::parse`): a final path segment of the form `*.EXT`, where `EXT` is a non-empty run of ASCII letters, digits, `_`, `-` and `+` (a valid `FileExtension`; non-ASCII characters are rejected), optionally preceded by any directory part such as `**/`; the directory part is ignored for routing; or the bare name of an extensionless file, written `NAME` or `**/NAME` (FR-014) | must |
 | FR-002 | WHEN a configured `file_patterns` entry is not a supported form THE SYSTEM SHALL NOT drop it silently | must |
 | FR-003 | WHEN a configured entry is not a supported form THE SYSTEM SHALL reject the config at load with `ConfigError::UnsupportedFilePattern` naming the server entry (its id), the pattern and the supported forms; loading a TOML file surfaces it inside `Error::TomlDe` (the entry is deserialized through `serde(try_from)`, and the message carries the line), while a value built in code reports it as `Error::Config` | must |
 | FR-004 | ~~Warning instead of rejection~~ superseded: the decision is rejection (section 9) | n/a |
 | FR-005 | THE check SHALL run when an `lsp_servers` entry is deserialized (`FilePattern` is the only representation of a pattern), so every load path (file, default, programmatic construction) is covered by it | must |
-| FR-006 | WHEN `NoServerForLanguage` is returned for a file whose language fell back to `plaintext` THE SYSTEM SHALL include in the error text the file extension (or that the file has none) and the `file_patterns` configured across servers (or that none are configured) | must |
+| FR-006 | WHEN `NoServerForLanguage` is returned for a file whose language fell back to `plaintext` THE SYSTEM SHALL include in the error text the file extension or extensionless file name (or that the file has neither) and the `file_patterns` configured across servers (or that none are configured) | must |
 | FR-007 | WHEN the fallback language is not `plaintext` THE existing error text SHALL be unchanged | should |
 | FR-008 | THE SYSTEM SHALL NOT change routing for supported patterns, including the default config and every pattern in the user guides | must |
 | FR-009 | THE configuration guide SHALL state the supported forms, remove the claim of full glob syntax, and show how to cover several extensions with several patterns (for example `["**/*.cpp", "**/*.h"]`) | must |
@@ -161,6 +161,8 @@ THEN they list the supported form, say how to cover several extensions, and agre
 | FR-011 | THE SYSTEM SHALL reject a pattern that names a single file (`src/main.rs`, `Cargo.toml`) as an unsupported form, because it would register the whole extension | must |
 | FR-012 | ~~Brace expansion~~ superseded: not supported; a pattern per extension covers several extensions | n/a |
 | FR-013 | THE `.local/testing/` playbooks SHALL gain a case for each unsupported form and for the no-server error, and the coverage status for config SHALL be reset | must |
+| FR-014 | THE SYSTEM SHALL accept the bare name of an extensionless file (`Makefile`, `Dockerfile`) as a pattern, written `NAME` or `**/NAME`, where `NAME` is a valid `FileName` (a non-empty run of the characters a `FileExtension` allows, so it has no dot); a name pattern with any other directory part (`docs/Makefile`) SHALL be rejected, so a pattern never claims every file of that name below one directory | must |
+| FR-015 | THE language map SHALL detect by extension when `Path::extension` reports one and by file name otherwise, so a name never competes with an extension; `NoServerForLanguage` carries a `FileKey` (extension, name or unmappable) and, for a name, suggests a `**/NAME` pattern | must |
 
 ## 4. Non-Functional Requirements
 
@@ -178,17 +180,20 @@ THEN they list the supported form, say how to cover several extensions, and agre
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
 | `file_patterns` entry | A configured string on an `lsp_servers` entry | raw pattern, owning server id |
-| Supported pattern (new, typed) | A pattern that maps to exactly one extension | extension (validated token) |
+| Supported pattern (new, typed) | A pattern that maps to exactly one extension or one extensionless file name | `PatternTarget`: extension or name (validated token) |
 | Unsupported pattern report (new) | What the validator or the warning carries | server id, pattern, supported-forms text |
-| Extension map (existing) | `extension -> language_id` used by language detection | built from workspace mappings overlaid with supported patterns |
-| `NoServerForLanguage` (existing) | Routing error | language id; gains extension and configured patterns when the language is the `plaintext` fallback |
+| Language map (`LanguageMap`) | `extension -> language_id` and `file name -> language_id` used by language detection | built from workspace mappings overlaid with supported patterns; `workspace.language_extensions` stays extension-only |
+| `NoServerForLanguage` (existing) | Routing error | language id; gains the `FileKey` and configured patterns when the language is the `plaintext` fallback |
 
 ## 6. Edge Cases and Error Handling
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | `**/*.{cpp,h}` | Rejected at load (FR-002, FR-003); list `**/*.cpp` and `**/*.h` instead |
-| `Makefile` | Reported: no extension, so no mapping; `workspace.language_extensions` is keyed by extension, so an extensionless file cannot be mapped today (section 9) |
+| `Makefile`, `**/Makefile` | Accepted (FR-014): maps the extensionless file named `Makefile` to the server's language |
+| `docs/Makefile` | Reported: a name pattern admits no directory part but `**/` (FR-014) |
+| `/Makefile` | Reported: a root-anchored name pattern is no bare name and not `**/NAME` (FR-014) |
+| `**/Makefile.am`, `**/.eslintrc` | Reported: the name has a dot, so it is neither a name nor `*.EXT` |
 | `src/**` or `**/*` | Reported: no extension |
 | `**/*.[ch]` | Reported: character class |
 | `**/*.ts?` | Reported: single-character wildcard |
@@ -239,8 +244,8 @@ THEN they list the supported form, say how to cover several extensions, and agre
 - Reject at load, not warn: matches the rule that invalid config fails with a diagnosable error ([[config/001-config-discovery-and-heuristics/spec|config/001]] FR-006); the message names the fix.
 - No brace expansion and no glob matching: several `**/*.ext` patterns cover several extensions.
 - Single-file patterns are rejected, not kept with a caveat: they over-match the whole extension.
-- Extensionless files (`Makefile`, `Dockerfile`) cannot be mapped today, because `workspace.language_extensions` is keyed by extension; the guides say so. Mapping by file name is a separate enhancement.
-- `get_tool_support` coverage ignoring the extension map is a separate issue.
+- Extensionless files (`Makefile`, `Dockerfile`) are mapped by a bare-name `file_patterns` entry (#675). `workspace.language_extensions` stays extension-only, and dotted names and dotfiles stay unsupported, so a name never has an extension and the two maps cannot both claim a file.
+- `get_tool_support` lists the languages a file can be detected as, through the same effective map (#676).
 - Windows-style separators in a pattern (`**\\*.rs`) are out of scope: the directory part is ignored, and the final segment is taken after the last `/`, so a backslash pattern is rejected rather than mis-parsed.
 
 ## 10. See Also

@@ -1231,7 +1231,7 @@ mod tests {
 
         let uris = ListenUris::resolve(
             &[canonical.clone(), alias.clone(), outside],
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         );
 
         let entries: Vec<_> = uris.canonical().collect();
@@ -1249,7 +1249,7 @@ mod tests {
         let (_dir, root, _file) = workspace_file();
         let uris = ListenUris::resolve(
             &[crate::test_lsp::absolute_uri("no/such/file.rs")],
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         );
         assert!(uris.is_empty());
     }
@@ -1274,7 +1274,7 @@ mod tests {
         let raw = crate::bridge::resources::make_uri(&file).unwrap();
         let uris = Arc::new(ListenUris::resolve(
             std::slice::from_ref(&raw),
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         ));
         let canonical = uris.canonical().next().unwrap().0.clone();
 
@@ -1387,7 +1387,7 @@ mod tests {
             .collect();
         let uris = Arc::new(ListenUris::resolve(
             &raws,
-            &WorkspaceRoots::from_configured(&[root]).unwrap(),
+            &WorkspaceRoots::from_paths(&[root]).unwrap(),
         ));
         let key = uris.canonical().next().unwrap().0.clone();
         let spellings = uris.raw_for(&key).count();

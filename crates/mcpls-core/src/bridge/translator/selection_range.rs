@@ -6,6 +6,7 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{MAX_SELECTION_CHAIN, Position, SelectionRangesResult};
+use super::navigation::ItemBudget;
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
@@ -15,30 +16,16 @@ use crate::error::Result;
 ///
 /// Walks the `parent` links iteratively, so the cost is bounded by the cap
 /// whatever the nesting.
-fn chain(first: lsp_types::SelectionRange) -> Chain {
-    let mut ranges = Vec::with_capacity(MAX_SELECTION_CHAIN);
-    let mut current = Some(first);
-    while let Some(node) = current {
-        if ranges.len() == MAX_SELECTION_CHAIN {
-            return Chain {
-                ranges,
-                truncated: true,
-            };
-        }
-        ranges.push(node.range);
-        current = node.parent.map(|parent| *parent);
-    }
-    Chain {
-        ranges,
-        truncated: false,
-    }
-}
-
-/// A selection chain cut to [`MAX_SELECTION_CHAIN`] ranges.
-#[derive(Debug, Default)]
-struct Chain {
-    ranges: Vec<lsp_types::Range>,
-    truncated: bool,
+fn chain(first: lsp_types::SelectionRange) -> (Vec<lsp_types::Range>, bool) {
+    let mut next = Some(first);
+    let ancestors = std::iter::from_fn(|| {
+        let node = next.take()?;
+        next = node.parent.map(|parent| *parent);
+        Some(node.range)
+    });
+    let mut budget = ItemBudget::with_cap(MAX_SELECTION_CHAIN);
+    let ranges = budget.admit_iter(ancestors);
+    (ranges, budget.truncated())
 }
 
 impl Translator {
@@ -85,10 +72,7 @@ impl Translator {
             .request_typed::<lsp_types::SelectionRangeRequest>(params, client.request_timeout())
             .await?;
 
-        let Chain {
-            ranges: lsp_ranges,
-            truncated,
-        } = response
+        let (lsp_ranges, truncated) = response
             .and_then(|chains| chains.into_iter().next())
             .map_or_default(chain);
         let mut ranges = Vec::with_capacity(lsp_ranges.len());
@@ -153,7 +137,7 @@ mod tests {
         encoding: Option<lsp_types::PositionEncodingKind>,
     ) -> (serde_json::Value, SelectionRangesResult) {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = encoding.map_or_else(
             || translator_with_capabilities(&dir, &server_id, caps()),
             |encoding| {
@@ -297,7 +281,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (translator, _server) = translator_with_capabilities(
             &dir,
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             lsp_types::ServerCapabilities::default(),
         );
         let path = dir.path().join("a.rs");
@@ -320,8 +304,8 @@ mod tests {
                 parent: Some(Box::new(node)),
             };
         }
-        let chain = chain(node);
-        assert_eq!(chain.ranges.len(), MAX_SELECTION_CHAIN);
-        assert!(chain.truncated);
+        let (ranges, truncated) = chain(node);
+        assert_eq!(ranges.len(), MAX_SELECTION_CHAIN);
+        assert!(truncated);
     }
 }

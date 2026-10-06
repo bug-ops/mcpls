@@ -51,7 +51,7 @@ const RESTART_CONCURRENCY: usize = 4;
 /// Longest accepted server id, in bytes.
 pub const MAX_SERVER_ID_BYTES: usize = 256;
 
-/// Why a list of server ids was rejected by [`ServerIds::try_new`].
+/// Why a list of server ids was rejected by [`ServerIds::try_new`] or [`ServerIds::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ServerIdsError {
     /// No ids were given.
@@ -60,7 +60,7 @@ pub enum ServerIdsError {
     /// More than [`MAX_RESTART_SERVER_IDS`] ids were given.
     #[error("`servers` may name at most {MAX_RESTART_SERVER_IDS} servers")]
     TooMany,
-    /// An id was empty or whitespace.
+    /// An id was empty or whitespace; only [`ServerIds::parse`] returns it.
     #[error("server ids must not be blank")]
     Blank,
     /// An id was longer than [`MAX_SERVER_ID_BYTES`].
@@ -77,7 +77,7 @@ pub enum ServerIdsError {
 /// use mcpls_core::bridge::{ServerIds, ServerIdsError};
 /// use mcpls_core::config::ServerId;
 ///
-/// let ids = ServerIds::try_new(vec![ServerId::from("rust"), ServerId::from("rust")]).unwrap();
+/// let ids = ServerIds::try_new(vec![ServerId::from_static("rust"), ServerId::from_static("rust")]).unwrap();
 /// assert_eq!(ids.as_slice().len(), 1);
 /// assert_eq!(ServerIds::try_new(Vec::new()), Err(ServerIdsError::Empty));
 /// ```
@@ -90,13 +90,10 @@ impl ServerIds {
     /// # Errors
     ///
     /// [`ServerIdsError`] when `ids` is empty, has more than
-    /// [`MAX_RESTART_SERVER_IDS`] entries, or holds a blank or oversized id.
+    /// [`MAX_RESTART_SERVER_IDS`] entries, or holds an oversized id.
     pub fn try_new(ids: Vec<ServerId>) -> std::result::Result<Self, ServerIdsError> {
         if ids.len() > MAX_RESTART_SERVER_IDS {
             return Err(ServerIdsError::TooMany);
-        }
-        if ids.iter().any(|id| id.as_str().trim().is_empty()) {
-            return Err(ServerIdsError::Blank);
         }
         if ids.iter().any(|id| id.as_str().len() > MAX_SERVER_ID_BYTES) {
             return Err(ServerIdsError::TooLong);
@@ -111,6 +108,33 @@ impl ServerIds {
         } else {
             Ok(Self(unique))
         }
+    }
+
+    /// Parse the ids of a request, checking the count, blankness and length
+    /// in that order, then drop repeats like [`Self::try_new`].
+    ///
+    /// # Errors
+    ///
+    /// [`ServerIdsError`] when `ids` is empty, has more than
+    /// [`MAX_RESTART_SERVER_IDS`] entries, or holds a blank or oversized id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::{ServerIds, ServerIdsError};
+    ///
+    /// assert_eq!(ServerIds::parse(vec![" ".to_owned()]), Err(ServerIdsError::Blank));
+    /// assert_eq!(ServerIds::parse(vec!["rust".to_owned()]).unwrap().as_slice().len(), 1);
+    /// ```
+    pub fn parse(ids: Vec<String>) -> std::result::Result<Self, ServerIdsError> {
+        if ids.len() > MAX_RESTART_SERVER_IDS {
+            return Err(ServerIdsError::TooMany);
+        }
+        let ids = ids
+            .into_iter()
+            .map(|id| ServerId::new(id).map_err(|_| ServerIdsError::Blank))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Self::try_new(ids)
     }
 
     /// The ids, in request order.
@@ -128,7 +152,7 @@ impl ServerIds {
 /// use mcpls_core::bridge::{RestartTarget, ServerIds};
 /// use mcpls_core::config::ServerId;
 ///
-/// let one = RestartTarget::Servers(ServerIds::try_new(vec![ServerId::from("rust")]).unwrap());
+/// let one = RestartTarget::Servers(ServerIds::try_new(vec![ServerId::from_static("rust")]).unwrap());
 /// assert_ne!(one, RestartTarget::All);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,7 +375,7 @@ impl DiagnosticsRole {
 }
 
 /// The part of notification handling that lives in `serve_with`'s scope
-/// (shutdown watch, subscription registry) and so cannot be built by the
+/// (shutdown token, subscription registry) and so cannot be built by the
 /// translator itself.
 pub trait NotificationWiring: std::fmt::Debug + Send + Sync {
     /// Start a diagnostics pump over `receivers` for `id`, returning a handle
@@ -819,16 +843,19 @@ mod tests {
     #[test]
     fn server_ids_drop_repeats_keep_order_and_reject_empty() {
         let ids = ServerIds::try_new(vec![
-            ServerId::from("b"),
-            ServerId::from("a"),
-            ServerId::from("b"),
+            ServerId::from_static("b"),
+            ServerId::from_static("a"),
+            ServerId::from_static("b"),
         ])
         .unwrap();
-        assert_eq!(ids.as_slice(), [ServerId::from("b"), ServerId::from("a")]);
+        assert_eq!(
+            ids.as_slice(),
+            [ServerId::from_static("b"), ServerId::from_static("a")]
+        );
         assert_eq!(ServerIds::try_new(Vec::new()), Err(ServerIdsError::Empty));
         let ids = |count: usize| {
             (0..count)
-                .map(|i| ServerId::from(format!("s{i}")))
+                .map(|i| ServerId::new(format!("s{i}")).unwrap())
                 .collect()
         };
         assert!(ServerIds::try_new(ids(MAX_RESTART_SERVER_IDS)).is_ok());
@@ -837,19 +864,29 @@ mod tests {
             Err(ServerIdsError::TooMany)
         );
         assert_eq!(
-            ServerIds::try_new(vec![ServerId::from(" ")]),
+            ServerIds::parse(vec![" ".to_owned()]),
             Err(ServerIdsError::Blank)
         );
         assert_eq!(
-            ServerIds::try_new(vec![ServerId::from("x".repeat(MAX_SERVER_ID_BYTES + 1))]),
+            ServerIds::try_new(vec![
+                ServerId::new("x".repeat(MAX_SERVER_ID_BYTES + 1)).unwrap()
+            ]),
             Err(ServerIdsError::TooLong)
+        );
+        assert_eq!(
+            ServerIds::parse(vec![" ".to_owned(); MAX_RESTART_SERVER_IDS + 1]),
+            Err(ServerIdsError::TooMany)
+        );
+        assert_eq!(
+            ServerIds::parse(vec!["x".repeat(MAX_SERVER_ID_BYTES + 1), " ".to_owned()]),
+            Err(ServerIdsError::Blank)
         );
     }
 
     #[test]
     fn restart_entry_flattens_the_outcome_next_to_the_server_id() {
         let entry = ServerRestartEntry {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             outcome: RestartOutcome::Failed {
                 reason: RestartFailure::SpawnFailed {
                     message: "gone".to_string(),
@@ -888,7 +925,8 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         use tempfile::TempDir;
-        use tokio::sync::{Mutex, watch};
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
 
         use super::*;
         use crate::bridge::translator::clock::{Clock, FakeClock};
@@ -908,17 +946,17 @@ mod tests {
             clock: Arc<FakeClock>,
             id: ServerId,
             _dir: TempDir,
-            _cancel: watch::Sender<bool>,
         }
 
         fn server_ids(names: &[&str]) -> RestartTarget {
             RestartTarget::Servers(
-                ServerIds::try_new(names.iter().map(|n| ServerId::from(*n)).collect()).unwrap(),
+                ServerIds::try_new(names.iter().map(|n| ServerId::new(*n).unwrap()).collect())
+                    .unwrap(),
             )
         }
 
         async fn fixture(dir: TempDir, script: &Path, wired: bool) -> Fixture {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let clock = Arc::new(FakeClock::new());
             let mut translator = Translator::new()
@@ -929,7 +967,7 @@ mod tests {
                 .with_notification_cache(Arc::clone(&cache))
                 .with_clock(clock.clone());
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+                WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
 
             let mut server = crate::lsp::LspServer::spawn(stub_server_config("rust", script))
@@ -942,14 +980,13 @@ mod tests {
             };
             translator.register_server_complete(server);
 
-            let (cancel, cancel_rx) = watch::channel(false);
             let wiring = PumpWiring::new(
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
-                cancel_rx,
+                CancellationToken::new(),
             );
             let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Authoritative);
             translator.set_notification_task(&id, pump);
@@ -962,7 +999,6 @@ mod tests {
                 clock,
                 id,
                 _dir: dir,
-                _cancel: cancel,
             }
         }
 
@@ -1076,7 +1112,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_restart_of_a_startup_failed_server_reports_not_running() {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let translator = Translator::new().with_router(ToolRouter::catch_all([(
                 id.clone(),
                 LanguageId::from_static("rust"),
@@ -1084,7 +1120,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             translator.rebind_router(&HashSet::new());
@@ -1110,7 +1146,7 @@ mod tests {
             translator.record_refusals(&[ServerSpawnFailure {
                 server_id: config.id(),
                 language_id: config.language_id.clone(),
-                command: config.command.to_string(),
+                command: config.command.server_command().clone(),
                 reason: StartupFailure::RefusedUntrustedWorkspace(
                     crate::error::UntrustedRefusal::NotAllowed { builtin: None },
                 ),
@@ -1159,7 +1195,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_restart_permit_classifies_in_order() {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let translator = Translator::new();
             assert_matches!(
                 translator.restart_permit(&id),
@@ -1176,7 +1212,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id.clone(),
                 language_id: crate::config::LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             assert_matches!(
@@ -1221,7 +1257,7 @@ mod tests {
         #[tokio::test]
         async fn test_restart_of_a_startup_failed_server_while_startup_settles_reports_not_running()
         {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let translator = Translator::new().with_router(ToolRouter::catch_all([(
                 id.clone(),
                 LanguageId::from_static("rust"),
@@ -1229,7 +1265,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             let _startup = translator.begin_startup();
@@ -1248,7 +1284,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_restart_of_a_still_expected_server_reports_initializing() {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let translator = Translator::new().with_router(ToolRouter::catch_all([(
                 id.clone(),
                 LanguageId::from_static("rust"),
@@ -1298,8 +1334,8 @@ mod tests {
             else {
                 panic!("expected UnknownServers, got {err:?}");
             };
-            assert_eq!(unknown, [ServerId::from("nope")]);
-            assert_eq!(configured, [ServerId::from("rust")]);
+            assert_eq!(unknown, [ServerId::from_static("nope")]);
+            assert_eq!(configured, [ServerId::from_static("rust")]);
             assert_eq!(read_log(&log).matches("started").count(), 1);
         }
 
@@ -1475,7 +1511,7 @@ mod tests {
             let fx = fixture(dir, &script, true).await;
             let mut broken = stub_server_config("rust", &script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("mcpls-test-missing-server");
+                ServerCommand::from_static("mcpls-test-missing-server").into();
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1531,16 +1567,15 @@ mod tests {
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let mut translator = Translator::new().with_notification_cache(Arc::clone(&cache));
             translator.set_workspace_roots(
-                WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
+                WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
-            let (_cancel, cancel_rx) = watch::channel(false);
             let wiring = PumpWiring::new(
                 PumpShared {
                     notification_cache: Arc::clone(&cache),
                     subs: SubscriptionRegistry::new(),
                     workspace_roots: translator.workspace_roots.clone(),
                 },
-                cancel_rx,
+                CancellationToken::new(),
             );
             let mut logs = Vec::new();
             for index in 0..6 {
@@ -1558,7 +1593,7 @@ mod tests {
                     pinned_tsserver: None,
                 };
                 translator.register_server_complete(server);
-                let id = ServerId::from(name.as_str());
+                let id = ServerId::new(name.as_str()).unwrap();
                 let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Secondary);
                 translator.set_notification_task(&id, pump);
                 logs.push(log);
@@ -1623,7 +1658,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_an_unregistered_server_is_never_throttled() {
-            let id = ServerId::from("rust");
+            let id = ServerId::from_static("rust");
             let clock = Arc::new(FakeClock::new());
             let translator = Translator::new().with_clock(clock.clone());
             translator.set_expected_servers(HashSet::from([id.clone()]));
@@ -1642,7 +1677,7 @@ mod tests {
             translator.record_startup_failures(&[ServerSpawnFailure {
                 server_id: id,
                 language_id: LanguageId::from_static("rust"),
-                command: "missing".to_string(),
+                command: ServerCommand::from_static("missing"),
                 reason: StartupFailure::InitTaskPanicked,
             }]);
             let failed = translator
@@ -1716,7 +1751,7 @@ mod tests {
             .expect("the seed server's diagnostics reach the cache");
             let mut broken = stub_server_config("rust", &script);
             broken.server_config_mut().command =
-                ServerCommand::from_static("mcpls-test-missing-server");
+                ServerCommand::from_static("mcpls-test-missing-server").into();
             lock_std(&fx.translator.servers)
                 .server_mut(&fx.id)
                 .unwrap()
@@ -1928,7 +1963,7 @@ mod server_text_tests {
         let mut result = RestartServerResult {
             servers: vec![
                 ServerRestartEntry {
-                    server_id: ServerId::from("a"),
+                    server_id: ServerId::from_static("a"),
                     outcome: RestartOutcome::Failed {
                         reason: RestartFailure::SpawnFailed {
                             message: format!("spawn {secret}"),
@@ -1936,7 +1971,7 @@ mod server_text_tests {
                     },
                 },
                 ServerRestartEntry {
-                    server_id: ServerId::from("b"),
+                    server_id: ServerId::from_static("b"),
                     outcome: RestartOutcome::Failed {
                         reason: RestartFailure::InitializeFailed {
                             message: format!("init {secret}"),
@@ -1944,7 +1979,7 @@ mod server_text_tests {
                     },
                 },
                 ServerRestartEntry {
-                    server_id: ServerId::from("c"),
+                    server_id: ServerId::from_static("c"),
                     outcome: RestartOutcome::NotRunning {
                         message: format!("gone {secret}"),
                     },

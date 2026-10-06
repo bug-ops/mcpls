@@ -13,34 +13,60 @@ use crate::bridge::WorkspaceRoots;
 use crate::config::LspServerConfig;
 use crate::lsp::{ManagedEnvVar, ParentEnv, child_env_var};
 
-/// Whether `path` is a regular file the process may execute.
+/// The host operating system, as far as spawning and executable lookup differ.
+///
+/// Passed explicitly so the Windows rules run, and are tested, on every OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    /// Windows: any regular file is executable, and `.cmd` shims exist.
+    Windows,
+    /// Every other host: a file is executable by its execute bit.
+    Other,
+}
+
+impl HostOs {
+    /// The host this build runs on.
+    pub const CURRENT: Self = if cfg!(windows) {
+        Self::Windows
+    } else {
+        Self::Other
+    };
+
+    /// Whether `path` is a regular file this host may execute: on Windows any
+    /// file, elsewhere one with an execute bit.
+    pub fn is_executable_file(self, path: &Path) -> bool {
+        match self {
+            Self::Windows => path.is_file(),
+            Self::Other => is_unix_executable(path),
+        }
+    }
+
+    /// `path` as spawned: on Windows a path without an extension gets `.exe`.
+    fn spawn_name(self, path: &Path) -> PathBuf {
+        if self == Self::Windows && path.extension().is_none() {
+            path.with_added_extension("exe")
+        } else {
+            path.to_path_buf()
+        }
+    }
+}
+
 #[cfg(unix)]
-pub fn is_executable_file(path: &Path) -> bool {
+fn is_unix_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// Whether `path` is a regular file the process may execute.
 #[cfg(not(unix))]
-pub fn is_executable_file(path: &Path) -> bool {
+fn is_unix_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// The executable regular file `path` names when spawned: on Windows a path
-/// without an extension is spawned as `<path>.exe`.
-fn spawn_target(path: &Path) -> Option<PathBuf> {
-    let target = windows_spawn_name(path, cfg!(windows));
-    is_executable_file(&target).then_some(target)
-}
-
-/// `path` as spawned: on Windows a path without an extension gets `.exe`.
-fn windows_spawn_name(path: &Path, windows: bool) -> PathBuf {
-    if windows && path.extension().is_none() {
-        path.with_added_extension("exe")
-    } else {
-        path.to_path_buf()
-    }
+/// The executable regular file `path` names when spawned on `host`.
+fn spawn_target(host: HostOs, path: &Path) -> Option<PathBuf> {
+    let target = host.spawn_name(path);
+    host.is_executable_file(&target).then_some(target)
 }
 
 /// The executable a spawn of a server's `command` runs.
@@ -74,11 +100,23 @@ pub fn resolve_named(
     config: &LspServerConfig,
     parent_env: impl ParentEnv,
 ) -> Option<ResolvedCommand> {
+    resolve_named_on(HostOs::CURRENT, name, config, parent_env)
+}
+
+/// [`resolve_named`] with the spawn rules of `host`: on Windows a bare name
+/// matches `<name>.exe`, and a name with an extension (`tsc.cmd`) matches
+/// as given.
+pub fn resolve_named_on(
+    host: HostOs,
+    name: &Path,
+    config: &LspServerConfig,
+    parent_env: impl ParentEnv,
+) -> Option<ResolvedCommand> {
     let found = if name.components().count() > 1 {
-        spawn_target(name)
+        spawn_target(host, name)
     } else {
         let path_var = child_env_var(config, ManagedEnvVar::Path.name(), parent_env)?;
-        std::env::split_paths(&path_var).find_map(|dir| spawn_target(&dir.join(name)))
+        std::env::split_paths(&path_var).find_map(|dir| spawn_target(host, &dir.join(name)))
     }?;
     let canonical = dunce::canonicalize(&found).ok()?;
     let spawn = std::path::absolute(&found).ok()?;
@@ -133,17 +171,17 @@ mod tests {
 
     #[test]
     fn test_windows_spawn_name_adds_exe_only_without_an_extension() {
-        let name = |path: &str, windows| windows_spawn_name(Path::new(path), windows);
+        let name = |path: &str, host: HostOs| host.spawn_name(Path::new(path));
         assert_eq!(
-            name("tools/rust-analyzer", true),
+            name("tools/rust-analyzer", HostOs::Windows),
             Path::new("tools/rust-analyzer.exe")
         );
         assert_eq!(
-            name("tools/server.cmd", true),
+            name("tools/server.cmd", HostOs::Windows),
             Path::new("tools/server.cmd")
         );
         assert_eq!(
-            name("tools/rust-analyzer", false),
+            name("tools/rust-analyzer", HostOs::Other),
             Path::new("tools/rust-analyzer")
         );
     }
@@ -155,7 +193,7 @@ mod tests {
         let (workspace, outside) = (base.join("ws"), base.join("outside"));
         std::fs::create_dir_all(workspace.join("bin")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        let boundary = WorkspaceRoots::from_configured(std::slice::from_ref(&workspace)).unwrap();
+        let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let path = std::env::join_paths([
             workspace.join("bin"),
             workspace.join("not-created-yet/bin"),
@@ -185,7 +223,7 @@ mod tests {
 
         fn config(command: &str) -> LspServerConfig {
             let mut config = LspServerConfig::rust_analyzer();
-            config.command = ServerCommand::new(command.to_string()).unwrap();
+            config.command = ServerCommand::new(command.to_string()).unwrap().into();
             config
         }
 

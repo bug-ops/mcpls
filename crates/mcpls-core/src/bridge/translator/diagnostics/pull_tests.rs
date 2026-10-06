@@ -1,10 +1,10 @@
 //! `get_diagnostics` as the writer of the pulled slot: storing, publishing and
 //! the races a pull in flight can lose.
 
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+use std::{assert_matches, fs};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -79,14 +79,13 @@ impl Fixture {
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::catch_all([(
-                ServerId::from("rust"),
+                ServerId::from_static("rust"),
                 LanguageId::from_static("rust"),
             )]));
-        translator.set_workspace_roots(
-            WorkspaceRoots::from_configured(&[dir.path().to_path_buf()]).unwrap(),
-        );
+        translator
+            .set_workspace_roots(WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap());
         let (client, server, _lanes) = fake_lsp_client_with_redactions(redactions);
-        translator.register_client("rust".to_string(), client);
+        translator.register_client(ServerId::from_static("rust"), client);
         let wiring = Arc::new(RecordingWiring {
             subscribed: std::sync::atomic::AtomicBool::new(true),
             ..RecordingWiring::default()
@@ -134,7 +133,7 @@ impl Fixture {
     }
 
     fn rust() -> ServerId {
-        ServerId::from("rust")
+        ServerId::from_static("rust")
     }
 }
 
@@ -461,6 +460,193 @@ async fn test_advertising_server_refusing_a_pull_is_an_error() {
 
     assert!(Fixture::finish(pull).await.is_err());
     assert_eq!(translator.pull_support(&id), PullSupport::Advertised);
+}
+
+type Answer = JoinHandle<Result<DiagnosticsAnswer>>;
+
+/// Awaits `answer` without the wall-clock cap of `finish_answer`, which would
+/// outrun a request timeout under paused time.
+async fn settle(answer: Answer) -> Result<DiagnosticsAnswer> {
+    answer.await.unwrap()
+}
+
+/// Drives one `get_diagnostics` whose pull requests the server answers with
+/// the JSON-RPC error `code` each time it is asked (the client retries some).
+async fn answer_with_error(
+    fx: &Fixture,
+    server: &mut FakeServer,
+    code: i64,
+) -> Result<DiagnosticsAnswer> {
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let mut pull = fx.spawn_answer();
+    loop {
+        tokio::select! {
+            request = next_pull_request(&mut wire) => {
+                write_error_response(&mut server.read_half_stdin, &request["id"], code, "no").await;
+            }
+            done = &mut pull => return done.unwrap(),
+        }
+    }
+}
+
+/// Drives one `get_diagnostics` whose pull request the server never answers.
+async fn answer_with_timeout(fx: &Fixture, server: &mut FakeServer) -> Result<DiagnosticsAnswer> {
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let pull = fx.spawn_answer();
+    drop(next_pull_request(&mut wire).await);
+    settle(pull).await
+}
+
+/// #680: one probe timeout is no proof; two in a row refuse the server, and
+/// each of them answers from the push cache.
+#[tokio::test(start_paused = true)]
+async fn test_second_consecutive_probe_timeout_refuses_the_server() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+
+    let first = answer_with_timeout(&fx, &mut server).await.unwrap();
+    assert_eq!(first.origin, DiagnosticsOrigin::PushCache);
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Probing
+    );
+
+    let second = answer_with_timeout(&fx, &mut server).await.unwrap();
+    assert_eq!(second.origin, DiagnosticsOrigin::PushCache);
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Unsupported
+    );
+}
+
+/// #680: an answer between two timeouts resets the count, and a server that
+/// answers once is never refused for timing out later.
+#[tokio::test(start_paused = true)]
+async fn test_timeout_answer_timeout_does_not_refuse() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    drop(answer_with_timeout(&fx, &mut server).await.unwrap());
+
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let pull = fx.spawn_answer();
+    answer(
+        &mut wire,
+        &mut server.read_half_stdin,
+        full_report(json!([])),
+    )
+    .await;
+    drop(Fixture::finish_answer(pull).await);
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Answers
+    );
+    drop(wire);
+
+    let failed = answer_with_timeout(&fx, &mut server).await;
+    assert_matches!(failed, Err(Error::Timeout(_)));
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Answers
+    );
+}
+
+/// #680: a cancelled, content-modified or server-cancelled reply says nothing
+/// about the method: the call answers from the push cache, the probe stays.
+#[tokio::test(start_paused = true)]
+async fn test_transient_probe_errors_leave_the_probe_unchanged() {
+    for code in [-32800, -32801, -32802] {
+        let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+        let answer = answer_with_error(&fx, &mut server, code).await.unwrap();
+        assert_eq!(answer.origin, DiagnosticsOrigin::PushCache, "{code}");
+        assert_eq!(
+            fx.translator.pull_support(&Fixture::rust()),
+            PullSupport::Probing,
+            "{code}"
+        );
+    }
+}
+
+/// #680: any other server error while probing surfaces as it did before and
+/// does not refuse the server.
+#[tokio::test(start_paused = true)]
+async fn test_other_probe_errors_surface_and_leave_the_probe_unchanged() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let failed = answer_with_error(&fx, &mut server, -32603).await;
+    assert_matches!(failed, Err(Error::LspServerError { code: -32603, .. }));
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Probing
+    );
+}
+
+/// #680: two first pulls in flight together that both time out are one failure
+/// to answer in time; only a pull sent after that timeout can be the second.
+#[tokio::test(start_paused = true)]
+async fn test_overlapping_first_timeouts_do_not_refuse_the_server() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let first = fx.spawn_answer();
+    let second = fx.spawn_answer();
+    drop(next_pull_request(&mut wire).await);
+    drop(next_pull_request(&mut wire).await);
+
+    assert_eq!(
+        settle(first).await.unwrap().origin,
+        DiagnosticsOrigin::PushCache
+    );
+    assert_eq!(
+        settle(second).await.unwrap().origin,
+        DiagnosticsOrigin::PushCache
+    );
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Probing
+    );
+
+    drop(wire);
+    drop(answer_with_timeout(&fx, &mut server).await.unwrap());
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Unsupported
+    );
+}
+
+/// #680: a transient reply between two timeouts neither counts nor resets, and
+/// a refused server is not asked again.
+#[tokio::test(start_paused = true)]
+async fn test_transient_reply_between_timeouts_is_neutral_and_refusal_stops_pulls() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    drop(answer_with_timeout(&fx, &mut server).await.unwrap());
+    drop(answer_with_error(&fx, &mut server, -32802).await.unwrap());
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Probing
+    );
+    drop(answer_with_timeout(&fx, &mut server).await.unwrap());
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Unsupported
+    );
+
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    let third = Fixture::finish_answer(fx.spawn_answer()).await;
+    assert_eq!(third.origin, DiagnosticsOrigin::PushCache);
+    assert!(
+        timeout(Duration::from_millis(50), next_pull_request(&mut wire))
+            .await
+            .is_err(),
+        "a refused server was pulled again"
+    );
+}
+
+/// #680: a timeout followed by `-32601` refuses at once.
+#[tokio::test(start_paused = true)]
+async fn test_timeout_then_method_not_found_refuses() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    drop(answer_with_timeout(&fx, &mut server).await.unwrap());
+    drop(answer_with_error(&fx, &mut server, -32601).await.unwrap());
+    assert_eq!(
+        fx.translator.pull_support(&Fixture::rust()),
+        PullSupport::Unsupported
+    );
 }
 
 /// SC-006 without disk timing: the tracker's synced version moves while the

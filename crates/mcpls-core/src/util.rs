@@ -8,6 +8,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::string::FromUtf8Error;
 use std::sync::{Mutex as StdMutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
 use tokio::task::JoinHandle;
@@ -22,6 +23,8 @@ pub enum BoundedUtf8Error {
     TooLarge {
         /// Number of bytes actually read.
         size: u64,
+        /// The byte limit that was exceeded.
+        max: NonZeroU64,
     },
     /// The bytes were within the limit but not valid UTF-8.
     #[error(transparent)]
@@ -42,8 +45,10 @@ pub enum BoundedUtf8Error {
 /// [`BoundedUtf8Error::InvalidUtf8`].
 pub fn check_bounded_utf8(buf: Vec<u8>, max: SizeLimit) -> Result<String, BoundedUtf8Error> {
     let size = buf.len() as u64;
-    if !max.admits(size) {
-        return Err(BoundedUtf8Error::TooLarge { size });
+    if let Some(limit) = max.get()
+        && size > limit.get()
+    {
+        return Err(BoundedUtf8Error::TooLarge { size, max: limit });
     }
     Ok(String::from_utf8(buf)?)
 }
@@ -72,7 +77,7 @@ pub enum ReadBoundedError {
         /// understated them.
         size: u64,
         /// The byte limit that was exceeded.
-        max: u64,
+        max: NonZeroU64,
     },
 }
 
@@ -147,18 +152,17 @@ impl RegularFile {
     /// [`ReadBoundedError::TooLarge`] past `max` bytes and
     /// [`ReadBoundedError::Io`] when the read fails.
     pub fn read_bounded(self, max: NonZeroU64) -> Result<Vec<u8>, ReadBoundedError> {
-        let max = max.get();
         let size = self.metadata.len();
-        if size > max {
+        if size > max.get() {
             return Err(ReadBoundedError::TooLarge { size, max });
         }
         let mut buf = Vec::new();
         self.file
-            .take(max.saturating_add(1))
+            .take(max.get().saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(ReadBoundedError::Io)?;
         let read = buf.len() as u64;
-        if read > max {
+        if read > max.get() {
             return Err(ReadBoundedError::TooLarge { size: read, max });
         }
         Ok(buf)
@@ -353,6 +357,33 @@ pub async fn catch_panic<T>(fut: impl Future<Output = T>) -> Result<T, TaskPanic
         .map_err(|payload| TaskPanicked::from_payload(payload.as_ref()))
 }
 
+/// Decides when a repeating condition may be logged at `warn` again.
+///
+/// The first occurrence is due at once, later ones only once `every` has
+/// passed since the last one that was due, so a source that repeats cannot
+/// flood the log.
+#[derive(Debug, Default)]
+pub struct WarnLimiter {
+    last: Option<Instant>,
+}
+
+impl WarnLimiter {
+    /// The period most warnings use between two lines.
+    pub const DEFAULT_PERIOD: Duration = Duration::from_mins(1);
+
+    /// Whether a warning is due at `now`; when it is, `now` becomes the new
+    /// reference point.
+    pub fn due(&mut self, now: Instant, every: Duration) -> bool {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) > every);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
 /// Locks a `std::sync::Mutex`, recovering the guard if a previous holder
 /// panicked while holding it.
 ///
@@ -370,6 +401,18 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+
+    #[test]
+    fn warn_limiter_is_due_at_first_and_then_once_per_interval() {
+        let every = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut limiter = WarnLimiter::default();
+        assert!(limiter.due(start, every));
+        assert!(!limiter.due(start + Duration::from_secs(1), every));
+        assert!(!limiter.due(start + every, every));
+        assert!(limiter.due(start + every + Duration::from_millis(1), every));
+        assert!(!limiter.due(start + every + Duration::from_secs(2), every));
+    }
 
     #[tokio::test]
     async fn catch_panic_passes_value_through() {
@@ -480,10 +523,7 @@ mod tests {
         std::fs::write(&path, b"{ }").unwrap();
         assert_matches!(
             read_regular_file_bounded(&path, limit(2)),
-            Err(BoundedFileError::Read(ReadBoundedError::TooLarge {
-                size: 3,
-                max: 2
-            }))
+            Err(BoundedFileError::Read(ReadBoundedError::TooLarge { size: 3, max })) if max == limit(2)
         );
     }
 
@@ -574,7 +614,7 @@ mod tests {
     fn check_bounded_utf8_too_large() {
         assert_matches!(
             check_bounded_utf8(b"hello".to_vec(), size(4)),
-            Err(BoundedUtf8Error::TooLarge { size: 5 })
+            Err(BoundedUtf8Error::TooLarge { size: 5, max }) if max.get() == 4
         );
     }
 
@@ -601,7 +641,7 @@ mod tests {
         buf.truncate(5);
         assert_matches!(
             check_bounded_utf8(buf, size(4)),
-            Err(BoundedUtf8Error::TooLarge { size: 5 })
+            Err(BoundedUtf8Error::TooLarge { size: 5, .. })
         );
     }
 

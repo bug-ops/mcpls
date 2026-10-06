@@ -1,7 +1,7 @@
 //! LSP client implementation with async request/response handling.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use lsp_types::LspErrorCodes;
@@ -21,6 +21,7 @@ use crate::lsp::types::{
     LspNotification, RequestId,
 };
 use crate::redaction::{RedactedText, Redactions};
+use crate::util::WarnLimiter;
 
 /// JSON-RPC protocol version.
 const JSONRPC_VERSION: &str = "2.0";
@@ -196,32 +197,55 @@ fn spawn_reader_task(
 
 /// The current run of consecutive undecodable inbound frames.
 #[derive(Debug, Default)]
-struct UndecodableRun(u32);
+struct UndecodableRun {
+    in_a_row: u32,
+    warn: WarnLimiter,
+    /// Frames dropped since the last `warn` line.
+    unreported: u32,
+}
 
 impl UndecodableRun {
     /// Passes `message` on. A decodable message ends the run; an undecodable
-    /// one extends it, logged at `warn` only when it starts the run so a server
-    /// that spams garbage cannot flood the log.
+    /// one extends it. Drops are logged at `warn` at most once a minute, with
+    /// the number dropped since the last line, and at `debug` otherwise, so a
+    /// server that spams garbage cannot flood the log.
     ///
     /// # Errors
     ///
     /// [`Error::LspProtocolError`] once the run reaches
     /// [`MAX_CONSECUTIVE_UNDECODABLE_FRAMES`], so the connection is torn down.
     fn observe(&mut self, message: InboundMessage) -> Result<InboundMessage> {
+        self.observe_at(message, std::time::Instant::now())
+    }
+
+    fn observe_at(
+        &mut self,
+        message: InboundMessage,
+        now: std::time::Instant,
+    ) -> Result<InboundMessage> {
         if !message.is_undecodable() {
-            self.0 = 0;
+            self.in_a_row = 0;
             return Ok(message);
         }
-        self.0 = self.0.saturating_add(1);
-        if self.0 >= MAX_CONSECUTIVE_UNDECODABLE_FRAMES {
+        self.in_a_row = self.in_a_row.saturating_add(1);
+        if self.in_a_row >= MAX_CONSECUTIVE_UNDECODABLE_FRAMES {
             return Err(Error::LspProtocolError(RedactedText::fixed(
                 "too many consecutive undecodable messages",
             )));
         }
-        if self.0 == 1 {
-            warn!("Dropped an undecodable LSP message; later ones in a row are logged at debug");
+        if self.warn.due(now, WarnLimiter::DEFAULT_PERIOD) {
+            warn!(
+                "Dropped an undecodable LSP message ({} others dropped since the last warning); \
+                 further ones are logged at debug for a minute",
+                self.unreported
+            );
+            self.unreported = 0;
         } else {
-            debug!("Dropped an undecodable LSP message ({} in a row)", self.0);
+            self.unreported = self.unreported.saturating_add(1);
+            debug!(
+                "Dropped an undecodable LSP message ({} in a row)",
+                self.in_a_row
+            );
         }
         Ok(message)
     }
@@ -288,6 +312,24 @@ pub struct LspClient {
 
     /// Secrets hidden from text derived from server output.
     redactions: Arc<Redactions>,
+
+    /// Identity of the connection, shared by every clone.
+    connection_id: ConnectionId,
+}
+
+/// Identity of one client connection, and so of one server process.
+///
+/// Clones of a client share it; every client built by this process gets a
+/// distinct one, so a result tied to a replaced process is told apart from the
+/// running one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionId(u64);
+
+impl ConnectionId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 impl Clone for LspClient {
@@ -305,6 +347,7 @@ impl Clone for LspClient {
             pending_failure: Arc::clone(&self.pending_failure),
             receiver_task: None,
             redactions: Arc::clone(&self.redactions),
+            connection_id: self.connection_id,
         }
     }
 }
@@ -343,6 +386,7 @@ impl LspClient {
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         }
     }
 
@@ -381,6 +425,7 @@ impl LspClient {
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         }
     }
 
@@ -426,12 +471,18 @@ impl LspClient {
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions,
+            connection_id: ConnectionId::next(),
         }
     }
 
     /// The configured settings, shared with the message loop.
     fn shared_settings(config: &LspServerConfig) -> Option<Arc<LspSettings>> {
         config.settings.clone().map(Arc::new)
+    }
+
+    /// Identity of the connection this client and its clones talk over.
+    pub(crate) const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
     }
 
     /// Secrets this client hides from text derived from server output.
@@ -2257,6 +2308,7 @@ mod tests {
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         };
 
         let (tx1, rx1) = oneshot::channel::<Result<Value>>();
@@ -2377,6 +2429,78 @@ mod tests {
 
         fn deeply_nested() -> String {
             format!("{}1{}", "{\"parent\":".repeat(200), "}".repeat(200))
+        }
+
+        /// #681: invalid UTF-8 in a response body fails its own request only.
+        #[tokio::test]
+        async fn test_invalid_utf8_response_fails_only_its_request() {
+            use tokio::io::AsyncWriteExt as _;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = spawn_hover(&client);
+            let first_request = read_framed_message(&mut reader).await;
+            let mut body = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":"x"#,
+                first_request["id"]
+            )
+            .into_bytes();
+            body.extend_from_slice(&[0xff, 0xfe]);
+            body.extend_from_slice(br#"y"}"#);
+            let stdin = &mut server.read_half_stdin;
+            stdin
+                .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            stdin.write_all(&body).await.unwrap();
+            stdin.flush().await.unwrap();
+
+            assert_matches!(
+                first.await.unwrap(),
+                Err(Error::LspProtocolError(message)) if message.as_str() == "undecodable response"
+            );
+
+            let second = spawn_hover(&client);
+            let second_request = read_framed_message(&mut reader).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &second_request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+            assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("alive"));
+        }
+
+        /// #681: undecodable frames are warned about at most once a minute,
+        /// with the number dropped silently since the last warning.
+        #[test]
+        fn test_undecodable_warning_is_time_limited_and_counts_the_suppressed() {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let captured = crate::test_lsp::CapturedLogs::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(captured.clone()),
+            );
+            let mut run = UndecodableRun::default();
+            let start = std::time::Instant::now();
+            let at = |secs| start + Duration::from_secs(secs);
+            for secs in [0, 1, 2, 30] {
+                run.observe_at(InboundMessage::UndecodableFrame, at(secs))
+                    .unwrap();
+            }
+            run.observe_at(InboundMessage::UndecodableFrame, at(61))
+                .unwrap();
+
+            let warnings: Vec<_> = captured
+                .entries()
+                .into_iter()
+                .filter(|(level, _)| *level == tracing::Level::WARN)
+                .map(|(_, message)| message)
+                .collect();
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(warnings[0].contains("(0 others"), "{warnings:?}");
+            assert!(warnings[1].contains("(3 others"), "{warnings:?}");
         }
 
         #[tokio::test]
@@ -3714,7 +3838,7 @@ mod tests {
             });
             let _ = read_framed_message(&mut reader).await;
 
-            client.mark_restarted(ServerId::from("rust"));
+            client.mark_restarted(ServerId::from_static("rust"));
             client
                 .shutdown_until(Instant::now() + Duration::from_millis(200))
                 .await

@@ -15,7 +15,7 @@ use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, Inde
 use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{DiagnosticsAvailability, DocumentTracker, uri_to_path};
 use crate::config::ServerId;
-use crate::util::truncate_string;
+use crate::util::{WarnLimiter, truncate_string};
 
 mod bounds;
 mod pulled_index;
@@ -361,7 +361,7 @@ const EVICTION_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_mi
 struct EvictionRecord {
     at: HashMap<DiagnosticsKey, std::time::Instant>,
     order: VecDeque<(DiagnosticsKey, std::time::Instant)>,
-    overflow_warned_at: Option<std::time::Instant>,
+    overflow_warn: WarnLimiter,
 }
 
 impl EvictionRecord {
@@ -410,11 +410,7 @@ impl EvictionRecord {
     }
 
     fn warn_overflow(&mut self, now: std::time::Instant) {
-        let due = self
-            .overflow_warned_at
-            .is_none_or(|at| now.saturating_duration_since(at) > EVICTION_REPLAY_WINDOW);
-        if due {
-            self.overflow_warned_at = Some(now);
+        if self.overflow_warn.due(now, EVICTION_REPLAY_WINDOW) {
             warn!(
                 "more than {MAX_RECENT_EVICTIONS} diagnostics clears evicted within {}s, \
                  forgetting the oldest; a re-attaching listen may miss them",
@@ -463,7 +459,9 @@ struct EvictionMark {
 /// forgotten the server is `overflowed`, and a file without entry or mark is
 /// then reported as possibly evicted rather than as pending. A server's marks
 /// and overflow are dropped with its diagnostics (respawn), and a file's mark
-/// with its next entry.
+/// with its next entry. The overflow also ends with the server's next accepted
+/// write, so a file forgotten before it reads as pending again instead of
+/// possibly evicted for as long as the process runs.
 #[derive(Debug, Default)]
 struct EvictionMarks {
     by_file: HashMap<DiagnosticsKey, EvictionMark>,
@@ -518,6 +516,16 @@ impl EvictionMarks {
 
     fn has_overflowed(&self, server: &ServerId) -> bool {
         self.overflowed.contains(server)
+    }
+
+    /// Ends `server`'s overflow and returns whether it was set. Called before
+    /// the write's own evictions, which can start a new one.
+    fn clear_overflow(&mut self, server: &ServerId) -> bool {
+        self.overflowed.remove(server)
+    }
+
+    fn restore_overflow(&mut self, server: &ServerId) {
+        self.overflowed.insert(server.clone());
     }
 }
 
@@ -1206,6 +1214,8 @@ impl NotificationCache {
 
         self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
+        self.eviction_marks.clear_overflow(server_id);
+
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
         // never needs room; only a genuinely new URI can trigger eviction.
@@ -1401,11 +1411,15 @@ impl NotificationCache {
         };
 
         let mut evicted = Vec::new();
+        let was_overflowed = self.eviction_marks.clear_overflow(server_id);
         let is_new_slot = self.take_entry(&slot_key).is_none();
         if is_new_slot {
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES {
                 let Some((_, _, victim)) = self.entry_to_evict(server_id, Protect::File(&file_key))
                 else {
+                    if was_overflowed {
+                        self.eviction_marks.restore_overflow(server_id);
+                    }
                     return PullWrite::Discarded {
                         reason: Discard::NoRoom,
                         evicted,
@@ -2014,7 +2028,7 @@ impl NotificationCache {
 /// use mcpls_core::lsp::LspNotification;
 ///
 /// let mut cache = NotificationCache::new();
-/// let server_id = ServerId::from("rust");
+/// let server_id = ServerId::from_static("rust");
 /// apply_lifecycle_notification(
 ///     &mut cache,
 ///     &server_id,
@@ -2076,7 +2090,7 @@ mod tests {
     /// fairness routes through one implicit server, so `set_diagnostics_route_count`
     /// is left at its default of `1` (full `MAX_DIAGNOSTIC_ENTRIES` budget).
     fn test_server() -> ServerId {
-        ServerId::from("test-server")
+        ServerId::from_static("test-server")
     }
 
     #[test]
@@ -2892,8 +2906,8 @@ mod tests {
     fn test_noisy_server_does_not_evict_quiet_server_entries() {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(2);
-        let noisy = ServerId::from("noisy");
-        let quiet = ServerId::from("quiet");
+        let noisy = ServerId::from_static("noisy");
+        let quiet = ServerId::from_static("quiet");
 
         let quiet_uri: Uri = Uri::from("file:///quiet/only_file.rs");
         cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
@@ -2929,7 +2943,7 @@ mod tests {
     fn test_dominant_server_exceeds_equal_share_while_others_idle() {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(4);
-        let dominant = ServerId::from("dominant");
+        let dominant = ServerId::from_static("dominant");
 
         let equal_share = MAX_DIAGNOSTIC_ENTRIES / 4;
         let more_than_share = equal_share + 100;
@@ -2969,8 +2983,8 @@ mod tests {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(1000); // fair share floors at 1
 
-        let a = ServerId::from("a");
-        let b = ServerId::from("b");
+        let a = ServerId::from_static("a");
+        let b = ServerId::from_static("b");
         for i in 0..2 {
             let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             cache.store_diagnostics(&a, &uri, Some(1), vec![]);
@@ -2983,7 +2997,7 @@ mod tests {
         // `a` and `b` are tied at 2 entries each, both over the floor-1
         // share -- `"b"` sorts after `"a"` lexicographically, so it is the
         // one always picked.
-        let writer = ServerId::from("writer");
+        let writer = ServerId::from_static("writer");
         assert_eq!(cache.server_to_evict_from(&writer), Some(b));
     }
 
@@ -3000,8 +3014,8 @@ mod tests {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(2); // fair share = 500 each
 
-        let a = ServerId::from("a");
-        let b = ServerId::from("b");
+        let a = ServerId::from_static("a");
+        let b = ServerId::from_static("b");
         for i in 0..500 {
             let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
             cache.store_diagnostics(&a, &uri, Some(1), vec![]);
@@ -3014,7 +3028,7 @@ mod tests {
 
         // `c` has never written before -- its very first write hits a full,
         // entirely-in-share aggregate.
-        let c = ServerId::from("c");
+        let c = ServerId::from_static("c");
         let new_uri: Uri = Uri::from("file:///c/first.rs");
         cache.store_diagnostics(&c, &new_uri, Some(1), vec![]);
 
@@ -3046,7 +3060,7 @@ mod tests {
     #[test]
     fn test_repeated_writes_same_owner_do_not_grow_order_map() {
         let mut cache = NotificationCache::new();
-        let server = ServerId::from("server");
+        let server = ServerId::from_static("server");
         let uri: Uri = Uri::from("file:///test.rs");
 
         let max_version = i32::try_from(MAX_DIAGNOSTIC_ENTRIES).unwrap() + 10;
@@ -3065,8 +3079,8 @@ mod tests {
     #[test]
     fn test_store_diagnostics_reassigns_ownership() {
         let mut cache = NotificationCache::new();
-        let old_owner = ServerId::from("old");
-        let new_owner = ServerId::from("new");
+        let old_owner = ServerId::from_static("old");
+        let new_owner = ServerId::from_static("new");
         let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
@@ -3093,7 +3107,7 @@ mod tests {
     #[test]
     fn test_diagnostics_owner_returns_publisher_after_store() {
         let mut cache = NotificationCache::new();
-        let server = ServerId::from("rust");
+        let server = ServerId::from_static("rust");
         let uri: Uri = Uri::from("file:///main.rs");
 
         cache.store_diagnostics(&server, &uri, Some(1), vec![]);
@@ -3116,8 +3130,8 @@ mod tests {
     #[test]
     fn test_diagnostics_owner_reflects_reassigned_ownership() {
         let mut cache = NotificationCache::new();
-        let old_owner = ServerId::from("old");
-        let new_owner = ServerId::from("new");
+        let old_owner = ServerId::from_static("old");
+        let new_owner = ServerId::from_static("new");
         let uri: Uri = Uri::from("file:///test.rs");
 
         cache.store_diagnostics(&old_owner, &uri, Some(1), vec![]);
@@ -3132,8 +3146,8 @@ mod tests {
     #[test]
     fn test_clear_server_diagnostics_scopes_to_one_server() {
         let mut cache = NotificationCache::new();
-        let crashed = ServerId::from("crashed");
-        let healthy = ServerId::from("healthy");
+        let crashed = ServerId::from_static("crashed");
+        let healthy = ServerId::from_static("healthy");
 
         let crashed_uri: Uri = Uri::from("file:///crashed/main.py");
         let healthy_uri: Uri = Uri::from("file:///healthy/main.rs");
@@ -3158,8 +3172,8 @@ mod tests {
     #[test]
     fn test_push_degraded_is_scoped_per_server_and_permanent() {
         let mut cache = NotificationCache::new();
-        let degraded = ServerId::from("degraded");
-        let healthy = ServerId::from("healthy");
+        let degraded = ServerId::from_static("degraded");
+        let healthy = ServerId::from_static("healthy");
 
         assert!(!cache.is_push_degraded(&degraded));
         assert!(!cache.is_push_degraded(&healthy));
@@ -3184,7 +3198,7 @@ mod tests {
     #[test]
     fn test_shrinking_budget_affects_eviction_target_not_existing_entries() {
         let mut cache = NotificationCache::new();
-        let server = ServerId::from("server");
+        let server = ServerId::from_static("server");
 
         for i in 0..MAX_DIAGNOSTIC_ENTRIES {
             let uri: Uri = Uri::from(format!("file:///file{i}.rs"));
@@ -3203,7 +3217,7 @@ mod tests {
 
         // A different server's first write, once the aggregate is full,
         // evicts from `server` (now far over its shrunk share) instead.
-        let other = ServerId::from("other");
+        let other = ServerId::from_static("other");
         let new_uri: Uri = Uri::from("file:///other/new.rs");
         cache.store_diagnostics(&other, &new_uri, Some(1), vec![]);
 
@@ -3224,8 +3238,8 @@ mod tests {
     #[test]
     fn test_fair_share_applies_by_default_without_explicit_route_count() {
         let mut cache = NotificationCache::new();
-        let noisy = ServerId::from("noisy");
-        let quiet = ServerId::from("quiet");
+        let noisy = ServerId::from_static("noisy");
+        let quiet = ServerId::from_static("quiet");
 
         let quiet_uri: Uri = Uri::from("file:///quiet/only_file.rs");
         cache.store_diagnostics(&quiet, &quiet_uri, Some(1), vec![]);
@@ -3343,9 +3357,9 @@ mod tests {
         let mut cache = NotificationCache::new();
         cache.set_diagnostics_route_count(3); // fair share = 333
 
-        let a = ServerId::from("a"); // over share, all real diagnostics
-        let b = ServerId::from("b"); // over share, all empty/clean
-        let c = ServerId::from("c"); // within share
+        let a = ServerId::from_static("a"); // over share, all real diagnostics
+        let b = ServerId::from_static("b"); // over share, all empty/clean
+        let c = ServerId::from_static("c"); // within share
 
         for i in 0..500 {
             let uri: Uri = Uri::from(format!("file:///a/file{i}.rs"));
@@ -3849,7 +3863,7 @@ mod tests {
     #[test]
     fn test_clear_server_diagnostics_leaves_no_dangling_file_index() {
         let mut cache = NotificationCache::new();
-        let (a, b) = (ServerId::from("a"), ServerId::from("b"));
+        let (a, b) = (ServerId::from_static("a"), ServerId::from_static("b"));
         cache.store_published_diagnostics(&a, &published("a1.rs"), None, vec![]);
         cache.store_published_diagnostics(
             &b,
@@ -3906,14 +3920,14 @@ mod tests {
                         );
                         let diagnostics = if empty { vec![] } else { vec![diagnostic_at(1, "e")] };
                         cache.store_published_diagnostics(
-                            &ServerId::from(format!("s{server}")),
+                            &ServerId::new(format!("s{server}")).unwrap(),
                             &PublishedDiagnosticsUri::for_test(source, canonical),
                             None,
                             diagnostics,
                         );
                     }
                     CacheOp::Clear { server } => {
-                        cache.clear_server_diagnostics(&ServerId::from(format!("s{server}")));
+                        cache.clear_server_diagnostics(&ServerId::new(format!("s{server}")).unwrap());
                     }
                 }
                 cache.assert_consistent();
@@ -4085,6 +4099,64 @@ mod tests {
         assert_eq!(marks.content(&file), Some(EvictedContent::Lost));
     }
 
+    fn overflowed_after_churn() -> NotificationCache {
+        let mut cache = full_cache(false);
+        for i in 0..=MAX_EVICTION_MARKS {
+            drop(write_error(&mut cache, &format!("file:///churn{i}.rs")));
+        }
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+        cache
+    }
+
+    /// #680: the overflow ends with the owner's next accepted push, so a file
+    /// forgotten earlier reads as pending again.
+    #[test]
+    fn test_overflow_ends_with_the_owners_next_accepted_push() {
+        let mut cache = NotificationCache::new();
+        cache.eviction_marks.overflowed.insert(route());
+        let unseen = Uri::from("file:///never-published.rs");
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Evicted
+        );
+
+        drop(write_error(&mut cache, "file:///fresh.rs"));
+
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Pending
+        );
+    }
+
+    /// #680: a pull is a write too, and another server's write leaves the
+    /// overflow alone.
+    #[test]
+    fn test_overflow_ends_with_the_owners_next_accepted_pull_only() {
+        let mut cache = NotificationCache::new();
+        cache.eviction_marks.overflowed.insert(route());
+        let other = ServerId::from_static("other-server");
+        cache.store_pulled_for_test(&other, &Uri::from("file:///other.rs"), Vec::new());
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+
+        cache.store_pulled_for_test(&route(), &Uri::from("file:///pulled.rs"), Vec::new());
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+    }
+
+    /// #680: the clear runs before the write's own evictions, so a write that
+    /// evicts into full marks leaves the server overflowed, and one that needs
+    /// no room ends it.
+    #[test]
+    fn test_overflow_clear_precedes_the_evictions_of_the_same_write() {
+        let mut cache = overflowed_after_churn();
+        drop(write_error(&mut cache, "file:///another-new.rs"));
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+
+        drop(write_error(&mut cache, "file:///another-new.rs"));
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+        cache.assert_consistent();
+    }
+
     /// #666 eviction pressure: once more files were evicted than the marks
     /// remember, a file without a mark is reported as possibly evicted for the
     /// server that lost marks, and still as pending for any other route.
@@ -4110,7 +4182,7 @@ mod tests {
             DiagnosticsAvailability::Evicted
         );
         assert_eq!(
-            cache.availability(&unseen, Some(&ServerId::from("other"))),
+            cache.availability(&unseen, Some(&ServerId::from_static("other"))),
             DiagnosticsAvailability::Pending
         );
 

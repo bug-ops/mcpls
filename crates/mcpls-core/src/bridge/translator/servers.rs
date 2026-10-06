@@ -17,7 +17,7 @@ use super::respawn::RespawnBackoff;
 use super::restart::RestartGeneration;
 use crate::config::ServerId;
 use crate::error::ServerSpawnFailure;
-use crate::lsp::{LspClient, LspServer};
+use crate::lsp::{ConnectionId, LspClient, LspServer};
 
 /// What a running slot holds.
 ///
@@ -135,9 +135,9 @@ pub(super) struct ServerSlot {
     pub(super) restart: RestartState,
     /// The task consuming this server's notification lanes.
     pub(super) notification_task: Option<AbortHandle>,
-    /// What a pull request showed about the running process; fresh for every
-    /// replacement.
-    pull_probe: PullProbe,
+    /// What a pull request showed about the process behind the connection;
+    /// read back only while that connection is the running one.
+    pull_probe: Option<(ConnectionId, PullProbe)>,
 }
 
 impl ServerStatus {
@@ -155,7 +155,7 @@ impl ServerSlot {
             backoff: None,
             restart: RestartState::default(),
             notification_task: None,
-            pull_probe: PullProbe::default(),
+            pull_probe: None,
         }
     }
 }
@@ -173,16 +173,34 @@ impl Servers {
         self.0.get_mut(id)
     }
 
-    /// What a pull request showed about `id`'s running process.
+    /// What a pull request showed about `id`'s running process; a result
+    /// recorded for a replaced process reads as untried.
     pub(super) fn pull_probe(&self, id: &ServerId) -> PullProbe {
-        self.0.get(id).map_or_default(|slot| slot.pull_probe)
+        let Some(slot) = self.0.get(id) else {
+            return PullProbe::default();
+        };
+        match (slot.pull_probe, self.client_ref(id)) {
+            (Some((conn, probe)), Some(client)) if conn == client.connection_id() => probe,
+            _ => PullProbe::default(),
+        }
     }
 
-    /// Records what a pull request showed about `id`'s running process.
-    pub(super) fn set_pull_probe(&mut self, id: &ServerId, probe: PullProbe) {
-        if let Some(slot) = self.0.get_mut(id) {
-            slot.pull_probe = probe;
+    /// Moves the probe of `id`'s process from what it is now, atomically under
+    /// the caller's guard. Returns the new probe, or `None` when `conn` is no
+    /// longer the running connection and nothing was recorded.
+    pub(super) fn update_pull_probe(
+        &mut self,
+        id: &ServerId,
+        conn: ConnectionId,
+        next: impl FnOnce(PullProbe) -> PullProbe,
+    ) -> Option<PullProbe> {
+        if self.client_ref(id)?.connection_id() != conn {
+            return None;
         }
+        let current = self.pull_probe(id);
+        let probe = next(current);
+        self.0.get_mut(id)?.pull_probe = Some((conn, probe));
+        Some(probe)
     }
 
     /// Every slot id, in no order.
@@ -192,9 +210,15 @@ impl Servers {
 
     /// The client of a running or stopped server.
     pub(super) fn client(&self, id: &ServerId) -> Option<LspClient> {
+        self.client_ref(id).cloned()
+    }
+
+    /// The client of a running or stopped server, borrowed, for readers that
+    /// only look at it under the guard.
+    pub(super) fn client_ref(&self, id: &ServerId) -> Option<&LspClient> {
         match &self.0.get(id)?.status {
-            ServerStatus::Running(backend) => Some(backend.client().clone()),
-            ServerStatus::Stopped(client) => Some(client.clone()),
+            ServerStatus::Running(backend) => Some(backend.client()),
+            ServerStatus::Stopped(client) => Some(client),
             ServerStatus::Expected { .. } | ServerStatus::Restarting | ServerStatus::Failed(_) => {
                 None
             }
@@ -404,7 +428,6 @@ impl Servers {
     /// displaced, so the caller drops it after releasing the guard.
     pub(super) fn register(&mut self, id: ServerId, backend: Backend) -> Registered {
         if let Some(slot) = self.0.get_mut(&id) {
-            slot.pull_probe = PullProbe::default();
             let was_expected = matches!(slot.status, ServerStatus::Expected { .. });
             let displaced =
                 match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
@@ -553,7 +576,6 @@ impl Servers {
             if matches!(slot.status, ServerStatus::Stopped(_)) {
                 return Err(Box::new(backend));
             }
-            slot.pull_probe = PullProbe::default();
             return Ok(
                 match std::mem::replace(&mut slot.status, ServerStatus::Running(backend)) {
                     ServerStatus::Running(old) => Some(old),
@@ -685,9 +707,9 @@ mod tests {
 
     fn failure(id: &str) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from(id),
+            server_id: ServerId::new(id).unwrap(),
             language_id: crate::config::LanguageId::from_static("rust"),
-            command: "x".to_string(),
+            command: crate::config::ServerCommand::from_static("x"),
             reason: StartupFailure::InitTaskPanicked,
         }
     }
@@ -695,7 +717,7 @@ mod tests {
     #[test]
     fn test_failed_then_expected_then_cleared_keeps_the_failure() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.record_failure(&failure("rust"));
         servers.set_expected(&HashSet::from([id.clone()]));
         assert!(servers.is_expected(&id));
@@ -710,7 +732,7 @@ mod tests {
     #[test]
     fn test_failure_of_an_expected_server_settles_it_as_failed() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.set_expected(&HashSet::from([id.clone()]));
         assert!(servers.record_failure(&failure("rust")));
         assert!(servers.failure(&id).is_some());
@@ -727,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_failure_on_a_running_or_stopped_slot_is_ignored() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         assert!(!servers.record_failure(&failure("rust")));
@@ -743,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn test_stopped_slot_keeps_the_dead_client_and_is_never_revived_by_a_swap() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
         drop(servers.remove_server(&id));
 
@@ -756,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn test_swap_replaces_the_backend_in_one_assignment_and_returns_the_old_one() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         let old = servers.slot_for_swap(&id, running_backend()).unwrap();
@@ -770,24 +792,34 @@ mod tests {
         assert!(servers.client(&id).is_some());
     }
 
-    /// #666: what a pull showed belongs to one process; a swap or a
-    /// registration starts the probe over, a restore keeps it.
+    /// #666, #680: what a pull showed belongs to one connection; a swap or a
+    /// registration starts the probe over, a restore keeps it, and a result
+    /// from a replaced connection is ignored.
     #[tokio::test]
-    async fn test_pull_probe_is_fresh_for_every_replacement_process() {
+    async fn test_pull_probe_is_bound_to_the_running_connection() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
         assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
+        let first = servers.client(&id).unwrap().connection_id();
 
-        servers.set_pull_probe(&id, PullProbe::Refused);
+        servers.update_pull_probe(&id, first, |_| PullProbe::Refused);
         let held = servers.take_for_restart(&id).unwrap();
         assert!(servers.restore(&id, held).is_none());
         assert_eq!(servers.pull_probe(&id), PullProbe::Refused);
 
         drop(servers.slot_for_swap(&id, running_backend()).unwrap());
         assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
+        let second = servers.client(&id).unwrap().connection_id();
+        assert_ne!(first, second);
 
-        servers.set_pull_probe(&id, PullProbe::Answered);
+        assert_eq!(
+            servers.update_pull_probe(&id, first, |_| PullProbe::Refused),
+            None
+        );
+        assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
+
+        servers.update_pull_probe(&id, second, |_| PullProbe::Answered);
         drop(servers.register(id.clone(), running_backend()));
         assert_eq!(servers.pull_probe(&id), PullProbe::Untried);
     }
@@ -795,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_and_restore_round_trip_and_refuse_a_settled_slot() {
         let mut servers = Servers::default();
-        let id = ServerId::from("rust");
+        let id = ServerId::from_static("rust");
         servers.register(id.clone(), running_backend());
 
         let held = servers.take_for_restart(&id).unwrap();
@@ -811,7 +843,10 @@ mod tests {
     #[test]
     fn test_clear_expected_keeps_failed_and_drops_plain_expected() {
         let mut servers = Servers::default();
-        let (failed, plain) = (ServerId::from("failed"), ServerId::from("plain"));
+        let (failed, plain) = (
+            ServerId::from_static("failed"),
+            ServerId::from_static("plain"),
+        );
         servers.record_failure(&failure("failed"));
         servers.set_expected(&HashSet::from([failed.clone(), plain.clone()]));
 
@@ -824,7 +859,7 @@ mod tests {
     #[test]
     fn test_set_expected_drops_expectation_of_servers_outside_the_set() {
         let mut servers = Servers::default();
-        let (a, b) = (ServerId::from("a"), ServerId::from("b"));
+        let (a, b) = (ServerId::from_static("a"), ServerId::from_static("b"));
         servers.set_expected(&HashSet::from([a.clone(), b.clone()]));
         servers.set_expected(&HashSet::from([a.clone()]));
         assert!(servers.is_expected(&a));

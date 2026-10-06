@@ -1439,7 +1439,7 @@ Same shape as `format_document`: an `edits` array of `{ range, new_text }` plus 
 
 - Returns an edit plan; nothing is applied
 - Edits are not capped, like `format_document`
-- A start or end line beyond the end of the document is rejected as invalid params before the request; a character past the end of its line is forwarded and the server clamps it to the line length (LSP 3.17), so `end_character: 999` means through the end of the line
+- A start or end line beyond the end of the document is rejected as invalid params before the request, and the error states the document's last line; a character past the end of its line is forwarded and the server clamps it to the line length (LSP 3.17), so `end_character: 999` means through the end of the line
 - Verified live on clangd and typescript-language-server; rust-analyzer does not advertise range formatting, so the call reports `capability_not_advertised` (see `get_tool_support`)
 
 ---
@@ -1543,7 +1543,7 @@ A `status` field selects the shape:
 
 - Requires a server advertising `prepareProvider`; mcpls advertises `rename.prepareSupport` so servers such as typescript-language-server answer with a range
 - Waits for indexing like `rename_symbol`, so a mid-index "not renameable" cannot mislead
-- A line beyond the end of the document is rejected as invalid params before the request; a character past the end of its line is forwarded and clamped by the server
+- A line beyond the end of the document is rejected as invalid params before the request, and the error states the document's last line; a character past the end of its line is forwarded and clamped by the server
 - A server error `-32602` or `-32001` (LSP's catch-all `UnknownErrorCode`, which clangd uses for "no symbol here") reads as `not_renameable` with the server's text in `server_message`; a genuine server failure reported with `-32001` reads the same way. rust-analyzer's "Invalid offset" `-32602` stays an error
 
 ---

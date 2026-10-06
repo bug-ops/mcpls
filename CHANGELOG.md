@@ -163,10 +163,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** untrusted-workspace mode refuses package runners, task runners, inline-eval interpreters, unanalyzable shell launches and `env -S`, and starts servers in the login home or a private temporary directory. (#682)
 - **Breaking:** HTTP application errors stay HTTP 200 with an in-band `-32602` for an unknown tool; bump rmcp to 3.5.1. (#682)
 - The default TypeScript server now publishes diagnostics, a server request or notification mcpls cannot decode no longer ends the connection, and project markers are searched in one bounded walk. (#682)
+- **Breaking:** `ServerId` loses its infallible `From<&str>`/`From<String>` (use `ServerId::new`, `from_static` or `ServerIds::parse`) and `LanguageId` rejects a blank value. (#685)
+- **Breaking:** `SearchDepth::new` returns `Result`, `FileSizeLimitExceeded.max`, `ReadBoundedError.max` and `BoundedUtf8Error.max` are `NonZeroU64`, spawn and untrusted refusals carry `ServerCommand`, and `FileExtension` is ASCII only. (#685)
+- **Breaking:** `WorkspaceConfig.roots` is `Vec<ConfiguredRoot>` and `LspServerConfig.command` is `LaunchCommand` (the `selection` field is gone); an empty root or `selection = "auto"` on a non-TypeScript command is rejected when the config is read. (#685)
+- **Breaking:** shutdown cancellation uses one `CancellationToken` and `tokio-util` is a required dependency of `mcpls-core`. (#685)
+- **Breaking:** `file_patterns` accept extensionless names (`Makefile`, `**/Dockerfile`) and `NoServerForLanguage` carries a `FileKey`; `get_tool_support` lists the languages the effective map routes. (#685)
+- Native `tsc` auto-selection works on Windows through the `tsc.cmd` shim, and the respawn tsserver pin is planned off the async runtime. (#685)
 
 ### Removed
 
 - **Breaking:** removed `Error::InvalidConfig`, `Error::InvalidUri`, `language_for_extension`, `validate_kind_filter` and `resolve_kind_filter`. (#682)
+- **Breaking:** removed `ConfigError::EmptyWorkspaceRoot` and `TsserverKept::UnsupportedPlatform`. (#685)
 
 ### Fixed
 
@@ -213,6 +220,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#637)
 - A pulled diagnostics result is dropped once the tracked document moved on, and a push that evicts a cache entry notifies its subscribers. (#682)
 - A panicked idle HTTP session reaper is restarted, and a panic in the SSE liveness forwarding task is logged. (#682)
+- The pull probe is bound to its connection, refused only on `-32601` or two consecutive timeouts, and the eviction overflow flag ends on the owner's next write. (#685)
+- Undecodable and malformed-header server frames warn at most once a minute, and a non-UTF-8 frame fails only its own request. (#685)
+- `PositionBeyondDocument` names the document's last line, and the `[[workspace.language_extensions]]` examples in the docs load. (#685)
 
 ## [0.6.0] - 2026-09-21
 

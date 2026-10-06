@@ -15,7 +15,7 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, FileExtension, FilePattern, LanguageId, ServerId, ToolKind,
+    BuiltinServer, FileKey, FilePattern, LanguageId, ServerCommand, ServerId, ToolKind,
     UnsupportedFilePattern,
 };
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
@@ -23,29 +23,34 @@ pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 use crate::util::{escape_control, truncate_str};
 
-/// Explains a `plaintext` routing failure: which extension had no mapping and
-/// which `file_patterns` were configured. Empty for any other language.
-fn no_server_detail(
-    language: &LanguageId,
-    extension: Option<&FileExtension>,
-    patterns: &[FilePattern],
-) -> String {
+/// Explains a `plaintext` routing failure: which extension or file name had no
+/// mapping and which `file_patterns` were configured. Empty for any other
+/// language.
+fn no_server_detail(language: &LanguageId, file: &FileKey, patterns: &[FilePattern]) -> String {
     if *language != LanguageId::PLAINTEXT {
         return String::new();
     }
-    let subject = extension.map_or_else(
-        || "the file has no usable extension".to_owned(),
-        |ext| format!("file extension '{ext}' is not mapped to any language"),
-    );
+    let (subject, remedy) = match file {
+        FileKey::Extension(ext) => (
+            format!("file extension '{ext}' is not mapped to any language"),
+            "a `*.EXT` file_patterns entry or workspace.language_extensions".to_owned(),
+        ),
+        FileKey::Name(name) => (
+            format!("file name '{name}' is not mapped to any language"),
+            format!("a `**/{name}` file_patterns entry"),
+        ),
+        FileKey::Unmappable => (
+            "the file has no usable extension or name".to_owned(),
+            "a `*.EXT` file_patterns entry or workspace.language_extensions".to_owned(),
+        ),
+    };
     let configured = if patterns.is_empty() {
         "no file_patterns are configured".to_owned()
     } else {
         let list: Vec<&str> = patterns.iter().map(FilePattern::as_str).collect();
         format!("configured file_patterns: {}", list.join(", "))
     };
-    format!(
-        " ({subject}; {configured}; map it with a `*.EXT` file_patterns entry or workspace.language_extensions)"
-    )
+    format!(" ({subject}; {configured}; map it with {remedy})")
 }
 
 /// Host platform, as far as [`NotFoundGuidance`] cares.
@@ -277,7 +282,7 @@ pub enum UntrustedRefusal {
     /// so untrusted mode cannot tell what would run.
     UnresolvedExecutable {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// The login home directory is unknown and the inherited `HOME` lies
     /// inside the workspace, where rustup, cargo and npm would read their
@@ -309,13 +314,13 @@ pub enum UntrustedRefusal {
     /// wrapper), so what would run is under the workspace's control.
     ProjectLauncher {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// The configured command starts the TypeScript server through a launcher
     /// that untrusted mode cannot pin to a binary outside the workspace.
     UnpinnedTypescriptLauncher {
         /// The configured `command`.
-        command: String,
+        command: ServerCommand,
     },
     /// A resolved path is not valid UTF-8, so untrusted mode cannot pass it
     /// on unchanged.
@@ -420,7 +425,7 @@ pub struct ServerSpawnFailure {
     /// Language ID of the failed server.
     pub language_id: LanguageId,
     /// Command that was attempted.
-    pub command: String,
+    pub command: ServerCommand,
     /// Why the server never registered.
     pub reason: StartupFailure,
 }
@@ -1005,10 +1010,6 @@ pub enum ConfigError {
         path: PathBuf,
     },
 
-    /// `workspace.roots` holds an empty path.
-    #[error("workspace.roots entries cannot be empty")]
-    EmptyWorkspaceRoot,
-
     /// `selection = "auto"` on an entry that is not typescript-language-server.
     #[error(
         "selection = \"auto\" is only valid for typescript-language-server entries (language \
@@ -1183,14 +1184,14 @@ pub enum Error {
     /// No LSP server configured for the given language.
     #[error(
         "no LSP server configured for language: {language}{}",
-        no_server_detail(.language, .extension.as_ref(), .patterns)
+        no_server_detail(.language, .file, .patterns)
     )]
     NoServerForLanguage {
         /// The language detected for the file.
         language: LanguageId,
-        /// The file's extension, `None` for an extensionless name or one that
-        /// is not a valid [`FileExtension`].
-        extension: Option<FileExtension>,
+        /// What identifies the file to the language map: its extension, its
+        /// extensionless name, or [`FileKey::Unmappable`].
+        file: FileKey,
         /// The `file_patterns` configured across all servers, so the error can
         /// show what was available to map the extension.
         patterns: Vec<FilePattern>,
@@ -1367,10 +1368,14 @@ pub enum Error {
     /// Only the line is checked: an LSP server clamps a character past the
     /// end of its line to the line length (LSP 3.17, `Position`), so such a
     /// character is forwarded unchanged.
-    #[error("line {line} is beyond the end of the document")]
+    #[error(
+        "line {line} is beyond the end of the document (the document ends at line {last_line})"
+    )]
     PositionBeyondDocument {
         /// The 1-based line the client supplied.
         line: std::num::NonZeroU32,
+        /// The 1-based number of the document's last line.
+        last_line: std::num::NonZeroU32,
     },
 
     /// A client-supplied `lsp-diagnostics://` resource URI was rejected.
@@ -1520,7 +1525,7 @@ pub enum Error {
         /// Actual file size.
         size: u64,
         /// Maximum allowed size.
-        max: u64,
+        max: std::num::NonZeroU64,
     },
 
     /// Path exists but does not refer to a regular file (e.g. a FIFO or a
@@ -1666,7 +1671,7 @@ pub const SERVER_RESTARTED_ERROR_CODE: i32 = -32054;
 /// use mcpls_core::error::{RetryableErrorData, WORKSPACE_INDEXING_ERROR_CODE};
 ///
 /// let data = RetryableErrorData::WorkspaceIndexing {
-///     server_id: ServerId::from("rust"),
+///     server_id: ServerId::from_static("rust"),
 ///     elapsed_secs: 30,
 /// };
 /// assert_eq!(data.code(), WORKSPACE_INDEXING_ERROR_CODE);
@@ -1775,7 +1780,7 @@ impl Error {
     /// use mcpls_core::error::{Error, McpErrorKind};
     ///
     /// let err = Error::WorkspaceIndexing {
-    ///     server_id: ServerId::from("rust"),
+    ///     server_id: ServerId::from_static("rust"),
     ///     elapsed_secs: 30,
     /// };
     /// let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
@@ -1976,20 +1981,21 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::config::{FileExtension, FileName};
 
     #[test]
     fn test_all_servers_failed_to_init_error() {
         let failures = vec![
             ServerSpawnFailure {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 language_id: LanguageId::from_static("rust"),
-                command: "rust-analyzer".to_string(),
+                command: ServerCommand::from_static("rust-analyzer"),
                 reason: StartupFailure::InitTaskPanicked,
             },
             ServerSpawnFailure {
-                server_id: ServerId::from("python"),
+                server_id: ServerId::from_static("python"),
                 language_id: LanguageId::from_static("python"),
-                command: "pyright".to_string(),
+                command: ServerCommand::from_static("pyright"),
                 reason: StartupFailure::InitTaskPanicked,
             },
         ];
@@ -2011,9 +2017,9 @@ mod tests {
     #[test]
     fn test_server_spawn_failure_display_names_init_panic() {
         let failure = ServerSpawnFailure {
-            server_id: ServerId::from("typescript"),
+            server_id: ServerId::from_static("typescript"),
             language_id: LanguageId::from_static("typescript"),
-            command: "tsserver".to_string(),
+            command: ServerCommand::from_static("tsserver"),
             reason: StartupFailure::InitTaskPanicked,
         };
 
@@ -2375,7 +2381,7 @@ mod tests {
     fn test_error_display_file_size_limit() {
         let err = Error::FileSizeLimitExceeded {
             size: 20_000_000,
-            max: 10_000_000,
+            max: std::num::NonZeroU64::new(10_000_000).unwrap(),
         };
         assert_eq!(
             err.to_string(),
@@ -2415,7 +2421,9 @@ mod tests {
     #[test]
     fn test_result_type_alias() {
         fn _returns_error() -> Result<i32> {
-            Err(Error::Config(ConfigError::EmptyWorkspaceRoot))
+            Err(Error::Config(ConfigError::NoParentDirectory {
+                path: PathBuf::new(),
+            }))
         }
 
         let result: Result<i32> = Ok(42);
@@ -2496,9 +2504,9 @@ mod tests {
 
     fn spawn_failure(id: &str, command: &str, error: Error) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from(id),
+            server_id: ServerId::new(id).unwrap(),
             language_id: LanguageId::new(id).unwrap(),
-            command: command.to_string(),
+            command: ServerCommand::new(command).unwrap(),
             reason: StartupFailure::Spawn(Arc::new(error)),
         }
     }
@@ -2549,9 +2557,9 @@ mod tests {
     #[test]
     fn test_server_failed_to_start_init_task_panicked_display() {
         let err = Error::ServerFailedToStart(Box::new(ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::InitTaskPanicked,
         }));
         assert!(err.to_string().contains("initialization task panicked"));
@@ -2572,7 +2580,7 @@ mod tests {
                 stderr: None,
             },
             Error::ServerUnavailable {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 retry_in: Duration::from_secs(1),
             },
         ] {
@@ -2637,7 +2645,7 @@ mod tests {
     #[test]
     fn test_server_unavailable_display_names_retry_delay() {
         let err = Error::ServerUnavailable {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             retry_in: Duration::from_secs(2),
         };
         assert_eq!(
@@ -2675,11 +2683,11 @@ mod tests {
     #[test]
     fn test_untrusted_refusal_new_variants_name_their_cause() {
         let launcher = UntrustedRefusal::ProjectLauncher {
-            command: "npx".to_owned(),
+            command: ServerCommand::from_static("npx"),
         };
         assert!(launcher.to_string().contains("'npx'"), "{launcher}");
         let unpinned = UntrustedRefusal::UnpinnedTypescriptLauncher {
-            command: "pnpm".to_owned(),
+            command: ServerCommand::from_static("pnpm"),
         };
         assert!(unpinned.to_string().contains("'pnpm'"), "{unpinned}");
         let non_utf8 = UntrustedRefusal::NonUtf8Path {
@@ -2700,7 +2708,7 @@ mod tests {
     fn no_server_for_language(language: &'static str) -> Error {
         Error::NoServerForLanguage {
             language: LanguageId::from_static(language),
-            extension: None,
+            file: FileKey::Unmappable,
             patterns: vec![],
         }
     }
@@ -2709,7 +2717,7 @@ mod tests {
     fn test_no_server_for_plaintext_names_extension_and_patterns() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
-            extension: Some(FileExtension::from_static("cpp")),
+            file: FileKey::Extension(FileExtension::from_static("cpp")),
             patterns: vec![
                 FilePattern::from_static("**/*.rs"),
                 FilePattern::from_static("**/*.h"),
@@ -2731,12 +2739,12 @@ mod tests {
     fn test_no_server_for_plaintext_without_patterns_or_extension() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::PLAINTEXT,
-            extension: None,
+            file: FileKey::Unmappable,
             patterns: vec![],
         };
         let message = err.to_string();
         assert!(
-            message.contains("the file has no usable extension"),
+            message.contains("the file has no usable extension or name"),
             "{message}"
         );
         assert!(
@@ -2749,7 +2757,7 @@ mod tests {
     fn test_no_server_for_other_language_text_is_unchanged() {
         let err = Error::NoServerForLanguage {
             language: LanguageId::from_static("nushell"),
-            extension: Some(FileExtension::from_static("nu")),
+            file: FileKey::Extension(FileExtension::from_static("nu")),
             patterns: vec![FilePattern::from_static("**/*.rs")],
         };
         assert_eq!(
@@ -2759,9 +2767,28 @@ mod tests {
     }
 
     #[test]
+    fn test_no_server_for_plaintext_name_suggests_a_name_pattern() {
+        let err = Error::NoServerForLanguage {
+            language: LanguageId::PLAINTEXT,
+            file: FileKey::Name(FileName::from_static("Makefile")),
+            patterns: vec![FilePattern::from_static("**/*.rs")],
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("file name 'Makefile' is not mapped"),
+            "{message}"
+        );
+        assert!(
+            message.contains("a `**/Makefile` file_patterns entry"),
+            "{message}"
+        );
+        assert!(!message.contains("*.EXT"), "{message}");
+    }
+
+    #[test]
     fn test_error_display_capability_not_supported() {
         let err = Error::CapabilityNotSupported {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             capability: Capability::Rename,
         };
         assert_eq!(
@@ -2773,7 +2800,7 @@ mod tests {
     #[test]
     fn test_error_display_workspace_indexing() {
         let err = Error::WorkspaceIndexing {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             elapsed_secs: 30,
         };
         assert_eq!(
@@ -2793,7 +2820,10 @@ mod tests {
             Error::NoResolvableListenUris,
             Error::ResourceUri(ResourceUriError::InvalidScheme("x".to_string())),
             Error::DocumentNotFound(PathBuf::from("/missing.rs")),
-            Error::FileSizeLimitExceeded { size: 100, max: 10 },
+            Error::FileSizeLimitExceeded {
+                size: 100,
+                max: std::num::NonZeroU64::new(10).unwrap(),
+            },
             Error::ListenFilterTooLarge { max: 1000 },
             Error::InvalidClientPath(InvalidClientPath::ContainsNul),
         ];
@@ -2846,7 +2876,7 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_workspace_indexing_is_retryable_with_dedicated_code() {
         let err = Error::WorkspaceIndexing {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             elapsed_secs: 30,
         };
         let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
@@ -2862,7 +2892,7 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_server_initializing_is_retryable_with_dedicated_code() {
         let err = Error::ServerInitializing {
-            server_id: ServerId::from("python"),
+            server_id: ServerId::from_static("python"),
         };
         let McpErrorKind::Retryable(data) = err.mcp_error_kind() else {
             panic!("expected ServerInitializing to classify as Retryable");
@@ -2903,7 +2933,7 @@ mod tests {
         let cases = [
             (
                 RetryableErrorData::WorkspaceIndexing {
-                    server_id: ServerId::from("rust"),
+                    server_id: ServerId::from_static("rust"),
                     elapsed_secs: 7,
                 },
                 WORKSPACE_INDEXING_ERROR_CODE,
@@ -2911,7 +2941,7 @@ mod tests {
             ),
             (
                 RetryableErrorData::ServerInitializing {
-                    server_id: ServerId::from("python"),
+                    server_id: ServerId::from_static("python"),
                 },
                 SERVER_INITIALIZING_ERROR_CODE,
                 serde_json::json!({"server_id": "python"}),
@@ -2959,7 +2989,7 @@ mod tests {
                 tool: crate::config::ToolKind::Hover,
             },
             Error::CapabilityNotSupported {
-                server_id: ServerId::from("rust"),
+                server_id: ServerId::from_static("rust"),
                 capability: Capability::Rename,
             },
             Error::NoWorkspaceRoots(PathBuf::from("/tmp")),
@@ -2995,9 +3025,13 @@ mod tests {
     fn test_position_beyond_document_is_invalid_params_naming_the_line() {
         let err = Error::PositionBeyondDocument {
             line: std::num::NonZeroU32::new(7).unwrap(),
+            last_line: std::num::NonZeroU32::new(3).unwrap(),
         };
         assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
-        assert_eq!(err.to_string(), "line 7 is beyond the end of the document");
+        assert_eq!(
+            err.to_string(),
+            "line 7 is beyond the end of the document (the document ends at line 3)"
+        );
     }
 
     /// #575: a malformed client path is caller-fault, whatever IO kind the
@@ -3117,9 +3151,9 @@ mod tests {
 
     fn refusal_failure(refusal: UntrustedRefusal) -> ServerSpawnFailure {
         ServerSpawnFailure {
-            server_id: ServerId::from("rust"),
+            server_id: ServerId::from_static("rust"),
             language_id: LanguageId::new("rust").unwrap(),
-            command: "rust-analyzer".to_string(),
+            command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::RefusedUntrustedWorkspace(refusal),
         }
     }

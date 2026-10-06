@@ -68,6 +68,7 @@ pub use error::Error;
 use mcp::SubscriptionRegistry;
 use runtime::{StartPlan, plan_server_starts, shutdown, spawn_lsp_servers_background};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 pub use transport::Transport;
 #[cfg(feature = "transport-http")]
@@ -130,7 +131,7 @@ async fn plan_off_runtime(
 /// Runs `work` on the blocking pool and returns its result, re-raising a panic
 /// in it on the caller. A join that failed for any other reason (the runtime
 /// shutting down cancelled it) is returned as the error.
-async fn on_blocking_pool<T: Send + 'static>(
+pub(crate) async fn on_blocking_pool<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
     match tokio::task::spawn_blocking(work).await {
@@ -218,7 +219,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     config.validate()?;
 
     let workspace_roots = WorkspaceRoots::from_configured(&config.workspace.roots)?;
-    let extension_map = config.build_effective_extension_map();
+    let language_map = config.build_effective_language_map();
 
     let startup_redactions = Arc::new(redaction::Redactions::for_servers(
         &config.lsp_servers,
@@ -255,7 +256,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let mut translator = Translator::new()
         .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
-        .with_extensions(extension_map)
+        .with_extensions(language_map)
         .with_file_patterns(
             config
                 .lsp_servers
@@ -296,8 +297,9 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     // `SubscriptionRegistry`.
     let subscription_registry = SubscriptionRegistry::new();
 
-    // Cancellation for pump tasks: send `true` to request shutdown.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    // Cancels the pump and startup tasks; dropping `serve_with` cancels it too.
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
 
     let lsp_init_handle = if applicable_configs.is_empty() {
         if refusals.is_empty() {
@@ -319,7 +321,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             Arc::clone(&translator),
             Arc::clone(&notification_cache),
             subscription_registry.clone(),
-            cancel_rx.clone(),
+            cancel.clone(),
             workspace_roots.clone(),
             max_concurrent_server_starts,
         ))
@@ -345,7 +347,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
 
-    shutdown(&cancel_tx, &translator, lsp_init_handle).await;
+    shutdown(&cancel, &translator, lsp_init_handle).await;
 
     info!("MCPLS server shutting down");
     result
@@ -354,7 +356,6 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
-    use std::path::PathBuf;
 
     use super::*;
     use crate::config::{
@@ -373,6 +374,16 @@ mod tests {
                 .await
                 .unwrap_err();
         assert_eq!(panicked.message(), "planning exploded");
+    }
+
+    /// #679: the work runs on a blocking-pool thread, not on the caller's.
+    #[tokio::test]
+    async fn test_on_blocking_pool_runs_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let worker = on_blocking_pool(|| std::thread::current().id())
+            .await
+            .unwrap();
+        assert_ne!(caller, worker);
     }
 
     // Tests for graceful degradation behavior
@@ -396,7 +407,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -407,7 +418,8 @@ mod tests {
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345"),
+                    command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345")
+                        .into(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -419,7 +431,6 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
                 workspace_trust: crate::config::WorkspaceTrust::default(),
@@ -445,6 +456,83 @@ mod tests {
             }
         }
 
+        /// #674: dropping the `serve_with` future cancels startup, so a server
+        /// still initializing is abandoned and its process killed, instead of
+        /// lingering until its init timeout.
+        #[tokio::test]
+        #[cfg(all(unix, feature = "transport-http"))]
+        async fn test_dropping_serve_with_abandons_a_server_still_initializing() {
+            use crate::config::{LspServerConfig, ServerStartConcurrency, WorkspaceConfig};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dunce::canonicalize(dir.path()).unwrap();
+            let pid_file = root.join("pid");
+            let script = format!("echo $$ > {}; exec sleep 600", pid_file.display());
+            let config = ServerConfig {
+                mcp: crate::config::McpConfig::default(),
+                workspace: WorkspaceConfig {
+                    roots: vec![crate::config::ConfiguredRoot::new(&root).unwrap()],
+                    position_encodings: PositionEncodings::DEFAULT,
+                    language_extensions: vec![],
+                    heuristics_max_depth: SearchDepth::DEFAULT,
+                    max_documents: DocumentLimit::DEFAULT,
+                    max_file_size: SizeLimit::DEFAULT,
+                    indexing_ready_timeout_seconds: IndexingReadyTimeoutSecs::DEFAULT,
+                    max_concurrent_server_starts: ServerStartConcurrency::DEFAULT,
+                },
+                lsp_servers: vec![LspServerConfig {
+                    language_id: LanguageId::from_static("rust"),
+                    command: ServerCommand::from_static("sh").into(),
+                    args: vec!["-c".to_owned(), script],
+                    env: std::collections::HashMap::new(),
+                    file_patterns: vec![FilePattern::from_static("**/*.rs")],
+                    initialization_options: None,
+                    settings: None,
+                    timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                    request_timeout_seconds: TimeoutSecs::new(30).unwrap(),
+                    heuristics: None,
+                    name: None,
+                    handles: None,
+                    indexing: crate::bridge::IndexingPolicy::Auto,
+                }],
+                project_config_status: ProjectConfigStatus::NotIgnored,
+                workspace_trust: crate::config::WorkspaceTrust::default(),
+            };
+            let http = crate::transport::HttpConfig::new("127.0.0.1:0".parse().unwrap());
+            let serving = tokio::spawn(serve_with(config, Transport::Http(http)));
+
+            let pid = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file)
+                        && let Some(pid) = text.trim().parse::<u32>().ok()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the server was never spawned");
+
+            serving.abort();
+            drop(serving.await);
+
+            let alive = |pid: u32| {
+                std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while alive(pid) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the abandoned server process is still running");
+        }
+
         #[tokio::test]
         async fn test_serve_starts_with_empty_config() {
             use crate::config::WorkspaceConfig;
@@ -455,7 +543,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::from("/tmp/test-workspace")],
+                    roots: vec![crate::config::ConfiguredRoot::new("/tmp/test-workspace").unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -514,7 +602,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![workspace_root],
+                    roots: vec![crate::config::ConfiguredRoot::new(workspace_root).unwrap()],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -568,7 +656,7 @@ mod tests {
             let config = ServerConfig {
                 mcp: crate::config::McpConfig::default(),
                 workspace: WorkspaceConfig {
-                    roots: vec![PathBuf::new()],
+                    roots: vec![],
                     position_encodings: PositionEncodings::DEFAULT,
                     language_extensions: vec![],
                     heuristics_max_depth: SearchDepth::DEFAULT,
@@ -579,7 +667,7 @@ mod tests {
                 },
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
-                    command: ServerCommand::from_static("rust-analyzer"),
+                    command: ServerCommand::from_static("rust-analyzer").into(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
@@ -591,10 +679,11 @@ mod tests {
                     name: None,
                     handles: None,
                     indexing: crate::bridge::IndexingPolicy::Auto,
-                    selection: crate::config::ServerSelection::Explicit,
                 }],
                 project_config_status: ProjectConfigStatus::NotIgnored,
-                workspace_trust: crate::config::WorkspaceTrust::default(),
+                workspace_trust: crate::config::WorkspaceTrust::untrusted([
+                    crate::config::ServerId::from_static("not-configured"),
+                ]),
             };
 
             // `validate()` runs before any spawn/transport work and should
@@ -613,8 +702,8 @@ mod tests {
                 Ok(result) => assert_matches!(
                     result,
                     Err(Error::Config(_)),
-                    "serve() must reject a caller-supplied config with an empty workspace root via \
-                     Error::Config, matching the load_from path; got: {result:?}"
+                    "serve() must reject a caller-supplied config that allows an unconfigured server \
+                     via Error::Config, matching the load_from path; got: {result:?}"
                 ),
             }
         }

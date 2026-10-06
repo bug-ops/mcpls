@@ -32,7 +32,7 @@ pub struct InvalidSearchDepth {
 ///
 /// assert_eq!(SearchDepth::default().get(), 10);
 /// assert_eq!(SearchDepth::new(64).unwrap().get(), 64);
-/// assert!(SearchDepth::new(65).is_none());
+/// assert!(SearchDepth::new(65).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "usize", into = "usize")]
@@ -41,22 +41,28 @@ pub struct SearchDepth(u8);
 impl SearchDepth {
     /// The built-in default, [`DEFAULT_HEURISTICS_MAX_DEPTH`].
     pub const DEFAULT: Self = match Self::new(DEFAULT_HEURISTICS_MAX_DEPTH) {
-        Some(depth) => depth,
-        None => panic!("the default search depth must be in range"),
+        Ok(depth) => depth,
+        Err(_) => panic!("the default search depth must be in range"),
     };
 
-    /// `None` when `depth` exceeds [`MAX_HEURISTICS_DEPTH`].
-    #[must_use]
-    pub const fn new(depth: usize) -> Option<Self> {
+    /// Builds a depth.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidSearchDepth`] when `depth` exceeds [`MAX_HEURISTICS_DEPTH`].
+    pub const fn new(depth: usize) -> Result<Self, InvalidSearchDepth> {
         const { assert!(MAX_HEURISTICS_DEPTH <= u8::MAX as usize) };
         if depth > MAX_HEURISTICS_DEPTH {
-            return None;
+            return Err(InvalidSearchDepth {
+                value: depth,
+                max: MAX_HEURISTICS_DEPTH,
+            });
         }
         #[expect(
             clippy::cast_possible_truncation,
             reason = "bounded by MAX_HEURISTICS_DEPTH, asserted to fit u8 above"
         )]
-        Some(Self(depth as u8))
+        Ok(Self(depth as u8))
     }
 
     /// The wrapped depth, at most [`MAX_HEURISTICS_DEPTH`].
@@ -76,10 +82,7 @@ impl TryFrom<usize> for SearchDepth {
     type Error = InvalidSearchDepth;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or(InvalidSearchDepth {
-            value,
-            max: MAX_HEURISTICS_DEPTH,
-        })
+        Self::new(value)
     }
 }
 
@@ -470,7 +473,7 @@ mod tests {
             SearchDepth::new(MAX_HEURISTICS_DEPTH).unwrap().get(),
             MAX_HEURISTICS_DEPTH
         );
-        assert!(SearchDepth::new(MAX_HEURISTICS_DEPTH + 1).is_none());
+        assert!(SearchDepth::new(MAX_HEURISTICS_DEPTH + 1).is_err());
         assert_eq!(SearchDepth::default().get(), DEFAULT_HEURISTICS_MAX_DEPTH);
     }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt as _};
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::pump::{PumpShared, PumpWiring, supervised_pump};
@@ -40,7 +41,7 @@ pub fn spawn_lsp_servers_background(
     translator: Arc<Translator>,
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscription_registry: SubscriptionRegistry,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     workspace_roots: WorkspaceRoots,
     max_concurrent_server_starts: ServerStartConcurrency,
 ) -> JoinHandle<()> {
@@ -51,7 +52,7 @@ pub fn spawn_lsp_servers_background(
             &translator,
             notification_cache,
             subscription_registry,
-            cancel_rx,
+            cancel,
             workspace_roots,
             max_concurrent_server_starts,
         );
@@ -153,7 +154,7 @@ async fn init_lsp_servers(
     translator: &Translator,
     notification_cache: Arc<Mutex<NotificationCache>>,
     subscription_registry: SubscriptionRegistry,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     workspace_roots: WorkspaceRoots,
     max_concurrent_starts: ServerStartConcurrency,
 ) {
@@ -174,13 +175,13 @@ async fn init_lsp_servers(
     let mut startup = Some(translator.begin_startup());
     translator.install_wiring(Arc::new(PumpWiring::new(
         pump_shared.clone(),
-        cancel_rx.clone(),
+        cancel.clone(),
     )));
     let mut settler = StartupSettler {
         translator,
         notification_cache,
         pump_shared,
-        cancel_rx: cancel_rx.clone(),
+        cancel: cancel.clone(),
         configured: configs
             .iter()
             .map(|config| {
@@ -196,9 +197,7 @@ async fn init_lsp_servers(
     };
 
     // TODO(#648): subscribed-file disk re-pull needs a task owned by serve_with
-    // TODO(#674): any change of this watch, including `send(false)` and a dropped sender, cancels here, while pump.rs waits for `true`
-    let mut cancel_rx = cancel_rx;
-    let mut cancelled = *cancel_rx.borrow();
+    let mut cancelled = cancel.is_cancelled();
     let mut pending = (!cancelled).then(|| start_servers(configs, max_concurrent_starts));
     loop {
         if pending.is_none() {
@@ -209,7 +208,7 @@ async fn init_lsp_servers(
         }
         tokio::select! {
             biased;
-            _ = cancel_rx.changed(), if !cancelled => {
+            () = cancel.cancelled(), if !cancelled => {
                 cancelled = true;
                 pending = None;
             }
@@ -258,7 +257,7 @@ struct StartupSettler<'a> {
     translator: &'a Translator,
     notification_cache: Arc<Mutex<NotificationCache>>,
     pump_shared: PumpShared,
-    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: CancellationToken,
     /// `(id, language)` of every configured server, settled or not.
     configured: Vec<(ServerId, LanguageId)>,
     roles: HashMap<ServerId, (LanguageId, tokio::sync::watch::Sender<DiagnosticsRole>)>,
@@ -277,7 +276,7 @@ impl StartupSettler<'_> {
     /// Receivers and indexing policy are taken before the server is visible;
     /// cancel is re-checked right before registering.
     async fn settle_started(&mut self, mut server: LspServer) {
-        if *self.cancel_rx.borrow() {
+        if self.cancel.is_cancelled() {
             return;
         }
         let notification_rx = server.take_notification_rx();
@@ -289,7 +288,7 @@ impl StartupSettler<'_> {
             .lock()
             .await
             .set_indexing_policy(config_id, policy);
-        if *self.cancel_rx.borrow() {
+        if self.cancel.is_cancelled() {
             return;
         }
 
@@ -310,7 +309,7 @@ impl StartupSettler<'_> {
                 lifecycle: lifecycle_rx,
                 pinned_tsserver,
             },
-            self.cancel_rx.clone(),
+            self.cancel.clone(),
             role_rx,
             self.pump_shared.clone(),
         ));
@@ -383,7 +382,7 @@ mod settler_tests {
         subs: SubscriptionRegistry,
         configs: &[&LspServerConfig],
     ) -> StartupSettler<'a> {
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
         StartupSettler {
             translator,
             notification_cache: Arc::clone(cache),
@@ -392,7 +391,7 @@ mod settler_tests {
                 subs,
                 workspace_roots: WorkspaceRoots::default(),
             },
-            cancel_rx,
+            cancel,
             configured: configs
                 .iter()
                 .map(|c| (c.id(), c.language_id.clone()))
@@ -407,17 +406,17 @@ mod settler_tests {
         ServerStartOutcome::Failed(ServerSpawnFailure {
             server_id: config.id(),
             language_id: config.language_id.clone(),
-            command: config.command.to_string(),
+            command: config.command.server_command().clone(),
             reason: StartupFailure::InitTaskPanicked,
         })
     }
 
     fn explicit_and_catch_all_translator() -> (Translator, LspServerConfig, LspServerConfig) {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some(ServerId::from("explicit"));
+        explicit.name = Some(ServerId::from_static("explicit"));
         explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some(ServerId::from("catch-all"));
+        catch_all.name = Some(ServerId::from_static("catch-all"));
         let translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
             .with_router(ToolRouter::from_configs([&explicit, &catch_all]).unwrap());
@@ -505,9 +504,9 @@ mod settler_tests {
         let translator = Translator::new();
         translator.set_expected_servers(std::iter::once(config.id()).collect());
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
         let mut settler = settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
-        settler.cancel_rx = cancel_rx;
+        settler.cancel = cancel.clone();
         let guard = cache.lock().await;
 
         let settle = settler.settle(ServerStartOutcome::Started(Box::new(
@@ -515,7 +514,7 @@ mod settler_tests {
         )));
         let release = async {
             tokio::task::yield_now().await;
-            cancel_tx.send_replace(true);
+            cancel.cancel();
             drop(guard);
         };
         tokio::join!(settle, release);
@@ -531,10 +530,10 @@ mod settler_tests {
         let translator = Translator::new();
         translator.set_expected_servers(std::iter::once(config.id()).collect());
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
         let mut settler = settler_for(&translator, &cache, SubscriptionRegistry::new(), &[&config]);
-        settler.cancel_rx = cancel_rx;
-        cancel_tx.send_replace(true);
+        settler.cancel = cancel.clone();
+        cancel.cancel();
 
         settler
             .settle(ServerStartOutcome::Started(Box::new(
@@ -551,10 +550,10 @@ mod settler_tests {
     #[tokio::test]
     async fn catch_all_role_flips_when_explicit_diagnostics_server_fails() {
         let mut explicit = LspServerConfig::rust_analyzer();
-        explicit.name = Some(ServerId::from("explicit"));
+        explicit.name = Some(ServerId::from_static("explicit"));
         explicit.handles = Some(ToolSet::new(vec![ToolKind::Diagnostics]).unwrap());
         let mut catch_all = LspServerConfig::rust_analyzer();
-        catch_all.name = Some(ServerId::from("catch-all"));
+        catch_all.name = Some(ServerId::from_static("catch-all"));
         let router = ToolRouter::from_configs([&explicit, &catch_all]).unwrap();
         let translator = Translator::new().with_router(router);
         translator.set_expected_servers([explicit.id(), catch_all.id()].into_iter().collect());
@@ -579,7 +578,7 @@ mod settler_tests {
             .settle(ServerStartOutcome::Failed(ServerSpawnFailure {
                 server_id: explicit.id(),
                 language_id: LanguageId::from_static("rust"),
-                command: explicit.command.to_string(),
+                command: explicit.command.server_command().clone(),
                 reason: StartupFailure::InitTaskPanicked,
             }))
             .await;
@@ -603,7 +602,7 @@ mod startup_tests {
     struct Startup {
         translator: Arc<Translator>,
         task: JoinHandle<()>,
-        cancel_tx: tokio::sync::watch::Sender<bool>,
+        cancel: CancellationToken,
     }
 
     fn start(configs: Vec<ServerInitConfig>) -> Startup {
@@ -619,21 +618,21 @@ mod startup_tests {
                 .with_router(router),
         );
         translator.set_expected_servers(configs.iter().map(|c| c.server_config().id()).collect());
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel = CancellationToken::new();
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
         let task = spawn_lsp_servers_background(
             configs,
             Arc::clone(&translator),
             cache,
             SubscriptionRegistry::new(),
-            cancel_rx,
+            cancel.clone(),
             WorkspaceRoots::default(),
             limit,
         );
         Startup {
             translator,
             task,
-            cancel_tx,
+            cancel,
         }
     }
 
@@ -706,7 +705,7 @@ mod startup_tests {
                 )
             })
             .await;
-            startup.cancel_tx.send_replace(true);
+            startup.cancel.cancel();
             startup.task.await.unwrap();
         }
     }
@@ -719,7 +718,7 @@ mod startup_tests {
         let gate = dir.path().join("gate");
         let mut broken = named_sh_init_config(dir.path(), "broken", "rust", "exit 1\n");
         broken.server_config_mut().command =
-            ServerCommand::from_static("mcpls-no-such-language-server");
+            ServerCommand::from_static("mcpls-no-such-language-server").into();
         let slow = named_sh_init_config(
             dir.path(),
             "slow",
@@ -744,11 +743,11 @@ mod startup_tests {
         );
         let failure = startup
             .translator
-            .startup_failure(&ServerId::from("broken"))
+            .startup_failure(&ServerId::from_static("broken"))
             .unwrap();
         std::assert_matches!(failure.reason, StartupFailure::Spawn(_));
 
-        startup.cancel_tx.send_replace(true);
+        startup.cancel.cancel();
         startup.task.await.unwrap();
     }
 
@@ -765,7 +764,7 @@ mod startup_tests {
             .map(|language| {
                 let mut config = named_sh_init_config(dir.path(), language, language, "exit 1\n");
                 config.server_config_mut().command =
-                    ServerCommand::from_static("mcpls-no-such-language-server");
+                    ServerCommand::from_static("mcpls-no-such-language-server").into();
                 config
             })
             .to_vec();
@@ -823,7 +822,7 @@ mod startup_tests {
 
         std::fs::write(&gate, "").unwrap();
         wait_until("the second server to start", || b_up.exists()).await;
-        startup.cancel_tx.send_replace(true);
+        startup.cancel.cancel();
         startup.task.await.unwrap();
     }
 
@@ -851,7 +850,7 @@ mod startup_tests {
         let startup = start(vec![stuck]);
 
         wait_until("the stuck server to start", || up.exists()).await;
-        startup.cancel_tx.send_replace(true);
+        startup.cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(5), startup.task)
             .await
             .unwrap()
@@ -989,7 +988,7 @@ mod init_supervision_tests {
         translator.record_startup_failures(&[crate::error::ServerSpawnFailure {
             server_id: id.clone(),
             language_id: LanguageId::from_static("rust"),
-            command: "rust-analyzer".to_string(),
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(Error::ServerTerminated)),
         }]);
 

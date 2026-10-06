@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -19,6 +20,7 @@ use tracing::{Level, debug, trace, warn};
 use crate::error::{Error, RedactedText, Result};
 use crate::lsp::types::{InboundMessage, RequestId};
 use crate::redaction::Redactions;
+use crate::util::WarnLimiter;
 
 /// Maximum allowed Content-Length (10 MB)
 const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -93,6 +95,7 @@ impl fmt::Debug for LspTransport {
 pub struct LspTransportReader {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     redactions: Arc<Redactions>,
+    malformed_header_warn: WarnLimiter,
 }
 
 impl fmt::Debug for LspTransportReader {
@@ -134,6 +137,7 @@ impl LspTransport {
             LspTransportReader {
                 stdout: BufReader::new(Box::new(stdout)),
                 redactions,
+                malformed_header_warn: WarnLimiter::default(),
             },
         )
     }
@@ -171,8 +175,8 @@ impl LspTransportReader {
     /// Reads headers, extracts Content-Length, reads exact message content,
     /// and parses it as a response, request or notification.
     ///
-    /// A frame whose body cannot be decoded (not JSON, nested past the parser's
-    /// limit, a malformed message) does not fail the stream: it is returned as
+    /// A frame whose body cannot be decoded (not JSON or not UTF-8, nested past
+    /// the parser's limit, a malformed message) does not fail the stream: it is returned as
     /// one of the `Undecodable*` messages, which say what was lost so the
     /// caller can fail one request or drop one notification and read on.
     ///
@@ -181,7 +185,7 @@ impl LspTransportReader {
     /// Returns an error if:
     /// - Reading headers fails
     /// - Content-Length header is missing or invalid
-    /// - Reading message content fails or is not UTF-8
+    /// - Reading message content fails
     /// - The stream ends
     pub async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
@@ -207,10 +211,13 @@ impl LspTransportReader {
             let content = self.read_content(content_length).await?;
 
             if tracing::enabled!(Level::TRACE) {
-                trace!("Received LSP message: {}", self.redactions.apply(&content));
+                trace!(
+                    "Received LSP message: {}",
+                    self.redactions.apply(&String::from_utf8_lossy(&content))
+                );
             }
 
-            let value: Value = match serde_json::from_str(&content) {
+            let value: Value = match serde_json::from_slice(&content) {
                 Ok(value) => value,
                 Err(error) => {
                     debug!(
@@ -289,10 +296,16 @@ impl LspTransportReader {
             if let Some((key, value)) = line.trim_end().split_once(':') {
                 headers.insert(key.trim().to_lowercase(), value.trim().to_string());
             } else {
-                warn!(
-                    "Malformed header: {}",
-                    crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES)
-                );
+                let shown =
+                    crate::util::truncate_str(line.trim(), crate::util::MAX_LOG_STRING_BYTES);
+                if self
+                    .malformed_header_warn
+                    .due(Instant::now(), WarnLimiter::DEFAULT_PERIOD)
+                {
+                    warn!("Malformed header: {shown}");
+                } else {
+                    debug!("Malformed header: {shown}");
+                }
             }
         }
 
@@ -301,15 +314,13 @@ impl LspTransportReader {
 
     /// Read exact number of content bytes.
     ///
-    /// Reads exactly `length` bytes from stdout and converts to UTF-8 string.
-    async fn read_content(&mut self, length: usize) -> Result<String> {
+    /// Reads exactly `length` bytes from stdout. They are not required to be
+    /// UTF-8 here: JSON parsing rejects invalid text, and a frame that fails
+    /// that way is dropped alone, without altering any text it carried.
+    async fn read_content(&mut self, length: usize) -> Result<Vec<u8>> {
         let mut buffer = vec![0u8; length];
         self.stdout.read_exact(&mut buffer).await?;
-
-        String::from_utf8(buffer).map_err(|e| {
-            self.redactions
-                .protocol_error(format_args!("Invalid UTF-8 in content: {e}"))
-        })
+        Ok(buffer)
     }
 }
 
@@ -393,7 +404,7 @@ impl Keys {
 /// tolerant, so what made the full decode fail (nesting past the parser's
 /// recursion limit, a lone surrogate escape, an out-of-range number) does not
 /// stop it.
-fn undecodable_message(content: &str) -> InboundMessage {
+fn undecodable_message(content: &[u8]) -> InboundMessage {
     #[derive(serde::Deserialize)]
     struct Envelope {
         #[serde(default)]
@@ -408,9 +419,9 @@ fn undecodable_message(content: &str) -> InboundMessage {
 
     // A top-level array would otherwise be read as the struct's fields in order.
     let envelope = content
-        .trim_start()
-        .starts_with('{')
-        .then(|| serde_json::from_str::<Envelope>(content).ok())
+        .trim_ascii_start()
+        .starts_with(b"{")
+        .then(|| serde_json::from_slice::<Envelope>(content).ok())
         .flatten();
     let Some(envelope) = envelope else {
         return InboundMessage::UndecodableFrame;
@@ -717,6 +728,30 @@ mod tests {
         );
     }
 
+    /// #681: bytes that are not UTF-8 inside a response fail only that request;
+    /// nothing is decoded lossily and the stream goes on.
+    #[tokio::test]
+    async fn test_response_with_invalid_utf8_is_attributed_to_its_request() {
+        let mut body = br#"{"jsonrpc":"2.0","id":4,"result":"a"#.to_vec();
+        body.extend_from_slice(&[0xff, 0xfe]);
+        body.extend_from_slice(br#"b"}"#);
+        let mut inbound = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        inbound.extend(body);
+        inbound.extend(frame(r#"{"jsonrpc":"2.0","id":5,"result":null}"#).into_bytes());
+        let (_, mut reader) = LspTransport::new(tokio::io::sink(), std::io::Cursor::new(inbound));
+
+        assert_matches!(
+            reader.receive().await,
+            Ok(InboundMessage::UndecodableResponse {
+                id: RequestId::Number(4)
+            })
+        );
+        assert_matches!(
+            reader.receive().await,
+            Ok(InboundMessage::Response(response)) if response.id == RequestId::Number(5)
+        );
+    }
+
     #[tokio::test]
     async fn test_string_id_is_recovered_from_an_undecodable_response() {
         let deep = frame(&format!(
@@ -949,6 +984,36 @@ mod tests {
 
         let header = format!("Content-Length: {}\r\n\r\n", content.len());
         assert!(header.contains(&expected_len.to_string()));
+    }
+
+    /// A server that sends many malformed header lines is warned about once.
+    #[tokio::test]
+    async fn test_malformed_header_warnings_are_rate_limited() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let inbound = format!(
+            "no colon one\r\nno colon two\r\nno colon three\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (_, mut reader) = LspTransport::new(
+            tokio::io::sink(),
+            std::io::Cursor::new(inbound.into_bytes()),
+        );
+
+        assert_matches!(reader.receive().await, Ok(InboundMessage::Response(_)));
+
+        let warnings = captured
+            .entries()
+            .into_iter()
+            .filter(|(level, message)| {
+                *level == tracing::Level::WARN && message.contains("Malformed header")
+            })
+            .count();
+        assert_eq!(warnings, 1);
     }
 
     #[test]

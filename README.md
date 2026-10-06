@@ -332,7 +332,7 @@ project_markers = ["Cargo.toml", "rust-toolchain.toml"]
 cargo.features = "all"
 checkOnSave.command = "clippy"
 
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
 ```

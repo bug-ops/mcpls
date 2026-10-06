@@ -101,7 +101,8 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
 /// caller-supplied `limit`, which otherwise has no upper bound of its own.
 pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 
-/// Per-response allowance of [`MAX_NORMALIZED_LOCATIONS`] items.
+/// Per-response allowance of items, [`MAX_NORMALIZED_LOCATIONS`] unless built
+/// with [`ItemBudget::with_cap`].
 ///
 /// Every item a handler normalizes must first pass through [`Self::admit`],
 /// so nested loops (e.g. call hierarchy `fromRanges`, workspace-edit
@@ -110,14 +111,21 @@ pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 #[derive(Debug)]
 pub(super) struct ItemBudget {
     remaining: usize,
+    cap: usize,
     truncated: bool,
 }
 
 impl ItemBudget {
     /// A fresh budget holding the full [`MAX_NORMALIZED_LOCATIONS`].
     pub(super) const fn new() -> Self {
+        Self::with_cap(MAX_NORMALIZED_LOCATIONS)
+    }
+
+    /// A fresh budget holding `cap` items.
+    pub(super) const fn with_cap(cap: usize) -> Self {
         Self {
-            remaining: MAX_NORMALIZED_LOCATIONS,
+            remaining: cap,
+            cap,
             truncated: false,
         }
     }
@@ -132,6 +140,19 @@ impl ItemBudget {
         }
         self.remaining = self.remaining.saturating_sub(items.len());
         items
+    }
+
+    /// Like [`Self::admit`] for a lazy sequence: pulls at most the remaining
+    /// allowance plus one item, so the cost stays bounded by the cap however
+    /// long the sequence is.
+    pub(super) fn admit_iter<T>(&mut self, items: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut items = items.into_iter();
+        let kept: Vec<T> = items.by_ref().take(self.remaining).collect();
+        if items.next().is_some() {
+            self.record_drop(kept.len().saturating_add(1));
+        }
+        self.remaining = self.remaining.saturating_sub(kept.len());
+        kept
     }
 
     /// Admits `items` only if all of them fit the remaining allowance;
@@ -157,8 +178,8 @@ impl ItemBudget {
         if !self.truncated {
             tracing::warn!(
                 reported,
-                cap = MAX_NORMALIZED_LOCATIONS,
-                "LSP response item count exceeds MAX_NORMALIZED_LOCATIONS; truncating"
+                cap = self.cap,
+                "LSP response item count exceeds the item cap; truncating"
             );
         }
         self.truncated = true;
@@ -817,7 +838,7 @@ mod tests {
     async fn test_wait_for_indexing_ready_without_cache_is_noop() {
         // No wired cache (most fixtures) must never block -- see `Translator::notification_cache`'s field doc.
         let translator = Translator::new();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .wait_for_indexing_ready(&server_id)
@@ -829,7 +850,7 @@ mod tests {
     async fn test_wait_for_indexing_ready_unknown_state_is_noop() {
         let translator = Translator::new()
             .with_notification_cache(Arc::new(Mutex::new(NotificationCache::new())));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
 
         translator
             .wait_for_indexing_ready(&server_id)
@@ -840,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_ready_state_is_noop() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -862,7 +883,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_wait_for_indexing_ready_uses_configured_timeout_override() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -885,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_loading_times_out() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -904,14 +925,14 @@ mod tests {
 
         assert_matches!(
             err,
-            Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from("rust")
+            Error::WorkspaceIndexing { server_id: id, .. } if id == ServerId::from_static("rust")
         );
     }
 
     #[tokio::test]
     async fn test_wait_for_indexing_ready_returns_ok_once_signaled_ready() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -954,7 +975,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_hover_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -988,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_hover_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -1037,7 +1058,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_hover_timeout_keeps_document_open_for_next_request() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             hover_provider: Some(lsp_types::HoverProvider::Bool(true)),
             ..Default::default()
@@ -1096,7 +1117,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_definition_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1134,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1185,7 +1206,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_references_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1224,7 +1245,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_dispatches_when_indexing_ready() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1276,7 +1297,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_implementation_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
             ..Default::default()
@@ -1313,7 +1334,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_type_definition_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1357,7 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_timeout_does_not_mutate_shared_state() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -1391,7 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_indexing_ready_one_callers_timeout_does_not_release_another() {
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         cache.lock().await.observe_indexing_signal(
             &server_id,
             "experimental/serverStatus",
@@ -1482,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_flattens_single_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1549,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_definition_does_not_filter_out_of_workspace_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             definition_provider: Some(lsp_types::DefinitionProvider::Bool(true)),
             ..Default::default()
@@ -1615,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_does_not_filter_out_of_workspace_location() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1709,7 +1730,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_references_sets_truncated_flag_past_cap() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             references_provider: Some(lsp_types::ReferencesProvider::Bool(true)),
             ..Default::default()
@@ -1774,7 +1795,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_implementation_flattens_location_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             implementation_provider: Some(lsp_types::ImplementationProvider::Bool(true)),
             ..Default::default()
@@ -1849,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_flattens_location_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -1906,7 +1927,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_flattens_link_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -1966,7 +1987,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_declaration_null_response_is_empty() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -2009,7 +2030,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_handle_declaration_returns_workspace_indexing_error_when_loading() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             declaration_provider: Some(lsp_types::DeclarationProvider::Bool(true)),
             ..Default::default()
@@ -2046,7 +2067,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_type_definition_flattens_definition_link_list() {
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             type_definition_provider: Some(lsp_types::TypeDefinitionProvider::Bool(true)),
             ..Default::default()
@@ -2224,6 +2245,18 @@ mod tests {
         assert!(budget.admit_whole(vec![0u8; 3]).is_none());
         assert!(budget.truncated());
         assert!(budget.admit_whole(vec![0u8; 2]).is_some());
+    }
+
+    #[test]
+    fn test_item_budget_with_cap_admits_a_lazy_sequence_up_to_the_cap() {
+        let mut budget = ItemBudget::with_cap(3);
+        assert_eq!(budget.admit_iter(0..3), [0, 1, 2]);
+        assert!(!budget.truncated());
+
+        let mut budget = ItemBudget::with_cap(3);
+        assert_eq!(budget.admit_iter(0..), [0, 1, 2]);
+        assert!(budget.truncated());
+        assert!(budget.admit_iter(0..2).is_empty());
     }
 
     #[test]

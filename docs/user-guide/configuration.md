@@ -281,17 +281,17 @@ leading dot (`"nu"`, not `".nu"`) and are case-sensitive. Allows you to:
 [workspace]
 
 # Add Nushell support
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
 
 # Override Rust to use custom language ID
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "custom-rust"
 
 # Add multiple extensions for Python
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["py", "pyi", "pyw"]
 language_id = "python"
 ```
@@ -343,11 +343,11 @@ For better performance, configure only the languages you actually use:
 [workspace]
 
 # Only Rust and Python
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["py", "pyi"]
 language_id = "python"
 ```
@@ -490,12 +490,12 @@ args = ["--stdio"]  # Many servers require --stdio flag
 
 ### `file_patterns`
 
-**Type**: Array of strings (`*.EXT` patterns)
+**Type**: Array of strings (`*.EXT` or bare file-name patterns)
 **Required**: No (defaults to empty array)
 
 File patterns to associate with this language server. mcpls routes a file by its
-extension, so a pattern's only effect is to map one extension to this server's
-`language_id`.
+extension, or by its name when it has none, so a pattern's only effect is to map one
+extension or one extensionless file name to this server's `language_id`.
 
 ```toml
 [[lsp_servers]]
@@ -516,15 +516,20 @@ digits, `_`, `-` or `+` (for example `**/*.rs`).
 - To cover several extensions, list one pattern per extension:
   `file_patterns = ["**/*.cpp", "**/*.h"]`. Brace expansion (`**/*.{cpp,h}`) is not
   supported.
+- An extensionless file is mapped by its bare name, written `NAME` or `**/NAME`
+  (`Makefile`, `**/Dockerfile`). The name is letters, digits, `_`, `-` or `+`, matches
+  case-sensitively, and takes no directory part other than `**/`: `docs/Makefile` is
+  rejected, since the pattern would claim every file of that name.
 - Any other form is rejected at startup with an error naming the server entry and the
-  pattern, never ignored: character classes (`**/*.[ch]`), `?`, extensionless names
-  (`Makefile`, `src/**`, `**/*`), dotfiles (`.eslintrc`), single files
+  pattern, never ignored: character classes (`**/*.[ch]`), `?`, `src/**`, `**/*`,
+  dotfiles and dotted names (`.eslintrc`, `Makefile.am`), single files
   (`src/main.rs`) and multi-part extensions (`**/*.tar.gz`).
-- Extensionless files cannot be mapped through `file_patterns`.
+- `workspace.language_extensions` maps extensions only; use a `file_patterns` name entry
+  for an extensionless file.
 
 When a file has no mapping at all, tool calls fail with
-`no LSP server configured for language: plaintext`, followed by the file's extension and
-the `file_patterns` configured across servers, so an unmapped extension is easy to spot.
+`no LSP server configured for language: plaintext`, followed by the file's extension or
+name and the `file_patterns` configured across servers, so an unmapped file is easy to spot.
 
 ### `timeout_seconds`
 
@@ -1005,7 +1010,7 @@ TypeScript 7 is the native port of the compiler. Its npm package ships no `lib/t
    `typescript-language-server` is kept (also when `tsc` needs `node` and `node` is not on `PATH`), and the choice and its reason are logged at info level.
    When the native server is chosen, mcpls replaces the entry's `command` and `args`; remove
    `selection` to keep your own. A TypeScript 6 install next to `typescript-language-server` wins over a
-   TypeScript 7 one. Windows is unchanged: `tsc` there is a `.cmd` shim, so use option 3.
+   TypeScript 7 one. On Windows the npm or pnpm `tsc.cmd` shim is mapped to its `typescript` package and the server is started as `node <package>\bin\tsc --lsp --stdio` with the absolute `node` found on `PATH` (a missing `node` keeps `typescript-language-server`); this launch has not been verified on a live Windows install, so option 3 remains the safe choice there.
 3. Run the TypeScript 7 native server explicitly. Edit the existing `typescript` entry
    of your config file (or remove it first) so that its `command` and `args` are as below, and
    remove its `selection` key (`selection = "auto"` is rejected on any other command):
@@ -1058,39 +1063,49 @@ roots = [
 ]
 
 # Language extensions (optional - defaults will be used if not specified)
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
-[[language_extensions]]
-extensions = ["ts", "tsx"]
+[[workspace.language_extensions]]
+extensions = ["ts"]
 language_id = "typescript"
 
-[[language_extensions]]
+[[workspace.language_extensions]]
+extensions = ["tsx"]
+language_id = "typescriptreact"
+
+[[workspace.language_extensions]]
 extensions = ["py", "pyi"]
 language_id = "python"
 
-# Rust backend
+# Rust (backend and CLI)
 [[lsp_servers]]
 language_id = "rust"
 command = "rust-analyzer"
 args = []
-file_patterns = ["**/backend/**/*.rs", "**/cli/**/*.rs"]
+file_patterns = ["**/*.rs"]
 
 # TypeScript frontend
 [[lsp_servers]]
 language_id = "typescript"
 command = "typescript-language-server"
 args = ["--stdio"]
-file_patterns = ["**/frontend/**/*.ts", "**/frontend/**/*.tsx"]
+file_patterns = ["**/*.ts", "**/*.tsx"]
 
 # Python scripts
 [[lsp_servers]]
 language_id = "python"
 command = "pyright-langserver"
 args = ["--stdio"]
-file_patterns = ["**/scripts/**/*.py"]
+file_patterns = ["**/*.py"]
 ```
+
+mcpls routes a file by its extension, or by its bare name when it has none, so
+`file_patterns` cannot limit a server to one directory of a monorepo: the directory
+part of an extension pattern (`**/backend/`) is ignored, and two servers claiming the
+same extension both route every file with it. Scope a server by project instead
+(workspace roots and `heuristics.project_markers`).
 
 ### C/C++ Project
 
@@ -1115,17 +1130,17 @@ compilationDatabasePath = "build"
 roots = ["/Users/username/projects/scripts"]
 
 # Add Nushell language support
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["nu"]
 language_id = "nushell"
 
 # Keep Rust support for other scripts
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["rs"]
 language_id = "rust"
 
 # Shell scripts
-[[language_extensions]]
+[[workspace.language_extensions]]
 extensions = ["sh", "bash"]
 language_id = "shellscript"
 

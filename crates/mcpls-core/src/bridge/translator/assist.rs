@@ -431,7 +431,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             completion_provider: Some(lsp_types::CompletionOptions::default()),
             ..Default::default()
@@ -478,7 +478,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             completion_provider: Some(lsp_types::CompletionOptions::default()),
             ..Default::default()
@@ -538,7 +538,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             inlay_hint_provider: Some(lsp_types::InlayHintProvider::Bool(true)),
             ..Default::default()
@@ -595,7 +595,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             inlay_hint_provider: Some(lsp_types::InlayHintProvider::Bool(true)),
             ..Default::default()
@@ -670,7 +670,7 @@ mod tests {
         use crate::config::ServerId;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let caps = lsp_types::ServerCapabilities {
             completion_provider: Some(lsp_types::CompletionOptions::default()),
             signature_help_provider: Some(lsp_types::SignatureHelpOptions::default()),
@@ -744,7 +744,7 @@ mod tests {
         };
         let (translator, _server) = translator_with_capabilities_and_encoding(
             &dir,
-            &ServerId::from("rust"),
+            &ServerId::from_static("rust"),
             caps,
             lsp_types::PositionEncodingKind::UTF8,
         );
@@ -893,7 +893,7 @@ mod tests {
         use crate::bridge::NotificationCache;
 
         let dir = TempDir::new().unwrap();
-        let server_id = ServerId::from("rust");
+        let server_id = ServerId::from_static("rust");
         let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
 
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
