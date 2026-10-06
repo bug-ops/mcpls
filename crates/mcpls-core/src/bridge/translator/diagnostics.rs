@@ -8,7 +8,7 @@ use lsp_types::{
     WorkDoneProgressParams,
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::Translator;
 use super::availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
@@ -31,6 +31,7 @@ use crate::bridge::{
 };
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
+use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::lock_std;
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
@@ -136,6 +137,47 @@ fn is_method_not_found(error: &Error) -> bool {
         Error::LspServerError { code, .. }
             if lsp_types::ErrorCodes::from(*code) == lsp_types::ErrorCodes::MethodNotFound
     )
+}
+
+/// Whether a server answered a request with an LSP code that says the result
+/// is not available right now, not that it never will be.
+fn is_transient_server_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::LspServerError { code, .. }
+            if matches!(
+                lsp_types::LspErrorCodes::from(*code),
+                lsp_types::LspErrorCodes::RequestCancelled
+                    | lsp_types::LspErrorCodes::ContentModified
+                    | lsp_types::LspErrorCodes::ServerCancelled
+            )
+    )
+}
+
+/// How a failed probe pull moves the probe of its server.
+enum ProbeOutcome {
+    /// The server does not know the method: refused at once.
+    Refuse,
+    /// The request timed out.
+    TimedOut,
+    /// The server could not answer right now; nothing is learned.
+    Transient,
+}
+
+impl ProbeOutcome {
+    /// The finding in `error`, or `None` when it is no probe finding and
+    /// surfaces as it would for any pull.
+    fn of(error: &Error) -> Option<Self> {
+        if is_method_not_found(error) {
+            Some(Self::Refuse)
+        } else if matches!(error, Error::Timeout(_)) {
+            Some(Self::TimedOut)
+        } else if is_transient_server_error(error) {
+            Some(Self::Transient)
+        } else {
+            None
+        }
+    }
 }
 
 /// Shared, never-mutated empty `workspace_roots` for an `EncodingCtx` built
@@ -375,8 +417,9 @@ impl Translator {
 
     /// Sends the pull request `support` calls for, and learns from how it
     /// ends: a server advertising no provider that answers is pulled from now
-    /// on, one that refuses with `-32601` is not pulled again (until it is
-    /// replaced) and its refusal is logged at DEBUG, not ERROR.
+    /// on, one that refuses with `-32601` or times out twice in a row is not
+    /// pulled again (until it is replaced) and its refusal is logged at DEBUG
+    /// or INFO, not ERROR.
     async fn request_pull(&self, doc: &PreparedDocument, support: PullSupport) -> PullAttempt {
         if !support.sends_pull() {
             return PullAttempt::PushOnly;
@@ -395,7 +438,9 @@ impl Translator {
         match response {
             Ok(response) => {
                 if support == PullSupport::Probing {
-                    self.record_pull_probe(server_id, PullProbe::Answered);
+                    self.record_pull_probe(server_id, client.connection_id(), |_| {
+                        PullProbe::Answered
+                    });
                 }
                 PullAttempt::Answered(match PullReport::from(response) {
                     PullReport::Full(mut items) => {
@@ -410,20 +455,58 @@ impl Translator {
                     PullReport::NotStored => None,
                 })
             }
-            Err(unclassified)
-                if support == PullSupport::Probing && is_method_not_found(unclassified.error()) =>
-            {
-                debug!(
-                    %server_id,
-                    error = %unclassified.handled(),
-                    "server advertises no diagnostic provider and refused a pull; \
-                     answering from the push cache"
-                );
-                self.record_pull_probe(server_id, PullProbe::Refused);
-                PullAttempt::PushOnly
+            Err(unclassified) if support == PullSupport::Probing => {
+                self.conclude_probe(server_id, client.connection_id(), unclassified)
             }
             Err(unclassified) => PullAttempt::Failed(unclassified.surface()),
         }
+    }
+
+    /// Learns from a pull request that failed while the server was still being
+    /// probed. A server that refuses or repeatedly times out is answered from
+    /// the push cache from now on, and so is this call when the failure says
+    /// nothing about the server; any other failure surfaces.
+    fn conclude_probe(
+        &self,
+        server_id: &ServerId,
+        conn: ConnectionId,
+        unclassified: UnclassifiedError,
+    ) -> PullAttempt {
+        let Some(outcome) = ProbeOutcome::of(unclassified.error()) else {
+            return PullAttempt::Failed(unclassified.surface());
+        };
+        let error = unclassified.handled();
+        match outcome {
+            ProbeOutcome::Refuse => {
+                debug!(
+                    %server_id,
+                    %error,
+                    "server advertises no diagnostic provider and refused a pull; \
+                     answering from the push cache"
+                );
+                self.record_pull_probe(server_id, conn, |_| PullProbe::Refused);
+            }
+            ProbeOutcome::TimedOut => {
+                let probe = self.record_pull_probe(server_id, conn, PullProbe::after_timeout);
+                if probe == Some(PullProbe::Refused) {
+                    info!(
+                        %server_id,
+                        %error,
+                        "server advertises no diagnostic provider and timed out on two pulls \
+                         in a row; answering from the push cache until it is replaced \
+                         (restart_server)"
+                    );
+                } else {
+                    debug!(%server_id, %error, "probe pull timed out; answering from the push cache");
+                }
+            }
+            ProbeOutcome::Transient => debug!(
+                %server_id,
+                %error,
+                "probe pull could not be answered right now; answering from the push cache"
+            ),
+        }
+        PullAttempt::PushOnly
     }
 
     /// What is known about `id` answering `textDocument/diagnostic`.
@@ -435,8 +518,13 @@ impl Translator {
         PullSupport::of(advertised, servers.pull_probe(id))
     }
 
-    fn record_pull_probe(&self, id: &ServerId, probe: PullProbe) {
-        lock_std(&self.servers).set_pull_probe(id, probe);
+    fn record_pull_probe(
+        &self,
+        id: &ServerId,
+        conn: ConnectionId,
+        next: impl FnOnce(PullProbe) -> PullProbe,
+    ) -> Option<PullProbe> {
+        lock_std(&self.servers).update_pull_probe(id, conn, next)
     }
 
     /// Meets a settled pull with the cache, under the caller's lock: stores

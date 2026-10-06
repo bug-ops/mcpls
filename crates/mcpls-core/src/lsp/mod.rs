@@ -15,7 +15,7 @@ pub(crate) mod tsserver_pin;
 pub(crate) mod types;
 
 pub(crate) use client::{
-    CONTENT_MODIFIED_RETRY_METHODS, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
+    CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
 };
 pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};
 pub(crate) use env::{ManagedEnvVar, ParentEnv, process_env};

@@ -15,8 +15,26 @@ pub(super) enum PullProbe {
     Untried,
     /// The process answered a pull request.
     Answered,
-    /// The process answered a pull request with `-32601`.
+    /// The process answered a pull request with `-32601`, or timed out on two
+    /// in a row.
     Refused,
+    /// The last pull request timed out and the one before it did not: a second
+    /// timeout in a row refuses the process.
+    ///
+    /// One timeout is not enough, since a large workspace's first pull can
+    /// outlast the request timeout on a server that answers pulls.
+    TimedOutOnce,
+}
+
+impl PullProbe {
+    /// The probe after one more pull request timed out.
+    pub(super) const fn after_timeout(self) -> Self {
+        match self {
+            Self::Untried => Self::TimedOutOnce,
+            Self::TimedOutOnce | Self::Refused => Self::Refused,
+            Self::Answered => Self::Answered,
+        }
+    }
 }
 
 /// Whether `get_diagnostics` can expect a pull answer from a server.
@@ -38,7 +56,7 @@ impl PullSupport {
     pub(super) const fn of(advertised: bool, probe: PullProbe) -> Self {
         match (advertised, probe) {
             (true, _) => Self::Advertised,
-            (false, PullProbe::Untried) => Self::Probing,
+            (false, PullProbe::Untried | PullProbe::TimedOutOnce) => Self::Probing,
             (false, PullProbe::Answered) => Self::Answers,
             (false, PullProbe::Refused) => Self::Unsupported,
         }
@@ -56,7 +74,12 @@ mod tests {
 
     #[test]
     fn test_advertising_wins_over_any_probe_result() {
-        for probe in [PullProbe::Untried, PullProbe::Answered, PullProbe::Refused] {
+        for probe in [
+            PullProbe::Untried,
+            PullProbe::TimedOutOnce,
+            PullProbe::Answered,
+            PullProbe::Refused,
+        ] {
             assert_eq!(PullSupport::of(true, probe), PullSupport::Advertised);
         }
     }
@@ -75,6 +98,20 @@ mod tests {
             PullSupport::of(false, PullProbe::Refused),
             PullSupport::Unsupported
         );
+    }
+
+    #[test]
+    fn test_one_timeout_keeps_probing_and_a_second_refuses() {
+        let once = PullProbe::Untried.after_timeout();
+        assert_eq!(once, PullProbe::TimedOutOnce);
+        assert_eq!(PullSupport::of(false, once), PullSupport::Probing);
+        assert_eq!(once.after_timeout(), PullProbe::Refused);
+    }
+
+    #[test]
+    fn test_a_timeout_never_undoes_an_answer_or_a_refusal() {
+        assert_eq!(PullProbe::Answered.after_timeout(), PullProbe::Answered);
+        assert_eq!(PullProbe::Refused.after_timeout(), PullProbe::Refused);
     }
 
     #[test]

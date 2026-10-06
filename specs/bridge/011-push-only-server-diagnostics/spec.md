@@ -155,7 +155,7 @@ THEN the output says the answer is push-derived
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | WHEN the routed server does not pull-answer, THE SYSTEM SHALL NOT send `textDocument/diagnostic` for `get_diagnostics`. Pull support is learned per server process, because `diagnosticProvider` is only the advertisement (pyright advertises `null` and answers pulls): a server that advertises a provider is pulled; one that does not is probed with its first pull, `-32601` marks it unsupported (no further pull until the process is replaced), an answered pull marks it as answering and it keeps being pulled | must |
+| FR-001 | WHEN the routed server does not pull-answer, THE SYSTEM SHALL NOT send `textDocument/diagnostic` for `get_diagnostics`. Pull support is learned per server process, because `diagnosticProvider` is only the advertisement (pyright advertises `null` and answers pulls): a server that advertises a provider is pulled; one that does not is probed with its pulls: `-32601`, or a request timeout twice in a row, marks it unsupported (no further pull until the process is replaced), an answered pull marks it as answering and it keeps being pulled. A cancelled, content-modified or server-cancelled reply (`-32800`, `-32801`, `-32802`) leaves the probe unchanged, and a server termination or any other transport failure never counts as a timeout | must |
 | FR-002 | WHEN the routed server is unsupported (FR-001) THE SYSTEM SHALL answer `get_diagnostics` from the push cache | must |
 | FR-003 | THE SYSTEM SHALL record whether a publish has ever been received for a file, so a published empty list (clean) is distinct from no publish yet | must |
 | FR-004 | WHEN a publish with an empty list has been received for the file THE SYSTEM SHALL answer with a successful empty result | must |
@@ -167,6 +167,8 @@ THEN the output says the answer is push-derived
 | FR-010 | THE existing `indexing_in_progress` and `push_notifications_degraded` flags SHALL keep their meaning and SHALL be reported alongside the new state | must |
 | FR-011 | THE `get_tool_support` coverage for `get_diagnostics` SHALL NOT claim full coverage for a server without `diagnosticProvider` without qualification | should |
 | FR-012 | THE new "pending or unknown" state SHALL also be available on `get_cached_diagnostics` and on the diagnostics resource read, so the three surfaces agree | should |
+| FR-013 | WHEN a probing pull ends with a timeout, a transient reply (FR-001) or `-32601`, THE SYSTEM SHALL answer that call from the push cache; any other probing failure surfaces as before and leaves the probe unchanged | must |
+| FR-014 | THE probe result SHALL belong to the connection (one server process) whose request produced it, so a late result of a replaced process never changes the replacement's probe | must |
 
 ## 4. Non-Functional Requirements
 
@@ -239,8 +241,9 @@ THEN the output says the answer is push-derived
 
 - **Response shape.** A structured `availability` field (`published`, `pending`, `evicted`) on `get_diagnostics`, `get_cached_diagnostics` and the resource read, and `origin` (`pull`, `push_cache`) on `get_diagnostics`; the call succeeds and the caller branches on the field. `pending` and `evicted` carry no answer, so an empty list next to them is not clean.
 - **No wait.** `get_diagnostics` returns `pending` at once; a bounded wait is a follow-up.
-- **How the cache records a clean file.** A published empty list is an ordinary entry (`published`). Capacity eviction of the last entry of a file leaves a mark: only clean entries evicted reads `published` (clean), a lost non-empty entry reads `evicted`. The marks are bounded; once a server lost the oldest of them, a file without entry or mark reads `evicted` for that server rather than `pending`. A server's marks are dropped with its diagnostics.
+- **How the cache records a clean file.** A published empty list is an ordinary entry (`published`). Capacity eviction of the last entry of a file leaves a mark: only clean entries evicted reads `published` (clean), a lost non-empty entry reads `evicted`. The marks are bounded; once a server lost the oldest of them, a file without entry or mark reads `evicted` for that server rather than `pending`. A server's marks are dropped with its diagnostics, and the overflow ends with the server's next accepted write (push or pull), applied before that write's own evictions. Trade-off: a file forgotten before that write reads `pending` afterwards, not `evicted`, so the flag cannot outlive the burst that set it.
 - **Capability predicate.** `diagnosticProvider` present (any form) is the advertisement; FR-001 adds what a probe learned. `get_tool_support` reports `push_only` for a server that advertises nothing and has not answered a pull, so a push-only route is never reported as plain `supported`.
+- **Probe refusal.** A timeout is evidence, but a large workspace's first pull can outlast the request timeout on a server that answers pulls, so one timeout leaves the server probing and a second in a row refuses it (logged at INFO, naming `restart_server`). An answer resets the count. The probe is stored with the identity of the connection that sent the request (`ConnectionId`, shared by the clones of one client); `Servers::pull_probe` reads it back only for the running connection and a late result from a replaced process is ignored.
 - **Respawn.** The learned pull support, the eviction marks and the cached diagnostics of the replaced process are dropped; the file reads `pending` until the replacement publishes. Subscribers are notified through the existing respawn invalidation.
 
 ## 10. See Also

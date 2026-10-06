@@ -1,7 +1,7 @@
 //! LSP client implementation with async request/response handling.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use lsp_types::LspErrorCodes;
@@ -288,6 +288,24 @@ pub struct LspClient {
 
     /// Secrets hidden from text derived from server output.
     redactions: Arc<Redactions>,
+
+    /// Identity of the connection, shared by every clone.
+    connection_id: ConnectionId,
+}
+
+/// Identity of one client connection, and so of one server process.
+///
+/// Clones of a client share it; every client built by this process gets a
+/// distinct one, so a result tied to a replaced process is told apart from the
+/// running one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionId(u64);
+
+impl ConnectionId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 impl Clone for LspClient {
@@ -305,6 +323,7 @@ impl Clone for LspClient {
             pending_failure: Arc::clone(&self.pending_failure),
             receiver_task: None,
             redactions: Arc::clone(&self.redactions),
+            connection_id: self.connection_id,
         }
     }
 }
@@ -343,6 +362,7 @@ impl LspClient {
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         }
     }
 
@@ -381,6 +401,7 @@ impl LspClient {
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         }
     }
 
@@ -426,12 +447,18 @@ impl LspClient {
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions,
+            connection_id: ConnectionId::next(),
         }
     }
 
     /// The configured settings, shared with the message loop.
     fn shared_settings(config: &LspServerConfig) -> Option<Arc<LspSettings>> {
         config.settings.clone().map(Arc::new)
+    }
+
+    /// Identity of the connection this client and its clones talk over.
+    pub(crate) const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
     }
 
     /// Secrets this client hides from text derived from server output.
@@ -2257,6 +2284,7 @@ mod tests {
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
+            connection_id: ConnectionId::next(),
         };
 
         let (tx1, rx1) = oneshot::channel::<Result<Value>>();

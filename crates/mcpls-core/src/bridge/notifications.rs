@@ -463,7 +463,9 @@ struct EvictionMark {
 /// forgotten the server is `overflowed`, and a file without entry or mark is
 /// then reported as possibly evicted rather than as pending. A server's marks
 /// and overflow are dropped with its diagnostics (respawn), and a file's mark
-/// with its next entry.
+/// with its next entry. The overflow also ends with the server's next accepted
+/// write, so a file forgotten before it reads as pending again instead of
+/// possibly evicted for as long as the process runs.
 #[derive(Debug, Default)]
 struct EvictionMarks {
     by_file: HashMap<DiagnosticsKey, EvictionMark>,
@@ -518,6 +520,16 @@ impl EvictionMarks {
 
     fn has_overflowed(&self, server: &ServerId) -> bool {
         self.overflowed.contains(server)
+    }
+
+    /// Ends `server`'s overflow and returns whether it was set. Called before
+    /// the write's own evictions, which can start a new one.
+    fn clear_overflow(&mut self, server: &ServerId) -> bool {
+        self.overflowed.remove(server)
+    }
+
+    fn restore_overflow(&mut self, server: &ServerId) {
+        self.overflowed.insert(server.clone());
     }
 }
 
@@ -1206,6 +1218,8 @@ impl NotificationCache {
 
         self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
+        self.eviction_marks.clear_overflow(server_id);
+
         // A replacement leaves its previous owner's order map (the owner may
         // differ when the diagnostics route changed, e.g. on respawn) and
         // never needs room; only a genuinely new URI can trigger eviction.
@@ -1401,11 +1415,15 @@ impl NotificationCache {
         };
 
         let mut evicted = Vec::new();
+        let was_overflowed = self.eviction_marks.clear_overflow(server_id);
         let is_new_slot = self.take_entry(&slot_key).is_none();
         if is_new_slot {
             while self.entries.len() >= MAX_DIAGNOSTIC_ENTRIES {
                 let Some((_, _, victim)) = self.entry_to_evict(server_id, Protect::File(&file_key))
                 else {
+                    if was_overflowed {
+                        self.eviction_marks.restore_overflow(server_id);
+                    }
                     return PullWrite::Discarded {
                         reason: Discard::NoRoom,
                         evicted,
@@ -4083,6 +4101,64 @@ mod tests {
         marks.record(file.clone(), route(), EvictedContent::Lost);
         marks.record(file.clone(), route(), EvictedContent::Clean);
         assert_eq!(marks.content(&file), Some(EvictedContent::Lost));
+    }
+
+    fn overflowed_after_churn() -> NotificationCache {
+        let mut cache = full_cache(false);
+        for i in 0..=MAX_EVICTION_MARKS {
+            drop(write_error(&mut cache, &format!("file:///churn{i}.rs")));
+        }
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+        cache
+    }
+
+    /// #680: the overflow ends with the owner's next accepted push, so a file
+    /// forgotten earlier reads as pending again.
+    #[test]
+    fn test_overflow_ends_with_the_owners_next_accepted_push() {
+        let mut cache = NotificationCache::new();
+        cache.eviction_marks.overflowed.insert(route());
+        let unseen = Uri::from("file:///never-published.rs");
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Evicted
+        );
+
+        drop(write_error(&mut cache, "file:///fresh.rs"));
+
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+        assert_eq!(
+            cache.availability(&unseen, Some(&route())),
+            DiagnosticsAvailability::Pending
+        );
+    }
+
+    /// #680: a pull is a write too, and another server's write leaves the
+    /// overflow alone.
+    #[test]
+    fn test_overflow_ends_with_the_owners_next_accepted_pull_only() {
+        let mut cache = NotificationCache::new();
+        cache.eviction_marks.overflowed.insert(route());
+        let other = ServerId::from_static("other-server");
+        cache.store_pulled_for_test(&other, &Uri::from("file:///other.rs"), Vec::new());
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+
+        cache.store_pulled_for_test(&route(), &Uri::from("file:///pulled.rs"), Vec::new());
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+    }
+
+    /// #680: the clear runs before the write's own evictions, so a write that
+    /// evicts into full marks leaves the server overflowed, and one that needs
+    /// no room ends it.
+    #[test]
+    fn test_overflow_clear_precedes_the_evictions_of_the_same_write() {
+        let mut cache = overflowed_after_churn();
+        drop(write_error(&mut cache, "file:///another-new.rs"));
+        assert!(cache.eviction_marks.has_overflowed(&route()));
+
+        drop(write_error(&mut cache, "file:///another-new.rs"));
+        assert!(!cache.eviction_marks.has_overflowed(&route()));
+        cache.assert_consistent();
     }
 
     /// #666 eviction pressure: once more files were evicted than the marks
