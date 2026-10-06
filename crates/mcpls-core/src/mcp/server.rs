@@ -2350,7 +2350,7 @@ mod tests {
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::LspInitFailed {
                         phase: crate::error::InitPhase::Initialize,
-                        source: Box::new(crate::error::Error::LspProtocolError(
+                        cause: Box::new(crate::error::Error::LspProtocolError(
                             crate::error::RedactedText::fixed("exited with token bravo-secret-222"),
                         )),
                         hint: None,

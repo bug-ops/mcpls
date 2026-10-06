@@ -720,7 +720,7 @@ impl fmt::Display for IdList<'_> {
 ///
 /// let err = Error::LspInitFailed {
 ///     phase: InitPhase::Initialize,
-///     source: Box::new(Error::ServerTerminated),
+///     cause: Box::new(Error::ServerTerminated),
 ///     hint: None,
 ///     stderr: None,
 /// };
@@ -1120,14 +1120,14 @@ impl fmt::Display for InitPhase {
 #[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
-    #[error("LSP server initialization failed: {phase}: {source}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
+    #[error("LSP server initialization failed: {phase}: {cause}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
     LspInitFailed {
         /// The handshake step that failed.
         phase: InitPhase,
         /// Why the step failed, so a timeout and a rejection by the server
-        /// stay distinguishable.
-        #[source]
-        source: Box<Self>,
+        /// stay distinguishable. Rendered by `Display` instead of being
+        /// exposed through `source()`, so the chain is not printed twice.
+        cause: Box<Self>,
         /// The likely cause and remedy, when one is known.
         hint: Option<InitFailureHint>,
         /// What the server wrote to stderr before failing, if anything.
@@ -2055,7 +2055,7 @@ mod tests {
     fn test_error_display_lsp_init_failed() {
         let err = Error::LspInitFailed {
             phase: InitPhase::Initialize,
-            source: Box::new(Error::Io(std::io::Error::other("server not found"))),
+            cause: Box::new(Error::Io(std::io::Error::other("server not found"))),
             hint: None,
             stderr: None,
         };
@@ -2238,7 +2238,7 @@ mod tests {
         let stderr = StderrExcerpt::complete(b"fatal: bad config", &Redactions::default());
         let failed = Error::LspInitFailed {
             phase: InitPhase::Initialize,
-            source: Box::new(Error::Io(std::io::Error::other("boom"))),
+            cause: Box::new(Error::Io(std::io::Error::other("boom"))),
             hint: None,
             stderr: stderr.clone(),
         };
@@ -2510,7 +2510,7 @@ mod tests {
             "rust-analyzer",
             Error::LspInitFailed {
                 phase: InitPhase::Initialize,
-                source: Box::new(Error::Io(std::io::Error::other("boom"))),
+                cause: Box::new(Error::Io(std::io::Error::other("boom"))),
                 hint: None,
                 stderr: None,
             },
@@ -2586,7 +2586,7 @@ mod tests {
         let hint = Some(InitFailureHint::NativeTypescriptOnly);
         let failed = Error::LspInitFailed {
             phase: InitPhase::Initialize,
-            source: Box::new(Error::Io(std::io::Error::other("x"))),
+            cause: Box::new(Error::Io(std::io::Error::other("x"))),
             hint,
             stderr: stderr.clone(),
         }
@@ -2656,7 +2656,7 @@ mod tests {
                     "pyright",
                     Error::LspInitFailed {
                         phase: InitPhase::Initialize,
-                        source: Box::new(Error::Io(std::io::Error::other("denied"))),
+                        cause: Box::new(Error::Io(std::io::Error::other("denied"))),
                         hint: None,
                         stderr: None,
                     },

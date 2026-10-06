@@ -599,7 +599,7 @@ impl LspServer {
                     )
                     .await);
                 }
-                Err(Error::LspInitFailed { phase, source, .. }) => {
+                Err(Error::LspInitFailed { phase, cause, .. }) => {
                     // The server may be about to exit after printing its reason,
                     // so wait the (bounded) end-of-file grace whether or not it
                     // has exited yet.
@@ -607,12 +607,12 @@ impl LspServer {
                     let hint = Self::init_failure_hint(&config);
                     return Err(Error::LspInitFailed {
                         phase,
-                        source,
+                        cause: Box::new(redactions.sanitize_error(*cause)),
                         hint,
                         stderr,
                     });
                 }
-                Err(init_error) => return Err(init_error),
+                Err(init_error) => return Err(redactions.sanitize_error(init_error)),
             };
 
         info!("LSP server initialized successfully");
@@ -654,7 +654,7 @@ impl LspServer {
             },
             None => Error::LspInitFailed {
                 phase: InitPhase::Initialize,
-                source: Box::new(init_error),
+                cause: Box::new(redactions.sanitize_error(init_error)),
                 hint,
                 stderr,
             },
@@ -965,7 +965,7 @@ impl LspServer {
                 } else {
                     Error::LspInitFailed {
                         phase: InitPhase::Initialize,
-                        source: Box::new(e),
+                        cause: Box::new(e),
                         hint: None,
                         stderr: None,
                     }
@@ -1269,7 +1269,7 @@ where
         .await
         .map_err(|e| Error::LspInitFailed {
             phase,
-            source: Box::new(e),
+            cause: Box::new(e),
             hint: None,
             stderr: None,
         })
@@ -1925,8 +1925,8 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
 
         assert_matches!(
             &err,
-            Error::LspInitFailed { phase: InitPhase::Initialize, source, .. }
-                if matches!(**source, Error::LspServerError { code: -32603, .. }),
+            Error::LspInitFailed { phase: InitPhase::Initialize, cause, .. }
+                if matches!(**cause, Error::LspServerError { code: -32603, .. }),
             "got {err:?}"
         );
         assert!(err.to_string().contains("rejected by server"), "{err}");

@@ -424,6 +424,19 @@ impl Redactions {
         Error::LspProtocolError(self.redact(&message.to_string()))
     }
 
+    /// `error` unchanged when its text holds no secret, otherwise an
+    /// [`Error::LspProtocolError`] carrying the redacted text, so an error
+    /// built from server-controlled text cannot hand a secret to the client.
+    pub(crate) fn sanitize_error(&self, error: Error) -> Error {
+        if self.is_empty() {
+            return error;
+        }
+        match self.apply(&error.to_string()) {
+            Cow::Borrowed(_) => error,
+            Cow::Owned(redacted) => Error::LspProtocolError(RedactedText(redacted)),
+        }
+    }
+
     /// Hides a secret cut by an elision boundary at the end of `head`: the
     /// longest trailing fragment of at least [`MIN_FRAGMENT_BYTES`] bytes that
     /// is a prefix of a secret is replaced by its marker.
@@ -777,6 +790,25 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "LSP protocol error: bad value [redacted:API_TOKEN] in frame"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_error_redacts_a_secret_and_keeps_a_clean_error() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+        let leaking = Error::LspServerError {
+            code: -32603,
+            message: "bad token ghp_abcdefgh".into(),
+            data: None,
+        };
+
+        let sanitized = set.sanitize_error(leaking);
+
+        assert!(!sanitized.to_string().contains("ghp_abcdefgh"), "{sanitized}");
+        assert!(sanitized.to_string().contains("[redacted:API_TOKEN]"));
+        assert_matches!(
+            set.sanitize_error(Error::ServerTerminated),
+            Error::ServerTerminated
         );
     }
 
