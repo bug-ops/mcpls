@@ -189,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** shutdown cancellation uses one `CancellationToken` and `tokio-util` is a required dependency of `mcpls-core`. (#685)
 - **Breaking:** `file_patterns` accept extensionless names (`Makefile`, `**/Dockerfile`) and `NoServerForLanguage` carries a `FileKey`; `get_tool_support` lists the languages the effective map routes. (#685)
 - Native `tsc` auto-selection works on Windows through the `tsc.cmd` shim, and the respawn tsserver pin is planned off the async runtime. (#685)
+- **Breaking:** untrusted mode parses a closed set of exec wrappers (`time`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `caffeinate`, `arch`, `env`, busybox applets), boundary-checks and absolutizes the program a wrapper starts, and refuses `sudo`, `doas`, `strace`, `unshare`, `gosu`, `su-exec`, `runas`, `wsl` and similar outright; refusals name the matched option bounded and escaped, and `UntrustedRefusal::ProjectLauncher` gains `cause`. (#719)
+- **Breaking:** `ServerEnv` stores its host at construction, so `get`, `insert` and `contains_key` lose the host parameter, and `resolve_command`, `child_env_var` and the tsserver pin read it from the config. (#719)
+- **Breaking:** `NotificationCache::diagnostics` returns an owned `DiagnosticInfo`, the diagnostics version lives only in `Origin`, and `ResourceDiagnosticsResponse.version` is `Option<DocumentVersion>`. (#719)
+- **Breaking:** `Error::Io` displays without the "I/O error: " prefix and `UnresolvableWorkspaceRoot` no longer repeats its source. (#719)
+- `IndexingGate::FileLocal` takes only a file-local capability, `DisclosedDocument` honors the request timeout, and unknown-argument errors bound client keys and cap the message at 4 KiB. (#719)
+- Untrusted mode also refuses `xargs`, `find` and `awk`, `MCPLS_CONFIG` is read through `var_os`, and CLI logging-init errors print on stderr (omitted from #708). (#719)
 
 ### Removed
 
