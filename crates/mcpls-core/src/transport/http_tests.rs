@@ -1475,7 +1475,7 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
                 diagnostics: vec![],
                 version: None,
             });
-        let tx = tx.clone();
+        let tx = &tx;
         async move { tx.send(notification).await.unwrap() }
     };
 
@@ -2282,7 +2282,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
                 diagnostics: vec![],
                 version: None,
             });
-        let tx = tx.clone();
+        let tx = &tx;
         async move { tx.send(notification).await.unwrap() }
     };
     publish(&file_util).await;
