@@ -1065,6 +1065,20 @@ impl LspClient {
     /// `report` payloads fail to deserialize could bypass the `kind`-based
     /// filter above entirely by sending malformed frames (security LOW /
     /// M1).
+    /// Whether `notification` is handed to the log/lifecycle lanes, as opposed
+    /// to the diagnostics mailbox or the floor.
+    fn reaches_a_lane(
+        notification: &LspNotification,
+        has_sink: bool,
+        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+    ) -> bool {
+        match notification {
+            LspNotification::PublishDiagnostics(_) => false,
+            LspNotification::LogMessage(_) | LspNotification::ShowMessage(_) => has_sink,
+            other => Self::lifecycle_lane(other, lifecycle_tx).is_some(),
+        }
+    }
+
     fn lifecycle_lane<'a>(
         notification: &LspNotification,
         lifecycle_tx: Option<&'a mpsc::Sender<LspNotification>>,
@@ -1282,7 +1296,9 @@ impl LspClient {
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
                 Self::redact_notification(&mut typed, redactions);
 
-                if tracing::enabled!(tracing::Level::TRACE) {
+                if tracing::enabled!(tracing::Level::TRACE)
+                    && Self::reaches_a_lane(&typed, notification_tx.is_some(), lifecycle_tx)
+                {
                     trace!(
                         "Forwarding notification: {}",
                         redactions.apply(&format!("{typed:?}"))
@@ -1449,23 +1465,44 @@ pub struct UnclassifiedError(Option<Box<Unclassified>>);
 /// An error response from the server, kept as the [`Error::LspServerError`] it
 /// becomes so a caller can classify it, and constructible from nothing else.
 #[derive(Debug)]
-struct ServerErrorResponse(Error);
+struct ServerErrorResponse {
+    code: i32,
+    message: String,
+    data: Option<Value>,
+    /// The [`Error`] built from the fields above, once a caller asked to see it.
+    error: std::sync::OnceLock<Error>,
+}
 
 impl ServerErrorResponse {
     const fn new(code: i32, message: String, data: Option<Value>) -> Self {
-        Self(Error::LspServerError {
+        Self {
             code,
             message,
             data,
-        })
+            error: std::sync::OnceLock::new(),
+        }
     }
 
     /// The code and message of the response.
-    fn code_and_message(&self) -> (i32, &str) {
-        match &self.0 {
-            Error::LspServerError { code, message, .. } => (*code, message.as_str()),
-            other => unreachable!("a ServerErrorResponse holds an LspServerError, not {other:?}"),
-        }
+    const fn code_and_message(&self) -> (i32, &str) {
+        (self.code, self.message.as_str())
+    }
+
+    /// The response as the error it becomes, for classification.
+    fn as_error(&self) -> &Error {
+        self.error.get_or_init(|| Error::LspServerError {
+            code: self.code,
+            message: self.message.clone(),
+            data: self.data.clone(),
+        })
+    }
+
+    fn into_error(self) -> Error {
+        self.error.into_inner().unwrap_or(Error::LspServerError {
+            code: self.code,
+            message: self.message,
+            data: self.data,
+        })
     }
 }
 
@@ -1482,13 +1519,10 @@ enum Unclassified {
 }
 
 impl Unclassified {
-    const fn error(&self) -> &Error {
+    fn error(&self) -> &Error {
         match self {
-            Self::Logged(error)
-            | Self::ServerResponse {
-                response: ServerErrorResponse(error),
-                ..
-            } => error,
+            Self::Logged(error) => error,
+            Self::ServerResponse { response, .. } => response.as_error(),
         }
     }
 
@@ -1504,7 +1538,7 @@ impl Unclassified {
             } => {
                 let (code, message) = response.code_and_message();
                 report(&method, &id, code, message);
-                response.0
+                response.into_error()
             }
         }
     }
