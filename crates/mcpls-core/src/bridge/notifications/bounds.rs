@@ -56,6 +56,11 @@ impl BoundedDiagnostics {
         self.0
     }
 
+    /// The bounded list, borrowed.
+    pub(crate) fn as_slice(&self) -> &[LspDiagnostic] {
+        &self.0
+    }
+
     /// Truncates each message to `MAX_ENTRY_TEXT_BYTES` and bounds the list to
     /// `MAX_DIAGNOSTICS_ENTRY_BYTES`, keeping the most severe diagnostics when
     /// the list has to be cut.

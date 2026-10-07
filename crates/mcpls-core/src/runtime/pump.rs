@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
@@ -17,7 +16,8 @@ use crate::bridge::{
 };
 use crate::config::ServerId;
 use crate::lsp::{
-    LostPublishes, LspNotification, NotificationInbox, PublishDelivery, PublishReader,
+    BoundedPublish, LostFiles, LspNotification, NotificationInbox, PublishDelivery, PublishReader,
+    ServerMessage,
 };
 use crate::mcp::SubscriptionRegistry;
 use crate::util::{catch_panic, lock_std};
@@ -94,7 +94,7 @@ impl std::fmt::Debug for DiagnosticsRoles {
 
 /// What a pump still reads; a source is `None` once it has closed.
 struct PumpInputs {
-    messages: Option<mpsc::Receiver<LspNotification>>,
+    messages: Option<mpsc::Receiver<ServerMessage>>,
     publishes: Option<PublishReader>,
     lifecycle: Option<mpsc::Receiver<LspNotification>>,
 }
@@ -107,9 +107,7 @@ impl PumpInputs {
 
 /// Next frame of `source`; `None` when it just closed (and is dropped), and
 /// pending forever once it was.
-async fn recv_open(
-    source: &mut Option<mpsc::Receiver<LspNotification>>,
-) -> Option<LspNotification> {
+async fn recv_open<T>(source: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
     let Some(receiver) = source else {
         return std::future::pending().await;
     };
@@ -137,14 +135,6 @@ async fn recv_publish(source: &mut Option<PublishReader>) -> Option<PublishDeliv
 enum Flow {
     Continue,
     Stop,
-}
-
-/// A drained notification and whether its path is resolved first.
-enum BatchItem {
-    /// An admitted publication: its path is resolved before it is applied.
-    Resolve(LspNotification),
-    /// Anything else: applied as it is.
-    Skip(LspNotification),
 }
 
 /// Everything one server's pump needs besides what it reads.
@@ -266,14 +256,12 @@ impl Pump {
         while !inputs.all_closed() {
             let flow = tokio::select! {
                 () = self.cancel.cancelled() => Flow::Stop,
-                frame = recv_open(&mut inputs.messages) => match frame {
-                    Some(first) => {
-                        let mut batch = vec![first];
-                        drain_messages(&mut inputs.messages, &mut batch);
-                        self.apply_batch(batch, &mut inputs.lifecycle).await
+                frame = recv_open(&mut inputs.messages) => {
+                    if let Some(message) = frame {
+                        self.on_message(message).await;
                     }
-                    None => Flow::Continue,
-                },
+                    Flow::Continue
+                }
                 delivery = recv_publish(&mut inputs.publishes) => match delivery {
                     Some(delivery) => self.apply_delivery(delivery, &mut inputs).await,
                     None => Flow::Continue,
@@ -301,37 +289,45 @@ impl Pump {
         .await;
     }
 
+    async fn on_message(&self, message: ServerMessage) {
+        let mut cache = self.notification_cache.lock().await;
+        match message {
+            ServerMessage::Log(m) => cache.store_log(m.kind.into(), m.message),
+            ServerMessage::Show(m) => cache.store_message(m.kind.into(), m.message),
+        }
+    }
+
     /// Applies one mailbox delivery: a publish is batched with the publishes
     /// that follow it, files the mailbox lost are marked in the cache.
     async fn apply_delivery(&mut self, delivery: PublishDelivery, inputs: &mut PumpInputs) -> Flow {
-        match delivery {
-            PublishDelivery::Publish(first) => {
-                let mut batch = vec![LspNotification::PublishDiagnostics(first)];
-                let mut lost = None;
-                if let Some(reader) = &mut inputs.publishes {
-                    while batch.len() < PUMP_BATCH {
-                        match reader.try_recv() {
-                            Some(PublishDelivery::Publish(next)) => {
-                                batch.push(LspNotification::PublishDiagnostics(next));
+        let mut next = Some(delivery);
+        while let Some(delivery) = next.take() {
+            let flow = match delivery {
+                PublishDelivery::Publish(first) => {
+                    let mut batch = vec![first];
+                    if let Some(reader) = &mut inputs.publishes {
+                        while batch.len() < PUMP_BATCH {
+                            match reader.try_recv() {
+                                Some(PublishDelivery::Publish(more)) => batch.push(more),
+                                other => {
+                                    next = other;
+                                    break;
+                                }
                             }
-                            Some(PublishDelivery::Lost(files)) => {
-                                lost = Some(files);
-                                break;
-                            }
-                            None => break,
                         }
                     }
+                    self.apply_batch(batch, &mut inputs.lifecycle).await
                 }
-                if self.apply_batch(batch, &mut inputs.lifecycle).await == Flow::Stop {
-                    return Flow::Stop;
+                PublishDelivery::Lost(files) => {
+                    self.apply_lost(&files, &mut inputs.lifecycle).await
                 }
-                match lost {
-                    Some(files) => self.apply_lost(files, &mut inputs.lifecycle).await,
-                    None => Flow::Continue,
-                }
+                PublishDelivery::LostUnnamed => self.apply_unnamed_loss().await,
+            };
+            if flow == Flow::Stop {
+                return Flow::Stop;
             }
-            PublishDelivery::Lost(files) => self.apply_lost(files, &mut inputs.lifecycle).await,
         }
+        Flow::Continue
     }
 
     /// Resolves `publications` while the lifecycle lane keeps being serviced;
@@ -368,32 +364,28 @@ impl Pump {
     /// arrival order, so a clear is never reordered.
     async fn apply_batch(
         &mut self,
-        batch: Vec<LspNotification>,
+        batch: Vec<BoundedPublish>,
         lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
     ) -> Flow {
         let admission_role = *self.role_rx.borrow();
-        let items: Vec<BatchItem> = batch
+        let items: Vec<(BoundedPublish, bool)> = batch
             .into_iter()
-            .map(|notif| {
-                if publication_admitted(&notif, admission_role, &self.workspace_roots) {
-                    BatchItem::Resolve(notif)
-                } else {
-                    BatchItem::Skip(notif)
-                }
+            .map(|publish| {
+                let admitted =
+                    publication_admitted(publish.uri(), admission_role, &self.workspace_roots);
+                (publish, admitted)
             })
             .collect();
         let publications: Vec<Publication<'_>> = items
             .iter()
-            .filter_map(|item| match item {
-                BatchItem::Resolve(LspNotification::PublishDiagnostics(p)) => Some(Publication {
-                    uri: &p.uri,
-                    kind: if p.diagnostics.is_empty() {
-                        PublicationKind::Clear
-                    } else {
-                        PublicationKind::Diagnostics
-                    },
-                }),
-                _ => None,
+            .filter(|(_, admitted)| *admitted)
+            .map(|(publish, _)| Publication {
+                uri: publish.uri(),
+                kind: if publish.diagnostics().as_slice().is_empty() {
+                    PublicationKind::Clear
+                } else {
+                    PublicationKind::Diagnostics
+                },
             })
             .collect();
         let Some(resolved) = self.resolve(&publications, lifecycle).await else {
@@ -402,17 +394,18 @@ impl Pump {
         drop(publications);
         let mut resolved = resolved.into_iter();
 
-        for item in items {
-            let (notif, published) = match item {
-                BatchItem::Resolve(notif) => (notif, resolved.next().flatten()),
-                BatchItem::Skip(notif) => (notif, None),
+        for (publish, admitted) in items {
+            let published = if admitted {
+                resolved.next().flatten()
+            } else {
+                None
             };
             // Re-read after the (possibly slow) resolve: a demotion in the
             // meantime must stop caching and fan-out (#174 s8).
             let role = *self.role_rx.borrow();
-            apply_notification(
+            apply_publish(
                 &self.server_id,
-                notif,
+                publish,
                 published,
                 role,
                 &self.notification_cache,
@@ -427,14 +420,14 @@ impl Pump {
     /// read as lost instead of `pending`, and tells their subscribers.
     async fn apply_lost(
         &mut self,
-        lost: LostPublishes,
+        lost: &LostFiles,
         lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
     ) -> Flow {
         if *self.role_rx.borrow() == DiagnosticsRole::Secondary {
             return Flow::Continue;
         }
         let uris: Vec<&lsp_types::Uri> = lost
-            .uris
+            .uris()
             .iter()
             .filter(|uri| self.workspace_roots.admits_uri(uri))
             .collect();
@@ -454,108 +447,76 @@ impl Pump {
             .flatten()
             .map(|published| bridge::DiagnosticsKey::of(published.canonical()))
             .collect();
-        let changed = self.notification_cache.lock().await.record_lost_publishes(
-            &self.server_id,
-            &files,
-            lost.overflowed,
-        );
+        let changed = self
+            .notification_cache
+            .lock()
+            .await
+            .record_lost_files(&self.server_id, &files);
         publish_invalidated(&self.subs, &changed).await;
         Flow::Continue
     }
-}
 
-/// Moves the frames already waiting in `source` into `batch`, up to
-/// [`PUMP_BATCH`] in all.
-fn drain_messages(
-    source: &mut Option<mpsc::Receiver<LspNotification>>,
-    batch: &mut Vec<LspNotification>,
-) {
-    let Some(receiver) = source else {
-        return;
-    };
-    while batch.len() < PUMP_BATCH {
-        match receiver.try_recv() {
-            Ok(notif) => batch.push(notif),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                *source = None;
-                return;
-            }
+    /// Marks that the mailbox lost more publishes than it could name.
+    async fn apply_unnamed_loss(&self) -> Flow {
+        if *self.role_rx.borrow() != DiagnosticsRole::Secondary {
+            self.notification_cache
+                .lock()
+                .await
+                .record_unnamed_loss(&self.server_id);
         }
+        Flow::Continue
     }
 }
 
 /// Notifications drained per resolve round.
 const PUMP_BATCH: usize = 64;
 
-/// Whether `notif` is a publication this pump should canonicalize and cache.
+/// Whether a publication for `uri` is one this pump should canonicalize and
+/// cache.
 fn publication_admitted(
-    notif: &LspNotification,
+    uri: &lsp_types::Uri,
     role: DiagnosticsRole,
     workspace_roots: &WorkspaceRoots,
 ) -> bool {
-    match notif {
-        LspNotification::PublishDiagnostics(p) => {
-            role == DiagnosticsRole::Authoritative && workspace_roots.admits_uri(&p.uri)
-        }
-        _ => false,
-    }
+    role == DiagnosticsRole::Authoritative && workspace_roots.admits_uri(uri)
 }
 
-/// Applies one drained notification; `published` is the resolution of a
-/// publication that passed [`publication_admitted`], `None` when it resolved
-/// outside the workspace or could not be resolved.
-async fn apply_notification(
+/// Applies one drained publication; `published` is the resolution of one that
+/// passed [`publication_admitted`], `None` when it resolved outside the
+/// workspace or could not be resolved.
+async fn apply_publish(
     server_id: &ServerId,
-    notif: LspNotification,
+    publish: BoundedPublish,
     published: Option<PublishedDiagnosticsUri>,
     role: DiagnosticsRole,
     notification_cache: &Mutex<NotificationCache>,
     subs: &SubscriptionRegistry,
 ) {
-    match notif {
-        LspNotification::PublishDiagnostics(p) => {
-            // Only the server the router resolves `Diagnostics` to for this
-            // notification's language caches (and notifies subscribers of) it
-            // -- see #174 §8.
-            if role == DiagnosticsRole::Secondary {
-                return;
-            }
-            let Some(published) = published else {
-                debug!(
-                    "dropping diagnostics for URI outside the workspace or unresolvable: {}",
-                    p.uri.as_ref()
-                );
-                return;
-            };
-            let write = notification_cache.lock().await.write_published_diagnostics(
-                server_id,
-                &published,
-                p.version.map(crate::bridge::DocumentVersion::new),
-                p.diagnostics,
-            );
-
-            if matches!(write, PushWrite::Stored { .. }) {
-                publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published))
-                    .await;
-            }
-            publish_invalidated(subs, write.evicted()).await;
-        }
-        LspNotification::LogMessage(m) => {
-            notification_cache
-                .lock()
-                .await
-                .store_log(m.kind.into(), m.message);
-        }
-        LspNotification::ShowMessage(m) => {
-            notification_cache
-                .lock()
-                .await
-                .store_message(m.kind.into(), m.message);
-        }
-        // Never classified onto this lane -- see `LspClient::message_loop_inner`'s routing.
-        LspNotification::Progress(_) | LspNotification::Other { .. } => {}
+    // Only the server the router resolves `Diagnostics` to for this
+    // notification's language caches (and notifies subscribers of) it
+    // -- see #174 §8.
+    if role == DiagnosticsRole::Secondary {
+        return;
     }
+    let (uri, version, diagnostics) = publish.into_parts();
+    let Some(published) = published else {
+        debug!(
+            "dropping diagnostics for URI outside the workspace or unresolvable: {}",
+            uri.as_ref()
+        );
+        return;
+    };
+    let write = notification_cache.lock().await.write_published_diagnostics(
+        server_id,
+        &published,
+        version.map(crate::bridge::DocumentVersion::new),
+        diagnostics,
+    );
+
+    if matches!(write, PushWrite::Stored { .. }) {
+        publish_to_subscribers(subs, || DiagnosticsResourceUri::for_published(&published)).await;
+    }
+    publish_invalidated(subs, write.evicted()).await;
 }
 
 /// Queues the resource `make_uri` builds on every session subscribed to it.
@@ -788,7 +749,7 @@ mod pump_tests {
     async fn test_pump_caches_before_peer_set() {
         let cache = make_cache();
         let subs = make_subs();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
@@ -847,7 +808,7 @@ mod pump_tests {
     async fn test_pump_drops_diagnostics_outside_workspace_roots() {
         let cache = make_cache();
         let subs = make_subs();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
@@ -934,7 +895,7 @@ mod pump_tests {
     async fn test_pump_exits_on_cancel() {
         let cache = make_cache();
         let subs = make_subs();
-        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
         let cancel = CancellationToken::new();
 
@@ -966,7 +927,7 @@ mod pump_tests {
     async fn test_pump_exits_when_cancel_guard_dropped() {
         let cache = make_cache();
         let subs = make_subs();
-        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
         let cancel = CancellationToken::new();
         let guard = cancel.clone().drop_guard();
@@ -998,7 +959,7 @@ mod pump_tests {
     async fn test_pump_survives_dropped_cancel_clone() {
         let cache = make_cache();
         let subs = make_subs();
-        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel::<LspNotification>(8);
         let cancel = CancellationToken::new();
 
@@ -1036,7 +997,7 @@ mod pump_tests {
         let translator = Arc::new(Mutex::new(Translator::new()));
         let cache = make_cache();
         let subs = make_subs();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
@@ -1108,7 +1069,7 @@ mod pump_tests {
     async fn test_pump_routes_other_notifications_to_indexing_signal() {
         let cache = make_cache();
         let subs = make_subs();
-        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_tx, rx) = pump_feed();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("rust");
@@ -1167,7 +1128,7 @@ mod pump_tests {
     async fn test_pump_routes_progress_begin_to_indexing_signal() {
         let cache = make_cache();
         let subs = make_subs();
-        let (_tx, rx) = mpsc::channel::<LspNotification>(8);
+        let (_tx, rx) = pump_feed();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("gopls");
@@ -1222,7 +1183,7 @@ mod pump_tests {
     async fn test_lifecycle_lane_unaffected_by_saturated_notification_lane() {
         let cache = make_cache();
         let subs = make_subs();
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, rx) = pump_feed();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("gopls");
@@ -1280,7 +1241,7 @@ mod pump_tests {
         .expect("lifecycle lane must still be served while the notification lane is backed up");
     }
 
-    use crate::test_lsp::{spawn_test_pump, spawn_test_pump_with_cache};
+    use crate::test_lsp::{pump_feed, spawn_test_pump, spawn_test_pump_with_cache};
 
     fn test_mcp_uri(file: &str) -> DiagnosticsResourceUri {
         DiagnosticsResourceUri::for_published(&PublishedDiagnosticsUri::for_test(
@@ -1661,7 +1622,7 @@ mod pump_tests {
         let failing: Arc<bridge::CanonicalizeFn> =
             Arc::new(|_: &std::path::Path| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         let cache = make_cache();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         tokio::spawn(diagnostics_pump_with_resolver(
@@ -1712,7 +1673,7 @@ mod pump_tests {
             Ok(p.to_path_buf())
         });
         let cache = make_cache();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let server_id = ServerId::from_static("rust");
@@ -1779,7 +1740,7 @@ mod pump_tests {
             gate.lock().map(|rx| rx.recv()).ok();
             Ok(p.to_path_buf())
         });
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         tokio::spawn(diagnostics_pump_with_resolver(
@@ -1872,7 +1833,7 @@ mod pump_tests {
             Ok(p.to_path_buf())
         });
         let cache = make_cache();
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let (role_tx, role_rx) = watch::channel(DiagnosticsRole::Authoritative);
@@ -1938,7 +1899,7 @@ mod pump_tests {
             gate.lock().map(|rx| rx.recv()).ok();
             Ok(p.to_path_buf())
         });
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = pump_feed();
         let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let pump = tokio::spawn(diagnostics_pump_with_resolver(
@@ -2187,7 +2148,7 @@ mod pump_tests {
             Arc::clone(&cache),
         );
         let publish = |path: PathBuf| {
-            let tx = tx.clone();
+            let tx = &tx;
             async move {
                 tx.send(LspNotification::PublishDiagnostics(
                     PublishDiagnosticsParams {

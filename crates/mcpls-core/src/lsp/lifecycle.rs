@@ -38,7 +38,7 @@ use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::lsp::{
     CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
-    PublishReader, process_env, tsserver_pin,
+    PublishReader, ServerMessage, process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -474,12 +474,11 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
-    /// Receiver for push notifications from the LSP server: diagnostics,
-    /// log messages, and show-message requests.
+    /// Receiver for the log and `showMessage` frames of the LSP server
+    /// ([`ServerMessage`]); diagnostics arrive on [`Self::publish_rx`].
     ///
-    /// Extract this before registering the server to receive real-time
-    /// notifications (e.g., `textDocument/publishDiagnostics`).
-    pub notification_rx: mpsc::Receiver<LspNotification>,
+    /// Extract this before registering the server to receive them in real time.
+    pub notification_rx: mpsc::Receiver<ServerMessage>,
     /// Receiver of the diagnostics mailbox: `textDocument/publishDiagnostics`
     /// is coalesced per file and a publish it cannot hold is reported as lost
     /// instead of being dropped (see [`PublishReader`]). Extract it with
@@ -560,7 +559,7 @@ impl LspServer {
     /// Use this to extract the receiver for a background pump task before registering
     /// the server with the translator. After this call, the server's `notification_rx`
     /// will never receive messages.
-    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
+    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<ServerMessage> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.notification_rx, dummy)
     }

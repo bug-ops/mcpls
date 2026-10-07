@@ -17,12 +17,11 @@ use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader};
 use crate::lsp::types::{
-    InboundMessage, JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcOutcome,
-    JsonRpcReply, JsonRpcRequest, LspNotification, RequestId,
+    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome, JsonRpcReply,
+    JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LspNotification, RequestId,
 };
-use crate::lsp::{DropLog, NotificationSink};
+use crate::lsp::{DropCounter, DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
-use crate::util::WarnLimiter;
 
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
@@ -194,9 +193,7 @@ fn spawn_reader_task(
 #[derive(Debug, Default)]
 struct UndecodableRun {
     in_a_row: u32,
-    warn: WarnLimiter,
-    /// Frames dropped since the last `warn` line.
-    unreported: u32,
+    drops: DropCounter,
 }
 
 impl UndecodableRun {
@@ -228,15 +225,12 @@ impl UndecodableRun {
                 "too many consecutive undecodable messages",
             )));
         }
-        if self.warn.due(now, WarnLimiter::DEFAULT_PERIOD) {
+        if let Some(suppressed) = self.drops.record(now) {
             warn!(
-                "Dropped an undecodable LSP message ({} others dropped since the last warning); \
-                 further ones are logged at debug for a minute",
-                self.unreported
+                "Dropped an undecodable LSP message ({suppressed} others dropped since the last \
+                 warning); further ones are logged at debug for a minute"
             );
-            self.unreported = 0;
         } else {
-            self.unreported = self.unreported.saturating_add(1);
             debug!(
                 "Dropped an undecodable LSP message ({} in a row)",
                 self.in_a_row
@@ -690,7 +684,7 @@ impl LspClient {
             let id = RequestId::Number(self.request_counter.fetch_add(1, Ordering::SeqCst));
             let (response_tx, response_rx) = oneshot::channel();
             let request = JsonRpcRequest {
-                jsonrpc: JSONRPC_VERSION.to_string(),
+                jsonrpc: JsonRpcVersion,
                 id: id.clone(),
                 method: method.to_string(),
                 params: params_value.clone(),
@@ -1085,22 +1079,19 @@ impl LspClient {
     /// `report` payloads fail to deserialize could bypass the `kind`-based
     /// filter above entirely by sending malformed frames (security LOW /
     /// M1).
-    fn notification_lane<'a>(
+    fn lifecycle_lane<'a>(
         notification: &LspNotification,
-        notification_tx: Option<&'a mpsc::Sender<LspNotification>>,
         lifecycle_tx: Option<&'a mpsc::Sender<LspNotification>>,
-    ) -> Option<(&'static str, &'a mpsc::Sender<LspNotification>)> {
+    ) -> Option<&'a mpsc::Sender<LspNotification>> {
         match notification {
             LspNotification::PublishDiagnostics(_)
             | LspNotification::LogMessage(_)
-            | LspNotification::ShowMessage(_) => notification_tx.map(|tx| ("notification", tx)),
+            | LspNotification::ShowMessage(_) => None,
             LspNotification::Progress(params) => {
-                crate::lsp::types::ProgressKind::from_value(&params.value)
-                    .and(lifecycle_tx)
-                    .map(|tx| ("lifecycle", tx))
+                crate::lsp::types::ProgressKind::from_value(&params.value).and(lifecycle_tx)
             }
             LspNotification::Other { method, .. } if method.as_ref() == "$/progress" => None,
-            LspNotification::Other { .. } => lifecycle_tx.map(|tx| ("lifecycle", tx)),
+            LspNotification::Other { .. } => lifecycle_tx,
         }
     }
 
@@ -1129,7 +1120,7 @@ impl LspClient {
                         }
                         ClientCommand::SendNotification { method, params } => {
                             let notification = serde_json::to_value(JsonRpcNotification {
-                                jsonrpc: JSONRPC_VERSION.to_string(),
+                                jsonrpc: JsonRpcVersion,
                                 method,
                                 params,
                             })?;
@@ -1196,6 +1187,60 @@ impl LspClient {
         Ok(())
     }
 
+    /// Hands `response` to the request waiting for it, if any.
+    async fn complete_pending(
+        pending_requests: &Arc<Mutex<PendingRequests>>,
+        response: JsonRpcResponse,
+        redactions: &Redactions,
+    ) {
+        trace!("Received response: id={:?}", response.id);
+
+        let sender = pending_requests.lock().await.remove(&response.id);
+
+        if let Some(sender) = sender {
+            match response.outcome {
+                JsonRpcOutcome::Error(error) => {
+                    // Deliberately not logged at `error!` here: this fires
+                    // for every attempt, before `LspClient::request`'s retry
+                    // loop knows whether the error is transient and about to
+                    // be retried (-32802, or -32801 for an allowlisted
+                    // method). Logging unconditionally at this point would
+                    // emit a spurious ERROR line for errors that are retried
+                    // and succeed. `request` logs at `warn!` on retry and
+                    // `error!` once the error is actually surfaced to the
+                    // caller (retry exhaustion or a non-retryable error);
+                    // the response id is already traced above.
+                    let message = redactions.apply(&error.message);
+                    trace!(
+                        "LSP error response: {} (code {})",
+                        Self::truncate_error_message_for_log(&message),
+                        error.code
+                    );
+                    // Truncated separately from the log line, to the larger
+                    // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
+                    // unbounded and attacker-influenceable (#313), but a
+                    // log-line-sized cut would also clip legitimate long
+                    // errors before the model ever sees them (S2).
+                    let caller_message =
+                        crate::util::truncate_str(&message, MAX_ERROR_MESSAGE_CALLER_BYTES);
+                    let _ = sender.send(Err(Error::LspServerError {
+                        code: error.code,
+                        message: caller_message,
+                        data: error.data,
+                    }));
+                }
+                JsonRpcOutcome::Result(result) => {
+                    let _ = sender.send(Ok(result));
+                }
+            }
+        } else {
+            warn!(
+                "Received response for unknown request ID: {:?}",
+                response.id
+            );
+        }
+    }
+
     /// Processes one fully-decoded inbound LSP message: resolves a matching
     /// pending request, answers a server-initiated request, or forwards a
     /// notification to its lane. Shared by `message_loop_inner`'s normal
@@ -1212,54 +1257,7 @@ impl LspClient {
     ) -> Result<()> {
         match message {
             InboundMessage::Response(response) => {
-                trace!("Received response: id={:?}", response.id);
-
-                let sender = pending_requests.lock().await.remove(&response.id);
-
-                if let Some(sender) = sender {
-                    if let Some(error) = response.error {
-                        // Deliberately not logged at `error!` here: this fires
-                        // for every attempt, before `LspClient::request`'s retry
-                        // loop knows whether the error is transient and about to
-                        // be retried (-32802, or -32801 for an allowlisted
-                        // method). Logging unconditionally at this point would
-                        // emit a spurious ERROR line for errors that are retried
-                        // and succeed. `request` logs at `warn!` on retry and
-                        // `error!` once the error is actually surfaced to the
-                        // caller (retry exhaustion or a non-retryable error);
-                        // the response id is already traced above.
-                        let message = redactions.apply(&error.message);
-                        trace!(
-                            "LSP error response: {} (code {})",
-                            Self::truncate_error_message_for_log(&message),
-                            error.code
-                        );
-                        // Truncated separately from the log line, to the larger
-                        // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
-                        // unbounded and attacker-influenceable (#313), but a
-                        // log-line-sized cut would also clip legitimate long
-                        // errors before the model ever sees them (S2).
-                        let caller_message =
-                            crate::util::truncate_str(&message, MAX_ERROR_MESSAGE_CALLER_BYTES);
-                        let _ = sender.send(Err(Error::LspServerError {
-                            code: error.code,
-                            message: caller_message,
-                            data: error.data,
-                        }));
-                    } else if let Some(result) = response.result {
-                        let _ = sender.send(Ok(result));
-                    } else {
-                        // LSP spec allows null result for some requests (e.g., hover with no info).
-                        // Treat as successful response with null value.
-                        trace!("Response with null result: {:?}", response.id);
-                        let _ = sender.send(Ok(Value::Null));
-                    }
-                } else {
-                    warn!(
-                        "Received response for unknown request ID: {:?}",
-                        response.id
-                    );
-                }
+                Self::complete_pending(pending_requests, response, redactions).await;
             }
             InboundMessage::UndecodableResponse { id } => {
                 warn!("Failed the request answered by an undecodable response: id={id:?}");
@@ -1298,39 +1296,48 @@ impl LspClient {
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
                 Self::redact_notification(&mut typed, redactions);
 
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    trace!(
+                        "Forwarding notification: {}",
+                        redactions.apply(&format!("{typed:?}"))
+                    );
+                }
+
                 // Diagnostics have their own delivery path: the mailbox coalesces
                 // per file and records what it cannot hold, so a burst is never
                 // dropped unrecorded.
-                let typed = match (typed, notification_tx) {
-                    (LspNotification::PublishDiagnostics(params), Some(sink)) => {
-                        debug!(
-                            "Forwarding diagnostics for {}: {} items",
-                            params.uri.as_ref(),
-                            params.diagnostics.len()
-                        );
-                        sink.publishes().publish(params);
+                let delivered = match typed {
+                    LspNotification::PublishDiagnostics(params) => {
+                        if let Some(sink) = notification_tx {
+                            debug!(
+                                "Forwarding diagnostics for {}: {} items",
+                                params.uri.as_ref(),
+                                params.diagnostics.len()
+                            );
+                            sink.publishes().publish(params);
+                        }
                         return Ok(());
                     }
-                    (typed, _) => typed,
+                    LspNotification::LogMessage(params) => notification_tx.map(|sink| {
+                        (
+                            Lane::Notification,
+                            sink.messages().try_send(ServerMessage::Log(params)).is_ok(),
+                        )
+                    }),
+                    LspNotification::ShowMessage(params) => notification_tx.map(|sink| {
+                        (
+                            Lane::Notification,
+                            sink.messages()
+                                .try_send(ServerMessage::Show(params))
+                                .is_ok(),
+                        )
+                    }),
+                    other => Self::lifecycle_lane(&other, lifecycle_tx)
+                        .map(|tx| (Lane::Lifecycle, tx.try_send(other).is_ok())),
                 };
 
-                let destination = Self::notification_lane(
-                    &typed,
-                    notification_tx.map(NotificationSink::messages),
-                    lifecycle_tx,
-                );
-
-                if let Some((lane, tx)) = destination {
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        trace!(
-                            "Forwarding notification: {}",
-                            redactions.apply(&format!("{typed:?}"))
-                        );
-                    }
-
-                    if tx.try_send(typed).is_err() {
-                        DropLog::of_lane(lane).record(&notification.method);
-                    }
+                if let Some((lane, false)) = delivered {
+                    DropLog::of(lane).record(&notification.method);
                 }
             }
         }
@@ -1456,30 +1463,23 @@ pub struct UnclassifiedError(Option<Box<Unclassified>>);
 /// An error response from the server, kept as the [`Error::LspServerError`] it
 /// becomes so a caller can classify it, and constructible from nothing else.
 #[derive(Debug)]
-struct ServerErrorResponse {
-    error: Error,
-    code: i32,
-}
+struct ServerErrorResponse(Error);
 
 impl ServerErrorResponse {
     const fn new(code: i32, message: String, data: Option<Value>) -> Self {
-        Self {
-            error: Error::LspServerError {
-                code,
-                message,
-                data,
-            },
+        Self(Error::LspServerError {
             code,
-        }
+            message,
+            data,
+        })
     }
 
     /// The code and message of the response.
-    const fn code_and_message(&self) -> (i32, &str) {
-        let message = match &self.error {
-            Error::LspServerError { message, .. } => message.as_str(),
-            _ => "",
-        };
-        (self.code, message)
+    fn code_and_message(&self) -> (i32, &str) {
+        match &self.0 {
+            Error::LspServerError { code, message, .. } => (*code, message.as_str()),
+            other => unreachable!("a ServerErrorResponse holds an LspServerError, not {other:?}"),
+        }
     }
 }
 
@@ -1500,7 +1500,7 @@ impl Unclassified {
         match self {
             Self::Logged(error)
             | Self::ServerResponse {
-                response: ServerErrorResponse { error, .. },
+                response: ServerErrorResponse(error),
                 ..
             } => error,
         }
@@ -1518,7 +1518,7 @@ impl Unclassified {
             } => {
                 let (code, message) = response.code_and_message();
                 report(&method, &id, code, message);
-                response.error
+                response.0
             }
         }
     }
@@ -1658,7 +1658,7 @@ mod tests {
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let notification = InboundMessage::Notification(JsonRpcNotification {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: JsonRpcVersion,
             method: "custom/echo".to_string(),
             params: Some(serde_json::json!({"env": "SuperSecretValue123"})),
         });
@@ -1838,7 +1838,7 @@ mod tests {
     #[test]
     fn test_register_capability_request_is_acknowledged() {
         let request = JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::String("ts1".to_string()),
             method: "client/registerCapability".to_string(),
             params: Some(serde_json::json!({ "registrations": [] })),
@@ -2020,7 +2020,7 @@ mod tests {
     #[test]
     fn test_work_done_progress_create_request_is_acknowledged() {
         let request = JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::String("wdp1".to_string()),
             method: "window/workDoneProgress/create".to_string(),
             params: Some(serde_json::json!({ "token": "indexing" })),
@@ -2038,7 +2038,6 @@ mod tests {
     /// overrunning the bounded lifecycle channel.
     #[test]
     fn test_report_progress_frame_reaches_neither_lane() {
-        let (notification_tx, _notification_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
 
         let report = LspNotification::Progress(lsp_types::ProgressParams {
@@ -2046,8 +2045,7 @@ mod tests {
             value: serde_json::json!({ "kind": "report", "percentage": 50 }),
         });
 
-        let destination =
-            LspClient::notification_lane(&report, Some(&notification_tx), Some(&lifecycle_tx));
+        let destination = LspClient::lifecycle_lane(&report, Some(&lifecycle_tx));
 
         assert!(
             destination.is_none(),
@@ -2063,7 +2061,6 @@ mod tests {
     /// bypass the kind-based filter entirely.
     #[test]
     fn test_malformed_progress_other_reaches_neither_lane() {
-        let (notification_tx, _notification_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
 
         let malformed = LspNotification::Other {
@@ -2071,8 +2068,7 @@ mod tests {
             params: None,
         };
 
-        let destination =
-            LspClient::notification_lane(&malformed, Some(&notification_tx), Some(&lifecycle_tx));
+        let destination = LspClient::lifecycle_lane(&malformed, Some(&lifecycle_tx));
 
         assert!(
             destination.is_none(),
@@ -2086,38 +2082,25 @@ mod tests {
     /// the report/malformed filters must not have overcorrected.
     #[test]
     fn test_begin_and_other_notifications_reach_lifecycle_lane() {
-        let (notification_tx, _notification_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
 
         let begin = LspNotification::Progress(lsp_types::ProgressParams {
             token: lsp_types::ProgressToken::Int(1),
             value: serde_json::json!({ "kind": "begin", "title": "Indexing" }),
         });
-        assert_eq!(
-            LspClient::notification_lane(&begin, Some(&notification_tx), Some(&lifecycle_tx))
-                .map(|(lane, _)| lane),
-            Some("lifecycle")
-        );
+        assert!(LspClient::lifecycle_lane(&begin, Some(&lifecycle_tx)).is_some());
 
         let server_status = LspNotification::Other {
             method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
             params: Some(serde_json::json!({ "quiescent": false })),
         };
-        assert_eq!(
-            LspClient::notification_lane(
-                &server_status,
-                Some(&notification_tx),
-                Some(&lifecycle_tx)
-            )
-            .map(|(lane, _)| lane),
-            Some("lifecycle")
-        );
+        assert!(LspClient::lifecycle_lane(&server_status, Some(&lifecycle_tx)).is_some());
     }
 
     #[test]
     fn test_unknown_server_request_returns_method_not_found() {
         let request = JsonRpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::String("unknown-1".to_string()),
             method: "custom/request".to_string(),
             params: None,
@@ -2151,10 +2134,9 @@ mod tests {
             .insert(RequestId::Number(1), response_tx);
 
         let null_response = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::Number(1),
-            result: None,
-            error: None,
+            outcome: JsonRpcOutcome::Result(Value::Null),
         };
 
         let sender = pending_requests.lock().await.remove(&null_response.id);
@@ -2198,10 +2180,9 @@ mod tests {
             .insert(RequestId::Number(1), response_tx);
 
         let error_response = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::Number(1),
-            result: None,
-            error: Some(JsonRpcError {
+            outcome: JsonRpcOutcome::Error(JsonRpcError {
                 code: -32601,
                 message: "Method not found".to_string(),
                 data: None,
@@ -2210,7 +2191,7 @@ mod tests {
 
         let sender = pending_requests.lock().await.remove(&error_response.id);
         if let Some(sender) = sender
-            && let Some(error) = error_response.error
+            && let JsonRpcOutcome::Error(error) = error_response.outcome
         {
             let _ = sender.send(Err(Error::LspServerError {
                 code: error.code,
@@ -2237,10 +2218,9 @@ mod tests {
         let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
 
         let response = JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::Number(999),
-            result: Some(Value::Null),
-            error: None,
+            outcome: JsonRpcOutcome::Result(Value::Null),
         };
 
         let sender = pending_requests.lock().await.remove(&response.id);
@@ -2310,7 +2290,10 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_version_constant() {
-        assert_eq!(JSONRPC_VERSION, "2.0");
+        assert_eq!(
+            serde_json::to_value(JsonRpcVersion).unwrap(),
+            serde_json::json!("2.0")
+        );
     }
 
     /// #239 regression: a request that times out must remove its own entry
@@ -3529,10 +3512,9 @@ mod tests {
 
             msg_tx
                 .send(Ok(InboundMessage::Response(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
+                    jsonrpc: JsonRpcVersion,
                     id: id.clone(),
-                    result: Some(serde_json::json!({ "ok": true })),
-                    error: None,
+                    outcome: JsonRpcOutcome::Result(serde_json::json!({ "ok": true })),
                 })))
                 .await
                 .unwrap();
@@ -3632,10 +3614,9 @@ mod tests {
 
             msg_tx
                 .send(Ok(InboundMessage::Response(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
+                    jsonrpc: JsonRpcVersion,
                     id: answered_id,
-                    result: Some(serde_json::json!({ "ok": true })),
-                    error: None,
+                    outcome: JsonRpcOutcome::Result(serde_json::json!({ "ok": true })),
                 })))
                 .await
                 .unwrap();

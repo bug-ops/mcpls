@@ -31,10 +31,12 @@ pub(crate) use lifecycle::{
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};
 pub use process::LIFELINE_SWEEP_BUDGET;
+pub use publish_mailbox::{
+    BoundedPublish, LostFiles, NotificationInbox, PublishDelivery, PublishReader, ServerMessage,
+};
+pub(crate) use publish_mailbox::{DropCounter, DropLog, Lane, NotificationSink};
 #[cfg(test)]
-pub(crate) use publish_mailbox::MailboxLimits;
-pub(crate) use publish_mailbox::{DropLog, NotificationSink};
-pub use publish_mailbox::{LostPublishes, NotificationInbox, PublishDelivery, PublishReader};
+pub(crate) use publish_mailbox::{MailboxLimits, PublishWriter, mailbox};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,

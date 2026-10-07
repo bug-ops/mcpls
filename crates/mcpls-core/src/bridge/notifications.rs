@@ -1356,7 +1356,7 @@ impl NotificationCache {
         server_id: &ServerId,
         published: &PublishedDiagnosticsUri,
         version: Option<DocumentVersion>,
-        diagnostics: Vec<LspDiagnostic>,
+        diagnostics: BoundedDiagnostics,
     ) -> PushWrite {
         let source_key = SlotKey::pushed(DiagnosticsKey::of(published.source()));
         let canonical_key = DiagnosticsKey::of(published.canonical());
@@ -1384,7 +1384,7 @@ impl NotificationCache {
             self.evict_entry(&oldest_alias);
         }
 
-        let diagnostics = BoundedDiagnostics::new(published.source(), diagnostics).0;
+        let diagnostics = diagnostics.into_vec();
 
         self.drop_superseded_pull(&canonical_key, published.canonical(), version);
 
@@ -1442,7 +1442,7 @@ impl NotificationCache {
             server_id,
             published,
             version.map(DocumentVersion::new),
-            diagnostics,
+            BoundedDiagnostics::new(published.source(), diagnostics),
         ));
     }
 
@@ -2342,15 +2342,13 @@ impl NotificationCache {
     /// diagnostics instead of `pending`, until the owner's next publish for
     /// them. The owner's older entries of such a file are removed: a newer
     /// publish exists that the cache cannot show, and older content must not
-    /// pass for it. `overflowed` marks that more files were lost than the
-    /// mailbox could name, as capacity eviction does.
+    /// pass for it.
     ///
     /// Returns the files whose view changed, for the caller to announce.
-    pub(crate) fn record_lost_publishes(
+    pub(crate) fn record_lost_files(
         &mut self,
         owner: &ServerId,
         files: &[DiagnosticsKey],
-        overflowed: bool,
     ) -> Vec<DiagnosticsKey> {
         for file in files {
             let stale: Vec<SlotKey> = self
@@ -2375,10 +2373,13 @@ impl NotificationCache {
                     .record(file.clone(), owner.clone(), EvictedContent::Lost);
             }
         }
-        if overflowed {
-            self.eviction_marks.restore_overflow(owner);
-        }
         files.to_vec()
+    }
+
+    /// Records that `owner` lost more publishes than the mailbox could name,
+    /// as capacity eviction does.
+    pub(crate) fn record_unnamed_loss(&mut self, owner: &ServerId) {
+        self.eviction_marks.restore_overflow(owner);
     }
 
     /// Whether any entry is cached for the file `key` names.
@@ -4157,7 +4158,7 @@ mod tests {
         let uri = file_uri("a.rs");
         cache.store_diagnostics(&server, &uri, None, vec![diagnostic_at(1, "old")]);
 
-        let changed = cache.record_lost_publishes(&server, &[DiagnosticsKey::of(&uri)], false);
+        let changed = cache.record_lost_files(&server, &[DiagnosticsKey::of(&uri)]);
 
         assert_eq!(changed, [DiagnosticsKey::of(&uri)]);
         assert!(!cache.has_diagnostics(&uri));
@@ -4179,9 +4180,8 @@ mod tests {
         let mut cache = NotificationCache::new();
         let server = test_server();
 
-        let changed = cache.record_lost_publishes(&server, &[], true);
+        cache.record_unnamed_loss(&server);
 
-        assert!(changed.is_empty());
         assert_eq!(
             cache.availability(&file_uri("unknown.rs"), Some(&server)),
             DiagnosticsAvailability::Evicted
@@ -4198,7 +4198,7 @@ mod tests {
                 &server,
                 &published(&format!("a{n}.rs")),
                 None,
-                vec![diagnostic_at(1, "e")],
+                BoundedDiagnostics::new(&file_uri("a.rs"), vec![diagnostic_at(1, "e")]),
             );
             std::assert_matches!(write, PushWrite::Stored { .. });
         }
@@ -4207,7 +4207,7 @@ mod tests {
             &server,
             &published("extra.rs"),
             None,
-            vec![diagnostic_at(9, "extra")],
+            BoundedDiagnostics::new(&file_uri("a.rs"), vec![diagnostic_at(9, "extra")]),
         );
 
         std::assert_matches!(write, PushWrite::Dropped { .. });
@@ -4510,7 +4510,7 @@ mod tests {
             &test_server(),
             &PublishedDiagnosticsUri::for_test(uri.clone(), uri),
             None,
-            vec![error_diagnostic()],
+            BoundedDiagnostics::new(&Uri::from(file), vec![error_diagnostic()]),
         )
     }
 
