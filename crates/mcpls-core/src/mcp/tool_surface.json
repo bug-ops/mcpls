@@ -524,9 +524,11 @@
             "refactor",
             "refactor.extract",
             "refactor.inline",
+            "refactor.move",
             "refactor.rewrite",
             "source",
             "source.organizeimports",
+            "source.fixall",
             null
           ],
           "type": [

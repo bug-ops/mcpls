@@ -725,8 +725,7 @@ impl Translator {
         range: BoundedRange,
         kind_filter: Option<CodeActionKindFilter>,
     ) -> Result<CodeActionsResult> {
-        let only =
-            kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k.as_str().to_owned())]);
+        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
 
         // Pass empty diagnostics context — rust-analyzer generates code actions
         // based on cursor position and its internal analysis state, not on the

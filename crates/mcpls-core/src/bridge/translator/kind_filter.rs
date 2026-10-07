@@ -242,24 +242,30 @@ pub enum CodeActionKindFilter {
     RefactorExtract,
     /// `refactor.inline`.
     RefactorInline,
+    /// `refactor.move`.
+    RefactorMove,
     /// `refactor.rewrite`.
     RefactorRewrite,
     /// `source`.
     Source,
     /// `source.organizeImports`.
     SourceOrganizeImports,
+    /// `source.fixAll`.
+    SourceFixAll,
 }
 
 impl CodeActionKindFilter {
     /// Every kind, in documentation order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::QuickFix,
         Self::Refactor,
         Self::RefactorExtract,
         Self::RefactorInline,
+        Self::RefactorMove,
         Self::RefactorRewrite,
         Self::Source,
         Self::SourceOrganizeImports,
+        Self::SourceFixAll,
     ];
 
     /// The canonical LSP spelling.
@@ -270,9 +276,27 @@ impl CodeActionKindFilter {
             Self::Refactor => "refactor",
             Self::RefactorExtract => "refactor.extract",
             Self::RefactorInline => "refactor.inline",
+            Self::RefactorMove => "refactor.move",
             Self::RefactorRewrite => "refactor.rewrite",
             Self::Source => "source",
             Self::SourceOrganizeImports => "source.organizeImports",
+            Self::SourceFixAll => "source.fixAll",
+        }
+    }
+}
+
+impl From<CodeActionKindFilter> for lsp_types::CodeActionKind {
+    fn from(filter: CodeActionKindFilter) -> Self {
+        match filter {
+            CodeActionKindFilter::QuickFix => Self::QuickFix,
+            CodeActionKindFilter::Refactor => Self::Refactor,
+            CodeActionKindFilter::RefactorExtract => Self::RefactorExtract,
+            CodeActionKindFilter::RefactorInline => Self::RefactorInline,
+            CodeActionKindFilter::RefactorMove => Self::RefactorMove,
+            CodeActionKindFilter::RefactorRewrite => Self::RefactorRewrite,
+            CodeActionKindFilter::Source => Self::Source,
+            CodeActionKindFilter::SourceOrganizeImports => Self::SourceOrganizeImports,
+            CodeActionKindFilter::SourceFixAll => Self::SourceFixAll,
         }
     }
 }
@@ -345,6 +369,18 @@ impl KindFilter for SymbolKindFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_every_code_action_kind_converts_to_its_canonical_lsp_spelling() {
+        for kind in CodeActionKindFilter::ALL {
+            assert_eq!(
+                String::from(lsp_types::CodeActionKind::from(kind)),
+                kind.as_str()
+            );
+        }
+        assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::SourceFixAll));
+        assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::RefactorMove));
+    }
 
     type CodeAction = KindFilterInput<CodeActionKindFilter>;
     type Symbol = KindFilterInput<SymbolKindFilter>;
@@ -545,9 +581,11 @@ mod tests {
                 "refactor",
                 "refactor.extract",
                 "refactor.inline",
+                "refactor.move",
                 "refactor.rewrite",
                 "source",
                 "source.organizeimports",
+                "source.fixall",
             ]
         );
         let symbols = SymbolKindFilter::schema();
