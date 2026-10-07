@@ -315,7 +315,7 @@ const MAX_ECHOED_PATH_BYTES: usize = 1024;
 /// The workspace names a program a launcher starts or a symlink target's final
 /// component. Unlike [`EchoedArgument`], the text is never cut at a space or an
 /// `=`, because a path is not an option with a value. It is bounded to
-/// [`MAX_ECHOED_PATH_BYTES`] of escaped text.
+/// 1024 bytes of escaped text.
 ///
 /// # Examples
 ///
