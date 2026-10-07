@@ -242,7 +242,7 @@ Not applicable — no code changes result from this spec.
 - Keep this spec's FRs marked speculative until their gating condition is met
 
 ### Ask First
-- Promoting any FR from this spec into a dedicated implementation spec (new `.local/specs/NNN-*`
+- Promoting any FR from this spec into a dedicated implementation spec (new `specs/<block>/NNN-*`
   directory), even after a gating condition appears to be met
 
 ### Never

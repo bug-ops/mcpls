@@ -9,7 +9,7 @@ tags:
   - config
   - diagnosability
 created: 2026-10-06
-status: approved
+status: implemented
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]]"

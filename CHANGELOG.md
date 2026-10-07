@@ -7,264 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-07
+
 ### Added
 
-- docs: issue forms, Contributor Covenant code of conduct and accessibility policy. (#741)
-- User documentation is now an mdBook in `book/`, published to GitHub Pages by a new workflow; `docs/` is removed and the READMEs link to the book. (#702)
-- **Breaking:** `--workspace-trust untrusted` and repeatable `--allow-server <id>` start only the named servers, refuse a config file or server executable inside the workspace, and spawn the resolved executable with a workspace-free `PATH` and the login home as `HOME`/`USERPROFILE`; new public `ServerConfig::workspace_trust` field (struct literals must set it), `ServerConfig::ensure_outside_workspace` and `load_discovered`, `ConfigOrigin`, `WorkspaceTrust`, `ServerAllowlist`, `Error::ConfigInsideWorkspace` and `StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal)`; untrusted conflicts with `--trust-project-config`. (#647)
-- `get_folding_ranges` tool (`textDocument/foldingRange`) with a `kind` filter and the `folding_range` `handles` value; collapsed text is redacted and cut to 256 bytes. (#644)
-- `get_selection_ranges` tool (`textDocument/selectionRange`) and the `selection_range` `handles` value; chains are capped at 32 ranges. (#644)
-- HTTP sessions now receive `resources/updated` on their GET stream for the resources they subscribed to. (#525)
-- `get_tool_support` tool reporting which tools are usable for which languages, per configured server capabilities. (#540)
-- Default server `instructions` now point to `get_tool_support`; `ToolRouter` is `Clone` and gains `configured_languages()`. (#540)
-- `mcpls-bench` (unpublished) latency benchmark harness with `fd`/rust-analyzer and `react-hook-form`/typescript-language-server scenarios (repository commit enforced, tool versions recorded), documented in `docs/benchmarks.md`. (#540)
-- `get_diagnostics` now reports `push_notifications_degraded`, sampled before and after the pull so a restart triggered by the call itself is caught. (#520)
-- Completions and signature help now report `positions_degraded`. (#520)
-- `subscriptions/listen` delivers diagnostics `resources/updated` to 2026-07-28 clients; new retryable error `-32053`. (#536)
-- Install and PATH guidance in the error for a missing LSP server executable, with a per-server install hint for the six builtin servers (`BuiltinServer`). (#530)
-- LSP servers and their descendants now die with mcpls on any exit (Windows Job Object, Unix watchdog group); descendants that call `setsid` survive on Unix (#541). (#546)
-- `HttpConfig` gains a header/body-stall timeout and a connection cap. (#546)
-- `proptest` properties and a `cargo-fuzz` target for the LSP frame parser. (#546)
-- HTTP GET streams are probed with an MCP ping and closed when the client stops answering, portably and behind proxies; new `--http-stream-liveness` flag and `HttpConfig::with_stream_liveness`. (#543, #553)
-- HTTP `subscriptions/listen` streams end after a jittered 15 to 30 minutes so half-open streams are released; `--http-stream-liveness off` disables it; new `LeaseWindow`, `ListenLease` and `HttpConfig::with_listen_lease`. (#551, #596)
-- `lsp::LIFELINE_SWEEP_BUDGET` public constant bounding the Unix process-tree sweep. (#541, #596)
-- `mcpls-bench` gains `--target` comparison targets for Serena and lsmcp, eight more scenarios, process-tree RSS with a Windows Job Object, work-dir locking, capped stderr logs and a scheduled `bench.yml` workflow. (#548, #596)
-- `go_to_declaration` tool (`textDocument/declaration`) and a `declaration` `handles` value. (#591)
-- `restart_server` tool restarting one, several or all LSP servers (kill-then-respawn, pump re-wired); annotated destructive and not read-only; new retryable error `-32054` for requests in flight. (#591)
-- Symbol-name addressing: `get_hover`, `get_definition`, `get_references`, `go_to_implementation`, `go_to_type_definition`, `prepare_call_hierarchy` and `rename_symbol` accept `symbol_name` (+ `symbol_kind`, `container`) and report `resolved_symbol`. (#591)
-- `prepare_type_hierarchy`, `get_supertypes` and `get_subtypes` tools for LSP 3.17 type hierarchy. (#609)
-- `prepare_rename` (rename pre-check with `renameable`, `default_behavior`, `not_renameable`), `get_document_highlights` and `format_range` tools. (#609)
-- Opt-in `context: "enclosing_symbol"` on `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and `get_diagnostics` attaches the innermost enclosing symbol to each item. (#609)
-- Workspace roots admit root-level system symlink spellings of every root (for example `/tmp` on macOS), each verified to resolve to the root. (#609)
-- `SECURITY.md` and a documented trust model for workspace-supplied code execution. (#609)
-- User guide section "Verifying an edit" documents the apply, save and poll `get_diagnostics` loop; a speculative-edit preview tool is a documented non-goal. (#609)
-- `--http-allowed-origin` and `HttpConfig::with_allowed_origins` accept extra browser origins as the typed `AllowedOrigin`; a non-loopback `Host` is still rejected. (#610)
-- `--http-allowed-host`, `MCPLS_HTTP_ALLOWED_HOSTS` and `HttpConfig::with_allowed_hosts` extend the loopback `Host` allowlist with the typed `AllowedHost`; the bound IP is allowed automatically, ports 80 and 443 must be omitted. (#597, #614)
-- Per-server `settings` table pushed after `initialized` and served on `workspace/configuration`; new `LspSettings` and `InvalidLspSettings`. (#598, #614)
-- `HttpConfig::write_stall_timeout` and `WriteStallTimeout` (30 s) free the connection permit of a peer that stops reading. (#600, #614)
-- The generated default TypeScript entry (`selection = "auto"`) starts the native `tsc --lsp --stdio` when TypeScript 7 is installed outside the workspace and no JavaScript tsserver can be pinned; new `ServerSelection`, `NativeTsc`, `TypescriptServerChoice` and `TsserverKept`. (#639)
-- `mcpls-bench` reports record the host (`os`, `arch`, `available_parallelism`), and `docs/benchmarks.md` describes how to publish results; no numbers are published. (#639)
-- `get_diagnostics` reports `availability` (`published`, `pending`, `evicted`) and `origin` (`pull`, `push_cache`), and the tool-support `push_only` route status marks servers without a pull provider. (#682)
-- `get_signature_help`, `get_inlay_hints`, `prepare_call_hierarchy` and `prepare_type_hierarchy` report `indexing_in_progress` like the other name-resolving tools. (#682)
-- `restart_server` reports `loading` until the replacement server signals indexing. (#682)
-- `lsp::MAX_CONSECUTIVE_UNDECODABLE_FRAMES` and `HttpConfig::with_session_idle_timeout` with the exported `IdleTimeout`. (#682)
-- New typed config values `FilePattern`, `FileExtension`, `ProjectMarker`, `SearchDepth`, `ServerCommand`, `ToolSet`, `BoundedText`, `LogFormat` and `ConfigError`. (#682)
+- New tools: `get_selection_ranges` and `get_folding_ranges` (#644); `go_to_declaration`, `restart_server` and symbol-name addressing (`symbol_name`, `symbol_kind`, `container`, `resolved_symbol`) on seven tools (#591); `prepare_type_hierarchy`, `get_supertypes`, `get_subtypes`, `prepare_rename`, `get_document_highlights` and `format_range` (#609); `get_tool_support` (#540).
+- Opt-in `context: "enclosing_symbol"` on location tools and `get_diagnostics` (#609, #640).
+- Untrusted-workspace mode: `--workspace-trust untrusted` with repeatable `--allow-server <id>` starts only named servers, refuses configs and executables inside the workspace, and spawns with a workspace-free `PATH` and login home (#647); closed-set analysis of shells, inline interpreters, package and task runners, exec wrappers and launcher arguments (#682, #708, #719, #721, #723, #724, #725, #727, #739).
+- HTTP: per-session `resources/updated` on GET streams (#525), `subscriptions/listen` with retryable error `-32053` (#536), stream liveness probing and listen leases (#543, #551, #553, #596), `--http-allowed-origin` and `--http-allowed-host` with typed `AllowedOrigin`/`AllowedHost` (#597, #610, #614), header, body, write-stall and connection-cap limits (#546, #614).
+- Config: per-server `settings` served on `workspace/configuration` (#598, #614); `selection = "auto"` starts native `tsc --lsp --stdio` when TypeScript 7 is installed (#639); typed config values (`FilePattern`, `FileExtension`, `ProjectMarker`, `SearchDepth`, `ServerCommand`, `ToolSet`, `BoundedText`, `LogFormat`, `ConfigError`) (#682).
+- Tool results report `positions_degraded` (#520), `push_notifications_degraded` (#520), diagnostics `availability` and `origin` (#682), and `indexing_in_progress` on signature help, inlay hints and hierarchy preparation (#682); `restart_server` reports `loading` (#682).
+- LSP servers and their descendants die with mcpls on any exit (Windows Job Object, Unix watchdog group) (#541, #546, #596).
+- Install and PATH guidance for a missing LSP server, with hints for the six builtin servers (#530); workspace roots admit root-level system symlink spellings such as `/tmp` on macOS (#609).
+- `mcpls-bench` (unpublished) latency harness with scenarios, comparison targets, process-tree RSS and a scheduled workflow (#540, #548, #596, #639).
+- `proptest` properties and a `cargo-fuzz` target for the LSP frame parser (#546); `SECURITY.md` trust model (#609).
+- Docs: user guide is an mdBook in `book/` published to GitHub Pages (#702); issue forms, code of conduct and accessibility policy (#741).
 
 ### Changed
 
-- **Breaking:** notification lanes, lost-publish deliveries and JSON-RPC frames are typed (`Lane`, `LostFiles`, `BoundedPublish`, `ServerMessage`, `JsonRpcVersion`, `JsonRpcResponse { outcome }`, `PublicationKind::Lost`); a response with both `result` and `error`, or a `jsonrpc` other than `"2.0"`, is now undecodable; `LspServer` lane receivers are private. (#729, #739)
-- **Breaking:** `ServerEnv` is keyed by a typed `EnvKey` (non-empty, no `=` or NUL, checked at config load); config text and numeric newtypes come from shared macros, `BoundedText` gains `FromStr`/`AsRef`/`Borrow`, and `SizeExceeded` fields are sealed behind `size()`/`max()` and exported from `error`. (#721, #731, #739)
-- **Breaking:** `rename_symbol` `new_name`, `get_completions` `trigger` and `restart_server` targets are parsed into bounded types at the MCP boundary (a blank name is rejected before any LSP request, limits are stated in bytes), the disclosed indexing path accepts only its four capabilities, and `get_code_actions` `kind_filter` gains `source.fixAll` and `refactor.move`; `tool_surface.json` changes. (#730, #739)
-- **Breaking:** range, hierarchy-item and location-result handlers share the `positioned.rs` request helpers; definition, references and locations results are one type, so the `locations` description reads "Locations found." and `positions_degraded` is no longer nullable on `go_to_implementation`, `go_to_type_definition` and `go_to_declaration`. (#728, #739)
-- **Breaking:** `Error::FileIo` and `Error::MalformedPath` report their cause once through `source()`; the new `ErrorChain` adapter renders the chain at the MCP boundary. (#720, #739)
-- **Breaking:** untrusted launcher analysis selects a shell's flag grammar by family, parses `env` with the shared option parser and names the matched flag spelling; `LauncherRefusal::program` is an `EchoedPath`, and `UnanalyzableLaunch::PathContainsEquals` becomes `UntrustedRefusal::WrappedProgramPathContainsEquals`. (#725, #727, #739)
-- **Breaking:** untrusted mode refuses a server whose `args` name an executable file inside the workspace (new `UntrustedRefusal::WorkspaceExecutableArgument` and `UnreadableWorkspaceArgument`), `pwsh -cwa`/`--command`, `fish -C`, `nu -e`, perl `-M`/`-d:` code, node/bun `--import` of `data:` URLs, `coreutils --coreutils-prog`, POSIX `-oc`/`+c` command strings, and `dotnet`, `pipenv`, `pixi`, `swift`, `stack` and `cabal` run subcommands. (#721, #723, #724, #727, #739)
-- **Breaking:** share one diagnostic severity enum (`DiagnosticSeverity` is an alias of `ReportedSeverity`) and one echo-bounding helper, move `HostOs` to `config`, name supervised background tasks, and adopt newer std APIs in the #708 and #719 delta. (#732, #739)
-- Untrusted mode also refuses inline code glued to a flag or given with `=` (`python3 -c'..'`, `node --eval=..`, `fish --command=..`), `script`, `su`, `flock`, `watch`, `sudo -s`/`-i`/`NAME=value`, `deno repl`, versioned shell names, and more exec wrappers (`arch`, `caffeinate`, `chroot`, `unshare`, `nsenter`, `strace`, `systemd-run`). (#708)
-- **Breaking:** `LspServer` gains `publish_rx` and `take_publish_rx`/`take_notification_inbox`, `diagnostics_pump` takes a `NotificationInbox`, and `PumpShared` gains `roles`; `publishDiagnostics` no longer travels on `notification_rx`. (#708)
-- **Breaking:** a tool argument the tool does not declare is rejected naming the first unknown field and the accepted ones (was silently ignored), every `tools/list` input schema carries `additionalProperties: false`, the `tools/list` size budget is 135,500 B, and `PositionParams` no longer implements `Serialize`, `RangeParams` neither `Serialize`, `Deserialize` nor `JsonSchema`. (#708)
-- **Breaking:** every kind filter input fails as `-32602` with a bounded message: `symbol_kind` no longer fails as a deserialization error, `get_folding_ranges` `kind` is case-insensitive and rejected the same way, an over-long value is not echoed; `KindFilter` is sealed, `KindFilterInput::Rejected` holds a `Rejection`, `into_known` takes a `KindFilterField`, `FoldingKindFilter` is no longer `Deserialize`, and `SymbolTargetInput::Name` is a struct variant. (#708)
-- `get_diagnostics`/`get_cached_diagnostics` and the diagnostics resource share one cache snapshot, and tool support keeps capabilities and pull support together per running server. (#708)
-- Positioned tool handlers build their request through one `position_request` path, and tools that report `indexing_in_progress` open a `DisclosedDocument` that can only answer with an `Indexed` result. (#708)
-- **Breaking:** `Error::NoServerForLanguage::patterns` is an `Arc<[FilePattern]>`, so a routing miss no longer clones every pattern. (#708)
-- **Breaking:** `get_diagnostics` reports `origin: "cache_after_failed_pull"` (new `DiagnosticsOrigin::CacheAfterFailedPull`) when the pull failed and the cache answered, instead of `pull`. (#708)
-- **Breaking:** `LspServerConfig::env` is a `ServerEnv` whose keys compare as the host compares names (fixes Windows `Path` overrides being missed by command resolution), a Windows config with two case variants of one key is rejected, `child_env_var` takes a `HostOs`, and `lsp::HostOs` is public. (#708)
-- **Breaking:** one `CommandStem` (ASCII-case-insensitive on every host) serves the launcher rules, TypeScript pin and `BuiltinServer::matches_command`, and `ServerSpawnFailed`, `ServerNotFound` and `ServerExitedDuringInit` carry a `ServerCommand`. (#708)
-- **Breaking:** new `UntrustedRefusal::AutoSelectionTarget` for an auto-selected TypeScript command that resolves to another program (was "not found"); `command_path::resolve_command` and `or_system_path` take a `HostOs`, so untrusted hardening follows the given host's rules; the TypeScript launcher check is shared by startup and respawn and names the configured command; outbound JSON-RPC replies use `JsonRpcReply`/`JsonRpcOutcome` with `lsp_types::ErrorCodes`. (#708)
-- The init-failure hint is computed on the blocking pool instead of the start task. (#708)
-- **Breaking:** one `util::SizeExceeded` replaces three size-error shapes (`Error::FileSizeLimitExceeded` and `ReadBoundedError`/`BoundedUtf8Error::TooLarge` now hold it), `Error::DocumentLimitExceeded::max` is `NonZeroUsize`, `ConfigError::DuplicateServerId` carries `EntrySummary` values, and `ServerCommand::from_static` now requires ASCII like the other text newtypes. (#708)
-- **Breaking:** `ServerStartConcurrency`, `MAX_TIMEOUT_SECONDS`, `MAX_HEURISTICS_DEPTH` and `DEFAULT_HEURISTICS_MAX_DEPTH` live in `config::limits`, and `BoundedSecs::new`/`ServerStartConcurrency::new` return `Result`. (#708)
-- **Breaking:** removed `LspServerConfig::should_spawn` and `ServerHeuristics::is_applicable`/`is_applicable_recursive`; `MarkerScan` is the only marker check. (#708)
-- **Breaking:** `ServerConfig::validate` only checks the allowlist; `load_from` no longer calls it, trust application rejects an unknown `--allow-server` id, and the duplicate-name warning is dropped. (#708)
-- **Breaking:** config load errors forward their source instead of repeating it (`Error::TomlDe`, `TomlSer`, `Config` are transparent), and an oversized config file reports `ConfigError::FileTooLarge` naming its fixed limit. (#708)
-- The CLI loads its config before the runtime starts, `serve_with` resolves workspace roots on the blocking pool, and the idle-session reaper restarts with backoff and a throttled panic log. (#708)
-- **Breaking:** diagnostics cache and indexing tracker encode their invariants in types (`DocumentVersion` replaces bare `i32` in `DiagnosticInfo::version`), and the size cap ranks a diagnostic without severity as information instead of hint. (#708)
-- **Breaking:** removed `Translator::merge_diagnostics`; `NotificationWiring` gains `publish_changed`, and `NotificationCache::diagnostics` reads pushed entries only. (#671)
-- **Breaking:** `get_diagnostics` merges through the cache, which can reorder items and bounds pulled ones like pushed ones. (#671)
-- **Breaking:** `go_to_declaration` accepts `context: "enclosing_symbol"` like the other location tools, and `Translator::handle_declaration` takes a `ResultContext`. (#640)
-- **Breaking:** `prepare_rename` and `format_range` reject a line beyond the end of the tracked document as invalid params before the LSP request (new `Error::PositionBeyondDocument`); characters past a line end are still forwarded and clamped by the server. (#640)
-- **Breaking:** a `prepare_rename` server error `-32001` (`UnknownErrorCode`, clangd's "no symbol here") now reads as `not_renameable` with the server's text. (#640)
-- **Breaking:** the tsserver pin now covers npm `.cmd`/`.ps1`/extensionless shims, pnpm global installs and `node`/`bun` running an absolute `cli.mjs`; `UnresolvedReason` gains `PackageRunner`, pnpm installs with `selection = "auto"` may start the native `tsc` on Unix, and `npx`, `bunx`, `deno npm:` and relative-script launches now log a not-pinned warning in trusted mode too. (#647)
-- **Breaking:** `tab_size` of `format_document` and `format_range` is the typed `TabSize` (1 to 32, `MAX_TAB_SIZE`); other values are rejected as invalid params, and `handle_format_document` and `handle_format_range` take a `TabSize`. (#640)
-- `lib.rs` split into `runtime/` and `transport.rs` into submodules; no behavior change. (#638)
-- Log targets move to `mcpls_core::runtime::*` and `mcpls_core::transport::*`; `Transport` implements `Debug`. (#638)
-- Connection I/O deadlines saturate at 30 years instead of one. (#638)
-- Newer std APIs adopted at the sites missed by the MSRV 1.99 raise; `clippy::allow_attributes_without_reason` is enforced and unused lint suppressions removed. (#638)
-- **Breaking:** `AllowedHost` rejects ports 0, 80 and 443 (`InvalidAllowedHost::DefaultPort`), so `--http-allowed-host x.example:443` fails at startup instead of answering `403`; `AllowedHost::port()` is no longer `const`. (#635)
-- **Breaking:** server timeouts, `position_encodings` and `language_id` are typed (`TimeoutSecs`, `IndexingReadyTimeoutSecs`, `PositionEncodings`, `LanguageId`) and rejected when the config is loaded, and the use-site clamps are gone; field and type changes in `ServerInitConfig`, `ServerSpawnFailure`, `ToolRouter`, `LspClient` and `Translator`, and a new `hint` field on `Error::LspInitFailed` and `Error::ServerExitedDuringInit`, affect embedders. (#635)
-- **Breaking:** the default TypeScript server pins `tsserver` to the one next to `typescript-language-server` instead of a workspace `node_modules`, for `npm -g` style symlink installs with a global `typescript`; Windows `.cmd`, pnpm, Volta, asdf, mise and `npx`/`bunx`/`node` launchers are not covered and log a warning. Opt out with `initialization_options.tsserver.path`. (#609)
-- **Breaking:** `get_diagnostics` returns the new `DocumentDiagnosticsResult`; `Translator::handle_references`, `handle_definition`, `handle_implementation`, `handle_type_definition` and `handle_diagnostics` take a `ResultContext`, and result `locations` are `ContextualLocation`. (#609)
-- **Breaking:** `ToolKind` gains `TypeHierarchy`, `DocumentHighlights` and `FormatRange`, and an explicit `handles` config now warns about those uncovered tools; `rename` also routes `prepare_rename`. (#609)
-- The client now advertises `rename.prepareSupport`. (#609)
-- **Breaking:** MSRV raised from 1.88 to 1.99. (#577)
-- **Breaking:** `get_tool_support` `routes[].language` is replaced by `routes[].languages`, grouping languages that share a status; the snapshot no longer clones router and server capabilities per call. (#549)
-- **Breaking:** `mcpls-bench` reports gain `memory`, `memory_summary`, `stderr_log`, `p95_us` and `orphans_killed`, and scenario `source.url` must be a canonical `https://github.com/<owner>/<repo>`; mcpls runs in its own process group killed on shutdown or SIGINT/SIGTERM. (#549)
-- CI checks `cargo check -p mcpls --locked`. (#549)
-- Bump rmcp to 3.5.0. (#536)
-- **Breaking:** `HttpConfig` gains a `stream_liveness` field. (#543, #553)
-- **Breaking:** `get_cached_diagnostics` and the diagnostics resource return a retryable error while the server starts, and `resources/subscribe`/`subscriptions/listen` report startup failures. (#545, #544, #553)
-- **Breaking:** `RetryableErrorData` gains a `ListenStreamsExhausted` variant. (#536)
-- **Breaking:** every tool now returns `structuredContent` with an `outputSchema`; the text copy is key-sorted JSON, so payloads roughly double. (#546)
-- **Breaking:** `McpErrorKind` is `#[non_exhaustive]` and gains `InvalidPosition`; out-of-range positions return the raw server error as `data`. (#546)
-- **Breaking:** `HttpConfig` gains `header_read_timeout` and `max_concurrent_connections` fields (`HeaderReadTimeout`, `ConnectionLimit`). (#546)
-- **Breaking:** the workspace sets `unsafe_code = "forbid"`. (#546)
-- **Breaking:** LSP servers leave mcpls's process group and are killed with their descendants, daemons included. (#546)
-- **Breaking:** the HTTP transport serves HTTP/1 only; prior-knowledge h2c is no longer accepted. (#546)
-- **Breaking:** `HttpConfig` gains a `listen_lease` field, and HTTP listen streams now end after 15 to 30 minutes unless liveness is `off`; clients must re-listen. (#551, #596)
-- **Breaking:** Unix servers get `processId: null` in `initialize` while the watchdog is bound, and the whole server tree, including descendants that call `setsid` or `setpgid`, is frozen and killed on exit, shutdown and respawn. (#541, #596)
-- `LspServer::shutdown` and `serve()` can take up to 8 s longer on Unix while the server's process tree is swept. (#541, #596)
-- **Breaking:** `mcpls-bench` reports replace `mcpls`, `mcpls_binary` and `server` with `target`, `stderr_log` becomes an object and `summary` rows gain `unsupported`. (#548, #596)
-- The diagnostics pump resolves published paths through a bounded memo with parallel canonicalization, so slow filesystems no longer stall it or drop publications. (#550, #596)
-- Server-supplied control characters are escaped in error messages, and `mcpls` escapes every text-mode log field; `escape_control` is public. (#546)
-- Counter and indexing arithmetic saturates or uses checked access, enforced by clippy in non-test code. (#546)
-- CI actions are pinned to commit SHAs, a weekly advisory scan runs, and `deny.toml` rejects unknown registries and sources. (#546)
-- CI builds the fuzz crate on every full run and runs a weekly 60 s fuzz smoke; Dependabot and cargo-deny cover `fuzz/`. (#546)
-- **Breaking:** `NotificationCache`/`DocumentTracker`/`DocumentState` internals are no longer public; removed `NotificationCache::{clear_diagnostics, clear_all_diagnostics, clear_logs, clear_messages}` and `DocumentTracker::{update, close_all}`. (#512)
-- **Breaking:** `workspace.heuristics_max_depth` is now bounded by `MAX_HEURISTICS_DEPTH` (64); larger values fail config validation. (#512)
-- **Breaking:** `SubscriptionRegistry` moved from `mcpls_core::bridge` to `mcpls_core::mcp`; its `register`, `any_contains` and `is_all_empty` methods are removed, and `ResourceSubscriptions` and `SubscriptionError` are no longer public. (#525)
-- **Breaking:** keys mcpls defines in tool results and the `mcpls-diagnostics://` resource are now snake_case (`indexing_in_progress`, `push_notifications_degraded`). (#520)
-- **Breaking:** retryable error `data` keys are now `server_id` and `elapsed_secs`, and `McpErrorKind::Retryable` wraps the new typed `RetryableErrorData`. (#520)
-- **Breaking:** `positions_degraded` is now `"request"` or `"response"` instead of a bool, and is omitted when positions are exact. (#520)
-- **Breaking:** `mcp_to_lsp_position`/`lsp_to_mcp_position` take the typed `Position`/`Position2D`, return `Converted` values, and are now crate-private. (#512, #520)
-- Release binaries now build with `panic = "unwind"`: a panic no longer orphans LSP children, and a server whose message loop panicked is respawned. (#530)
-- **`Translator::register_client`/`register_server`** — Breaking change: now crate-private; use the new `Translator::register_server_complete`, which registers the client, server and respawn config together. (#530)
-- **`LspClient::shutdown`/`LspServer::shutdown`** — Breaking change: now has an overall deadline of `lsp::SHUTDOWN_TIMEOUT` and may return the new `Error::ShutdownTimeout`; a wedged message loop is aborted and its pending requests failed. (#530)
-- **`Error::ServerNotFound`** — Breaking change: a missing server binary now yields this variant instead of `Error::ServerSpawnFailed`. (#530)
-- Breaking: `DroppedEdits` gains public `exceeds_item_cap` and `shadowed_by_changes` fields. (#487, #498, #519)
-- **Breaking:** a language whose server failed to start now yields `Error::ServerFailedToStart` (typed `StartupFailure`, incl. install guidance) instead of `NoServerForLanguage`; `ServerSpawnFailure.message` is now `reason`, `AllServersFailedToInit.count` and `Error::NoServersAvailable` are removed, `ServerUnavailable.reason` is now `retry_in`, and `Translator::register_server_config` is removed. (#527, #529, #537)
-- Added `Error::ServerExitedDuringInit` (with a rust-analyzer rustup hint via `BuiltinServer::early_exit_hint`) and the public `StartupFailure` enum. (#527, #537)
-- **Breaking:** `workspace.max_file_size` is capped at 1 GiB (`MAX_FILE_SIZE_LIMIT`), and the per-response disk-read budget now derives from it (4x, at most 256 MiB). (#489, #537)
-- **Breaking:** a lone `\r` now ends a line in tracked and on-disk documents, following the LSP line model. (#513, #537)
-- **Breaking:** `SignatureParameter.label` is now `Option<String>` holding the label text for tuple labels, and `CallHierarchyPrepareResult` gains `truncated`; `DocumentTracker::take_evicted` and `EvictedDocument` are removed and `apply_lifecycle_notification` is now public. (#511, #516, #515, #517, #537)
-- **Breaking:** `validate_path_against_roots`, `Translator::set_workspace_roots`, `McplsServer::new` and `BridgeContext::new` take the new `WorkspaceRoots`; a path is accepted only under a canonical root, its configured form or the logical `$PWD`. (#533, #552)
-- **Breaking:** `Error::LspInitFailed` and `Error::ServerExitedDuringInit` gain `stderr: Option<StderrExcerpt>`, a bounded excerpt of the server's stderr with secret-named env, flag and option values redacted. (#534, #552)
-- Accepted HTTP sockets set `TCP_USER_TIMEOUT` to 60 s on Linux and Android, bounding half-open SSE streams; no effect elsewhere or behind a reverse proxy. (#531, #552)
-- **Breaking:** the seven name-addressable tools take a position or a `symbol_name` and return an optional `resolved_symbol`. (#591)
-- **Breaking:** on Unix each LSP server leads its own process group behind its own watchdog, and respawn, restart and shutdown kill that whole group, shared daemons such as Gradle and Bloop included (#542). (#591)
-- **Breaking:** `Error`, `McpErrorKind`, `RetryableErrorData` and `ToolKind` gain variants for symbol resolution, server restart and declaration. (#591)
-- **Breaking:** `HttpConfig::new` takes only the bind address; the path is a validated `HttpPath` and `max_concurrent_sessions` a `SessionLimit`. (#590)
-- **Breaking:** bind failures are `Error::HttpBind` and `Error::Timeout` carries a `Duration`. (#590)
-- **Breaking:** `project_config_ignored: bool` is now `ProjectConfigStatus` on `ServerConfig`, `McplsServer::new` and `BridgeContext::new`. (#590)
-- **Breaking:** the HTTP transport answers `403` to a non-loopback `Origin`. (#590)
-- **Breaking:** with `--http-stream-liveness off` an open GET stream no longer keeps a session alive past 5 minutes without requests. (#590)
-- **Breaking:** an invalid `MCPLS_HTTP_PATH` exits with a usage error even in stdio mode. (#590)
-- **Breaking:** `NotificationCache` diagnostics readers take `&Uri` and `Translator::cached_diagnostics_uri` returns `Uri`. (#590)
-- **Breaking:** `LspServer::spawn_batch` is concurrent and `ToolRouter::rebind` re-derives routes per `ServerSettlement`. (#590)
-- `cargo-deny` denies yanked crates. (#590)
-- Rename and code-action edits and `out_of_workspace` accept alias spellings of a root; edits additionally need exact-case containment and a canonical path under a root, so a symlink pointing out or a retargeted alias is dropped. (#580)
-- **Breaking:** `WorkspaceRoots::resolve` is replaced by the fallible `WorkspaceRoots::from_configured`, and `canonical_shared` is removed. (#580)
-- **Breaking:** `ServerConfig::load_from`, `load` and `load_with_trust` keep `workspace.roots` as written (not canonical; relative for a relative config path or the global config); `WorkspaceRoots::from_configured` canonicalizes at startup. (#580)
-- **Breaking:** `Translator` path handlers, `validate_path_against_roots` and `bridge::resources::parse_uri` use the new `ClientPath`; `Error` gains `InvalidClientPath` and `MalformedPath`. (#580)
-- **Breaking:** removed `LspServer::spawn_batch`, `ServerInitResult` and `ServerInitConfig::notification_tx`. (#610)
-- **Breaking:** `WorkspaceConfig` gains `max_concurrent_server_starts` (default 8), which bounds how many language servers start at once. (#610)
-- **Breaking:** `Error::LspProtocolError` carries `RedactedText`, so secrets echoed in protocol errors are redacted. (#610)
-- **Breaking:** JSON logs escape control and deceptive characters in every string, so a multi-line value reads as the literal `\n`. (#610)
-- **Breaking:** `get_server_logs` `min_level` is a lowercase enum, anything else is rejected, and `Translator::handle_server_logs` takes `Option<LogLevel>`. (#610)
-- **Breaking:** `HttpConfig::max_request_body` (`RequestBodyLimit`, clamped to 64 MiB) replaces `max_request_body_bytes`, `with_max_request_body_bytes` and `DEFAULT_MAX_REQUEST_BODY_BYTES`. (#610)
-- **Breaking:** `LspServerConfig` gains a public `settings` field, and `HttpConfig` gains `allowed_hosts` and `write_stall_timeout`. (#597, #598, #600, #614)
-- With `settings` set, `workspace.configuration` is advertised and rust-analyzer and jdtls may replace `initialization_options`; mcpls warns when both are set. (#598, #614)
-- HTTP connections close with a bounded linger so early 403 and 413 reach the client; the status is guaranteed only for bodies up to 1 MiB. (#602, #614)
-- Listen replay is paced (burst 32, 320 per second, best effort) and the eviction record is a capped map; use `listen_with_capacity` of at least 2000 for a guarantee. (#593, #614)
-- Tool results redact configured secrets in server display text as `[redacted:NAME]`; edits, URIs, identifiers and command arguments are unchanged, so redaction is partial. (#599, #614)
-- `SECURITY.md` trust model names `settings` and `initialization_options`. (#598, #614)
-- **Breaking:** an unknown `--log-level` or `MCPLS_LOG` level is rejected at startup; a bare word must be a level (use `mcpls_core=trace`, not `mcpls_core`). (#637)
-- **Breaking:** `Error` variants carry typed sources: `McpServer` and `Transport` are replaced. (#637)
-- **Breaking:** `validate_path_against_roots` is replaced by `WorkspaceRoots::validate`, which returns `WorkspacePath`. (#637)
-- **Breaking:** client positions are validated at the MCP boundary; line or column 0 or above 1,000,000 is `-32602`. (#637)
-- **Breaking:** call and type hierarchy items share one `HierarchyItem`; a malformed call hierarchy `item` is a tool error, not `-32602`. (#637)
-- `tools/list` payload shrinks from about 181 KB to about 122 KB. (#637)
-- **Breaking:** `ServerInitConfig` gains `redactions`; tool and resource errors hide every configured server's secrets. (#637)
-- **Breaking:** `Translator::set_expected_servers` no longer marks a registered server expected. (#637)
-- An idle HTTP session close is bounded, and an unresolvable internal URI is classified as an internal error. (#637)
-- `Translator` keeps each server's state in one slot and its lifecycle in one phase. (#637)
-- **Breaking:** `Translator::handle_incoming_calls`, `handle_outgoing_calls`, `handle_supertypes` and `handle_subtypes` take the new `CheckedHierarchyItem`; a hierarchy item with a zero, oversized or reversed range is rejected with `-32602`, and `Error` gains `InvalidHierarchyItemInput`. (#639)
-- **Breaking:** detected and mapped language ids are `LanguageId` (`build_extension_map`, `build_effective_extension_map`, `language_for_extension`, `DocumentTracker::new`, `Translator::with_extensions` and `is_diagnostics_route`, `react_variant_language_id`, `base_language_id`), and `Error::NoServerForLanguage` and `NoServerForTool` carry a `LanguageId`. (#639)
-- **Breaking:** a config file must be a regular file: `--config /dev/null` and `--config <(...)` are rejected as `NotARegularFile`; documents and the config loader share one open-and-verify. (#639)
-- **Breaking:** `LspServerConfig` gains `selection`; generated configs carry `selection = "auto"` on the TypeScript entry, so add it to an existing config to opt in, and older mcpls versions reject the key. (#639)
-- **Breaking:** `file_patterns` accepts only `*.ext`, `**/*.ext` and `dir/*.ext` forms; braces, `**/*`, single files, compound extensions such as `**/*.d.ts` and backslash patterns now fail config loading. (#682)
-- **Breaking:** `extensions` with a leading dot, absolute or multi-component `project_markers`, blank `name`, `command` or `mcp.*` values, and empty or duplicate `handles` are rejected when the config is loaded. (#682)
-- **Breaking:** `LspServerConfig`, `WorkspaceConfig`, `McpConfig` and `LanguageExtensionMapping` fields, `ServerHeuristics`, `ProjectMarker`, `SearchDepth` and `ToolPrefix::from_str` use the typed values and error types. (#682)
-- **Breaking:** `Error::Config(ConfigError)` replaces `Error::InvalidConfig`, and `DocumentTracker::new`, `detect_language`, `ResourceLimits` and `build_effective_extension_map` take or return the typed values. (#682)
-- **Breaking:** `ServerInitConfig` has private fields and a constructor, `Error::LspInitFailed` holds the cause in `cause`, `CapabilityNotSupported` carries a typed capability, and `NoServerForLanguage` and `UntrustedRefusal` change shape. (#682)
-- **Breaking:** symbol kind filters are typed end to end, accepted in any case and forwarded canonically; the tool schemas list the lowercase spellings. (#682)
-- **Breaking:** every positioned tool rejects a line past the end of the document with `-32602`. (#682)
-- **Breaking:** servers without a pull provider answer `get_diagnostics` from the push cache, and `restart_server` gates requests on the replacement server's indexing. (#682)
-- **Breaking:** untrusted-workspace mode refuses package runners, task runners, inline-eval interpreters, unanalyzable shell launches and `env -S`, and starts servers in the login home or a private temporary directory. (#682)
-- **Breaking:** HTTP application errors stay HTTP 200 with an in-band `-32602` for an unknown tool; bump rmcp to 3.5.1. (#682)
-- The default TypeScript server now publishes diagnostics, a server request or notification mcpls cannot decode no longer ends the connection, and project markers are searched in one bounded walk. (#682)
-- **Breaking:** `ServerId` loses its infallible `From<&str>`/`From<String>` (use `ServerId::new`, `from_static` or `ServerIds::parse`) and `LanguageId` rejects a blank value. (#685)
-- **Breaking:** `SearchDepth::new` returns `Result`, `FileSizeLimitExceeded.max`, `ReadBoundedError.max` and `BoundedUtf8Error.max` are `NonZeroU64`, spawn and untrusted refusals carry `ServerCommand`, and `FileExtension` is ASCII only. (#685)
-- **Breaking:** `WorkspaceConfig.roots` is `Vec<ConfiguredRoot>` and `LspServerConfig.command` is `LaunchCommand` (the `selection` field is gone); an empty root or `selection = "auto"` on a non-TypeScript command is rejected when the config is read. (#685)
-- **Breaking:** shutdown cancellation uses one `CancellationToken` and `tokio-util` is a required dependency of `mcpls-core`. (#685)
-- **Breaking:** `file_patterns` accept extensionless names (`Makefile`, `**/Dockerfile`) and `NoServerForLanguage` carries a `FileKey`; `get_tool_support` lists the languages the effective map routes. (#685)
-- Native `tsc` auto-selection works on Windows through the `tsc.cmd` shim, and the respawn tsserver pin is planned off the async runtime. (#685)
-- **Breaking:** untrusted mode parses a closed set of exec wrappers (`time`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `caffeinate`, `arch`, `env`, busybox applets), boundary-checks and absolutizes the program a wrapper starts, and refuses `sudo`, `doas`, `strace`, `unshare`, `gosu`, `su-exec`, `runas`, `wsl` and similar outright; refusals name the matched option bounded and escaped, and `UntrustedRefusal::ProjectLauncher` gains `cause`. (#719)
-- **Breaking:** `ServerEnv` stores its host at construction, so `get`, `insert` and `contains_key` lose the host parameter, and `resolve_command`, `child_env_var` and the tsserver pin read it from the config. (#719)
-- **Breaking:** `NotificationCache::diagnostics` returns an owned `DiagnosticInfo`, the diagnostics version lives only in `Origin`, and `ResourceDiagnosticsResponse.version` is `Option<DocumentVersion>`. (#719)
-- **Breaking:** `Error::Io` displays without the "I/O error: " prefix and `UnresolvableWorkspaceRoot` no longer repeats its source. (#719)
-- `IndexingGate::FileLocal` takes only a file-local capability, `DisclosedDocument` honors the request timeout, and unknown-argument errors bound client keys and cap the message at 4 KiB. (#719)
-- Untrusted mode also refuses `xargs`, `find` and `awk`, `MCPLS_CONFIG` is read through `var_os`, and CLI logging-init errors print on stderr (omitted from #708). (#719)
+- **Breaking:** MSRV raised from 1.88 to 1.99 (#577); rmcp bumped to 3.5.1 (#536, #682).
+- **Breaking:** every tool returns `structuredContent` with an `outputSchema`, result keys are snake_case, `positions_degraded` is `"request"`/`"response"`, retryable error `data` keys are `server_id` and `elapsed_secs` (#520, #546).
+- **Breaking:** an undeclared tool argument is rejected with the accepted fields named, every `tools/list` input schema sets `additionalProperties: false`, and inputs (`new_name`, `trigger`, `restart_server` targets, kind filters, `tab_size`, `min_level`) are parsed into bounded types at the MCP boundary (#640, #610, #708, #730, #739).
+- **Breaking:** positions are validated at the boundary (line or column 0 or above 1,000,000 is `-32602`, a line past the document end is rejected) and a lone `\r` ends a line (#513, #637, #640, #682).
+- **Breaking:** `get_diagnostics` merges through the cache, answers from the push cache for servers without a pull provider, and reports `origin: "cache_after_failed_pull"` after a failed pull (#671, #682, #708); cache and tool-support snapshots are shared (#708).
+- **Breaking:** `get_tool_support` `routes[].language` becomes `routes[].languages` (#549); `prepare_rename` maps `-32001` to `not_renameable` (#640); `workspace.max_file_size` is capped at 1 GiB (#489, #537).
+- **Breaking:** workspace roots are typed (`WorkspaceRoots`, `ConfiguredRoot`, `WorkspacePath`, `ClientPath`), kept as written at load and canonicalized at startup; rename and code-action edits accept alias spellings but need a canonical path under a root (#533, #552, #580, #637, #685).
+- **Breaking:** config values are typed and rejected at load (`TimeoutSecs`, `PositionEncodings`, `LanguageId`, `EnvKey`, `ServerEnv`, `LaunchCommand`, `CommandStem`, `HostOs`, `file_patterns` forms, `project_markers`, `handles`); `--config` must be a regular file; unknown `--log-level` is rejected; `AllowedHost` rejects ports 0, 80 and 443 (#635, #637, #639, #682, #685, #708, #721, #731, #739).
+- **Breaking:** the default TypeScript server pins `tsserver` to the bundled one for symlink, npm shim, pnpm global and `node`/`bun <abs cli.mjs>` launches; other launchers log a warning (#609, #647).
+- **Breaking:** errors are typed and chained (`ServerFailedToStart`/`StartupFailure`, `ServerNotFound`, `ServerExitedDuringInit`, `ShutdownTimeout`, `PositionBeyondDocument`, `InvalidClientPath`, `ErrorChain`, `SizeExceeded`, `Config(ConfigError)`) with redacted text, bounded stderr excerpts and install hints; several old variants are removed (#527, #529, #530, #534, #537, #552, #610, #637, #682, #708, #720, #739).
+- **Breaking:** notification, JSON-RPC and diagnostics types are typed (`Lane`, `ServerMessage`, `JsonRpcVersion`, `DocumentVersion`, `DiagnosticsOrigin`, `ReportedSeverity`, `NotificationInbox`); a response with both `result` and `error` or a `jsonrpc` other than `"2.0"` is undecodable; internals of `NotificationCache`, `DocumentTracker` and `LspServer` are no longer public (#512, #671, #708, #719, #729, #739).
+- **Breaking:** the Translator, bridge and HTTP APIs change shape (`register_server_complete`, `ResultContext`, `CheckedHierarchyItem`/`HierarchyItem`, `ToolKind` variants, `TabSize`, `HttpConfig::new` takes only the address, `HttpPath`, `SessionLimit`, `RequestBodyLimit`, `ProjectConfigStatus`, `SubscriptionRegistry` moved to `mcp`, `ServerInitConfig` private fields) (#512, #525, #530, #590, #591, #609, #610, #614, #637, #639, #640).
+- **Breaking:** HTTP serves HTTP/1 only, answers `403` to a non-loopback `Origin`, ends listen streams after 15 to 30 minutes unless liveness is `off`, and keeps application errors at HTTP 200 (#546, #551, #590, #596, #682).
+- **Breaking:** on Unix each server leads its own process group behind a watchdog and is killed with its descendants on exit, shutdown, respawn and restart; `processId` is `null` in `initialize` (#541, #546, #591, #596).
+- **Breaking:** release binaries use `panic = "unwind"` so a panic no longer orphans LSP children (#530); the workspace forbids `unsafe_code` (#546).
+- Language servers start concurrently, bounded by `workspace.max_concurrent_server_starts` (default 8) (#590, #610).
+- Tool results redact configured secrets in server text as `[redacted:NAME]`; JSON logs and server control characters are escaped (#546, #599, #610, #614).
+- Result caps use one shared item budget and edits are tallied (`DroppedEdits`) (#487, #498, #519); positions and size arithmetic are typed and checked (#512, #546).
+- `lib.rs` and `transport.rs` split into `runtime/` and `transport/` submodules, log targets move accordingly (#638).
+- `tools/list` payload shrinks from about 181 KB to about 122 KB (#637).
+- CI pins actions to commit SHAs, runs weekly advisory and fuzz scans, builds `fuzz/`, checks `cargo check -p mcpls --locked`, and `cargo-deny` rejects unknown sources and yanked crates (#546, #549, #590).
 
 ### Removed
 
-- **Breaking:** removed `Error::InvalidConfig`, `Error::InvalidUri`, `language_for_extension`, `validate_kind_filter` and `resolve_kind_filter`. (#682)
-- **Breaking:** removed `ConfigError::EmptyWorkspaceRoot` and `TsserverKept::UnsupportedPlatform`. (#685)
+- **Breaking:** `Error::InvalidConfig`, `Error::InvalidUri`, `language_for_extension`, `validate_kind_filter`, `resolve_kind_filter`, `ConfigError::EmptyWorkspaceRoot`, `TsserverKept::UnsupportedPlatform`, `LspServer::spawn_batch`, `LspServerConfig::should_spawn` and `ServerHeuristics::is_applicable` (#682, #685, #610, #708).
 
 ### Fixed
 
-- The publish mailbox no longer strands a replaced publish after order compaction, and lost-publish marks survive a transient path-resolution failure. (#726, #739)
-- Untrusted refusals echo a wrapped program's whole path instead of cutting it at a space or `=`. (#725, #739)
-- `publishDiagnostics` bursts are no longer dropped above 256 frames: each server's publishes go through a per-file coalescing mailbox bounded to 1000 files and 64 MiB, files it cannot hold read `evicted` and notify subscribers, and overflow warnings are rate limited. (#708)
-- A respawned server's diagnostics pump now follows later role changes made while servers settle, and the pump loop tracks its sources in one state type. (#708)
-- `get_diagnostics` and the cache reads no longer list a pushed error the server's pull for the edited document already reported as fixed; only pull-covered items of an older push are dropped. (#708)
-- A dropped alias diagnostics publish no longer notifies resource subscribers (`PushWrite` is `Stored` or `Dropped`). (#708)
-- Untrusted mode refuses more shells (`ash`, `hush`, `mksh`, `nu`, ...) and inline interpreters (`deno eval`, `bun -e`, ...) given a command string, and exec wrappers (`time`, `nice`, `timeout`, `sudo`, ...) whose arguments start a refused command, failing closed past 8 nested wrappers; `SECURITY.md` calls the lists closed, not exhaustive. (#708)
-- A server restart or respawn now also notifies subscribers of files cached only under a symlink spelling. (#671)
-- `get_diagnostics` stores a full pull report in the diagnostics cache and notifies `lsp-diagnostics://` subscribers when a file's diagnostics change; `get_cached_diagnostics` and `resources/read` include pulled diagnostics. (#671)
-- A language-server response that cannot be decoded (for example nested past the JSON recursion limit) now fails only its own request instead of tearing down the connection; new `InboundMessage::UndecodableResponse`. (#644)
-- `out_of_workspace` is documented and tested as alias-aware: a `/tmp` spelling of a root under `/private/tmp` reads `false`. (#640)
-- The TypeScript install hint and docs pin `typescript@6`; a TypeScript-7-only install is named in the init-failure error (`InitFailureHint`), and next to the server also in the tsserver pin warning. (#635)
-- `test_run_http_enforces_loopback_origin` no longer fails intermittently on a connection reset after the `403` response. (#601)
-- Language servers start concurrently and each is usable as soon as its own `initialize` completes. (#590)
-- An invalid `--http-path` is rejected at argument parsing instead of panicking. (#590)
-- A client answering liveness probes on an open GET stream is no longer dropped after 5 minutes. (#590)
-- HTTP session ids are no longer logged at the default level. (#590)
-- Configured secrets are redacted from server messages, errors, wire traces and spawn arguments. (#590)
-- `escape_control` and stderr cleaning share one deceptive-character set. (#590)
-- Unix: descendants of an LSP server that call `setsid` or `setpgid`, such as rust-analyzer's flycheck, are killed when mcpls exits, including on shutdown and respawn. (#541, #596)
-- Roots from a config file are admitted under their configured symlinked spelling again, including relative roots of a relative config path. (#580)
-- An empty, NUL-containing or not-a-directory `file_path` returns `-32602` instead of `-32603`, including an empty `get_tool_support` `file_path`, which no longer acts as no filter. (#580)
-- Abandoned HTTP sessions now expire after 5 min without client activity instead of living on while subscribed files change. (#536)
-- Columns past the end of a line now clamp to the line length, and column 1 or the empty line after a final newline no longer raise a false `positions_degraded`. (#520)
-- Call-hierarchy, inlay-hint, code-action, and rename handlers now cap normalized items with one shared budget, reporting overflow via `truncated` / `dropped.exceeds_item_cap`. (#487, #519)
-- Workspace-edit conversion now tallies `documentChanges` entries shadowed by a non-empty `changes` map and no longer lists a file whose edits were all dropped. (#498, #519)
-- `DocumentTracker` LRU eviction now skips a document whose handler is still awaiting its LSP response, returning `DocumentLimitExceeded` when no safe candidate exists. (#503, #519)
-- Test-only `raw_len` and `subscription_registry` helpers no longer trigger dead-code lints without the `transport-http` feature. (#491, #519)
-- `test_timeout_handling` now cancels the handler after a single poll and `test_diagnostics_with_error` a bounded retry, mitigating CI flakiness that was not reproduced locally. (#473, #466, #519)
-- A panic in the background LSP init task, a diagnostics pump, or an MCP request handler is now contained and reported instead of leaving tools stuck on `ServerInitializing` or a request unanswered. (#528, #537)
-- Respawn reads the server config from the registered `LspServer`, removing the duplicate map. (#529, #537)
-- A stale `didClose` is no longer sent after an evicted document is reopened. (#515, #537)
-- Call-hierarchy prepare results are capped by the shared item budget. (#516, #537)
-- Tuple signature-parameter labels are returned as label text instead of raw server-encoding offsets. (#511, #537)
-- Tracker line lookups use a sparse line index instead of an O(offset) scan under the global mutex. (#488, #537)
-- HTTP transport tests bind their own listener and no longer sleep, the timeout test is replaced by deterministic paused-clock tests, and the diagnostics test polls only while indexing. (#524, #518, #517, #537)
-- `get_cached_diagnostics` and the diagnostics resource now report a server startup failure instead of an empty list. (#535, #552)
-- Paths outside every workspace root are rejected before any filesystem access, narrowing the existence oracle for outside paths. (#533, #552)
-- Diagnostics published under a symlink spelling are keyed by the canonical path, merged per source on read, and now match subscriptions. (#532, #552)
-- A respawned LSP server's surviving child processes are now killed on Unix (#542). (#591)
-- Servers that wait for a configuration push, such as pyright, answer requests: `workspace/didChangeConfiguration` with null settings follows `initialized`. (#610)
-- Configured secrets echoed in pushed and pulled diagnostics (message, source, code, related information, `data`) and `$/progress` text are redacted before caching. (#610)
-- POST and resume response streams are cut 1 hour after they open (`ResponseStreamDeadline`), so a vanished peer no longer pins its session slot; a peer that stops reading a response still holds it until TCP gives up (#600). (#610)
-- An empty top-level `settings` key is rejected. (#637)
-- `workspace/configuration` answers a non-object item with `null`. (#637)
-- A not-renameable `prepare_rename` reply no longer logs at ERROR. (#637)
-- Slow HTTP readers and request bodies are cut instead of holding a connection. (#637)
-- `GIT_AUTHOR_NAME`, `SSH_AUTH_SOCK` and `XAUTHORITY` are no longer redacted as secrets. (#637)
-- A pulled diagnostics result is dropped once the tracked document moved on, and a push that evicts a cache entry notifies its subscribers. (#682)
-- A panicked idle HTTP session reaper is restarted, and a panic in the SSE liveness forwarding task is logged. (#682)
-- The pull probe is bound to its connection, refused only on `-32601` or two consecutive timeouts, and the eviction overflow flag ends on the owner's next write. (#685)
-- Undecodable and malformed-header server frames warn at most once a minute, and a non-UTF-8 frame fails only its own request. (#685)
-- `PositionBeyondDocument` names the document's last line, and the `[[workspace.language_extensions]]` examples in the docs load. (#685)
+- Diagnostics: stale pushed errors no longer outlive a fresh pull, `publishDiagnostics` bursts are coalesced per file instead of dropped, lost publishes are marked `evicted`, symlink-spelled publishes are keyed canonically and notify subscribers, pulls are stored and notify `lsp-diagnostics://` subscribers, and startup failures are reported instead of an empty list (#532, #535, #552, #671, #708, #726, #739).
+- A language-server response or message that cannot be decoded fails only its own request; a panic in an init task, pump or handler is contained and reported (#528, #537, #644, #682).
+- Servers that wait for a configuration push, such as pyright, answer requests; an empty `settings` key is rejected and `workspace/configuration` answers non-object items with `null` (#610, #637).
+- Configured secrets are redacted from diagnostics, progress text, server messages, errors, wire traces and spawn arguments (#590, #610).
+- HTTP: abandoned sessions expire, stalled peers and slow readers are cut, an invalid `--http-path` no longer panics, session ids are not logged, and a client answering probes is no longer dropped (#536, #590, #600, #610, #637).
+- Unix descendants that call `setsid` or `setpgid` are killed on exit and respawn (#541, #542, #596).
+- Roots keep their configured symlinked spelling; paths outside every root are rejected before filesystem access; bad `file_path` values return `-32602` (#533, #552, #580).
+- Columns past a line end clamp instead of raising a false `positions_degraded`; tuple signature labels return label text; `didClose` is no longer sent for a reopened evicted document; in-flight documents are not evicted; tracker line lookups no longer scan (#488, #503, #511, #515, #520, #537).
+- TypeScript guidance pins `typescript@6` and names a TypeScript-7-only install in init errors (#635); native `tsc` selection works on Windows (#685).
+- Flaky tests (`test_run_http_enforces_loopback_origin`, `test_timeout_handling`, `test_diagnostics_with_error`) and dead-code lints without `transport-http` (#466, #473, #491, #517, #518, #519, #524, #537, #601).
 
 ## [0.6.0] - 2026-09-21
 
@@ -1058,7 +856,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/bug-ops/mcpls/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bug-ops/mcpls/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bug-ops/mcpls/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bug-ops/mcpls/compare/v0.3.9...v0.4.0

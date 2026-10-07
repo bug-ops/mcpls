@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.
 irm https://raw.githubusercontent.com/bug-ops/mcpls/main/scripts/install.ps1 | iex
 ```
 
-On Linux and macOS, `MCPLS_INSTALL_DIR` changes the target directory and `MCPLS_VERSION` selects a release tag such as `v0.6.0` instead of the latest.
+On Linux and macOS, `MCPLS_INSTALL_DIR` changes the target directory and `MCPLS_VERSION` selects a release tag such as `v0.7.0` instead of the latest.
 
 Verify the install:
 

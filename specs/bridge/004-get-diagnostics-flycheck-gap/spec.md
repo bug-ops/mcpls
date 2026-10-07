@@ -8,7 +8,7 @@ tags:
   - bridge
   - diagnostics
 created: 2026-07-25
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

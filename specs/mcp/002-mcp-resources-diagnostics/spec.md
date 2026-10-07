@@ -10,7 +10,7 @@ tags:
   - resources
   - diagnostics
 created: 2026-07-30
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[bridge/004-get-diagnostics-flycheck-gap/spec]]"
@@ -78,7 +78,7 @@ SO THAT my implementation can be event-driven rather than polling-based.
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Performance | Zero extra LSP round-trips: use the existing notification pump output |
-| NFR-002 | Compatibility | rmcp crate must expose resource registration and `notifications/resources/updated` send API — verify before implementation (rmcp 3.2.0 currently used) |
+| NFR-002 | Compatibility | rmcp crate must expose resource registration and `notifications/resources/updated` send API — verify before implementation (rmcp 3.5.1 currently used) |
 | NFR-003 | Performance | Steady-state publishes for already-seen files cost no filesystem call (memo hit); a cold burst is bounded by 8 parallel canonicalizations rather than one per publish in sequence (#550) |
 
 ## 5. See Also

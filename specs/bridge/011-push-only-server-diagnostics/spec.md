@@ -9,7 +9,7 @@ tags:
   - bridge
   - diagnostics
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[bridge/004-get-diagnostics-flycheck-gap/spec|bridge/004-get-diagnostics-flycheck-gap]]"

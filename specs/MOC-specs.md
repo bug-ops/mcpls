@@ -13,7 +13,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 |---|------|------|----------|--------|-------|
 | 001 | [[config/001-config-discovery-and-heuristics/spec\|config-discovery-and-heuristics]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | implemented | #615, #634 |
-| 003 | [[config/003-unsupported-file-pattern-forms/spec\|unsupported-file-pattern-forms]] | bug | P3 | approved (implemented, #669) | #669 |
+| 003 | [[config/003-unsupported-file-pattern-forms/spec\|unsupported-file-pattern-forms]] | bug | P3 | implemented (#669) | #669 |
 
 ## lsp
 
@@ -38,7 +38,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
 | 001 | [[mcp/001-mcp-tool-surface-and-routing/spec\|mcp-tool-surface-and-routing]] | enhancement | P1 | implemented (retroactive) | — |
-| 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | draft | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012) |
+| 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | implemented | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012) |
 | 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298; #493 (stateless subscriptions, closed as research); #522 (subscriptions/listen implemented); #593 (paced replay, bounded eviction record) |
 | 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
 | 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461 |
@@ -54,6 +54,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | draft | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | draft | #749 |
+| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730 |
 
 ## bridge
 
@@ -62,16 +63,16 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 001 | [[bridge/001-position-encoding-layer/spec\|position-encoding-layer]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[bridge/002-document-tracker-synchronization/spec\|document-tracker-synchronization]] | enhancement | P1 | implemented (retroactive) | — |
 | 003 | [[bridge/003-rwlock-translator/spec\|rwlock-translator]] | enhancement | P2 | superseded | #114 |
-| 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | draft | — |
+| 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | implemented | — |
 | 005 | [[bridge/005-expose-document-tracker-limits/spec\|expose-document-tracker-limits]] | enhancement | P2 | implemented (#324) | — |
 | 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
 | 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | implemented | #565 |
 | 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
 | 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648, #649 (follow-ups) |
 | 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
-| 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | draft (implemented, #666, #670) | #666; #670 |
-| 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | draft (implemented, #667) | #667 |
-| 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | draft (implemented, #668) | #668 |
+| 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | implemented (#666, #670) | #666; #670 |
+| 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | implemented (#667) | #667 |
+| 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | implemented (#668) | #668 |
 | 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | implemented (coverage-based exclusion, learned pull sources) | #703 |
 
 ## runtime

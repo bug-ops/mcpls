@@ -9,7 +9,7 @@ tags:
   - security
   - hardening
 created: 2026-10-06
-status: accepted
+status: implemented
 related:
   - "[[constitution]]"
   - "[[runtime/003-workspace-supplied-code-execution/spec|runtime/003-workspace-supplied-code-execution]]"

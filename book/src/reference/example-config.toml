@@ -25,6 +25,13 @@ roots = [
 # Position encoding preference (utf-8 is more efficient for Rust)
 position_encodings = ["utf-8", "utf-16"]
 
+# Limits (all optional; the values shown are the defaults)
+# heuristics_max_depth = 10                # project-marker search depth, at most 64
+# max_documents = 100                      # open documents at once, 0 disables
+# max_file_size = 10485760                 # bytes, 0 disables, at most 1 GiB
+# max_concurrent_server_starts = 8         # servers initializing at once
+# indexing_ready_timeout_seconds = 30      # above 3 and below 60
+
 # Language extension mappings (optional)
 # mcpls recognizes 30 languages by default. Customize here to:
 # - Add support for specialized file types
@@ -83,9 +90,17 @@ timeout_seconds = 30
 
 # Uncomment and configure as needed:
 
+# request_timeout_seconds = 30   # each LSP request behind a tool call
+# indexing = "disabled"          # opt out of indexing-readiness gating
+
 # [lsp_servers.initialization_options]
 # cargo.features = "all"
 # checkOnSave.command = "clippy"
+
+# Settings pushed after `initialized` and served on workspace/configuration
+# (must not be empty)
+# [lsp_servers.settings]
+# "rust-analyzer.check.command" = "clippy"
 
 # Python - pyright
 # [[lsp_servers]]
@@ -96,10 +111,13 @@ timeout_seconds = 30
 # timeout_seconds = 30
 
 # TypeScript/JavaScript - typescript-language-server
+# selection = "auto" starts the native TypeScript 7 server (tsc --lsp --stdio)
+# when it is installed; the command and args below are the fallback.
 # [[lsp_servers]]
 # language_id = "typescript"
 # command = "typescript-language-server"
 # args = ["--stdio"]
+# selection = "auto"
 # file_patterns = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx"]
 # timeout_seconds = 30
 
