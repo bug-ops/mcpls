@@ -476,23 +476,22 @@ pub struct LspServer {
     position_encoding: PositionEncodingKind,
     /// Receiver for the log and `showMessage` frames of the LSP server
     /// ([`ServerMessage`]); diagnostics arrive on [`Self::publish_rx`].
-    ///
-    /// Extract this before registering the server to receive them in real time.
-    pub notification_rx: mpsc::Receiver<ServerMessage>,
+    /// Taken for a pump with [`Self::take_notification_inbox`].
+    notification_rx: mpsc::Receiver<ServerMessage>,
     /// Receiver of the diagnostics mailbox: `textDocument/publishDiagnostics`
     /// is coalesced per file and a publish it cannot hold is reported as lost
-    /// instead of being dropped (see [`PublishReader`]). Extract it with
-    /// [`Self::take_publish_rx`].
-    pub publish_rx: PublishReader,
+    /// instead of being dropped (see [`PublishReader`]). Taken for a pump with
+    /// [`Self::take_notification_inbox`].
+    publish_rx: PublishReader,
     /// Receiver for the lifecycle lane (P3): `$/progress` `begin`/`end`
     /// frames and unrecognized notifications (which carry e.g.
     /// rust-analyzer's `experimental/serverStatus`), kept separate from
     /// [`Self::notification_rx`] so a high-volume diagnostics publisher can
     /// never starve out a workspace-readiness signal, or vice versa.
     ///
-    /// Extract this before registering the server, the same way as
-    /// [`Self::notification_rx`] -- see [`Self::take_lifecycle_rx`].
-    pub lifecycle_rx: mpsc::Receiver<LspNotification>,
+    /// Extract this before registering the server -- see
+    /// [`Self::take_lifecycle_rx`].
+    lifecycle_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management and
     /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
@@ -555,11 +554,7 @@ impl LspServer {
     }
 
     /// Take the notification receiver out of this server, replacing it with a dummy channel.
-    ///
-    /// Use this to extract the receiver for a background pump task before registering
-    /// the server with the translator. After this call, the server's `notification_rx`
-    /// will never receive messages.
-    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<ServerMessage> {
+    fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<ServerMessage> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.notification_rx, dummy)
     }
@@ -571,17 +566,15 @@ impl LspServer {
     }
 
     /// Take the diagnostics mailbox out of this server, replacing it with a
-    /// closed one. Extract it with [`Self::take_notification_rx`] before
-    /// registering the server for a pump.
-    pub fn take_publish_rx(&mut self) -> PublishReader {
+    /// closed one.
+    fn take_publish_rx(&mut self) -> PublishReader {
         std::mem::replace(&mut self.publish_rx, PublishReader::closed())
     }
 
     /// Take the lifecycle receiver out of this server, replacing it with a
     /// dummy channel -- the lifecycle-lane counterpart to
-    /// [`Self::take_notification_rx`]. Extract this before registering the
-    /// server for a background pump task to drain, the same way as
-    /// [`Self::notification_rx`].
+    /// [`Self::take_notification_inbox`]. Extract this before registering the
+    /// server for a background pump task to drain.
     pub fn take_lifecycle_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.lifecycle_rx, dummy)

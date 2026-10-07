@@ -534,14 +534,13 @@ impl EvictionRecord {
     }
 
     fn prune_expired(&mut self, now: std::time::Instant) {
-        while let Some((key, at)) = self.order.front() {
-            if now.saturating_duration_since(*at) <= EVICTION_REPLAY_WINDOW {
-                break;
+        while let Some((key, at)) = self
+            .order
+            .pop_front_if(|(_, at)| now.saturating_duration_since(*at) > EVICTION_REPLAY_WINDOW)
+        {
+            if self.is_live(&key, at) {
+                self.at.remove(&key);
             }
-            if self.is_live(key, *at) {
-                self.at.remove(key);
-            }
-            self.order.pop_front();
         }
     }
 
