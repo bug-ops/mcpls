@@ -14,14 +14,14 @@ User documentation: <https://bug-ops.github.io/mcpls/>. API documentation: <http
 
 ```toml
 [dependencies]
-mcpls-core = "0.6"
+mcpls-core = "0.7"
 ```
 
 Enable the `transport-http` feature to serve over Streamable HTTP:
 
 ```toml
 [dependencies]
-mcpls-core = { version = "0.6", features = ["transport-http"] }
+mcpls-core = { version = "0.7", features = ["transport-http"] }
 ```
 
 ## Usage

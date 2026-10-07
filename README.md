@@ -79,9 +79,10 @@ Rust projects need no configuration. Other languages and clients are covered in 
 - **Cross-references, definitions, implementations** across the whole workspace
 - **Real diagnostics** from the compiler, not guesses
 - **Rename and code-action edits** returned for the client to apply
-- **Call and type hierarchies**, symbol search, formatting, inlay hints
-- **Several language servers at once**, with graceful degradation when one fails
-- **stdio by default**, optional HTTP transport with Host and Origin allowlists
+- **Call and type hierarchies**, symbol search, formatting, inlay hints, selection and folding ranges
+- **Address code by symbol name** as well as by position, and restart language servers on demand
+- **Several language servers at once**, started concurrently and stopped with mcpls, with graceful degradation when one fails
+- **stdio by default**, optional HTTP transport with Host and Origin allowlists and resource subscriptions
 - **Untrusted-workspace mode** for analyzing code you do not trust
 - **Single Rust binary**, no runtime dependencies, no `unsafe` code
 

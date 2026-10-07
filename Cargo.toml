@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Andrei G. <k05h31@gmail.com>"]
@@ -30,7 +30,7 @@ hyper-util = "0.1.20"
 ignore = "0.4"
 libc = "0.2"
 lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }
-mcpls-core = { path = "crates/mcpls-core", version = "0.6.0" }
+mcpls-core = { path = "crates/mcpls-core", version = "0.7.0" }
 nix = { version = "0.31", default-features = false, features = ["user"] }
 predicates = "3.1"
 process-wrap = { version = "10.0.1", default-features = false }

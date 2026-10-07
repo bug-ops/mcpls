@@ -114,7 +114,7 @@ between spec versions under time pressure.
 
 **Acceptance criteria:**
 ```
-GIVEN this spec exists in .local/specs/mcp/003-mcp-2026-stateless-adoption/
+GIVEN this spec exists in specs/mcp/003-mcp-2026-stateless-adoption/
 WHEN a maintainer next reviews rmcp's release notes for a version that claims
      2026-07-28 conformance
 THEN this spec's Functional Requirements table gives them a checklist of the
@@ -158,7 +158,7 @@ this finding is P3 research, and `rmcp` conformance work is incomplete.
 |----|----------|-------------|
 | NFR-001 | Backward compatibility | mcpls SHALL NOT upgrade its `rmcp` dependency to a version that makes the stateless (no-`initialize`) model the *only* supported mode until `rmcp`'s own Tier rollout (per its roadmap) reaches a stage the maintainers judge stable — avoids adopting an unstable protocol surface mid-rollout |
 | NFR-002 | Compatibility window | Given Roots, Sampling, and Logging carry a 12-month deprecation window in 2026-07-28, mcpls's migration timeline SHOULD align with that window rather than rushing ahead of it, since mcpls does not currently implement Sampling or Elicitation (Roots/Logging usage should be confirmed — `[NEEDS CLARIFICATION: does mcpls currently use MCP Roots or Logging features from crates/mcpls-core/src/mcp/, and if so, are they exposed to clients today?]`) |
-| NFR-003 | Traceability | This spec SHALL be discoverable from `.local/specs/MOC-specs.md` and cross-linked with issues #119 and #122 so a future continuous-improvement cycle surfaces it automatically when scanning open research items |
+| NFR-003 | Traceability | This spec SHALL be discoverable from `specs/MOC-specs.md` and cross-linked with issues #119 and #122 so a future continuous-improvement cycle surfaces it automatically when scanning open research items |
 | NFR-004 | No premature action | No source code under `crates/` SHALL be modified as a result of this spec — it is a tracking/planning artifact only, consistent with its P3/research classification |
 
 ## 5. Data Model
@@ -186,7 +186,7 @@ that mcpls's MCP layer will eventually need to represent:
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | Spec discoverability | Spec is linked from `.local/specs/MOC-specs.md` and readable without additional context |
+| SC-001 | Spec discoverability | Spec is linked from `specs/MOC-specs.md` and readable without additional context |
 | SC-002 | Issue cross-linking | Issues #119 and #122 (or their successors) reference this spec, or this spec is referenced from a future issue tracking the actual migration |
 | SC-003 | No premature implementation | Zero commits to `crates/` reference this spec as their justification until `rmcp` conformance is confirmed by a maintainer |
 

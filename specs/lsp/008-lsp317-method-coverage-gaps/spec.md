@@ -10,7 +10,7 @@ tags:
   - lsp
   - mcp
 created: 2026-10-04
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/002-lsp317-missing-tools/spec|lsp317-missing-tools]]"
@@ -28,7 +28,7 @@ related:
 > [!info] Metadata
 > **Type**: enhancement / competitor-gap
 > **Priority**: P3 (declaration), P4 (type hierarchy, prepare rename, document highlight, range formatting)
-> **Implemented**: group A (declaration) with #567 as the `go_to_declaration` tool, routed through the `declaration` `handles` value, gated on `declarationProvider` and on indexing readiness like `get_definition`, taking a position only; link results are flattened like definition links. Groups B and C remain draft.
+> **Implemented**: group A (declaration) with #567 as the `go_to_declaration` tool, routed through the `declaration` `handles` value, gated on `declarationProvider` and on indexing readiness like `get_definition`, taking a position only; link results are flattened like definition links. Groups B and C (type hierarchy, prepare rename, document highlight, range formatting) are implemented; see the decision below.
 > **Related issues**: #567 (declaration, P3), #568 (type hierarchy, P4), #569 (minor methods: prepare rename, document highlight, range formatting, P4)
 
 ## Decision (#568, #569): Groups B and C implemented, declaration untouched

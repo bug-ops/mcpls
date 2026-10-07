@@ -82,7 +82,7 @@ serve.
 - LSP server spawn/initialize/respawn mechanics themselves —
   [[lsp/001-lsp-server-lifecycle-and-respawn/spec|spec lsp/001]].
 - Position/range conversion inside each handler — [[bridge/001-position-encoding-layer/spec|spec bridge/001]].
-- Adding new MCP tools — this spec documents the routing/dispatch architecture the existing 20
+- Adding new MCP tools — this spec documents the routing/dispatch architecture the existing 31
   tools already use, not a proposal for new tools (see
   [[lsp/002-lsp317-missing-tools/spec|spec lsp/002]] for that history).
 
