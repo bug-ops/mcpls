@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** notification lanes, lost-publish deliveries and JSON-RPC frames are typed (`Lane`, `LostFiles`, `BoundedPublish`, `ServerMessage`, `JsonRpcVersion`, `JsonRpcResponse { outcome }`, `PublicationKind::Lost`); a response with both `result` and `error`, or a `jsonrpc` other than `"2.0"`, is now undecodable; `LspServer` lane receivers are private. (#729, #739)
+- **Breaking:** `ServerEnv` is keyed by a typed `EnvKey` (non-empty, no `=` or NUL, checked at config load); config text and numeric newtypes come from shared macros, `BoundedText` gains `FromStr`/`AsRef`/`Borrow`, and `SizeExceeded` fields are sealed behind `size()`/`max()` and exported from `error`. (#721, #731, #739)
+- **Breaking:** `rename_symbol` `new_name`, `get_completions` `trigger` and `restart_server` targets are parsed into bounded types at the MCP boundary (a blank name is rejected before any LSP request, limits are stated in bytes), the disclosed indexing path accepts only its four capabilities, and `get_code_actions` `kind_filter` gains `source.fixAll` and `refactor.move`; `tool_surface.json` changes. (#730, #739)
+- Range, hierarchy-item and location-result handlers share the `positioned.rs` request helpers; definition, references and locations results are one type, so the `locations` description reads "Locations found." and `positions_degraded` is no longer nullable on `go_to_implementation`, `go_to_type_definition` and `go_to_declaration`. (#728, #739)
+- `Error::FileIo` and `Error::MalformedPath` report their cause once through `source()`; the new `ErrorChain` adapter renders the chain at the MCP boundary. (#720, #739)
+- **Breaking:** untrusted launcher analysis selects a shell's flag grammar by family, parses `env` with the shared option parser and names the matched flag spelling; `LauncherRefusal::program` is an `EchoedPath`, and `UnanalyzableLaunch::PathContainsEquals` becomes `UntrustedRefusal::WrappedProgramPathContainsEquals`. (#725, #727, #739)
+- **Breaking:** untrusted mode refuses a server whose `args` name an executable file inside the workspace (new `UntrustedRefusal::WorkspaceExecutableArgument` and `UnreadableWorkspaceArgument`), `pwsh -cwa`/`--command`, `fish -C`, `nu -e`, perl `-M`/`-d:` code, node/bun `--import` of `data:` URLs, `coreutils --coreutils-prog`, POSIX `-oc`/`+c` command strings, and `dotnet`, `pipenv`, `pixi`, `swift`, `stack` and `cabal` run subcommands. (#721, #723, #724, #727, #739)
+- Share one diagnostic severity enum and one echo-bounding helper, move `HostOs` to `config`, name supervised background tasks, and adopt newer std APIs in the #708 and #719 delta. (#732, #739)
 - Untrusted mode also refuses inline code glued to a flag or given with `=` (`python3 -c'..'`, `node --eval=..`, `fish --command=..`), `script`, `su`, `flock`, `watch`, `sudo -s`/`-i`/`NAME=value`, `deno repl`, versioned shell names, and more exec wrappers (`arch`, `caffeinate`, `chroot`, `unshare`, `nsenter`, `strace`, `systemd-run`). (#708)
 - **Breaking:** `LspServer` gains `publish_rx` and `take_publish_rx`/`take_notification_inbox`, `diagnostics_pump` takes a `NotificationInbox`, and `PumpShared` gains `roles`; `publishDiagnostics` no longer travels on `notification_rx`. (#708)
 - **Breaking:** a tool argument the tool does not declare is rejected naming the first unknown field and the accepted ones (was silently ignored), every `tools/list` input schema carries `additionalProperties: false`, the `tools/list` size budget is 135,500 B, and `PositionParams` no longer implements `Serialize`, `RangeParams` neither `Serialize`, `Deserialize` nor `JsonSchema`. (#708)
@@ -203,6 +211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The publish mailbox no longer strands a replaced publish after order compaction, and lost-publish marks survive a transient path-resolution failure. (#726, #739)
+- Untrusted refusals echo a wrapped program's whole path instead of cutting it at a space or `=`. (#725, #739)
 - `publishDiagnostics` bursts are no longer dropped above 256 frames: each server's publishes go through a per-file coalescing mailbox bounded to 1000 files and 64 MiB, files it cannot hold read `evicted` and notify subscribers, and overflow warnings are rate limited. (#708)
 - A respawned server's diagnostics pump now follows later role changes made while servers settle, and the pump loop tracks its sources in one state type. (#708)
 - `get_diagnostics` and the cache reads no longer list a pushed error the server's pull for the edited document already reported as fixed; only pull-covered items of an older push are dropped. (#708)
