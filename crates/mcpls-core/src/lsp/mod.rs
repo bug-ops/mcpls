@@ -41,5 +41,3 @@ pub use types::{
 };
 
 pub use crate::config::HostOs;
-#[cfg(test)]
-pub(crate) use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;

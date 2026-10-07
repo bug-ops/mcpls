@@ -2267,7 +2267,7 @@ mod tests {
         });
         let mut reader = BufReader::new(&mut fake.write_stdout);
         let wire = crate::test_lsp::read_framed_message(&mut reader).await;
-        let pad = "x".repeat(crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES - 20);
+        let pad = "x".repeat(crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES - 20);
         let message = format!("Invalid offset {pad}{secret}");
         crate::test_lsp::write_error_response(
             &mut fake.read_half_stdin,
@@ -5385,7 +5385,7 @@ sleep 0.3
     }
 
     #[test]
-    fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
+    fn test_resource_diagnostics_response_new_neither_open_nor_cached_is_untracked() {
         let response = ResourceDiagnosticsResponse::new(
             DocumentState::NotOpen,
             None,
@@ -5397,7 +5397,7 @@ sleep 0.3
     }
 
     #[test]
-    fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
+    fn test_resource_diagnostics_response_new_open_but_uncached_is_tracked() {
         let response = ResourceDiagnosticsResponse::new(
             DocumentState::Open,
             None,
@@ -5415,7 +5415,7 @@ sleep 0.3
     /// is non-empty, contradicting the documented "untracked implies empty
     /// diagnostics" contract.
     #[test]
-    fn test_build_resource_diagnostics_response_cached_but_unopened_is_tracked() {
+    fn test_resource_diagnostics_response_new_cached_but_unopened_is_tracked() {
         let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -5455,7 +5455,7 @@ sleep 0.3
     /// `push_notifications_degraded` signal as `get_cached_diagnostics`, since
     /// both serve the same cache and go dark the same way after a respawn.
     #[test]
-    fn test_build_resource_diagnostics_response_flags_push_degraded() {
+    fn test_resource_diagnostics_response_new_flags_push_degraded() {
         let response = ResourceDiagnosticsResponse::new(
             DocumentState::NotOpen,
             None,
@@ -5475,7 +5475,7 @@ sleep 0.3
     /// response carries the same `indexing_in_progress` signal
     /// `get_diagnostics`/`get_cached_diagnostics` surface.
     #[test]
-    fn test_build_resource_diagnostics_response_flags_indexing_in_progress() {
+    fn test_resource_diagnostics_response_new_flags_indexing_in_progress() {
         let response = ResourceDiagnosticsResponse::new(
             DocumentState::NotOpen,
             None,
@@ -5836,7 +5836,7 @@ sleep 0.3
             let message = response["result"]["content"][0]["text"].as_str().unwrap();
             assert!(message.starts_with("failed to deserialize parameters:"));
             assert!(!message.contains(&long_key));
-            assert!(message.len() <= crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES + 64);
+            assert!(message.len() <= crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES + 64);
         }
     }
 
