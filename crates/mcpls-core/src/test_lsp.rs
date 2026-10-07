@@ -77,7 +77,7 @@ pub fn fake_lsp_client_with_config(config: LspServerConfig) -> (LspClient, FakeS
 /// [`fake_lsp_client_with_lanes`].
 pub struct FakeLanes {
     /// Log/showMessage lane.
-    pub notification_rx: tokio::sync::mpsc::Receiver<crate::lsp::LspNotification>,
+    pub notification_rx: tokio::sync::mpsc::Receiver<crate::lsp::ServerMessage>,
     /// The diagnostics mailbox.
     pub publishes: crate::lsp::PublishReader,
     /// Lifecycle lane (`$/progress` `begin`/`end`, unrecognized notifications).
@@ -417,15 +417,64 @@ pub fn with_read_preamble(body: &str) -> String {
     format!("{READ_REQUEST_SH}{body}")
 }
 
+/// Feeds a pump the way a client's message loop does: publishes go through the
+/// diagnostics mailbox, log and `showMessage` frames through the bounded
+/// channel.
+#[derive(Debug)]
+pub struct PumpFeed {
+    messages: tokio::sync::mpsc::Sender<crate::lsp::ServerMessage>,
+    publishes: crate::lsp::PublishWriter,
+}
+
+impl PumpFeed {
+    /// Delivers `notification` on the lane the client routes it to.
+    ///
+    /// # Panics
+    ///
+    /// On a notification of the lifecycle lane, which a [`PumpFeed`] does not
+    /// carry.
+    pub async fn send(
+        &self,
+        notification: crate::lsp::LspNotification,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<crate::lsp::ServerMessage>> {
+        use crate::lsp::{LspNotification, ServerMessage};
+        match notification {
+            LspNotification::PublishDiagnostics(params) => {
+                self.publishes.publish(params);
+                Ok(())
+            }
+            LspNotification::LogMessage(params) => {
+                self.messages.send(ServerMessage::Log(params)).await
+            }
+            LspNotification::ShowMessage(params) => {
+                self.messages.send(ServerMessage::Show(params)).await
+            }
+            lifecycle @ (LspNotification::Progress(_) | LspNotification::Other { .. }) => {
+                panic!("not a notification-lane frame: {lifecycle:?}")
+            }
+        }
+    }
+}
+
+/// A [`PumpFeed`] and the inbox of the pump it feeds.
+pub fn pump_feed() -> (PumpFeed, crate::lsp::NotificationInbox) {
+    let (messages, messages_rx) = tokio::sync::mpsc::channel(32);
+    let (publishes, publishes_rx) = crate::lsp::mailbox(crate::lsp::MailboxLimits::default());
+    (
+        PumpFeed {
+            messages,
+            publishes,
+        },
+        crate::lsp::NotificationInbox::new(messages_rx, publishes_rx),
+    )
+}
+
 /// Spawns a real [`crate::runtime::pump::diagnostics_pump`] over `subs` and returns the
-/// sender feeding it plus the cancel token.
+/// feed of its notification lane plus the cancel token.
 pub fn spawn_test_pump(
     subs: crate::mcp::SubscriptionRegistry,
     workspace_roots: WorkspaceRoots,
-) -> (
-    tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
-    CancellationToken,
-) {
+) -> (PumpFeed, CancellationToken) {
     let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
         crate::bridge::NotificationCache::new(),
     ));
@@ -438,11 +487,8 @@ pub fn spawn_test_pump_with_cache(
     subs: crate::mcp::SubscriptionRegistry,
     workspace_roots: WorkspaceRoots,
     notification_cache: std::sync::Arc<tokio::sync::Mutex<crate::bridge::NotificationCache>>,
-) -> (
-    tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
-    CancellationToken,
-) {
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+) -> (PumpFeed, CancellationToken) {
+    let (tx, rx) = pump_feed();
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
     // Held so the lifecycle lane stays open for the pump's lifetime.
     let (_cache, cancel) = spawn_pump(
@@ -465,12 +511,12 @@ pub fn spawn_test_pump_with_tsserver_pin(
     tokio::sync::mpsc::Sender<crate::lsp::LspNotification>,
     CancellationToken,
 ) {
-    let (notification_tx, rx) = tokio::sync::mpsc::channel(32);
+    let (feed, rx) = pump_feed();
     let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(8);
     let (_cache, cancel) = spawn_pump(
         rx,
         lifecycle_rx,
-        notification_tx,
+        feed,
         crate::mcp::SubscriptionRegistry::default(),
         WorkspaceRoots::default(),
         std::sync::Arc::new(tokio::sync::Mutex::new(

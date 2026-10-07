@@ -70,6 +70,19 @@ pub enum PublicationKind {
     Diagnostics,
     /// Carries none: it only empties the entry, so it must never be lost.
     Clear,
+    /// Marks a file whose publish the mailbox lost: it carries no diagnostics
+    /// and, like a clear, must never be dropped.
+    Lost,
+}
+
+impl PublicationKind {
+    /// Whether a persistent transient failure must still place the URI.
+    const fn never_dropped(self) -> bool {
+        match self {
+            Self::Diagnostics => false,
+            Self::Clear | Self::Lost => true,
+        }
+    }
 }
 
 /// One published URI handed to [`PublishedPathResolver::resolve_batch`].
@@ -193,7 +206,7 @@ impl PublishedPathResolver {
     /// resolved, or a canonical path outside every root (for example a symlink
     /// pointing out of the workspace). A transient filesystem error is retried
     /// after each of [`TRANSIENT_RETRY_BACKOFF`]; if it persists, a
-    /// [`PublicationKind::Clear`] is placed under the path's last known
+    /// [`PublicationKind::Clear`] or [`PublicationKind::Lost`] is placed under the path's last known
     /// canonical form, or failing that its own lexically normalized spelling
     /// marked [`CanonicalForm::Fallback`] (a clear only ever empties an entry,
     /// and dropping it would leave the client with stale errors), while any
@@ -238,7 +251,7 @@ impl PublishedPathResolver {
                     (hit.to_path_buf(), CanonicalForm::Resolved)
                 } else if let Some(Resolution::Canonical(path)) = fresh.get(&source) {
                     (path.clone(), CanonicalForm::Resolved)
-                } else if transient && publication.kind == PublicationKind::Clear {
+                } else if transient && publication.kind.never_dropped() {
                     self.memo.last_known(&source).map_or_else(
                         || (lexically_normalize(&source), CanonicalForm::Fallback),
                         |known| (known.to_path_buf(), CanonicalForm::Resolved),
@@ -589,6 +602,26 @@ mod tests {
         assert!(out[0].is_none());
         assert_eq!(out[1].as_ref().unwrap().canonical(), &file);
         assert!(!out[1].as_ref().unwrap().is_canonical());
+    }
+
+    #[tokio::test]
+    async fn test_persistent_transient_error_keeps_lost_mark() {
+        let (_dir, root) = root();
+        let file = uri(&root.join("a.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver =
+            PublishedPathResolver::with_canonicalizer(failing_then_ok(&calls, usize::MAX));
+        let lost = Publication {
+            uri: &file,
+            kind: PublicationKind::Lost,
+        };
+
+        let first = resolver.resolve_batch(&[lost], &roots_of(&root)).await;
+        let holdoff = resolver.resolve_batch(&[lost], &roots_of(&root)).await;
+
+        for out in [first, holdoff] {
+            assert_eq!(out[0].as_ref().unwrap().canonical(), &file);
+        }
     }
 
     #[tokio::test]

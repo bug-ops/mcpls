@@ -312,8 +312,8 @@ impl Redactions {
                 config
                     .env
                     .iter()
-                    .filter(|(name, _)| is_secret_name(name))
-                    .map(|(name, value)| (name.clone(), value.clone())),
+                    .filter(|(name, _)| is_secret_name(name.as_str()))
+                    .map(|(name, value)| (name.to_string(), value.clone())),
             );
             collect_secret_args(&config.args, &mut candidates);
             if let Some(options) = &config.initialization_options {
@@ -553,9 +553,10 @@ mod tests {
     #[test]
     fn test_for_servers_covers_every_configured_server_over_one_environment() {
         let mut first = server_config();
-        first
-            .env
-            .insert("FIRST_TOKEN".into(), "first-secret-value".into());
+        first.env.insert(
+            crate::config::EnvKey::from_static("FIRST_TOKEN"),
+            "first-secret-value".into(),
+        );
         let mut second = server_config();
         second.args = vec!["--api-key=second-secret-value".into()];
 
@@ -926,9 +927,12 @@ mod tests {
         let mut config = server_config();
         config.env = crate::config::ServerEnv::from_entries(
             [
-                ("API_TOKEN".to_string(), "tok-1234567890".to_string()),
                 (
-                    "RUSTUP_TOOLCHAIN".to_string(),
+                    crate::config::EnvKey::from_static("API_TOKEN"),
+                    "tok-1234567890".to_string(),
+                ),
+                (
+                    crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
                     "nightly-2024-01-01".to_string(),
                 ),
             ],

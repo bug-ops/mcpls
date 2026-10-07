@@ -381,7 +381,7 @@ pub(super) async fn supervise_idle_reaper(
     cancel: tokio_util::sync::CancellationToken,
 ) {
     supervise(
-        "idle HTTP session reaper",
+        crate::error::BackgroundTask::IdleSessionReaper,
         || run_idle_reaper(std::sync::Arc::clone(&manager), cancel.clone()),
         &cancel,
         RestartDelays {
@@ -408,7 +408,7 @@ struct RestartDelays {
 /// during the delay. A panic is logged at error level at most once per
 /// `delays.max`, so a task that panics at once does not flood the log.
 async fn supervise<Fut: std::future::Future<Output = ()>>(
-    what: &'static str,
+    what: crate::error::BackgroundTask,
     mut run: impl FnMut() -> Fut,
     cancel: &tokio_util::sync::CancellationToken,
     delays: RestartDelays,
@@ -1432,7 +1432,7 @@ mod tests {
             tokio::spawn(async move {
                 let counting = std::sync::Arc::clone(&runs);
                 supervise(
-                    "test task",
+                    crate::error::BackgroundTask::IdleSessionReaper,
                     move || {
                         counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         async { panic!("always") }
@@ -1465,7 +1465,7 @@ mod tests {
             tokio::spawn(async move {
                 let waiting = cancel.clone();
                 supervise(
-                    "test task",
+                    crate::error::BackgroundTask::IdleSessionReaper,
                     || {
                         let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let waiting = waiting.clone();
@@ -1498,7 +1498,7 @@ mod tests {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 supervise(
-                    "test task",
+                    crate::error::BackgroundTask::IdleSessionReaper,
                     || async { panic!("always") },
                     &cancel,
                     test_delays(),

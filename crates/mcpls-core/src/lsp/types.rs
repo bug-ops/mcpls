@@ -8,18 +8,44 @@ use lsp_types::Notification as _;
 pub use lsp_types::{
     LogMessageParams, ProgressParams, PublishDiagnosticsParams, ShowMessageParams,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Deserializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use tracing::debug;
 
 /// JSON-RPC protocol version carried by every message.
 pub const JSONRPC_VERSION: &str = "2.0";
 
+/// The `"jsonrpc": "2.0"` member of a message: serializes as [`JSONRPC_VERSION`]
+/// and refuses to deserialize from anything else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JsonRpcVersion;
+
+impl Serialize for JsonRpcVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(JSONRPC_VERSION)
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let version = Cow::<str>::deserialize(deserializer)?;
+        if version == JSONRPC_VERSION {
+            Ok(Self)
+        } else {
+            Err(de::Error::invalid_value(
+                de::Unexpected::Str(&version),
+                &JSONRPC_VERSION,
+            ))
+        }
+    }
+}
+
 /// JSON-RPC 2.0 request message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     /// JSON-RPC version, always "2.0".
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion,
     /// Request identifier.
     pub id: RequestId,
     /// Method name.
@@ -30,25 +56,64 @@ pub struct JsonRpcRequest {
 }
 
 /// JSON-RPC 2.0 response message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserializing refuses a response that carries both `result` and `error`,
+/// and reads one that carries neither as a `null` result.
+#[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcResponse {
     /// JSON-RPC version, always "2.0".
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion,
     /// Request identifier.
     pub id: RequestId,
-    /// Result value (if successful).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    /// Error object (if failed).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
+    /// How the request ended.
+    #[serde(flatten)]
+    pub outcome: JsonRpcOutcome,
+}
+
+impl<'de> Deserialize<'de> for JsonRpcResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A present `result: null` must stay distinguishable from an absent one.
+        fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+            Value::deserialize(deserializer).map(Some)
+        }
+
+        #[derive(Deserialize)]
+        struct Raw {
+            jsonrpc: JsonRpcVersion,
+            id: RequestId,
+            #[serde(default, deserialize_with = "present")]
+            result: Option<Value>,
+            #[serde(default)]
+            error: Option<JsonRpcError>,
+        }
+
+        let Raw {
+            jsonrpc,
+            id,
+            result,
+            error,
+        } = Raw::deserialize(deserializer)?;
+        let outcome = match (result, error) {
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom("response carries both result and error"));
+            }
+            (Some(result), None) => JsonRpcOutcome::Result(result),
+            (None, Some(error)) => JsonRpcOutcome::Error(error),
+            (None, None) => JsonRpcOutcome::Result(Value::Null),
+        };
+        Ok(Self {
+            jsonrpc,
+            id,
+            outcome,
+        })
+    }
 }
 
 /// JSON-RPC 2.0 notification message (no response expected).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
     /// JSON-RPC version, always "2.0".
-    pub jsonrpc: String,
+    pub jsonrpc: JsonRpcVersion,
     /// Method name.
     pub method: String,
     /// Optional method parameters.
@@ -80,8 +145,8 @@ impl JsonRpcError {
     }
 }
 
-/// How an outbound JSON-RPC response ends: a result or an error, never both
-/// and never neither.
+/// How a JSON-RPC response ends: a result or an error, never both and never
+/// neither.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JsonRpcOutcome {
@@ -104,7 +169,7 @@ impl From<Result<Value, JsonRpcError>> for JsonRpcOutcome {
 /// outbound envelope is built.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcReply {
-    jsonrpc: &'static str,
+    jsonrpc: JsonRpcVersion,
     id: RequestId,
     #[serde(flatten)]
     outcome: JsonRpcOutcome,
@@ -115,7 +180,7 @@ impl JsonRpcReply {
     #[must_use]
     pub const fn new(id: RequestId, outcome: JsonRpcOutcome) -> Self {
         Self {
-            jsonrpc: JSONRPC_VERSION,
+            jsonrpc: JsonRpcVersion,
             id,
             outcome,
         }
@@ -213,7 +278,7 @@ pub enum LspNotification {
 /// payload (`ProgressParams::value` is `serde_json::Value`; `gen-lsp-types`
 /// 0.11.0 has no union type for it).
 ///
-/// Single source of truth for both `LspClient::notification_lane` (routes
+/// Single source of truth for both `LspClient::lifecycle_lane` (routes
 /// `begin`/`end` to the lifecycle lane, drops everything else) and
 /// `bridge::indexing::IndexingTracker::observe_progress` (the settle/latch
 /// transition) -- previously each read `value["kind"]` independently, so
@@ -314,6 +379,8 @@ impl LspNotification {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use serde_json::json;
 
     use super::*;
@@ -343,7 +410,7 @@ mod tests {
     #[test]
     fn test_request_serialization() {
         let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion,
             id: RequestId::Number(1),
             method: "textDocument/hover".to_string(),
             params: Some(json!({"key": "value"})),
@@ -360,10 +427,11 @@ mod tests {
         let json_str = r#"{"jsonrpc":"2.0","id":1,"result":{"key":"value"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
 
-        assert_eq!(response.jsonrpc, "2.0");
         assert_eq!(response.id, RequestId::Number(1));
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+        assert_matches!(
+            response.outcome,
+            JsonRpcOutcome::Result(value) if value == json!({"key": "value"})
+        );
     }
 
     #[test]
@@ -372,12 +440,10 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
 
-        assert_eq!(response.jsonrpc, "2.0");
         assert_eq!(response.id, RequestId::Number(1));
-        assert!(response.result.is_none());
-        assert!(response.error.is_some());
-
-        let error = response.error.unwrap();
+        let JsonRpcOutcome::Error(error) = response.outcome else {
+            panic!("expected an error outcome");
+        };
         assert_eq!(error.code, -32600);
         assert_eq!(error.message, "Invalid Request");
     }
@@ -385,7 +451,7 @@ mod tests {
     #[test]
     fn test_notification_serialization() {
         let notification = JsonRpcNotification {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JsonRpcVersion,
             method: "initialized".to_string(),
             params: None,
         };
@@ -419,23 +485,49 @@ mod tests {
         let json_str = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
         let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
 
-        assert_eq!(response.jsonrpc, "2.0");
         assert_eq!(response.id, RequestId::Number(1));
-        assert!(response.result.is_none());
-        assert!(response.error.is_none());
+        assert_matches!(response.outcome, JsonRpcOutcome::Result(Value::Null));
     }
 
     #[test]
     fn test_null_vs_missing_result() {
         let null_json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
         let null_response: JsonRpcResponse = serde_json::from_str(null_json).unwrap();
-        assert!(null_response.result.is_none());
+        assert_matches!(null_response.outcome, JsonRpcOutcome::Result(Value::Null));
 
         let missing_json = r#"{"jsonrpc":"2.0","id":1}"#;
         let missing_response: JsonRpcResponse = serde_json::from_str(missing_json).unwrap();
-        assert!(missing_response.result.is_none());
+        assert_matches!(
+            missing_response.outcome,
+            JsonRpcOutcome::Result(Value::Null)
+        );
+    }
 
-        assert_eq!(null_response.result, missing_response.result);
+    #[test]
+    fn test_response_with_both_result_and_error_is_refused() {
+        let both = r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":1,"message":"x"}}"#;
+
+        assert!(serde_json::from_str::<JsonRpcResponse>(both).is_err());
+    }
+
+    #[test]
+    fn test_response_with_a_null_error_is_a_result() {
+        let json_str = r#"{"jsonrpc":"2.0","id":1,"result":3,"error":null}"#;
+
+        let response: JsonRpcResponse = serde_json::from_str(json_str).unwrap();
+
+        assert_matches!(response.outcome, JsonRpcOutcome::Result(value) if value == json!(3));
+    }
+
+    #[test]
+    fn test_any_other_jsonrpc_version_is_refused() {
+        for version in [r#""1.0""#, r#""2""#, "2.0", "null"] {
+            let response = format!(r#"{{"jsonrpc":{version},"id":1,"result":null}}"#);
+            let request = format!(r#"{{"jsonrpc":{version},"id":1,"method":"m"}}"#);
+
+            assert!(serde_json::from_str::<JsonRpcResponse>(&response).is_err());
+            assert!(serde_json::from_str::<JsonRpcRequest>(&request).is_err());
+        }
     }
 
     #[test]

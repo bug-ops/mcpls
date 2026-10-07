@@ -204,7 +204,7 @@ pub struct McplsServer {
     reason = "by-value `e` lets this be passed straight to `Result::map_err`"
 )]
 fn map_bridge_error(e: crate::error::Error) -> McpError {
-    let message = e.to_string();
+    let message = crate::error::ErrorChain(&e).to_string();
     match e.mcp_error_kind() {
         crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
         crate::error::McpErrorKind::InvalidPosition(raw) => {
@@ -466,15 +466,36 @@ struct ResourceDiagnosticsResponse {
     signals: RouteSignals,
 }
 
+/// Whether a file is currently open through `DocumentTracker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentState {
+    Open,
+    NotOpen,
+}
+
+impl DocumentState {
+    const fn of(open: bool) -> Self {
+        if open { Self::Open } else { Self::NotOpen }
+    }
+}
+
 impl ResourceDiagnosticsResponse {
+    /// Builds `read_resource`'s response for a file. `tracked` is true when the
+    /// file is open (`document`) *or* the diagnostics cache already holds an
+    /// entry for it (`entry.is_some()`) -- not `document` alone: an LSP server
+    /// publishes `textDocument/publishDiagnostics` for whatever it analyzes,
+    /// including files mcpls never explicitly opened (e.g. one rust-analyzer
+    /// pulls in transitively), so `document` alone could report
+    /// `tracked: false` while `diagnostics` is still non-empty, contradicting
+    /// the documented "untracked implies empty diagnostics" contract.
     fn new(
-        tracked: bool,
+        document: DocumentState,
         entry: Option<&DiagnosticInfo>,
         availability: DiagnosticsAvailability,
         signals: RouteSignals,
     ) -> Self {
         Self {
-            tracked,
+            tracked: document == DocumentState::Open || entry.is_some(),
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
             availability,
@@ -491,29 +512,6 @@ struct DiagnosticsSnapshot {
     signals: RouteSignals,
     /// The server that published the cached diagnostics, if any.
     owner: Option<crate::config::ServerId>,
-}
-
-/// Build `read_resource`'s response for a file. `tracked` is true when the
-/// file is currently open via `DocumentTracker` (`document_open`) *or* the
-/// diagnostics cache already holds an entry for it (`entry.is_some()`) --
-/// not `document_open` alone: an LSP server publishes
-/// `textDocument/publishDiagnostics` for whatever it analyzes, including
-/// files mcpls never explicitly opened (e.g. one rust-analyzer pulls in
-/// transitively), so `document_open` alone could report `tracked: false`
-/// while `diagnostics` is still non-empty, contradicting the documented
-/// "untracked implies empty diagnostics" contract.
-fn build_resource_diagnostics_response(
-    document_open: bool,
-    entry: Option<&DiagnosticInfo>,
-    availability: DiagnosticsAvailability,
-    signals: RouteSignals,
-) -> ResourceDiagnosticsResponse {
-    ResourceDiagnosticsResponse::new(
-        document_open || entry.is_some(),
-        entry,
-        availability,
-        signals,
-    )
 }
 
 // Diagnostics were redacted when they entered the cache or the pull path.
@@ -822,15 +820,14 @@ impl McplsServer {
         // Merging push-model (flycheck/clippy) diagnostics into the pull
         // result, including the pull-error-but-cache-has-data fallback, is
         // handled inside handle_diagnostics itself -- see its doc comment.
-        let result = match validated {
-            Ok(path) => {
-                self.context
-                    .translator
-                    .handle_validated_diagnostics(&path, context, &self.context.notification_cache)
-                    .await
-            }
-            Err(e) => Err(e),
-        };
+        let result = async {
+            let path = validated?;
+            self.context
+                .translator
+                .handle_validated_diagnostics(&path, context, &self.context.notification_cache)
+                .await
+        }
+        .await;
 
         let after = {
             let cache = self.context.notification_cache.lock().await;
@@ -1230,8 +1227,8 @@ impl McplsServer {
         Parameters(CachedDiagnosticsParams { file_path }): Parameters<CachedDiagnosticsParams>,
     ) -> Result<Json<CachedDiagnosticsResponse>, McpError> {
         let file_path = parse_client_path(file_path)?;
-        let result = match self.diagnostics_snapshot(&file_path).await {
-            Ok((
+        let result = async {
+            let (
                 _,
                 DiagnosticsSnapshot {
                     sources,
@@ -1239,25 +1236,24 @@ impl McplsServer {
                     signals,
                     owner,
                 },
-            )) => {
-                let diag_info = sources.merge();
-                let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
-                    self.context.translator.position_encoding_for(&server_id)
-                });
-                let result = Translator::diagnostics_from_cache_entry(
-                    diag_info.as_ref(),
-                    encoding,
-                    self.context.translator.document_tracker(),
-                )
-                .await;
-                Ok(CachedDiagnosticsResponse {
-                    result,
-                    availability,
-                    signals,
-                })
-            }
-            Err(e) => Err(e),
-        };
+            ) = self.diagnostics_snapshot(&file_path).await?;
+            let diag_info = sources.merge();
+            let encoding = owner.map_or(PositionEncoding::Utf16, |server_id| {
+                self.context.translator.position_encoding_for(&server_id)
+            });
+            let result = Translator::diagnostics_from_cache_entry(
+                diag_info.as_ref(),
+                encoding,
+                self.context.translator.document_tracker(),
+            )
+            .await;
+            Ok::<_, crate::error::Error>(CachedDiagnosticsResponse {
+                result,
+                availability,
+                signals,
+            })
+        }
+        .await;
 
         self.structured_result(result)
     }
@@ -1499,10 +1495,12 @@ impl McplsServer {
         // Merging the sources (dedupe, sort, size cap) runs after the cache
         // lock is released, since `diagnostics_pump` needs the same lock.
         let diag_info = snapshot.sources.merge();
-        Ok(build_resource_diagnostics_response(
-            self.context
-                .translator
-                .is_document_open(validated_path.as_path()),
+        Ok(ResourceDiagnosticsResponse::new(
+            DocumentState::of(
+                self.context
+                    .translator
+                    .is_document_open(validated_path.as_path()),
+            ),
             diag_info.as_ref(),
             snapshot.availability,
             snapshot.signals,
@@ -2017,7 +2015,9 @@ mod tests {
 
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
-    use crate::bridge::{Capability, IndexingSignal, LogLevel, ResultContext, RouteSignals};
+    use crate::bridge::{
+        Capability, IndexingSignal, LogLevel, NewName, ResultContext, RouteSignals,
+    };
     use crate::config::{
         FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle, ServerCommand,
     };
@@ -2267,7 +2267,7 @@ mod tests {
         });
         let mut reader = BufReader::new(&mut fake.write_stdout);
         let wire = crate::test_lsp::read_framed_message(&mut reader).await;
-        let pad = "x".repeat(crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES - 20);
+        let pad = "x".repeat(crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES - 20);
         let message = format!("Invalid offset {pad}{secret}");
         crate::test_lsp::write_error_response(
             &mut fake.read_half_stdin,
@@ -2286,6 +2286,41 @@ mod tests {
                 assert!(!text.contains(&secret[..len]), "{len}: {text}");
             }
         }
+    }
+
+    /// #720: the error's `Display` no longer repeats its source, so the MCP
+    /// boundary renders the chain and the OS cause reaches the client once.
+    #[test]
+    fn test_map_bridge_error_carries_the_os_cause_once() {
+        let file_io = crate::error::Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        let mapped = map_bridge_error(file_io);
+        assert_eq!(
+            mapped.message.matches("no such file").count(),
+            1,
+            "{}",
+            mapped.message
+        );
+        assert!(mapped.message.contains("a.rs"), "{}", mapped.message);
+    }
+
+    /// #720: a secret carried by a chained cause is still hidden by the funnel.
+    #[test]
+    fn test_render_error_hides_secrets_in_the_rendered_chain() {
+        let redactions = two_server_redactions("bravo-secret-222");
+        let file_io = crate::error::Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: std::io::Error::other("denied for bravo-secret-222"),
+        };
+        let rendered = render_error(file_io, &redactions);
+        assert!(
+            !rendered.message.contains("bravo-secret-222"),
+            "{}",
+            rendered.message
+        );
+        assert!(rendered.message.contains("denied"), "{}", rendered.message);
     }
 
     /// #612: an embedder's client whose own set lacks another server's
@@ -2694,8 +2729,8 @@ mod tests {
         assert_eq!(pulled["origin"], "push_cache");
         assert_eq!(pulled["indexing_in_progress"], false);
 
-        let resource = serde_json::to_value(build_resource_diagnostics_response(
-            true,
+        let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
+            DocumentState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -2770,7 +2805,7 @@ mod tests {
                 server
                     .rename_symbol(Parameters(RenameParams {
                         target: position(line, character).into(),
-                        new_name: "x".into(),
+                        new_name: NewName::try_new("x").unwrap(),
                     }))
                     .await
                     .map(|_| ()),
@@ -3624,8 +3659,8 @@ mod tests {
             signals,
         })
         .unwrap();
-        let resource = serde_json::to_value(build_resource_diagnostics_response(
-            true,
+        let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
+            DocumentState::Open,
             None,
             DiagnosticsAvailability::Pending,
             signals,
@@ -3747,7 +3782,7 @@ mod tests {
                 character: 5,
             }
             .into(),
-            new_name: "new_name".to_string(),
+            new_name: NewName::try_new("new_name").unwrap(),
         });
 
         let result = server.rename_symbol(params).await;
@@ -5264,7 +5299,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
         let response = ResourceDiagnosticsResponse::new(
-            false,
+            DocumentState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5283,7 +5318,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
         let response = ResourceDiagnosticsResponse::new(
-            true,
+            DocumentState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5321,7 +5356,7 @@ sleep 0.3
             data: None,
         }]);
         let response = ResourceDiagnosticsResponse::new(
-            true,
+            DocumentState::Open,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5338,7 +5373,7 @@ sleep 0.3
     }
 
     /// A path `read_resource` never opened reports `is_document_open() == false`
-    /// -- one of the two inputs `build_resource_diagnostics_response` ORs together.
+    /// -- one of the two inputs `ResourceDiagnosticsResponse::new` ORs together.
     #[tokio::test]
     async fn test_read_resource_untracked_path_is_not_open() {
         let server = create_test_server();
@@ -5350,9 +5385,9 @@ sleep 0.3
     }
 
     #[test]
-    fn test_build_resource_diagnostics_response_neither_open_nor_cached_is_untracked() {
-        let response = build_resource_diagnostics_response(
-            false,
+    fn test_resource_diagnostics_response_new_neither_open_nor_cached_is_untracked() {
+        let response = ResourceDiagnosticsResponse::new(
+            DocumentState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5362,9 +5397,9 @@ sleep 0.3
     }
 
     #[test]
-    fn test_build_resource_diagnostics_response_open_but_uncached_is_tracked() {
-        let response = build_resource_diagnostics_response(
-            true,
+    fn test_resource_diagnostics_response_new_open_but_uncached_is_tracked() {
+        let response = ResourceDiagnosticsResponse::new(
+            DocumentState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5380,7 +5415,7 @@ sleep 0.3
     /// is non-empty, contradicting the documented "untracked implies empty
     /// diagnostics" contract.
     #[test]
-    fn test_build_resource_diagnostics_response_cached_but_unopened_is_tracked() {
+    fn test_resource_diagnostics_response_new_cached_but_unopened_is_tracked() {
         let entry = sample_diagnostic_info(vec![lsp_types::Diagnostic {
             range: lsp_types::Range {
                 start: lsp_types::Position {
@@ -5402,8 +5437,8 @@ sleep 0.3
             data: None,
         }]);
 
-        let response = build_resource_diagnostics_response(
-            false,
+        let response = ResourceDiagnosticsResponse::new(
+            DocumentState::NotOpen,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5420,9 +5455,9 @@ sleep 0.3
     /// `push_notifications_degraded` signal as `get_cached_diagnostics`, since
     /// both serve the same cache and go dark the same way after a respawn.
     #[test]
-    fn test_build_resource_diagnostics_response_flags_push_degraded() {
-        let response = build_resource_diagnostics_response(
-            false,
+    fn test_resource_diagnostics_response_new_flags_push_degraded() {
+        let response = ResourceDiagnosticsResponse::new(
+            DocumentState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {
@@ -5440,9 +5475,9 @@ sleep 0.3
     /// response carries the same `indexing_in_progress` signal
     /// `get_diagnostics`/`get_cached_diagnostics` surface.
     #[test]
-    fn test_build_resource_diagnostics_response_flags_indexing_in_progress() {
-        let response = build_resource_diagnostics_response(
-            false,
+    fn test_resource_diagnostics_response_new_flags_indexing_in_progress() {
+        let response = ResourceDiagnosticsResponse::new(
+            DocumentState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {
@@ -5801,7 +5836,7 @@ sleep 0.3
             let message = response["result"]["content"][0]["text"].as_str().unwrap();
             assert!(message.starts_with("failed to deserialize parameters:"));
             assert!(!message.contains(&long_key));
-            assert!(message.len() <= crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES + 64);
+            assert!(message.len() <= crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES + 64);
         }
     }
 
@@ -6678,7 +6713,7 @@ sleep 0.3
             McpTool::RenameSymbol => server
                 .rename_symbol(Parameters(RenameParams {
                     target: position().into(),
-                    new_name: "renamed".to_string(),
+                    new_name: NewName::try_new("renamed").unwrap(),
                 }))
                 .await
                 .map(|_| ()),

@@ -1,22 +1,19 @@
 //! Completions, signature help, and inlay hints handlers.
 
-use lsp_types::{
-    CompletionTriggerKind, InlayHintParams, TextDocumentIdentifier, WorkDoneProgressParams,
-};
+use lsp_types::CompletionTriggerKind;
 
 use super::Translator;
 use super::dto::{
-    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, PositionRange,
-    SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
+    Completion, CompletionTrigger, CompletionsResult, InlayHintEntry, InlayHintsResult, Position,
+    PositionRange, SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{Capability, DisclosedCapability, IndexingGate};
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::bridge::{ClientPath, Indexed};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
-/// Extract hover contents as markdown string.
 /// Convert LSP `Documentation` to a plain string.
 fn extract_documentation(doc: lsp_types::Documentation) -> String {
     match doc {
@@ -103,50 +100,23 @@ fn signature_parameters(
         .collect()
 }
 
-/// Maximum length, in bytes, of a `get_completions` `trigger` parameter.
-///
-/// The LSP spec defines `triggerCharacter` as a single character, but
-/// `CompletionsParams.trigger` is still an unbounded free-form `String`
-/// forwarded to the LSP server as `trigger_character` with no cap of its
-/// own (#309 M3) -- the same forwarding-without-a-cap shape `new_name` and
-/// `query` had. 8 bytes comfortably covers any single Unicode codepoint (at
-/// most 4 bytes in UTF-8) with margin, while still rejecting anything that
-/// isn't plausibly "one character".
-pub(super) const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
-
-/// Validate parameters for `handle_completions`.
-fn validate_completions_params(trigger: Option<&str>) -> Result<()> {
-    if let Some(trigger) = trigger
-        && trigger.len() > MAX_TRIGGER_CHARACTER_BYTES
-    {
-        return Err(Error::InvalidToolParams(format!(
-            "trigger too long: {} bytes (max {MAX_TRIGGER_CHARACTER_BYTES})",
-            trigger.len()
-        )));
-    }
-    Ok(())
-}
-
 impl Translator {
     /// Handle completions request.
     ///
     /// # Errors
     ///
-    /// Returns an error if `trigger` exceeds the maximum allowed length,
-    /// the LSP request fails, the file cannot be opened, the routed server
+    /// Returns an error if the LSP request fails, the file cannot be opened, the routed server
     /// does not advertise `completionProvider` support, or the server is
     /// still indexing the workspace (see `wait_for_indexing_ready`).
     pub async fn handle_completions(
         &self,
         file_path: ClientPath,
         position: Position,
-        trigger: Option<String>,
+        trigger: Option<CompletionTrigger>,
     ) -> Result<CompletionsResult> {
-        validate_completions_params(trigger.as_deref())?;
-
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
-            trigger_character: Some(trigger_char),
+            trigger_character: Some(trigger_char.into_string()),
         });
 
         let Positioned {
@@ -175,10 +145,7 @@ impl Translator {
                     label: item.label,
                     kind: item.kind.map(lsp_kind_to_u32),
                     detail: item.detail,
-                    documentation: item.documentation.map(|doc| match doc {
-                        lsp_types::Documentation::String(s) => s,
-                        lsp_types::Documentation::MarkupContent(m) => m.value,
-                    }),
+                    documentation: item.documentation.map(extract_documentation),
                 })
                 .collect(),
             positions_degraded: ctx.positions_degraded(),
@@ -213,7 +180,7 @@ impl Translator {
             .disclosed_position_request::<lsp_types::SignatureHelpRequest>(
                 &file_path,
                 position,
-                Capability::SignatureHelp,
+                DisclosedCapability::SignatureHelp,
                 (),
             )
             .await?;
@@ -265,26 +232,23 @@ impl Translator {
         file_path: ClientPath,
         range: PositionRange,
     ) -> Result<Indexed<InlayHintsResult>> {
-        let (start, end) = (range.start(), range.end());
-        let doc = self
-            .prepare_disclosed_document(&file_path, Capability::InlayHints, &[start, end])
+        let Positioned {
+            result:
+                Indexed {
+                    result: response,
+                    indexing,
+                },
+            ctx,
+            doc,
+        } = self
+            .disclosed_range_request::<lsp_types::InlayHintRequest>(
+                &file_path,
+                DisclosedCapability::InlayHints,
+                range,
+                (),
+            )
             .await?;
         let uri = doc.uri();
-        let ctx = self.encoding_ctx(doc.server_id());
-
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: lsp_types::Range {
-                start: ctx.to_lsp(uri, start).await,
-                end: ctx.to_lsp(uri, end).await,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let Indexed {
-            result: response,
-            indexing,
-        } = doc.request::<lsp_types::InlayHintRequest>(params).await?;
 
         let mut budget = ItemBudget::new();
         let lsp_hints = budget.admit(response.unwrap_or_default());
@@ -293,11 +257,9 @@ impl Translator {
             let position = ctx.to_mcp(uri, hint.position).await;
             let label = match hint.label {
                 lsp_types::Label::String(s) => s,
-                lsp_types::Label::InlayHintLabelPartList(parts) => parts
-                    .into_iter()
-                    .map(|p| p.value)
-                    .collect::<Vec<_>>()
-                    .concat(),
+                lsp_types::Label::InlayHintLabelPartList(parts) => {
+                    parts.into_iter().map(|p| p.value).collect::<String>()
+                }
             };
             let tooltip = hint.tooltip.map(|t| match t {
                 lsp_types::Tooltip::String(s) => s,
@@ -332,26 +294,8 @@ mod tests {
     use crate::bridge::IndexingSignal;
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
+    use crate::error::Error;
     use crate::test_lsp::client_path;
-
-    /// #309 M3: `trigger` has no cap of its own even though the LSP spec
-    /// defines it as a single character.
-    #[test]
-    fn test_validate_completions_params_rejects_oversized_trigger() {
-        let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
-        let result = validate_completions_params(Some(&trigger));
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[test]
-    fn test_validate_completions_params_accepts_typical_trigger_char() {
-        assert!(validate_completions_params(Some(".")).is_ok());
-    }
-
-    #[test]
-    fn test_validate_completions_params_accepts_none() {
-        assert!(validate_completions_params(None).is_ok());
-    }
 
     /// End-to-end: `handle_completions` must surface
     /// `Error::WorkspaceIndexing` -- not an empty result -- while the routed

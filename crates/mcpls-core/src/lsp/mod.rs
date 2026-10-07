@@ -15,11 +15,8 @@ mod transport;
 pub(crate) mod tsserver_pin;
 pub(crate) mod types;
 
-pub(crate) use client::{
-    CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
-};
+pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, UnclassifiedError};
 pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};
-pub use command_path::HostOs;
 pub(crate) use env::{ManagedEnvVar, ParentEnv, process_env};
 #[cfg(test)]
 #[cfg(unix)]
@@ -31,12 +28,16 @@ pub(crate) use lifecycle::{
 #[cfg(test)]
 pub(crate) use lifecycle::{fake_lsp_server, fake_lsp_server_with_config};
 pub use process::LIFELINE_SWEEP_BUDGET;
+pub use publish_mailbox::{
+    BoundedPublish, LostFiles, NotificationInbox, PublishDelivery, PublishReader, ServerMessage,
+};
+pub(crate) use publish_mailbox::{DropCounter, DropLog, Lane, NotificationSink};
 #[cfg(test)]
-pub(crate) use publish_mailbox::MailboxLimits;
-pub(crate) use publish_mailbox::{DropLog, NotificationSink};
-pub use publish_mailbox::{LostPublishes, NotificationInbox, PublishDelivery, PublishReader};
+pub(crate) use publish_mailbox::{MailboxLimits, PublishWriter, mailbox};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,
     RequestId,
 };
+
+pub use crate::config::HostOs;

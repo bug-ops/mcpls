@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 
+use crate::config::EnvKey;
 use crate::error::HomeVariable;
 
 /// A lookup into mcpls's own environment, injected so callers and tests need
@@ -43,6 +44,12 @@ impl ManagedEnvVar {
         Self::UserProfile,
         Self::NoDefaultCurrentDirectoryInExePath,
     ];
+
+    /// The variable's name as an [`EnvKey`].
+    #[must_use]
+    pub const fn key(self) -> EnvKey {
+        EnvKey::from_static(self.name())
+    }
 
     /// The variable's name in the environment.
     #[must_use]

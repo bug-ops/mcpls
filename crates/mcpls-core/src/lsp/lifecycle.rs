@@ -38,7 +38,7 @@ use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::lsp::{
     CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
-    PublishReader, process_env, tsserver_pin,
+    PublishReader, ServerMessage, process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -474,26 +474,24 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
-    /// Receiver for push notifications from the LSP server: diagnostics,
-    /// log messages, and show-message requests.
-    ///
-    /// Extract this before registering the server to receive real-time
-    /// notifications (e.g., `textDocument/publishDiagnostics`).
-    pub notification_rx: mpsc::Receiver<LspNotification>,
+    /// Receiver for the log and `showMessage` frames of the LSP server
+    /// ([`ServerMessage`]); diagnostics arrive on [`Self::publish_rx`].
+    /// Taken for a pump with [`Self::take_notification_inbox`].
+    notification_rx: mpsc::Receiver<ServerMessage>,
     /// Receiver of the diagnostics mailbox: `textDocument/publishDiagnostics`
     /// is coalesced per file and a publish it cannot hold is reported as lost
-    /// instead of being dropped (see [`PublishReader`]). Extract it with
-    /// [`Self::take_publish_rx`].
-    pub publish_rx: PublishReader,
+    /// instead of being dropped (see [`PublishReader`]). Taken for a pump with
+    /// [`Self::take_notification_inbox`].
+    publish_rx: PublishReader,
     /// Receiver for the lifecycle lane (P3): `$/progress` `begin`/`end`
     /// frames and unrecognized notifications (which carry e.g.
     /// rust-analyzer's `experimental/serverStatus`), kept separate from
     /// [`Self::notification_rx`] so a high-volume diagnostics publisher can
     /// never starve out a workspace-readiness signal, or vice versa.
     ///
-    /// Extract this before registering the server, the same way as
-    /// [`Self::notification_rx`] -- see [`Self::take_lifecycle_rx`].
-    pub lifecycle_rx: mpsc::Receiver<LspNotification>,
+    /// Extract this before registering the server -- see
+    /// [`Self::take_lifecycle_rx`].
+    lifecycle_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management and
     /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
@@ -556,11 +554,7 @@ impl LspServer {
     }
 
     /// Take the notification receiver out of this server, replacing it with a dummy channel.
-    ///
-    /// Use this to extract the receiver for a background pump task before registering
-    /// the server with the translator. After this call, the server's `notification_rx`
-    /// will never receive messages.
-    pub fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
+    fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<ServerMessage> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.notification_rx, dummy)
     }
@@ -572,17 +566,15 @@ impl LspServer {
     }
 
     /// Take the diagnostics mailbox out of this server, replacing it with a
-    /// closed one. Extract it with [`Self::take_notification_rx`] before
-    /// registering the server for a pump.
-    pub fn take_publish_rx(&mut self) -> PublishReader {
+    /// closed one.
+    fn take_publish_rx(&mut self) -> PublishReader {
         std::mem::replace(&mut self.publish_rx, PublishReader::closed())
     }
 
     /// Take the lifecycle receiver out of this server, replacing it with a
     /// dummy channel -- the lifecycle-lane counterpart to
-    /// [`Self::take_notification_rx`]. Extract this before registering the
-    /// server for a background pump task to drain, the same way as
-    /// [`Self::notification_rx`].
+    /// [`Self::take_notification_inbox`]. Extract this before registering the
+    /// server for a background pump task to drain.
     pub fn take_lifecycle_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
         let (_, dummy) = tokio::sync::mpsc::channel(1);
         std::mem::replace(&mut self.lifecycle_rx, dummy)
@@ -943,16 +935,12 @@ impl LspServer {
                     // CodeAction objects (not just legacy Command objects).
                     code_action_literal_support: Some(lsp_types::ClientCodeActionLiteralOptions {
                         code_action_kind: lsp_types::ClientCodeActionKindOptions {
-                            value_set: vec![
-                                lsp_types::CodeActionKind::Empty,
-                                lsp_types::CodeActionKind::QuickFix,
-                                lsp_types::CodeActionKind::Refactor,
-                                lsp_types::CodeActionKind::RefactorExtract,
-                                lsp_types::CodeActionKind::RefactorInline,
-                                lsp_types::CodeActionKind::RefactorRewrite,
-                                lsp_types::CodeActionKind::Source,
-                                lsp_types::CodeActionKind::SourceOrganizeImports,
-                            ],
+                            value_set: std::iter::once(lsp_types::CodeActionKind::Empty)
+                                .chain(
+                                    crate::bridge::CodeActionKindFilter::ALL
+                                        .map(lsp_types::CodeActionKind::from),
+                                )
+                                .collect(),
                         },
                     }),
                     ..Default::default()
@@ -1771,7 +1759,10 @@ mod tests {
         });
 
         let mut env = crate::config::ServerEnv::default();
-        env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
+        env.insert(
+            crate::config::EnvKey::from_static("PYTHONPATH"),
+            "/usr/lib".to_string(),
+        );
 
         let config = ServerInitConfig::new(
             LspServerConfig {
@@ -2202,14 +2193,14 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
         );
-        config
-            .server_config
-            .env
-            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("OTHER_VALUE"),
+            "bravo-secret-222".to_string(),
+        );
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "s3cr3t-value".to_string(),
+        );
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
             "bravo-secret-222".to_owned(),
@@ -2232,13 +2223,13 @@ echo 'fatal: bad toolchain' >&2
             "echo \"token=$API_TOKEN toolchain=$RUSTUP_TOOLCHAIN\" >&2\nexit 1\n",
         );
         config.server_config.env.insert(
-            "RUSTUP_TOOLCHAIN".to_string(),
+            crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
             "nightly-2024-01-01".to_string(),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "s3cr3t-value".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2320,10 +2311,10 @@ sleep 5
             .server_config
             .args
             .push("--api-key=SuperSecretArg456".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let mut server = LspServer::spawn(config).await.unwrap();
         let mut rx = server.take_notification_rx();
@@ -2357,10 +2348,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2381,10 +2372,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2764,7 +2755,10 @@ sleep 5
         let on = |host| {
             let mut config = bare_server_config(HashMap::new());
             config.env = crate::config::ServerEnv::from_entries(
-                [("Path".to_string(), "/over".to_string())],
+                [(
+                    crate::config::EnvKey::from_static("Path"),
+                    "/over".to_string(),
+                )],
                 host,
             )
             .unwrap();
@@ -2777,7 +2771,7 @@ sleep 5
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only
     /// `command`/`args`/`env` matter.
-    fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
+    fn bare_server_config(env: HashMap<crate::config::EnvKey, String>) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
@@ -2943,7 +2937,7 @@ sleep 5
     fn test_build_command_includes_configured_env_vars() {
         let mut env = HashMap::new();
         env.insert(
-            "MCPLS_TEST_CONFIGURED".to_string(),
+            crate::config::EnvKey::from_static("MCPLS_TEST_CONFIGURED"),
             "from-server-config".to_string(),
         );
         let config = bare_server_config(env);
@@ -2963,7 +2957,10 @@ sleep 5
     #[test]
     fn test_build_command_configured_env_overrides_allowlisted_var() {
         let mut env = HashMap::new();
-        env.insert("PATH".to_string(), "/configured/override/path".to_string());
+        env.insert(
+            crate::config::EnvKey::from_static("PATH"),
+            "/configured/override/path".to_string(),
+        );
         let config = bare_server_config(env);
         let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| {
             (key == "PATH").then(|| "/parent/bin".into())

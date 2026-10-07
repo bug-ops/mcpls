@@ -5,17 +5,20 @@
 use std::time::Duration;
 
 use lsp_types::{
-    CallHierarchyPrepareParams, CompletionContext, CompletionParams, DeclarationParams,
-    DefinitionParams, DocumentHighlightParams, HoverParams, ImplementationParams, InlayHintParams,
-    PartialResultParams, PrepareRenameParams, ReferenceContext, ReferenceParams, RenameParams,
-    SignatureHelpParams, TextDocumentIdentifier, TextDocumentPositionParams, TypeDefinitionParams,
-    TypeHierarchyPrepareParams, WorkDoneProgressParams,
+    CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    CodeActionContext, CodeActionParams, CompletionContext, CompletionParams, DeclarationParams,
+    DefinitionParams, DocumentHighlightParams, DocumentRangeFormattingParams, FormattingOptions,
+    HoverParams, ImplementationParams, InlayHintParams, PartialResultParams, PrepareRenameParams,
+    ReferenceContext, ReferenceParams, RenameParams, SignatureHelpParams, TextDocumentIdentifier,
+    TextDocumentPositionParams, TypeDefinitionParams, TypeHierarchyPrepareParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkDoneProgressParams,
 };
 
 use super::Translator;
-use super::dto::Position;
+use super::dto::{CheckedHierarchyItem, Position, PositionRange};
 use super::encoding_ctx::EncodingCtx;
-use super::routing::{Capability, IndexingGate, PreparedDocument};
+use super::hierarchy::{LspHierarchyItem, hierarchy_item_to_lsp};
+use super::routing::{Capability, DisclosedCapability, IndexingGate, PreparedDocument};
 use crate::bridge::{ClientPath, Indexed, IndexingSignal};
 use crate::config::ServerId;
 use crate::error::Result;
@@ -168,6 +171,109 @@ impl FromPosition for RenameParams {
         }
     }
 }
+
+/// LSP request params built from a resolved document range.
+///
+/// The range counterpart of [`FromPosition`], implemented once per
+/// range-taking request so [`Translator::range_request`] builds each of them
+/// through the same path.
+pub(super) trait FromRange: RequestTimeout + Sized {
+    /// Request-specific input beyond the range (`()` when there is none).
+    type Extra;
+
+    /// Builds the params from the converted range, defaulting the work-done
+    /// and partial-result progress fields.
+    fn from_range(
+        text_document: TextDocumentIdentifier,
+        range: lsp_types::Range,
+        extra: Self::Extra,
+    ) -> Self;
+}
+
+impl FromRange for InlayHintParams {
+    type Extra = ();
+
+    fn from_range(text_document: TextDocumentIdentifier, range: lsp_types::Range, (): ()) -> Self {
+        Self {
+            text_document,
+            range,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        }
+    }
+}
+
+impl RequestTimeout for DocumentRangeFormattingParams {}
+
+impl FromRange for DocumentRangeFormattingParams {
+    type Extra = FormattingOptions;
+
+    fn from_range(
+        text_document: TextDocumentIdentifier,
+        range: lsp_types::Range,
+        options: FormattingOptions,
+    ) -> Self {
+        Self {
+            text_document,
+            range,
+            options,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        }
+    }
+}
+
+impl RequestTimeout for CodeActionParams {}
+
+impl FromRange for CodeActionParams {
+    type Extra = CodeActionContext;
+
+    fn from_range(
+        text_document: TextDocumentIdentifier,
+        range: lsp_types::Range,
+        context: CodeActionContext,
+    ) -> Self {
+        Self {
+            text_document,
+            range,
+            context,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
+/// LSP request params that walk one level around a hierarchy item.
+pub(super) trait FromItem: RequestTimeout + Sized {
+    /// The LSP item type the params carry.
+    type Item: From<LspHierarchyItem>;
+
+    /// Builds the params around `item`, defaulting the progress fields.
+    fn from_item(item: Self::Item) -> Self;
+}
+
+macro_rules! from_item_with_partial {
+    ($($params:ty => $item:ty),+ $(,)?) => {$(
+        impl RequestTimeout for $params {}
+
+        impl FromItem for $params {
+            type Item = $item;
+
+            fn from_item(item: $item) -> Self {
+                Self {
+                    item,
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                }
+            }
+        }
+    )+};
+}
+
+from_item_with_partial!(
+    CallHierarchyIncomingCallsParams => lsp_types::CallHierarchyItem,
+    CallHierarchyOutgoingCallsParams => lsp_types::CallHierarchyItem,
+    TypeHierarchySupertypesParams => lsp_types::TypeHierarchyItem,
+    TypeHierarchySubtypesParams => lsp_types::TypeHierarchyItem,
+);
 
 /// A sent positioned request's result, with the encoding context and the
 /// document it was made against.
@@ -374,7 +480,7 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
+        capability: DisclosedCapability,
         extra: <R::Params as FromPosition>::Extra,
     ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
     where
@@ -388,6 +494,115 @@ impl Translator {
             .positioned_params::<R::Params>(doc.server_id(), doc.uri(), position, extra)
             .await;
         let result = doc.request::<R>(params).await?;
+        Ok(Positioned { result, ctx, doc })
+    }
+    async fn ranged_params<P: FromRange>(
+        &self,
+        server_id: &ServerId,
+        uri: &lsp_types::Uri,
+        range: PositionRange,
+        extra: P::Extra,
+    ) -> (EncodingCtx, P) {
+        let ctx = self.encoding_ctx(server_id);
+        let lsp_range = ctx.denormalize_range(uri, range).await;
+        let params = P::from_range(
+            TextDocumentIdentifier { uri: uri.clone() },
+            lsp_range,
+            extra,
+        );
+        (ctx, params)
+    }
+
+    /// Gates and opens `file_path`, converts `range`, and sends the request.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prepare_positioned_document`] and
+    /// [`LspClient::request_typed`].
+    pub(super) async fn range_request<R>(
+        &self,
+        file_path: &ClientPath,
+        indexing_gate: IndexingGate,
+        range: PositionRange,
+        extra: <R::Params as FromRange>::Extra,
+    ) -> Result<Positioned<R::Result>>
+    where
+        R: lsp_types::Request,
+        R::Params: FromRange,
+    {
+        let doc = self
+            .prepare_positioned_document(file_path, indexing_gate, &[range.start(), range.end()])
+            .await?;
+        let (ctx, params) = self
+            .ranged_params::<R::Params>(doc.server_id(), doc.uri(), range, extra)
+            .await;
+        let client = doc.client();
+        let result = client
+            .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
+            .await?;
+        Ok(Positioned { result, ctx, doc })
+    }
+
+    /// As [`Self::range_request`] for a name-resolving tool that discloses
+    /// indexing instead of gating on it; the result is [`Indexed`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prepare_disclosed_document`] and
+    /// [`DisclosedDocument::request`].
+    pub(super) async fn disclosed_range_request<R>(
+        &self,
+        file_path: &ClientPath,
+        capability: DisclosedCapability,
+        range: PositionRange,
+        extra: <R::Params as FromRange>::Extra,
+    ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
+    where
+        R: lsp_types::Request,
+        R::Params: FromRange,
+    {
+        let doc = self
+            .prepare_disclosed_document(file_path, capability, &[range.start(), range.end()])
+            .await?;
+        let (ctx, params) = self
+            .ranged_params::<R::Params>(doc.server_id(), doc.uri(), range, extra)
+            .await;
+        let result = doc.request::<R>(params).await?;
+        Ok(Positioned { result, ctx, doc })
+    }
+    /// Resolves, gates and queries one level around a hierarchy `item`.
+    ///
+    /// The returned document's URI is the canonical one the request carried,
+    /// not the client's raw spelling (`sym/../f`) that could resolve elsewhere
+    /// on the server's side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the item's URI is not a workspace file, the
+    /// document cannot be gated or opened, or the LSP request fails.
+    pub(super) async fn item_request<R>(
+        &self,
+        item: CheckedHierarchyItem,
+        capability: Capability,
+    ) -> Result<Positioned<R::Result>>
+    where
+        R: lsp_types::Request,
+        R::Params: FromItem,
+    {
+        let item_uri = lsp_types::Uri::from(item.uri());
+        let path = self.parse_file_uri(&item_uri).await?;
+        let doc = self
+            .prepare_gated_document_for_path(&path, IndexingGate::Required(capability))
+            .await?;
+        let ctx = self.encoding_ctx(doc.server_id());
+        let lsp_item = hierarchy_item_to_lsp(item, doc.uri().clone(), &ctx).await;
+        let client = doc.client();
+        let result = client
+            .request_typed::<R>(
+                R::Params::from_item(lsp_item),
+                <R::Params as RequestTimeout>::timeout(client),
+            )
+            .await?;
         Ok(Positioned { result, ctx, doc })
     }
 }
@@ -406,6 +621,48 @@ mod tests {
                 character: 7,
             },
         }
+    }
+
+    #[test]
+    fn test_from_range_builds_params_for_each_range_request() {
+        let range = lsp_types::Range {
+            start: lsp_types::Position {
+                line: 1,
+                character: 2,
+            },
+            end: lsp_types::Position {
+                line: 3,
+                character: 4,
+            },
+        };
+        let document = position_params().text_document;
+
+        let hints = InlayHintParams::from_range(document.clone(), range, ());
+        assert_eq!(hints.range, range);
+        assert_eq!(hints.text_document, document);
+
+        let format = DocumentRangeFormattingParams::from_range(
+            document.clone(),
+            range,
+            FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(format.range, range);
+        assert_eq!(format.options.tab_size, 2);
+
+        let actions = CodeActionParams::from_range(
+            document,
+            range,
+            CodeActionContext {
+                diagnostics: vec![],
+                only: None,
+                trigger_kind: None,
+            },
+        );
+        assert_eq!(actions.range, range);
     }
 
     #[test]

@@ -6,10 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    CodeActionKindFilter, FoldingKindFilter, HierarchyItem, KindFilterField, KindFilterInput,
-    LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, Position, Position2D, Range,
-    RestartTarget, ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolQuery,
-    SymbolTarget, TabSize,
+    CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, KindFilterField,
+    KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NewName, Position,
+    Position2D, Range, RestartTarget, ResultContext, ServerIds, ServerIdsError, SymbolKindFilter,
+    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize,
 };
 use crate::error::Error;
 
@@ -110,7 +110,41 @@ macro_rules! target_wire {
             container: Option<String>,
             $($extra)*
         }
+
+        impl $name {
+            /// Moves the addressing fields out into the target, leaving them
+            /// empty; the tool's own fields stay in place.
+            fn take_target(&mut self) -> Result<SymbolTargetParams, TargetAddressError> {
+                SymbolTargetParams::from_parts(
+                    std::mem::take(&mut self.file_path),
+                    (self.line, self.character),
+                    self.symbol_name.take(),
+                    self.symbol_kind.take(),
+                    self.container.take(),
+                )
+            }
+        }
     };
+}
+
+/// Why the addressing fields of a tool call do not name exactly one symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TargetAddressError {
+    /// `symbol_kind` or `container` was given without `symbol_name`.
+    #[error("`symbol_kind` and `container` apply only with `symbol_name`")]
+    QualifierWithoutName,
+    /// Both a position and a `symbol_name` were given.
+    #[error("give either `line` and `character`, or `symbol_name`, not both")]
+    BothForms,
+    /// Neither a position nor a `symbol_name` was given.
+    #[error("give `line` and `character`, or `symbol_name`")]
+    NoForm,
+    /// Only one of `line` and `character` was given.
+    #[error("`line` and `character` must be given together and not with `symbol_name`")]
+    HalfPosition,
+    /// The symbol name or container is blank or too long.
+    #[error(transparent)]
+    Name(#[from] SymbolNameError),
 }
 
 /// Shared position parameters (file path plus 1-based line/character) used by
@@ -226,62 +260,40 @@ impl SymbolTargetParams {
     ///
     /// # Errors
     ///
-    /// A message when the fields do not address exactly one symbol, or when a
-    /// symbol name or container is blank or too long.
+    /// A [`TargetAddressError`] when the fields do not address exactly one
+    /// symbol, or when a symbol name or container is blank or too long.
     fn from_parts(
         file_path: PathBuf,
         position: (Option<u32>, Option<u32>),
         symbol_name: Option<String>,
         symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
         container: Option<String>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TargetAddressError> {
         let target = match (position, symbol_name) {
             ((Some(line), Some(character)), None) => {
                 if symbol_kind.is_some() || container.is_some() {
-                    return Err(
-                        "`symbol_kind` and `container` apply only with `symbol_name`".to_string(),
-                    );
+                    return Err(TargetAddressError::QualifierWithoutName);
                 }
                 SymbolTargetInput::Position { line, character }
             }
             ((None, None), Some(name)) => SymbolTargetInput::Name {
-                name: SymbolName::try_new(name).map_err(|e| e.to_string())?,
+                name: SymbolName::try_new(name)?,
                 kind: symbol_kind,
-                container: container
-                    .map(SymbolName::try_new)
-                    .transpose()
-                    .map_err(|e| e.to_string())?,
+                container: container.map(SymbolName::try_new).transpose()?,
             },
-            ((Some(_), Some(_)), Some(_)) => {
-                return Err(
-                    "give either `line` and `character`, or `symbol_name`, not both".to_string(),
-                );
-            }
-            ((None, None), None) => {
-                return Err("give `line` and `character`, or `symbol_name`".to_string());
-            }
-            _ => {
-                return Err(
-                    "`line` and `character` must be given together and not with `symbol_name`"
-                        .to_string(),
-                );
-            }
+            ((Some(_), Some(_)), Some(_)) => return Err(TargetAddressError::BothForms),
+            ((None, None), None) => return Err(TargetAddressError::NoForm),
+            _ => return Err(TargetAddressError::HalfPosition),
         };
         Ok(Self { file_path, target })
     }
 }
 
 impl TryFrom<SymbolTargetWire> for SymbolTargetParams {
-    type Error = String;
+    type Error = TargetAddressError;
 
-    fn try_from(wire: SymbolTargetWire) -> Result<Self, Self::Error> {
-        Self::from_parts(
-            wire.file_path,
-            (wire.line, wire.character),
-            wire.symbol_name,
-            wire.symbol_kind,
-            wire.container,
-        )
+    fn try_from(mut wire: SymbolTargetWire) -> Result<Self, Self::Error> {
+        wire.take_target()
     }
 }
 
@@ -325,17 +337,11 @@ pub struct ReferencesParams {
 }
 
 impl TryFrom<ReferencesWire> for ReferencesParams {
-    type Error = String;
+    type Error = TargetAddressError;
 
-    fn try_from(wire: ReferencesWire) -> Result<Self, Self::Error> {
+    fn try_from(mut wire: ReferencesWire) -> Result<Self, Self::Error> {
         Ok(Self {
-            target: SymbolTargetParams::from_parts(
-                wire.file_path,
-                (wire.line, wire.character),
-                wire.symbol_name,
-                wire.symbol_kind,
-                wire.container,
-            )?,
+            target: wire.take_target()?,
             include_declaration: wire.include_declaration,
             context: wire.context,
         })
@@ -365,17 +371,11 @@ pub struct NavigationParams {
 }
 
 impl TryFrom<NavigationWire> for NavigationParams {
-    type Error = String;
+    type Error = TargetAddressError;
 
-    fn try_from(wire: NavigationWire) -> Result<Self, Self::Error> {
+    fn try_from(mut wire: NavigationWire) -> Result<Self, Self::Error> {
         Ok(Self {
-            target: SymbolTargetParams::from_parts(
-                wire.file_path,
-                (wire.line, wire.character),
-                wire.symbol_name,
-                wire.symbol_kind,
-                wire.container,
-            )?,
+            target: wire.take_target()?,
             context: wire.context,
         })
     }
@@ -453,8 +453,9 @@ target_wire! {
     /// Wire form of [`RenameParams`].
     #[schemars(description = "Parameters for renaming a symbol across the workspace.")]
     RenameWire {
-        #[schemars(description = "New name for the symbol.")]
-        new_name: String,
+        #[schemars(description = "New name for the symbol (non-blank, at most 1000 bytes).")]
+        #[schemars(with = "String")]
+        new_name: NewName,
     }
 }
 
@@ -466,21 +467,15 @@ pub struct RenameParams {
     /// The symbol to rename.
     pub target: SymbolTargetParams,
     /// New name for the symbol.
-    pub new_name: String,
+    pub new_name: NewName,
 }
 
 impl TryFrom<RenameWire> for RenameParams {
-    type Error = String;
+    type Error = TargetAddressError;
 
-    fn try_from(wire: RenameWire) -> Result<Self, Self::Error> {
+    fn try_from(mut wire: RenameWire) -> Result<Self, Self::Error> {
         Ok(Self {
-            target: SymbolTargetParams::from_parts(
-                wire.file_path,
-                (wire.line, wire.character),
-                wire.symbol_name,
-                wire.symbol_kind,
-                wire.container,
-            )?,
+            target: wire.take_target()?,
             new_name: wire.new_name,
         })
     }
@@ -490,8 +485,11 @@ position_wire! {
     /// Wire form of [`CompletionsParams`].
     #[schemars(description = "Parameters for getting code completion suggestions.")]
     CompletionsWire {
-        #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
-        trigger: Option<String>,
+        #[schemars(
+            description = "Optional trigger character (e.g., '.', ':', '->'), at most 8 bytes."
+        )]
+        #[schemars(with = "Option<String>")]
+        trigger: Option<CompletionTrigger>,
     }
 }
 
@@ -503,7 +501,7 @@ pub struct CompletionsParams {
     /// Position in the file to operate on.
     pub position: PositionParams,
     /// Optional trigger character (e.g., '.', ':', '->').
-    pub trigger: Option<String>,
+    pub trigger: Option<CompletionTrigger>,
 }
 
 impl From<CompletionsWire> for CompletionsParams {
@@ -929,21 +927,29 @@ pub struct RestartServerParams {
     pub target: RestartTarget,
 }
 
+/// Why the selectors of a `restart_server` call do not name a set of servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RestartTargetError {
+    /// Both `servers` and `all` were given.
+    #[error("give either `servers` or `all`, not both")]
+    BothSelectors,
+    /// Neither `servers` nor `all: true` was given.
+    #[error("give `servers` (a non-empty list of server ids) or `all: true`")]
+    NoSelector,
+    /// The `servers` list is empty, too long or holds a bad id.
+    #[error(transparent)]
+    Servers(#[from] ServerIdsError),
+}
+
 impl TryFrom<RestartServerWire> for RestartServerParams {
-    type Error = String;
+    type Error = RestartTargetError;
 
     fn try_from(wire: RestartServerWire) -> Result<Self, Self::Error> {
         let target = match (wire.servers, wire.all) {
-            (Some(_), true) => return Err("give either `servers` or `all`, not both".to_string()),
-            (None, false) => {
-                return Err(
-                    "give `servers` (a non-empty list of server ids) or `all: true`".to_string(),
-                );
-            }
+            (Some(_), true) => return Err(RestartTargetError::BothSelectors),
+            (None, false) => return Err(RestartTargetError::NoSelector),
             (None, true) => RestartTarget::All,
-            (Some(ids), false) => {
-                RestartTarget::Servers(ServerIds::parse(ids).map_err(|e| e.to_string())?)
-            }
+            (Some(ids), false) => RestartTarget::Servers(ServerIds::parse(ids)?),
         };
         Ok(Self { target })
     }
@@ -982,6 +988,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::bridge::{MAX_NEW_NAME_LENGTH, MAX_TRIGGER_CHARACTER_BYTES};
 
     #[test]
     fn restart_params_accept_servers_or_all() {
@@ -1085,6 +1092,63 @@ mod tests {
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn restart_selector_errors_are_typed() {
+        let parse = |json: serde_json::Value| {
+            serde_json::from_value::<RestartServerParams>(json)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(parse(serde_json::json!({"servers": ["a"], "all": true})).contains("not both"));
+        assert!(parse(serde_json::json!({})).contains("or `all: true`"));
+        assert!(parse(serde_json::json!({"servers": []})).contains("must not be empty"));
+    }
+
+    #[test]
+    fn symbol_target_errors_name_the_violated_rule() {
+        let error = |json: serde_json::Value| {
+            serde_json::from_value::<SymbolTargetParams>(json)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error(serde_json::json!({"file_path": "/a.rs"})).contains("give `line`"));
+        assert!(
+            error(serde_json::json!({"file_path": "/a.rs", "line": 1}))
+                .contains("must be given together")
+        );
+        assert!(
+            error(serde_json::json!({"file_path": "/a.rs", "symbol_name": " "}))
+                .contains("must not be blank")
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_blank_or_oversized_new_name_while_parsing() {
+        let parse = |new_name: &str| {
+            serde_json::from_value::<RenameParams>(serde_json::json!({
+                "file_path": "/a.rs", "line": 1, "character": 1, "new_name": new_name,
+            }))
+        };
+        assert!(parse("renamed").is_ok());
+        assert!(parse(&"a".repeat(MAX_NEW_NAME_LENGTH)).is_ok());
+        assert!(parse("").is_err());
+        assert!(parse("  ").is_err());
+        assert!(parse(&"a".repeat(MAX_NEW_NAME_LENGTH + 1)).is_err());
+    }
+
+    #[test]
+    fn completions_reject_an_oversized_trigger_while_parsing() {
+        let parse = |trigger: &str| {
+            serde_json::from_value::<CompletionsParams>(serde_json::json!({
+                "file_path": "/a.rs", "line": 1, "character": 1, "trigger": trigger,
+            }))
+        };
+        assert!(parse(".").is_ok());
+        assert!(parse("->").is_ok());
+        assert!(parse(&"a".repeat(MAX_TRIGGER_CHARACTER_BYTES)).is_ok());
+        assert!(parse(&"a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1)).is_err());
     }
 
     #[test]

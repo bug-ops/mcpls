@@ -11,18 +11,18 @@ use serde::{Deserialize, Serialize};
 
 use super::bounded_secs::TimeoutSecs;
 use super::command_stem::CommandStem;
+use super::host_os::HostOs;
 use super::language_id::LanguageId;
 #[cfg(test)]
 use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
-use super::server_env::ServerEnv;
+use super::server_env::{EnvKey, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::impl_text_newtype;
 use crate::bridge::IndexingPolicy;
 use crate::error::ConfigError;
-use crate::lsp::HostOs;
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -526,7 +526,7 @@ struct RawLspServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    env: BTreeMap<EnvKey, String>,
     #[serde(default)]
     file_patterns: Vec<String>,
     #[serde(default)]
@@ -613,9 +613,7 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
         })?;
         let env = ServerEnv::from_entries(env, HostOs::CURRENT).map_err(|error| {
             ConfigError::DuplicateEnvKey {
-                server: name
-                    .clone()
-                    .unwrap_or_else(|| ServerId::from(language_id.clone())),
+                server: entry_id(name.as_ref(), &language_id),
                 error,
             }
         })?;
@@ -623,9 +621,7 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
             .iter()
             .map(|pattern| {
                 FilePattern::parse(pattern).map_err(|pattern| ConfigError::UnsupportedFilePattern {
-                    server: name
-                        .clone()
-                        .unwrap_or_else(|| ServerId::from(language_id.clone())),
+                    server: entry_id(name.as_ref(), &language_id),
                     pattern,
                 })
             })
@@ -800,9 +796,7 @@ impl LspServerConfig {
     /// collide (see `ToolRouter::from_configs` for the enforcement).
     #[must_use]
     pub fn id(&self) -> ServerId {
-        self.name
-            .clone()
-            .unwrap_or_else(|| ServerId::from(self.language_id.clone()))
+        entry_id(self.name.as_ref(), &self.language_id)
     }
 
     /// Build a built-in server config, filling in every field not passed as
@@ -926,6 +920,12 @@ impl LspServerConfig {
             ["build.zig", "build.zig.zon"],
         )
     }
+}
+
+/// The id a server entry is known by: its `name`, else its language.
+fn entry_id(name: Option<&ServerId>, language: &LanguageId) -> ServerId {
+    name.cloned()
+        .unwrap_or_else(|| ServerId::from(language.clone()))
 }
 
 #[cfg(test)]
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         let mut env = ServerEnv::default();
-        env.insert("RUST_LOG".to_string(), "debug".to_string());
+        env.insert(EnvKey::from_static("RUST_LOG"), "debug".to_string());
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),

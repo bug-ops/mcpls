@@ -10,6 +10,13 @@
 /// rejects blank text, `from_static` additionally requires ASCII so the
 /// literal check is a subset of `new`'s. `$what` names the value in the
 /// `from_static` panic message.
+///
+/// The `checked` form generates the same pair for a `Cow<'static, str>`
+/// newtype with its own rules: `$check` is a `fn(&str) -> Result<(), $err>`
+/// and `$valid` a `const fn(&str) -> bool` that agree on what is valid.
+///
+/// The `@impl` form is the shared tail for a generic type, taking its generic
+/// parameters in brackets.
 macro_rules! impl_text_newtype {
     ($ty:ident, $err:ident, non_blank, $what:literal) => {
         impl $ty {
@@ -57,10 +64,41 @@ macro_rules! impl_text_newtype {
             }
         }
 
-        impl_text_newtype!($ty, $err);
+        impl_text_newtype!(@impl [] $ty, $err);
+    };
+    ($ty:ident, $err:ident, checked = $check:path, valid = $valid:path, $what:literal) => {
+        impl $ty {
+            /// Builds the value from a literal, checked at compile time when
+            /// evaluated in a `const` context.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the literal is not a valid value of this type.
+            #[must_use]
+            pub const fn from_static(text: &'static str) -> Self {
+                assert!($valid(text), concat!("invalid ", $what));
+                Self(::std::borrow::Cow::Borrowed(text))
+            }
+
+            /// Builds the value from any string.
+            ///
+            /// # Errors
+            ///
+            #[doc = concat!("Returns [`", stringify!($err), "`] naming the first rule `text` breaks.")]
+            pub fn new(text: impl Into<String>) -> ::std::result::Result<Self, $err> {
+                let text = text.into();
+                $check(&text)?;
+                Ok(Self(::std::borrow::Cow::Owned(text)))
+            }
+        }
+
+        impl_text_newtype!(@impl [] $ty, $err);
     };
     ($ty:ident, $err:ty) => {
-        impl $ty {
+        impl_text_newtype!(@impl [] $ty, $err);
+    };
+    (@impl [$($gen:tt)*] $ty:ty, $err:ty) => {
+        impl<$($gen)*> $ty {
             /// The validated text.
             #[must_use]
             pub fn as_str(&self) -> &str {
@@ -68,13 +106,13 @@ macro_rules! impl_text_newtype {
             }
         }
 
-        impl ::std::fmt::Display for $ty {
+        impl<$($gen)*> ::std::fmt::Display for $ty {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(self.as_str())
             }
         }
 
-        impl TryFrom<String> for $ty {
+        impl<$($gen)*> TryFrom<String> for $ty {
             type Error = $err;
 
             fn try_from(text: String) -> ::std::result::Result<Self, Self::Error> {
@@ -82,13 +120,13 @@ macro_rules! impl_text_newtype {
             }
         }
 
-        impl From<$ty> for String {
+        impl<$($gen)*> From<$ty> for String {
             fn from(value: $ty) -> Self {
                 Self::from(value.0)
             }
         }
 
-        impl ::std::str::FromStr for $ty {
+        impl<$($gen)*> ::std::str::FromStr for $ty {
             type Err = $err;
 
             fn from_str(text: &str) -> ::std::result::Result<Self, Self::Err> {
@@ -96,25 +134,25 @@ macro_rules! impl_text_newtype {
             }
         }
 
-        impl AsRef<str> for $ty {
+        impl<$($gen)*> AsRef<str> for $ty {
             fn as_ref(&self) -> &str {
                 self.as_str()
             }
         }
 
-        impl ::std::borrow::Borrow<str> for $ty {
+        impl<$($gen)*> ::std::borrow::Borrow<str> for $ty {
             fn borrow(&self) -> &str {
                 self.as_str()
             }
         }
 
-        impl PartialEq<str> for $ty {
+        impl<$($gen)*> PartialEq<str> for $ty {
             fn eq(&self, other: &str) -> bool {
                 self.as_str() == other
             }
         }
 
-        impl PartialEq<&str> for $ty {
+        impl<$($gen)*> PartialEq<&str> for $ty {
             fn eq(&self, other: &&str) -> bool {
                 self.as_str() == *other
             }

@@ -4,6 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use lsp_types::Diagnostic as LspDiagnostic;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use super::message_as_str;
 
@@ -22,15 +24,21 @@ pub(super) const DUPLICATE_RANGE_PROXIMITY_LINES: u32 = 3;
 ///
 /// Ordered from most to least severe, which is also the order the size cap
 /// keeps diagnostics in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+#[schemars(rename = "DiagnosticSeverity")]
+#[schemars(description = "Diagnostic severity.")]
 pub enum ReportedSeverity {
-    /// An error.
+    /// Error diagnostic.
     Error,
-    /// A warning.
+    /// Warning diagnostic.
     Warning,
-    /// Information, also what a diagnostic without a usable severity reads as.
+    /// Informational diagnostic; also what a diagnostic without a usable
+    /// severity reads as.
     Information,
-    /// A hint.
+    /// Hint diagnostic.
     Hint,
 }
 

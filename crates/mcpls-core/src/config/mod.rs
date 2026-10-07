@@ -3,8 +3,10 @@
 //! This module provides configuration structures for MCPLS,
 //! including LSP server definitions and workspace settings.
 
+mod bounded_number;
 mod bounded_secs;
 mod command_stem;
+mod host_os;
 mod language;
 mod language_id;
 mod language_map;
@@ -25,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub use bounded_secs::{BoundedSecs, IndexingReadyTimeoutSecs, InvalidSecs, TimeoutSecs};
 pub use command_stem::CommandStem;
+pub use host_os::HostOs;
 pub use language::{base_language_id, react_variant_language_id};
 pub use language_id::{InvalidLanguageId, LanguageId};
 pub use language_map::{FileKey, LanguageMap};
@@ -48,7 +51,7 @@ pub use server::{
     BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
     ServerCommand, ServerHeuristics, ServerSelection,
 };
-pub use server_env::{DuplicateEnvKey, ServerEnv};
+pub use server_env::{DuplicateEnvKey, EnvKey, InvalidEnvKey, ServerEnv};
 pub use settings::{InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;

@@ -984,7 +984,7 @@ impl TrackedFile {
             &server(),
             &PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone()),
             version.map(DocumentVersion::new),
-            vec![error(2, "pushed")],
+            bounded(vec![error(2, "pushed")]),
         ));
     }
 
@@ -1111,7 +1111,7 @@ impl TrackedFile {
             owner,
             &PublishedDiagnosticsUri::for_test(self.uri.clone(), self.uri.clone()),
             Some(DocumentVersion::new(version)),
-            items,
+            BoundedDiagnostics::new(&self.uri, items),
         ));
     }
 

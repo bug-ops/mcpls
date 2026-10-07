@@ -46,6 +46,148 @@ pub enum InvalidPosition {
     TooLarge,
 }
 
+/// Longest accepted `rename_symbol` `new_name`, in bytes.
+///
+/// No real identifier approaches this length in any language mcpls targets.
+pub const MAX_NEW_NAME_LENGTH: usize = 1_000;
+
+/// Why [`NewName::try_new`] rejected a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InvalidNewName {
+    /// The name is empty or only whitespace.
+    #[error("new_name must not be blank")]
+    Blank,
+    /// The name is longer than [`MAX_NEW_NAME_LENGTH`].
+    #[error("new_name too long: {len} bytes (max {MAX_NEW_NAME_LENGTH})")]
+    TooLong {
+        /// The name's length in bytes.
+        len: usize,
+    },
+}
+
+/// The name a `rename_symbol` call renames to: non-blank and at most
+/// [`MAX_NEW_NAME_LENGTH`] bytes, so an unusable name is rejected before any
+/// language server is asked.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{InvalidNewName, NewName};
+///
+/// assert_eq!(NewName::try_new("renamed")?.as_str(), "renamed");
+/// assert_eq!(NewName::try_new("  "), Err(InvalidNewName::Blank));
+/// # Ok::<(), InvalidNewName>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct NewName(String);
+
+impl NewName {
+    /// Validates `raw` as given; surrounding whitespace is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidNewName::Blank`] or [`InvalidNewName::TooLong`].
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, InvalidNewName> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            return Err(InvalidNewName::Blank);
+        }
+        if raw.len() > MAX_NEW_NAME_LENGTH {
+            return Err(InvalidNewName::TooLong { len: raw.len() });
+        }
+        Ok(Self(raw))
+    }
+
+    /// The name text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The name text, owned.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for NewName {
+    type Error = InvalidNewName;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_new(raw)
+    }
+}
+
+/// Longest accepted `get_completions` `trigger`, in bytes.
+///
+/// LSP defines `triggerCharacter` as a single character; 8 bytes covers any
+/// one Unicode codepoint (at most 4 bytes in UTF-8) and short multi-character
+/// triggers such as `->`, while rejecting anything that is not plausibly a
+/// trigger.
+pub const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
+
+/// A `get_completions` trigger longer than [`MAX_TRIGGER_CHARACTER_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("trigger too long: {len} bytes (max {MAX_TRIGGER_CHARACTER_BYTES})")]
+pub struct InvalidCompletionTrigger {
+    /// The trigger's length in bytes.
+    pub len: usize,
+}
+
+/// The text that triggered a completion request, bounded to
+/// [`MAX_TRIGGER_CHARACTER_BYTES`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::CompletionTrigger;
+///
+/// assert_eq!(CompletionTrigger::try_new("->")?.as_str(), "->");
+/// assert!(CompletionTrigger::try_new("123456789").is_err());
+/// # Ok::<(), mcpls_core::bridge::InvalidCompletionTrigger>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CompletionTrigger(String);
+
+impl CompletionTrigger {
+    /// Validates the length of `raw`.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidCompletionTrigger`] when `raw` exceeds
+    /// [`MAX_TRIGGER_CHARACTER_BYTES`].
+    pub fn try_new(raw: impl Into<String>) -> Result<Self, InvalidCompletionTrigger> {
+        let raw = raw.into();
+        if raw.len() > MAX_TRIGGER_CHARACTER_BYTES {
+            return Err(InvalidCompletionTrigger { len: raw.len() });
+        }
+        Ok(Self(raw))
+    }
+
+    /// The trigger text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The trigger text, owned.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for CompletionTrigger {
+    type Error = InvalidCompletionTrigger;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_new(raw)
+    }
+}
+
 /// Largest tab size a client may request for formatting.
 pub const MAX_TAB_SIZE: u32 = 32;
 
@@ -398,80 +540,8 @@ pub struct HoverResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// Result of a definition request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DefinitionResult {
-    /// Locations of the definition.
-    pub locations: Vec<ContextualLocation>,
-    /// Whether `locations` was capped below the LSP server's full response
-    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
-    /// exist than are returned here. Omitted (defaults to `false`) when
-    /// serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
-    /// servers only); omitted when all are exact. Tells whether the queried position
-    /// or only the returned offsets are affected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "PositionDegradation")]
-    pub positions_degraded: Option<PositionDegradation>,
-    /// Set only when `context: "enclosing_symbol"` was requested and at least one
-    /// item was looked up: how many files were enriched or skipped, and whether
-    /// the file cap or time budget cut it short.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "EnrichmentSummary")]
-    pub enrichment: Option<EnrichmentSummary>,
-}
-
-/// Result of a references request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReferencesResult {
-    /// Locations of all references.
-    pub locations: Vec<ContextualLocation>,
-    /// Whether `locations` was capped below the LSP server's full response
-    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references
-    /// exist than are returned here. Omitted (defaults to `false`) when
-    /// serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
-    /// servers only); omitted when all are exact. Tells whether the queried position
-    /// or only the returned offsets are affected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "PositionDegradation")]
-    pub positions_degraded: Option<PositionDegradation>,
-    /// Set only when `context: "enclosing_symbol"` was requested and at least one
-    /// item was looked up: how many files were enriched or skipped, and whether
-    /// the file cap or time budget cut it short.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "EnrichmentSummary")]
-    pub enrichment: Option<EnrichmentSummary>,
-}
-
 /// Diagnostic severity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum DiagnosticSeverity {
-    /// Error diagnostic.
-    Error,
-    /// Warning diagnostic.
-    Warning,
-    /// Informational diagnostic.
-    Information,
-    /// Hint diagnostic.
-    Hint,
-}
-
-impl From<ReportedSeverity> for DiagnosticSeverity {
-    fn from(severity: ReportedSeverity) -> Self {
-        match severity {
-            ReportedSeverity::Error => Self::Error,
-            ReportedSeverity::Warning => Self::Warning,
-            ReportedSeverity::Information => Self::Information,
-            ReportedSeverity::Hint => Self::Hint,
-        }
-    }
-}
+pub type DiagnosticSeverity = ReportedSeverity;
 
 /// A single diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -889,7 +959,8 @@ pub struct SignatureHelpResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// Result of a go-to-implementation or go-to-type-definition request.
+/// Locations answering a definition, references, implementation,
+/// type-definition or declaration request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocationsResult {
     /// Locations found.
@@ -904,6 +975,7 @@ pub struct LocationsResult {
     /// servers only); omitted when all are exact. Tells whether the queried position
     /// or only the returned offsets are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
     /// Set only when `context: "enclosing_symbol"` was requested and at least one
     /// item was looked up: how many files were enriched or skipped, and whether
@@ -912,6 +984,12 @@ pub struct LocationsResult {
     #[schemars(with = "EnrichmentSummary")]
     pub enrichment: Option<EnrichmentSummary>,
 }
+
+/// Result of a definition request.
+pub type DefinitionResult = LocationsResult;
+
+/// Result of a references request.
+pub type ReferencesResult = LocationsResult;
 
 /// A single inlay hint entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1278,32 +1356,7 @@ impl JsonSchema for FoldingKindFilter {
     }
 }
 
-impl kind_filter::sealed::Sealed for FoldingKindFilter {}
-
-impl KindFilter for FoldingKindFilter {
-    const SCHEMA_NAME: &'static str = "FoldingKindFilter";
-
-    fn parse(text: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|filter| filter.as_str().eq_ignore_ascii_case(text))
-    }
-
-    fn canonical(self) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed(self.as_str())
-    }
-
-    fn valid_values() -> String {
-        format!("{:?}", Self::ALL.map(Self::as_str))
-    }
-
-    fn schema() -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "string",
-            "enum": Self::ALL.map(Self::as_str),
-        })
-    }
-}
+kind_filter::closed_kind_filter!(FoldingKindFilter, "FoldingKindFilter");
 
 impl FoldingKindFilter {
     /// Every filter, in documentation order.
@@ -1416,30 +1469,6 @@ impl ServerText for HoverResult {
             positions_degraded: _,
         } = self;
         redactions.redact_in_place(contents);
-    }
-}
-
-impl ServerText for DefinitionResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            locations,
-            truncated: _,
-            positions_degraded: _,
-            enrichment: _,
-        } = self;
-        locations.redact_server_text(redactions);
-    }
-}
-
-impl ServerText for ReferencesResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            locations,
-            truncated: _,
-            positions_degraded: _,
-            enrichment: _,
-        } = self;
-        locations.redact_server_text(redactions);
     }
 }
 

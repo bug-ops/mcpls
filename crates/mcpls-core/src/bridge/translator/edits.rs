@@ -3,8 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use lsp_types::{
-    DocumentFormattingParams, DocumentRangeFormattingParams, FormattingOptions,
-    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+    DocumentFormattingParams, FormattingOptions, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 use tokio::task::JoinSet;
 
@@ -12,8 +11,8 @@ use super::Translator;
 use super::diagnostics::diagnostic_to_mcp;
 use super::dto::{
     BoundedRange, CodeAction, CodeActionsResult, CommandDescription, DocumentChanges, DroppedEdits,
-    FormatDocumentResult, Position, PrepareRenameOutcome, PrepareRenameResult, RenameResult,
-    TabSize, TextEdit, WorkspaceEditDescription,
+    FormatDocumentResult, NewName, Position, PrepareRenameOutcome, PrepareRenameResult,
+    RenameResult, TabSize, TextEdit, WorkspaceEditDescription,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::CodeActionKindFilter;
@@ -26,26 +25,6 @@ use crate::error::{Error, McpErrorKind, Result};
 use crate::escape_control;
 use crate::lsp::{LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
-
-/// Maximum length, in bytes, of a `rename_symbol` `new_name` parameter.
-///
-/// `new_name` is forwarded to the routed LSP server as-is with no inherent
-/// bound of its own -- unlike `workspace_symbol_search`'s `query` (see
-/// `validate_query_length`), it previously relied entirely on outer
-/// transport limits (#309). No real identifier approaches this length in any
-/// language mcpls targets.
-pub(super) const MAX_NEW_NAME_LENGTH: usize = 1_000;
-
-/// Validate parameters for `handle_rename`.
-fn validate_rename_params(new_name: &str) -> Result<()> {
-    if new_name.len() > MAX_NEW_NAME_LENGTH {
-        return Err(Error::InvalidToolParams(format!(
-            "new_name too long: {} bytes (max {MAX_NEW_NAME_LENGTH})",
-            new_name.len()
-        )));
-    }
-    Ok(())
-}
 
 /// Convert a raw LSP `WorkspaceEdit` into MCP `DocumentChanges`.
 ///
@@ -445,7 +424,7 @@ async fn convert_code_action(
     };
 
     let command = action.command.map(|cmd| {
-        let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+        let arguments = cmd.arguments.unwrap_or_default();
         CommandDescription {
             title: cmd.title,
             command: cmd.command,
@@ -532,8 +511,7 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an error if `new_name` exceeds the maximum allowed length,
-    /// the LSP request fails, the file cannot be opened, the routed server
+    /// Returns an error if the LSP request fails, the file cannot be opened, the routed server
     /// does not advertise `renameProvider` support, or the server is still
     /// indexing the workspace (see `Translator::wait_for_indexing_ready`) --
     /// a rename needs the same whole-workspace reference index as
@@ -542,10 +520,8 @@ impl Translator {
         &self,
         file_path: ClientPath,
         position: Position,
-        new_name: String,
+        new_name: NewName,
     ) -> Result<RenameResult> {
-        validate_rename_params(&new_name)?;
-
         let Positioned {
             result: response,
             ctx,
@@ -555,7 +531,7 @@ impl Translator {
                 &file_path,
                 position,
                 IndexingGate::Required(Capability::Rename),
-                new_name,
+                new_name.into_string(),
             )
             .await?;
 
@@ -705,38 +681,24 @@ impl Translator {
         tab_size: TabSize,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (start, end) = (range.range().start(), range.range().end());
-        let doc = self
-            .prepare_positioned_document(
+        let options = FormattingOptions {
+            tab_size: tab_size.get(),
+            insert_spaces,
+            ..Default::default()
+        };
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .range_request::<lsp_types::DocumentRangeFormattingRequest>(
                 &file_path,
                 IndexingGate::FileLocal(FileLocalCapability::FormatRange),
-                &[start, end],
+                range.range(),
+                options,
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let params = DocumentRangeFormattingParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: lsp_types::Range {
-                start: ctx.to_lsp(uri, start).await,
-                end: ctx.to_lsp(uri, end).await,
-            },
-            options: FormattingOptions {
-                tab_size: tab_size.get(),
-                insert_spaces,
-                ..Default::default()
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::DocumentRangeFormattingRequest>(
-                params,
-                client.request_timeout(),
-            )
-            .await?;
+        let response_uri = doc.uri().clone();
 
         Ok(FormatDocumentResult {
             edits: convert_text_edits(response.unwrap_or_default(), &ctx, &response_uri).await,
@@ -763,49 +725,32 @@ impl Translator {
         range: BoundedRange,
         kind_filter: Option<CodeActionKindFilter>,
     ) -> Result<CodeActionsResult> {
-        let (start, end) = (range.range().start(), range.range().end());
-
-        let doc = self
-            .prepare_positioned_document(
-                &file_path,
-                IndexingGate::Required(Capability::CodeActions),
-                &[start, end],
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let range = lsp_types::Range {
-            start: ctx.to_lsp(uri, start).await,
-            end: ctx.to_lsp(uri, end).await,
-        };
-
-        // Build context with optional kind filter
-        let only =
-            kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k.as_str().to_owned())]);
+        let only = kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k)]);
 
         // Pass empty diagnostics context — rust-analyzer generates code actions
         // based on cursor position and its internal analysis state, not on the
         // passed diagnostics.  Passing stale cached diagnostics (which may lack
         // the internal `data` field ra uses for fix mapping) suppresses results.
-        let context_diagnostics: Vec<lsp_types::Diagnostic> = vec![];
-
-        let params = lsp_types::CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: lsp_types::CodeActionContext {
-                diagnostics: context_diagnostics,
-                only,
-                trigger_kind: Some(lsp_types::CodeActionTriggerKind::Invoked),
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
+        let context = lsp_types::CodeActionContext {
+            diagnostics: vec![],
+            only,
+            trigger_kind: Some(lsp_types::CodeActionTriggerKind::Invoked),
         };
 
-        let response = client
-            .request_typed::<lsp_types::CodeActionRequest>(params, client.request_timeout())
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .range_request::<lsp_types::CodeActionRequest>(
+                &file_path,
+                IndexingGate::Required(Capability::CodeActions),
+                range.range(),
+                context,
+            )
             .await?;
+        let (server_id, client) = (doc.server_id(), doc.client());
+        let response_uri = doc.uri().clone();
         let mut budget = ItemBudget::new();
         let mut entries = budget.admit(response.unwrap_or_default());
         let resolve_supported = self.code_action_resolve_supported(server_id);
@@ -825,7 +770,7 @@ impl Translator {
                     .await
                 }
                 lsp_types::CodeActionResponse::Command(cmd) => {
-                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+                    let arguments = cmd.arguments.unwrap_or_default();
                     CodeAction {
                         title: cmd.title.clone(),
                         kind: None,
@@ -903,7 +848,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        "new_name".to_string(),
+                        NewName::try_new("new_name").unwrap(),
                     )
                     .await
             })
@@ -1012,7 +957,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        "new_name".to_string(),
+                        NewName::try_new("new_name").unwrap(),
                     )
                     .await
             })
@@ -1075,34 +1020,6 @@ mod tests {
         );
         assert_eq!(result.dropped.unsupported_file_operation, 0);
         assert_eq!(result.dropped.unsupported_snippet_edit, 0);
-    }
-
-    /// #309: `new_name` has no inherent bound of its own and is forwarded to
-    /// the LSP server as-is, so it must be rejected before that happens.
-    #[test]
-    fn test_validate_rename_params_rejects_oversized_new_name() {
-        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
-        let result = validate_rename_params(&new_name);
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[test]
-    fn test_validate_rename_params_accepts_name_at_exact_limit() {
-        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH);
-        assert!(validate_rename_params(&new_name).is_ok());
-    }
-
-    #[test]
-    fn test_validate_rename_params_accepts_typical_identifier() {
-        assert!(validate_rename_params("my_variable").is_ok());
-    }
-
-    /// #309: length checks have no lower bound -- an empty `new_name` is
-    /// syntactically valid input for this validator (semantic rejection of
-    /// an empty rename target, if desired, is a separate concern).
-    #[test]
-    fn test_validate_rename_params_accepts_empty_string() {
-        assert!(validate_rename_params("").is_ok());
     }
 
     #[tokio::test]
@@ -2930,7 +2847,7 @@ mod tests {
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 4),
-                "new_name".to_string(),
+                NewName::try_new("new_name").unwrap(),
             )
             .await
             .unwrap_err();
@@ -2981,7 +2898,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        "new_name".to_string(),
+                        NewName::try_new("new_name").unwrap(),
                     )
                     .await
             })

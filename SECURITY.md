@@ -172,7 +172,8 @@ enforces the following, and nothing more:
   `unshare`, `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`:
   they change the user, root, directory or environment, or take optional
   arguments) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
-  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
+  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle`, `dotnet`, `pipenv`,
+  `pixi`, `swift`, `stack` and `cabal`. `npx` runs
   `./node_modules/.bin/<name>` from the working directory before anything else
   and reads a workspace `.npmrc`, so the planted package would run. `env` is
   unwrapped; `env -S`, `env -P`, a `PATH=` assignment and a relative program that `env -C`
@@ -180,17 +181,23 @@ enforces the following, and nothing more:
   starts is resolved from mcpls' working directory and spawned by its absolute
   path). A command string
   cannot be analyzed either, so it is refused for these shells (`-c`, `--command`,
-  `--commands`, `/c`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
+  `--commands`, `/c`, `/k`, `/r`, PowerShell's `-Command`, `-CommandWithArgs`
+  (`-cwa`) and `-EncodedCommand`, fish's `-C` and `--init-command`, nushell's
+  `-e` and `--execute`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
   `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`,
   `powershell`, `pwsh` (also as a `busybox` applet, and with a version suffix such
   as `ksh93`), and for these interpreters given an inline program (`-e`, `-E`,
   `-c`, `-p`, `-r`, `--eval`, `--print`, also with the value glued on or after
   `=`): `node`, `nodejs`,
-  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`.
+  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`;
+  also a perl `-M` or `-m` value that is more than a module name and an import
+  list (`-MPOSIX;code`), and a `data:` URL given to `--import`, `--loader` or
+  `--experimental-loader` of `node`, `nodejs` and `bun`.
   The wrappers with a small option grammar (`time`, `nice`, `nohup`, `timeout`,
   `setsid`, `stdbuf`, `caffeinate`, `arch`, and `env`, also under their Homebrew GNU
   names `gtime`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`, `genv` and as `busybox`,
-  `toybox` or `coreutils` applets) are parsed against a closed table of their options: the first
+  `toybox` or `coreutils` applets, the last as `coreutils --coreutils-prog=NAME`
+  or, for uutils, the bare applet name; `--coreutils-prog-shebang=` is refused) are parsed against a closed table of their options: the first
   non-option after the options (and `timeout`'s duration) is the program they
   start, and what follows it belongs to that program. An option the table does
   not list, a missing value or command, and nesting deeper than 8 levels are
@@ -199,8 +206,18 @@ enforces the following, and nothing more:
   and replaced by its absolute path, as the server's own executable is. `deno lsp`
   is allowed. These lists are closed, not exhaustive: a shell, interpreter or
   wrapper that is not named here (`numactl`, `prlimit`, `ltrace`, `valgrind`,
-  `firejail`, `sg`, `run-parts`) is admitted without unwrapping it, so the program it starts is not
-  checked, and its command string is unexamined. A resolved wrapped-program path
+  `firejail`, `sg`, `run-parts`, `xcrun`, `sandbox-exec`) is admitted without
+  unwrapping it, and its command string is unexamined. Whichever launcher
+  precedes it, though, a server is refused when an argument of its `command`
+  (or the text after the first `=` of one, as in `--exec=<path>`), resolved
+  against the directory the server starts in with symlinks followed, is an
+  executable file inside the workspace; a file without an execute bit (on
+  Windows, without a program extension), a directory and text that is no file
+  are admitted, and so is a program given by bare name, which the sanitized
+  `PATH` already keeps out of the workspace. An argument that lies inside the
+  workspace and cannot be read (permission denied) is refused as well. An
+  executable data file passed in `args` is therefore refused. On a file system where every file has the execute bit (WSL
+  drvfs, exFAT, SMB shares) every workspace file in `args` is refused. A resolved wrapped-program path
   that contains `=` is refused, because `env` would read it as an assignment. The list matches the command's
   file stem and arguments and is best-effort: the trusted configuration is the
   boundary, so install the server globally and give its absolute path as
@@ -222,8 +239,10 @@ enforces the following, and nothing more:
 
 What the mode does not cover:
 
-- Interpreter arguments: `node <workspace>/cli.mjs` runs workspace code, and
-  only the `node` executable is checked.
+- Interpreter arguments that are not executable files: `node
+  <workspace>/cli.mjs` runs workspace code, and only the `node` executable is
+  checked, unless `cli.mjs` has an execute bit (any executable file named in
+  `args` is refused, see Launcher).
 - With no configured `workspace.roots`, the working directory is the checkout
   unless it is `/` or the login home. With no account entry, or a `$HOME` that
   differs from it and equals the working directory, binaries under it (such as
@@ -250,6 +269,9 @@ What the mode does not cover:
   (refused only for the TypeScript server) pick versions from workspace files;
   Go switches toolchains from `go.mod`. The executable check sees only the
   launcher, and the launcher list is best-effort.
+- The argument check (see Launcher) runs once, when the server is planned. A
+  restart or respawn reuses the admitted configuration, so a file in `args`
+  that becomes executable afterwards is not caught.
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not

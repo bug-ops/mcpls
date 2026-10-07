@@ -207,7 +207,7 @@ pub(super) async fn diagnostic_to_mcp(
 ) -> Diagnostic {
     Diagnostic {
         range: ctx.normalize_range(uri, diag.range).await,
-        severity: ReportedSeverity::of(diag).into(),
+        severity: ReportedSeverity::of(diag),
         message: message_as_str(&diag.message).to_string(),
         code: reported_code(diag).map(std::borrow::Cow::into_owned),
     }

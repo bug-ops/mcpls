@@ -7,6 +7,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 
 use serde::{Deserialize, Serialize};
 
+use super::bounded_number::impl_bounded_number;
+use super::text_newtype::impl_text_newtype;
+
 /// Default max depth for recursive marker search.
 pub const DEFAULT_HEURISTICS_MAX_DEPTH: usize = 10;
 
@@ -62,12 +65,6 @@ pub struct InvalidServerStartConcurrency;
 pub struct ServerStartConcurrency(NonZeroUsize);
 
 impl ServerStartConcurrency {
-    /// Eight servers at a time.
-    pub const DEFAULT: Self = match Self::new(8) {
-        Ok(limit) => limit,
-        Err(_) => panic!("the default concurrency must be non-zero"),
-    };
-
     /// Builds a limit.
     ///
     /// # Errors
@@ -87,25 +84,14 @@ impl ServerStartConcurrency {
     }
 }
 
-impl Default for ServerStartConcurrency {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl TryFrom<usize> for ServerStartConcurrency {
-    type Error = InvalidServerStartConcurrency;
-
-    fn try_from(limit: usize) -> Result<Self, Self::Error> {
-        Self::new(limit)
-    }
-}
-
-impl From<ServerStartConcurrency> for usize {
-    fn from(limit: ServerStartConcurrency) -> Self {
-        limit.get()
-    }
-}
+impl_bounded_number!(
+    ServerStartConcurrency,
+    usize,
+    InvalidServerStartConcurrency,
+    default = 8,
+    "Eight servers at a time.",
+    into = ServerStartConcurrency::get
+);
 
 /// Why a number is not a valid [`SearchDepth`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,12 +123,6 @@ pub struct InvalidSearchDepth {
 pub struct SearchDepth(u8);
 
 impl SearchDepth {
-    /// The built-in default, [`DEFAULT_HEURISTICS_MAX_DEPTH`].
-    pub const DEFAULT: Self = match Self::new(DEFAULT_HEURISTICS_MAX_DEPTH) {
-        Ok(depth) => depth,
-        Err(_) => panic!("the default search depth must be in range"),
-    };
-
     /// Builds a depth.
     ///
     /// # Errors
@@ -170,25 +150,14 @@ impl SearchDepth {
     }
 }
 
-impl Default for SearchDepth {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl TryFrom<usize> for SearchDepth {
-    type Error = InvalidSearchDepth;
-
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<SearchDepth> for usize {
-    fn from(depth: SearchDepth) -> Self {
-        depth.get()
-    }
-}
+impl_bounded_number!(
+    SearchDepth,
+    usize,
+    InvalidSearchDepth,
+    default = DEFAULT_HEURISTICS_MAX_DEPTH,
+    "The built-in default, [`DEFAULT_HEURISTICS_MAX_DEPTH`].",
+    into = SearchDepth::get
+);
 
 /// Upper bound for `workspace.max_file_size` (1 GiB).
 ///
@@ -236,9 +205,6 @@ pub struct SizeLimit(Option<NonZeroU64>);
 impl SizeLimit {
     /// No limit.
     pub const UNLIMITED: Self = Self(None);
-
-    /// The built-in default, 10 MiB.
-    pub const DEFAULT: Self = Self::from_static(10 * 1024 * 1024);
 
     /// A limit of `bytes`, where `0` means unlimited.
     ///
@@ -302,25 +268,14 @@ impl SizeLimit {
     }
 }
 
-impl Default for SizeLimit {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl TryFrom<u64> for SizeLimit {
-    type Error = InvalidSizeLimit;
-
-    fn try_from(bytes: u64) -> Result<Self, Self::Error> {
-        Self::new(bytes)
-    }
-}
-
-impl From<SizeLimit> for u64 {
-    fn from(limit: SizeLimit) -> Self {
-        limit.0.map_or(0, NonZeroU64::get)
-    }
-}
+impl_bounded_number!(
+    SizeLimit,
+    u64,
+    InvalidSizeLimit,
+    default = 10 * 1024 * 1024,
+    "The built-in default, 10 MiB.",
+    into = |limit: SizeLimit| limit.0.map_or(0, NonZeroU64::get)
+);
 
 /// A count limit that is either absent or a positive number of documents.
 ///
@@ -430,45 +385,9 @@ impl<const MAX: usize> BoundedText<MAX> {
         }
         Ok(Self(text))
     }
-
-    /// The validated text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
-impl<const MAX: usize> std::fmt::Display for BoundedText<MAX> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl<const MAX: usize> TryFrom<String> for BoundedText<MAX> {
-    type Error = InvalidBoundedText;
-
-    fn try_from(text: String) -> Result<Self, Self::Error> {
-        Self::new(text)
-    }
-}
-
-impl<const MAX: usize> From<BoundedText<MAX>> for String {
-    fn from(text: BoundedText<MAX>) -> Self {
-        text.0
-    }
-}
-
-impl<const MAX: usize> PartialEq<str> for BoundedText<MAX> {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl<const MAX: usize> PartialEq<&str> for BoundedText<MAX> {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
+impl_text_newtype!(@impl [const MAX: usize] BoundedText<MAX>, InvalidBoundedText);
 
 #[cfg(test)]
 mod tests {
@@ -494,6 +413,16 @@ mod tests {
             BoundedText::<4>::new("ééé").unwrap_err().to_string(),
             "exceeds the maximum of 4 bytes (6 given)"
         );
+    }
+
+    #[test]
+    fn test_bounded_text_has_the_shared_text_conversions() {
+        let text: BoundedText<8> = "hello".parse().unwrap();
+        assert_eq!(text.as_ref() as &str, "hello");
+        assert_eq!(std::borrow::Borrow::<str>::borrow(&text), "hello");
+        assert_eq!(text.to_string(), "hello");
+        assert_eq!(String::from(text), "hello");
+        assert!("123456789".parse::<BoundedText<8>>().is_err());
     }
 
     #[test]

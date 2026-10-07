@@ -7,17 +7,17 @@
 //! publish per file (a later publish supersedes an earlier one), bounded in
 //! files and in bytes. A publish the mailbox cannot hold is not discarded
 //! quietly: its file is recorded as lost, and the reader hands the lost files
-//! over so the cache can say so ([`PublishDelivery::Lost`]).
+//! over so the cache can say so ([`PublishDelivery::Lost`],
+//! [`PublishDelivery::LostUnnamed`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use lsp_types::{PublishDiagnosticsParams, Uri};
+use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams, Uri};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
-use super::types::LspNotification;
 use crate::bridge::{BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES};
 use crate::util::{WarnLimiter, lock_std};
 
@@ -52,28 +52,130 @@ impl Default for MailboxLimits {
     }
 }
 
-/// Files whose publish the mailbox could not deliver.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct LostPublishes {
-    /// The files, oldest loss first.
-    pub uris: Vec<Uri>,
-    /// More files were lost than are listed, so some losses are unnamed. Handed
-    /// over on its own, after the pending publishes.
-    pub overflowed: bool,
+/// Counts dropped frames and says when one is worth a warning: at most once
+/// per [`DROP_WARN_PERIOD`], so a flood cannot flood the log.
+#[derive(Debug, Default)]
+pub struct DropCounter {
+    warn: WarnLimiter,
+    suppressed: usize,
+}
+
+impl DropCounter {
+    /// A counter whose first drop warns at once.
+    pub const fn new() -> Self {
+        Self {
+            warn: WarnLimiter::new(),
+            suppressed: 0,
+        }
+    }
+
+    /// Records one drop at `now`. `Some(n)` when a warning is due, with `n` the
+    /// drops silenced since the previous warning; the caller logs it once it
+    /// holds no lock.
+    pub fn record(&mut self, now: Instant) -> Option<usize> {
+        if self.warn.due(now, DROP_WARN_PERIOD) {
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
+/// A `publishDiagnostics` whose diagnostics are already bounded the way the
+/// cache stores them, so no later stage bounds them again.
+#[derive(Debug)]
+pub struct BoundedPublish {
+    uri: Uri,
+    version: Option<i32>,
+    diagnostics: BoundedDiagnostics,
+}
+
+impl BoundedPublish {
+    fn new(params: PublishDiagnosticsParams) -> (Self, usize) {
+        let PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version,
+        } = params;
+        let diagnostics = BoundedDiagnostics::new(&uri, diagnostics);
+        let bytes = diagnostics.buffered_bytes();
+        (
+            Self {
+                uri,
+                version,
+                diagnostics,
+            },
+            bytes,
+        )
+    }
+
+    /// The file the server published for, exactly as it spelled it.
+    #[must_use]
+    pub const fn uri(&self) -> &Uri {
+        &self.uri
+    }
+
+    /// The document version the diagnostics are for, if the server said.
+    #[must_use]
+    pub const fn version(&self) -> Option<i32> {
+        self.version
+    }
+
+    /// The bounded diagnostics.
+    #[must_use]
+    pub const fn diagnostics(&self) -> &BoundedDiagnostics {
+        &self.diagnostics
+    }
+
+    /// The URI, version and bounded diagnostics.
+    #[must_use]
+    pub fn into_parts(self) -> (Uri, Option<i32>, BoundedDiagnostics) {
+        (self.uri, self.version, self.diagnostics)
+    }
+}
+
+/// A non-empty list of files whose publish the mailbox could not deliver,
+/// oldest loss first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LostFiles(Vec<Uri>);
+
+impl LostFiles {
+    fn new(uris: Vec<Uri>) -> Option<Self> {
+        (!uris.is_empty()).then_some(Self(uris))
+    }
+
+    /// The lost files.
+    #[must_use]
+    pub fn uris(&self) -> &[Uri] {
+        &self.0
+    }
 }
 
 /// One thing the reader takes out of the mailbox.
 #[derive(Debug)]
 pub enum PublishDelivery {
     /// The latest pending publish of a file.
-    Publish(PublishDiagnosticsParams),
-    /// Publishes that never made it into the mailbox.
-    Lost(LostPublishes),
+    Publish(BoundedPublish),
+    /// Named files whose publish never made it into the mailbox.
+    Lost(LostFiles),
+    /// More files were lost than the mailbox could name. Handed over on its
+    /// own, after the pending publishes.
+    LostUnnamed,
+}
+
+/// A frame of the log and `showMessage` lane.
+#[derive(Debug)]
+pub enum ServerMessage {
+    /// A `window/logMessage`.
+    Log(LogMessageParams),
+    /// A `window/showMessage`.
+    Show(ShowMessageParams),
 }
 
 #[derive(Debug)]
 struct Pending {
-    params: PublishDiagnosticsParams,
+    publish: BoundedPublish,
     bytes: usize,
 }
 
@@ -87,8 +189,7 @@ struct State {
     lost: Vec<Uri>,
     lost_keys: HashSet<DiagnosticsKey>,
     lost_overflowed: bool,
-    dropped_since_warn: usize,
-    warn: WarnLimiter,
+    drops: DropCounter,
     writer_gone: bool,
     reader_gone: bool,
 }
@@ -126,10 +227,10 @@ impl State {
         while let Some(key) = self.order.pop_front() {
             if let Some(pending) = self.pending.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(pending.bytes);
-                return Some(PublishDelivery::Publish(pending.params));
+                return Some(PublishDelivery::Publish(pending.publish));
             }
         }
-        self.take_lost_overflow().map(PublishDelivery::Lost)
+        std::mem::take(&mut self.lost_overflowed).then_some(PublishDelivery::LostUnnamed)
     }
 
     fn mark_lost(&mut self, key: DiagnosticsKey, uri: Uri) {
@@ -144,37 +245,15 @@ impl State {
         self.lost.push(uri);
     }
 
-    fn take_lost_files(&mut self) -> Option<LostPublishes> {
-        if self.lost.is_empty() {
-            return None;
-        }
+    fn take_lost_files(&mut self) -> Option<LostFiles> {
+        let lost = LostFiles::new(std::mem::take(&mut self.lost))?;
         self.lost_keys.clear();
-        Some(LostPublishes {
-            uris: std::mem::take(&mut self.lost),
-            overflowed: false,
-        })
+        Some(lost)
     }
 
-    /// The unnamed losses, handed over only once nothing is pending so the
-    /// cache can mark them after the burst's own writes.
-    fn take_lost_overflow(&mut self) -> Option<LostPublishes> {
-        std::mem::take(&mut self.lost_overflowed)
-            .then(LostPublishes::default)
-            .map(|lost| LostPublishes {
-                overflowed: true,
-                ..lost
-            })
-    }
-
-    fn count_drop(&mut self) {
-        self.dropped_since_warn = self.dropped_since_warn.saturating_add(1);
-        if self.warn.due(std::time::Instant::now(), DROP_WARN_PERIOD) {
-            warn!(
-                "publishDiagnostics mailbox is full: dropped {} publish(es) since the last \
-                 warning; the files read as evicted until the server publishes again",
-                std::mem::take(&mut self.dropped_since_warn)
-            );
-        }
+    /// Counts one dropped publish; `Some(n)` when a warning is due.
+    fn count_drop(&mut self) -> Option<usize> {
+        self.drops.record(Instant::now())
     }
 }
 
@@ -217,21 +296,14 @@ impl PublishWriter {
     /// publish of the file is withdrawn too, so the file never reads as
     /// published with content older than what the server last said.
     pub fn publish(&self, params: PublishDiagnosticsParams) {
-        let PublishDiagnosticsParams {
-            uri,
-            diagnostics,
-            version,
-        } = params;
-        let diagnostics = BoundedDiagnostics::new(&uri, diagnostics);
-        let bytes = diagnostics.buffered_bytes();
-        let diagnostics = diagnostics.into_vec();
-        let key = DiagnosticsKey::of(&uri);
+        let (publish, bytes) = BoundedPublish::new(params);
+        let key = DiagnosticsKey::of(publish.uri());
         let limits = self.shared.limits;
         let mut state = lock_std(&self.shared.state);
         if state.reader_gone {
             debug!(
                 "dropping a publish for {}: nobody reads the mailbox",
-                uri.as_ref()
+                publish.uri().as_ref()
             );
             return;
         }
@@ -243,29 +315,28 @@ impl PublishWriter {
             .saturating_add(bytes)
             <= limits.max_bytes
             && (!is_new || state.pending.len() < limits.max_pending);
-        state.withdraw(&key);
         state.compact_order(limits.max_pending);
-        if fits {
+        state.withdraw(&key);
+        let warn_due = if fits {
             state.bytes = state.bytes.saturating_add(bytes);
             if is_new {
                 state.order.push_back(key.clone());
             }
-            state.pending.insert(
-                key,
-                Pending {
-                    params: PublishDiagnosticsParams {
-                        uri,
-                        diagnostics,
-                        version,
-                    },
-                    bytes,
-                },
-            );
+            state.pending.insert(key, Pending { publish, bytes });
+            None
         } else {
+            let (uri, ..) = publish.into_parts();
             state.mark_lost(key, uri);
-            state.count_drop();
-        }
+            state.count_drop()
+        };
         drop(state);
+        if let Some(suppressed) = warn_due {
+            warn!(
+                "publishDiagnostics mailbox is full: dropped a publish ({suppressed} others \
+                 since the last warning); the files read as evicted until the server publishes \
+                 again"
+            );
+        }
         self.shared.wake.notify_one();
     }
 }
@@ -325,19 +396,19 @@ impl Drop for PublishReader {
 /// unrecorded.
 #[derive(Debug)]
 pub struct NotificationSink {
-    messages: mpsc::Sender<LspNotification>,
+    messages: mpsc::Sender<ServerMessage>,
     publishes: PublishWriter,
 }
 
 impl NotificationSink {
     /// A sink over `messages` with a mailbox of the default limits.
-    pub fn new(messages: mpsc::Sender<LspNotification>) -> (Self, PublishReader) {
+    pub fn new(messages: mpsc::Sender<ServerMessage>) -> (Self, PublishReader) {
         Self::with_limits(messages, MailboxLimits::default())
     }
 
     /// As [`Self::new`] with explicit mailbox limits.
     pub fn with_limits(
-        messages: mpsc::Sender<LspNotification>,
+        messages: mpsc::Sender<ServerMessage>,
         limits: MailboxLimits,
     ) -> (Self, PublishReader) {
         let (publishes, reader) = mailbox(limits);
@@ -351,7 +422,7 @@ impl NotificationSink {
     }
 
     /// The channel log and `showMessage` frames go through.
-    pub const fn messages(&self) -> &mpsc::Sender<LspNotification> {
+    pub const fn messages(&self) -> &mpsc::Sender<ServerMessage> {
         &self.messages
     }
 
@@ -363,13 +434,10 @@ impl NotificationSink {
 
 /// Everything a server's notification lane delivers to the bridge: log and
 /// `showMessage` frames from a bounded channel, and the diagnostics mailbox.
-///
-/// A plain receiver converts into an inbox with a closed mailbox, for
-/// consumers that only look at the channel.
 #[derive(Debug)]
 pub struct NotificationInbox {
     /// The log/showMessage channel.
-    pub messages: mpsc::Receiver<LspNotification>,
+    pub messages: mpsc::Receiver<ServerMessage>,
     /// The diagnostics mailbox.
     pub publishes: PublishReader,
 }
@@ -377,7 +445,7 @@ pub struct NotificationInbox {
 impl NotificationInbox {
     /// An inbox over `messages` and `publishes`.
     #[must_use]
-    pub const fn new(messages: mpsc::Receiver<LspNotification>, publishes: PublishReader) -> Self {
+    pub const fn new(messages: mpsc::Receiver<ServerMessage>, publishes: PublishReader) -> Self {
         Self {
             messages,
             publishes,
@@ -385,9 +453,28 @@ impl NotificationInbox {
     }
 }
 
-impl From<mpsc::Receiver<LspNotification>> for NotificationInbox {
-    fn from(messages: mpsc::Receiver<LspNotification>) -> Self {
+#[cfg(test)]
+impl From<mpsc::Receiver<ServerMessage>> for NotificationInbox {
+    fn from(messages: mpsc::Receiver<ServerMessage>) -> Self {
         Self::new(messages, PublishReader::closed())
+    }
+}
+
+/// A notification lane that can drop a frame under pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Log and `showMessage` frames.
+    Notification,
+    /// `$/progress` `begin`/`end` and unrecognized notifications.
+    Lifecycle,
+}
+
+impl Lane {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::Lifecycle => "lifecycle",
+        }
     }
 }
 
@@ -395,43 +482,39 @@ impl From<mpsc::Receiver<LspNotification>> for NotificationInbox {
 /// [`DROP_WARN_PERIOD`], naming the lane and the count since the last warning.
 #[derive(Debug)]
 pub struct DropLog {
-    lane: &'static str,
-    state: StdMutex<(WarnLimiter, usize)>,
+    lane: Lane,
+    drops: StdMutex<DropCounter>,
 }
 
 impl DropLog {
-    pub const fn new(lane: &'static str) -> Self {
+    const fn new(lane: Lane) -> Self {
         Self {
             lane,
-            state: StdMutex::new((WarnLimiter::new(), 0)),
+            drops: StdMutex::new(DropCounter::new()),
         }
     }
 
-    /// The log of the lane named `lane` (`"notification"` or `"lifecycle"`);
-    /// shared by every server, so a flood on one lane warns once a period.
-    pub fn of_lane(lane: &str) -> &'static Self {
-        static NOTIFICATION: DropLog = DropLog::new("notification");
-        static LIFECYCLE: DropLog = DropLog::new("lifecycle");
-        if lane == "lifecycle" {
-            &LIFECYCLE
-        } else {
-            &NOTIFICATION
+    /// The log of `lane`; shared by every server, so a flood on one lane warns
+    /// once a period.
+    pub fn of(lane: Lane) -> &'static Self {
+        static NOTIFICATION: DropLog = DropLog::new(Lane::Notification);
+        static LIFECYCLE: DropLog = DropLog::new(Lane::Lifecycle);
+        match lane {
+            Lane::Notification => &NOTIFICATION,
+            Lane::Lifecycle => &LIFECYCLE,
         }
     }
 
     /// Records one dropped frame of `method`; the frame itself is logged at
     /// DEBUG only.
     pub fn record(&self, method: &str) {
-        debug!("dropping notification: lane={}, method={method}", self.lane);
-        let mut state = lock_std(&self.state);
-        state.1 = state.1.saturating_add(1);
-        if state.0.due(std::time::Instant::now(), DROP_WARN_PERIOD) {
-            let dropped = std::mem::take(&mut state.1);
-            drop(state);
+        let lane = self.lane.name();
+        debug!("dropping notification: lane={lane}, method={method}");
+        let warn_due = lock_std(&self.drops).record(Instant::now());
+        if let Some(suppressed) = warn_due {
             warn!(
-                "dropped {dropped} notification(s) on the {} lane since the last warning \
-                 (channel full or closed)",
-                self.lane
+                "dropped a notification on the {lane} lane ({suppressed} others since the last \
+                 warning; channel full or closed)"
             );
         }
     }
@@ -439,6 +522,8 @@ impl DropLog {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use lsp_types::Diagnostic;
 
     use super::*;
@@ -470,9 +555,9 @@ mod tests {
         }
     }
 
-    async fn next_publish(reader: &mut PublishReader) -> PublishDiagnosticsParams {
+    async fn next_publish(reader: &mut PublishReader) -> BoundedPublish {
         match reader.recv().await {
-            Some(PublishDelivery::Publish(params)) => params,
+            Some(PublishDelivery::Publish(publish)) => publish,
             other => panic!("expected a publish, got {other:?}"),
         }
     }
@@ -486,7 +571,7 @@ mod tests {
         drop(writer);
 
         for n in 0..10 {
-            assert_eq!(next_publish(&mut reader).await.uri, uri(n));
+            assert_eq!(next_publish(&mut reader).await.uri(), &uri(n));
         }
         assert!(reader.recv().await.is_none());
     }
@@ -499,9 +584,13 @@ mod tests {
         drop(writer);
 
         let delivered = next_publish(&mut reader).await;
-        assert_eq!(delivered.diagnostics.len(), 1);
+        assert_eq!(delivered.diagnostics().as_slice().len(), 1);
         assert_eq!(
-            delivered.diagnostics.first().map(|d| d.message.clone()),
+            delivered
+                .diagnostics()
+                .as_slice()
+                .first()
+                .map(|d| d.message.clone()),
             Some("new".to_owned().into())
         );
         assert!(reader.recv().await.is_none());
@@ -517,10 +606,9 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("the loss must be handed over first");
         };
-        assert_eq!(lost.uris, [uri(2), uri(3)]);
-        assert!(!lost.overflowed);
-        assert_eq!(next_publish(&mut reader).await.uri, uri(0));
-        assert_eq!(next_publish(&mut reader).await.uri, uri(1));
+        assert_eq!(lost.uris(), [uri(2), uri(3)]);
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(0));
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
     }
 
     /// A replacement that does not fit withdraws the older pending publish
@@ -536,7 +624,7 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("expected the lost file");
         };
-        assert_eq!(lost.uris, [uri(1)]);
+        assert_eq!(lost.uris(), [uri(1)]);
         assert!(reader.recv().await.is_none());
     }
 
@@ -554,6 +642,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_after_order_compaction_is_still_delivered() {
+        let one = bytes_of(0, "x");
+        let (writer, mut reader) = mailbox(small(4, one * 2));
+        for n in 0..16 {
+            writer.publish(publish_of(n, "x"));
+            writer.publish(publish_of(n, &"y".repeat(one * 4)));
+        }
+        writer.publish(publish_of(100, "x"));
+        writer.publish(publish_of(100, "z"));
+        drop(writer);
+
+        let mut delivered = None;
+        while let Some(delivery) = reader.recv().await {
+            if let PublishDelivery::Publish(params) = delivery {
+                delivered = Some(params);
+            }
+        }
+        let delivered = delivered.expect("the replaced publish must reach the reader");
+        assert_eq!(delivered.uri(), &uri(100));
+        assert_eq!(
+            delivered
+                .diagnostics()
+                .as_slice()
+                .first()
+                .map(|d| d.message.clone()),
+            Some("z".to_owned().into())
+        );
+    }
+
+    #[tokio::test]
+    async fn delivered_publish_carries_bounded_diagnostics() {
+        let (writer, mut reader) = mailbox(small(10, usize::MAX));
+        let oversized = 512 * 1024;
+        writer.publish(publish_of(1, &"m".repeat(oversized)));
+        drop(writer);
+
+        let delivered = next_publish(&mut reader).await;
+
+        let message = delivered
+            .diagnostics()
+            .as_slice()
+            .first()
+            .map(|d| d.message.clone());
+        assert_matches!(
+            message,
+            Some(lsp_types::Message::String(text)) if text.len() < oversized
+        );
+    }
+
+    #[test]
+    fn drop_counter_warns_once_per_period_and_counts_the_silenced() {
+        let mut counter = DropCounter::new();
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+
+        assert_eq!(counter.record(at(0)), Some(0));
+        assert_eq!(counter.record(at(1)), None);
+        assert_eq!(counter.record(at(2)), None);
+        assert_eq!(counter.record(at(61)), Some(2));
+    }
+
+    #[test]
+    fn each_lane_has_its_own_drop_log() {
+        for lane in [Lane::Notification, Lane::Lifecycle] {
+            assert_eq!(DropLog::of(lane).lane, lane);
+        }
+    }
+
+    #[tokio::test]
     async fn byte_cap_bounds_what_is_buffered() {
         let one = bytes_of(0, "e");
         let (writer, mut reader) = mailbox(small(100, one * 3));
@@ -567,7 +724,8 @@ mod tests {
         while let Some(item) = reader.recv().await {
             match item {
                 PublishDelivery::Publish(_) => delivered += 1,
-                PublishDelivery::Lost(files) => lost += files.uris.len(),
+                PublishDelivery::Lost(files) => lost += files.uris().len(),
+                PublishDelivery::LostUnnamed => panic!("no unnamed losses expected"),
             }
         }
         assert_eq!((delivered, lost), (3, 7));
@@ -584,12 +742,8 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("expected losses");
         };
-        assert_eq!(lost.uris.len(), MAX_LOST_FILES);
-        assert!(!lost.overflowed);
-        let Some(PublishDelivery::Lost(rest)) = reader.recv().await else {
-            panic!("expected the unnamed losses");
-        };
-        assert!(rest.uris.is_empty() && rest.overflowed);
+        assert_eq!(lost.uris().len(), MAX_LOST_FILES);
+        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnnamed));
         assert!(reader.recv().await.is_none());
     }
 

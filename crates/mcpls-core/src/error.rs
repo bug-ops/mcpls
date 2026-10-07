@@ -19,12 +19,10 @@ use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
     LanguageId, ServerCommand, ServerId, ToolKind, UnsupportedFilePattern,
 };
-use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
-use crate::util::{
-    SizeExceeded, escape_control, escape_control_owned, truncate_str, truncate_string,
-};
+pub use crate::util::SizeExceeded;
+use crate::util::{MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded, escape_control, truncate_str};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -280,10 +278,9 @@ impl EchoedArgument {
     #[must_use]
     pub fn name(arg: &str) -> Self {
         let name = arg
-            .split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .unwrap_or_default();
-        Self(bounded_escaped(name, MAX_SYMBOL_NAME_BYTES))
+            .split_once(|c: char| c == '=' || c.is_whitespace())
+            .map_or(arg, |(name, _)| name);
+        Self(escape_bounded(name, MAX_SYMBOL_NAME_BYTES))
     }
 
     /// The echoed text.
@@ -293,25 +290,65 @@ impl EchoedArgument {
     }
 }
 
-/// `text` with control and deceptive characters escaped, then bounded: escaping
-/// first, because it can multiply the length.
-fn bounded_escaped(text: &str, max_bytes: usize) -> String {
-    truncate_string(escape_control_owned(text.to_owned()), max_bytes)
-}
-
 /// Most bytes of a workspace-controlled path shown in a refusal.
 const MAX_ECHOED_PATH_BYTES: usize = 1024;
 
-/// `Display` adapter for a path the workspace names (a symlink target's final
-/// component is its choice): bounded and escaped like [`EchoedArgument`].
-struct EchoedPath<'a>(&'a Path);
+/// A path the workspace names, shown whole, escaped and bounded.
+///
+/// The workspace names a program a launcher starts or a symlink target's final
+/// component. Unlike [`EchoedArgument`], the text is never cut at a space or an
+/// `=`, because a path is not an option with a value. It is bounded to
+/// 1024 bytes of escaped text.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use mcpls_core::error::EchoedPath;
+///
+/// let path = EchoedPath::new(Path::new("/opt/my tools/a=b/srv"));
+/// assert_eq!(path.as_str(), "/opt/my tools/a=b/srv");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoedPath(String);
 
-impl fmt::Display for EchoedPath<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&bounded_escaped(
-            &self.0.display().to_string(),
+impl EchoedPath {
+    /// The whole of `path`, escaped and bounded.
+    #[must_use]
+    pub fn new(path: &Path) -> Self {
+        Self(escape_bounded(
+            &path.to_string_lossy(),
             MAX_ECHOED_PATH_BYTES,
         ))
+    }
+
+    /// The program an argument names: its whole path, unless the text reads
+    /// as an assignment (an `=` before any path separator), which is cut at
+    /// the `=` like [`EchoedArgument`] so a value that is not a program is not
+    /// echoed.
+    #[must_use]
+    pub fn program(arg: &str) -> Self {
+        let assignment = arg
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.contains(std::path::is_separator));
+        if assignment {
+            Self(EchoedArgument::name(arg).0)
+        } else {
+            Self::new(Path::new(arg))
+        }
+    }
+
+    /// The echoed text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EchoedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -362,27 +399,105 @@ impl fmt::Display for RunnerSubcommand {
     }
 }
 
-/// The flag that gives a shell a command string.
+/// The spelling of a long flag that gives a shell a command string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongCommandName {
+    /// `--command`.
+    Command,
+    /// `--commands`.
+    Commands,
+    /// `--init-command`, which fish runs as a command string.
+    InitCommand,
+    /// `--execute`, which nushell runs as a command string.
+    Execute,
+}
+
+impl LongCommandName {
+    /// The flag as written on a command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "--command",
+            Self::Commands => "--commands",
+            Self::InitCommand => "--init-command",
+            Self::Execute => "--execute",
+        }
+    }
+}
+
+/// A switch of `cmd` that gives it a command string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdSwitch {
+    /// `/c`.
+    C,
+    /// `/k`.
+    K,
+    /// `/r`.
+    R,
+}
+
+impl CmdSwitch {
+    /// The switch as written on a command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::C => "/c",
+            Self::K => "/k",
+            Self::R => "/r",
+        }
+    }
+}
+
+/// A PowerShell parameter that gives it a command, however abbreviated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerShellParameter {
+    /// `-Command`.
+    Command,
+    /// `-CommandWithArgs`.
+    CommandWithArgs,
+    /// `-EncodedCommand`.
+    EncodedCommand,
+}
+
+impl PowerShellParameter {
+    /// The full parameter name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "-Command",
+            Self::CommandWithArgs => "-CommandWithArgs",
+            Self::EncodedCommand => "-EncodedCommand",
+        }
+    }
+}
+
+/// The flag that gives a shell a command string, as the shell's family
+/// spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellFlag {
     /// `-c`, alone or inside a cluster such as `-lc`.
     DashC,
-    /// `--command` or `--commands`.
-    LongCommand,
+    /// fish's `-C`, which runs an init command string.
+    DashCapitalC,
+    /// nushell's `-e`, which executes a command string.
+    DashE,
+    /// A long flag such as `--command`.
+    LongCommand(LongCommandName),
     /// `cmd`'s `/c`, `/k` or `/r`.
-    SlashC,
-    /// PowerShell's `-Command`, `-CommandWithArgs`, `-EncodedCommand` or an
-    /// abbreviation of them.
-    PowerShellCommand,
+    SlashC(CmdSwitch),
+    /// A PowerShell parameter or an abbreviation or alias of it.
+    PowerShell(PowerShellParameter),
 }
 
 impl fmt::Display for ShellFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DashC => "-c",
-            Self::LongCommand => "--command",
-            Self::SlashC => "/c",
-            Self::PowerShellCommand => "-Command",
+            Self::DashCapitalC => "-C",
+            Self::DashE => "-e",
+            Self::LongCommand(name) => name.as_str(),
+            Self::SlashC(switch) => switch.as_str(),
+            Self::PowerShell(parameter) => parameter.as_str(),
         })
     }
 }
@@ -396,6 +511,12 @@ pub enum InlineFlag {
     Eval,
     /// `--print`.
     Print,
+    /// `--import`, given a `data:` URL.
+    Import,
+    /// `--loader`, given a `data:` URL.
+    Loader,
+    /// `--experimental-loader`, given a `data:` URL.
+    ExperimentalLoader,
 }
 
 impl InlineFlag {
@@ -406,6 +527,9 @@ impl InlineFlag {
             Self::Short(_) => None,
             Self::Eval => Some("--eval"),
             Self::Print => Some("--print"),
+            Self::Import => Some("--import"),
+            Self::Loader => Some("--loader"),
+            Self::ExperimentalLoader => Some("--experimental-loader"),
         }
     }
 }
@@ -414,8 +538,9 @@ impl fmt::Display for InlineFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Short(letter) => write!(f, "-{letter}"),
-            Self::Eval => f.write_str("--eval"),
-            Self::Print => f.write_str("--print"),
+            Self::Eval | Self::Print | Self::Import | Self::Loader | Self::ExperimentalLoader => {
+                f.write_str(self.long_name().unwrap_or_default())
+            }
         }
     }
 }
@@ -492,9 +617,6 @@ pub enum UnanalyzableLaunch {
     RelativeProgramAfterChdir,
     /// The program name is empty.
     BlankProgram,
-    /// The vetted path of a wrapped program contains `=`, which `env` would
-    /// read as an assignment.
-    PathContainsEquals,
 }
 
 impl fmt::Display for UnanalyzableLaunch {
@@ -510,9 +632,6 @@ impl fmt::Display for UnanalyzableLaunch {
                 f.write_str("it starts a relative program after changing directory")
             }
             Self::BlankProgram => f.write_str("the program name is empty"),
-            Self::PathContainsEquals => {
-                f.write_str("its resolved path contains '=', which env reads as an assignment")
-            }
         }
     }
 }
@@ -524,14 +643,14 @@ pub enum LauncherRefusal {
     /// A launcher selects workspace code.
     SelectsWorkspaceCode {
         /// The launcher's name.
-        program: EchoedArgument,
+        program: EchoedPath,
         /// What about it does.
         trigger: LaunchTrigger,
     },
     /// The launch cannot be analyzed, which untrusted mode treats as unsafe.
     Unanalyzable {
         /// The launcher's name.
-        program: EchoedArgument,
+        program: EchoedPath,
         /// Why it cannot be analyzed.
         reason: UnanalyzableLaunch,
     },
@@ -640,12 +759,35 @@ pub enum UntrustedRefusal {
         /// What about the launch the analysis refused.
         cause: LauncherRefusal,
     },
+    /// An argument of the configured command names an executable file inside
+    /// the workspace, which whatever launcher precedes it would start.
+    WorkspaceExecutableArgument {
+        /// The position of the argument in the configured `args`.
+        index: usize,
+        /// The canonical path of the executable.
+        executable: PathBuf,
+    },
+    /// An argument of the configured command lies inside the workspace and
+    /// cannot be read, so untrusted mode cannot tell whether it is an
+    /// executable.
+    UnreadableWorkspaceArgument {
+        /// The position of the argument in the configured `args`.
+        index: usize,
+        /// The path the argument names, lexically normalized.
+        path: PathBuf,
+    },
     /// A program an exec wrapper or `env` starts was not found on a search
     /// path outside the workspace, so untrusted mode cannot tell what would
     /// run.
     UnresolvedWrappedProgram {
         /// The wrapped program, as configured.
-        program: EchoedArgument,
+        program: EchoedPath,
+    },
+    /// The vetted path of a program an exec wrapper starts contains `=`, which
+    /// `env` would read as an assignment, so it cannot be passed on unchanged.
+    WrappedProgramPathContainsEquals {
+        /// The wrapped program, as configured.
+        program: EchoedPath,
     },
     /// The configured command starts the TypeScript server through a launcher
     /// that untrusted mode cannot pin to a binary outside the workspace.
@@ -683,7 +825,19 @@ impl fmt::Display for UntrustedRefusal {
             Self::WorkspaceExecutable { executable } => write!(
                 f,
                 "its executable {} lies inside the workspace, which untrusted mode never runs",
-                EchoedPath(executable)
+                EchoedPath::new(executable)
+            ),
+            Self::WorkspaceExecutableArgument { index, executable } => write!(
+                f,
+                "its argument at index {index}, {}, is an executable inside the workspace, \
+                 which untrusted mode never runs",
+                EchoedPath::new(executable)
+            ),
+            Self::UnreadableWorkspaceArgument { index, path } => write!(
+                f,
+                "its argument at index {index}, {}, lies inside the workspace and cannot be \
+                 read, so untrusted mode cannot tell whether it is an executable",
+                EchoedPath::new(path)
             ),
             Self::UnresolvedExecutable { command } => write!(
                 f,
@@ -708,19 +862,25 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its {variable}, {}, lies inside the workspace and the login home directory is \
                  unknown, so untrusted mode cannot give it a safe one",
-                EchoedPath(home)
+                EchoedPath::new(home)
             ),
             Self::WorkspaceTsserver { tsserver } => write!(
                 f,
                 "the tsserver it would use, {}, lies inside the workspace, which untrusted \
                  mode never runs",
-                EchoedPath(tsserver)
+                EchoedPath::new(tsserver)
             ),
             Self::ProjectLauncher { cause, .. } => cause.fmt(f),
             Self::UnresolvedWrappedProgram { program } => write!(
                 f,
                 "the program '{program}' its launcher starts was not found where the child \
                  would look it up, which untrusted mode requires"
+            ),
+            Self::WrappedProgramPathContainsEquals { program } => write!(
+                f,
+                "the program '{program}' its launcher starts resolves to a path containing \
+                 '=', which env reads as an assignment, so untrusted mode cannot pin it; give \
+                 a program whose path has no '='"
             ),
             Self::UnpinnedTypescriptLauncher { command } => write!(
                 f,
@@ -731,7 +891,7 @@ impl fmt::Display for UntrustedRefusal {
             Self::NonUtf8Path { what, path } => write!(
                 f,
                 "its {what}, {}, is not valid UTF-8, so untrusted mode cannot pass it on",
-                EchoedPath(path)
+                EchoedPath::new(path)
             ),
             Self::NoSafeWorkingDirectory => f.write_str(
                 "no directory outside the workspace is available to start it in, which \
@@ -803,6 +963,8 @@ impl fmt::Display for FailedToStart<'_> {
                         write!(f, "; restart mcpls with `--allow-server {id}` to start it")
                     }
                     UntrustedRefusal::WorkspaceExecutable { .. }
+                    | UntrustedRefusal::WorkspaceExecutableArgument { .. }
+                    | UntrustedRefusal::UnreadableWorkspaceArgument { .. }
                     | UntrustedRefusal::UnresolvedExecutable { .. }
                     | UntrustedRefusal::AutoSelectionTarget { .. }
                     | UntrustedRefusal::WorkspaceHome { .. }
@@ -811,6 +973,7 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::WorkspaceTsserver { .. }
                     | UntrustedRefusal::ProjectLauncher { .. }
                     | UntrustedRefusal::UnresolvedWrappedProgram { .. }
+                    | UntrustedRefusal::WrappedProgramPathContainsEquals { .. }
                     | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
                     | UntrustedRefusal::NonUtf8Path { .. }
                     | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
@@ -1266,7 +1429,8 @@ impl fmt::Display for EarlyExitDetail<'_> {
     }
 }
 
-/// A background task whose failure surfaces as [`Error::TaskFailed`].
+/// A background task whose failure surfaces as [`Error::TaskFailed`] or is
+/// reported by its supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackgroundTask {
@@ -1282,6 +1446,8 @@ pub enum BackgroundTask {
     FileOpen,
     /// Planning which configured servers to start, on the blocking pool.
     ServerPlanning,
+    /// The reaper that expires idle HTTP sessions.
+    IdleSessionReaper,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -1293,6 +1459,7 @@ impl fmt::Display for BackgroundTask {
             Self::PathValidation => "path validation",
             Self::FileOpen => "file open",
             Self::ServerPlanning => "server start planning",
+            Self::IdleSessionReaper => "idle HTTP session reaper",
         })
     }
 }
@@ -1792,7 +1959,7 @@ pub enum Error {
     /// (`WorkspaceRoots::validate`); the same IO kinds raised later, while
     /// reading or opening an already validated file, stay [`Error::FileIo`]
     /// because there they are environmental.
-    #[error("malformed file path {path:?}: {source}")]
+    #[error("malformed file path {path:?}")]
     MalformedPath {
         /// The path as supplied by the client.
         path: PathBuf,
@@ -1808,7 +1975,7 @@ pub enum Error {
     /// freshly supplied in this request or was tracked from an earlier one
     /// and has since been deleted/moved on disk -- is caller-fault; any
     /// other IO failure is not.
-    #[error("file I/O error for {path:?}: {source}")]
+    #[error("file I/O error for {path:?}")]
     FileIo {
         /// Path to the file.
         path: PathBuf,
@@ -2325,12 +2492,53 @@ impl Error {
 /// A specialized Result type for mcpls-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Renders an error followed by its causes, `outer: cause: root`, skipping a
+/// cause whose text the preceding text already contains.
+///
+/// An error type's own message names what failed and leaves the cause to
+/// [`std::error::Error::source`]; this is where a reader that wants the whole
+/// story (an MCP client, a log line) joins them once.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use mcpls_core::error::{Error, ErrorChain};
+///
+/// let error = Error::FileIo {
+///     path: PathBuf::from("a.rs"),
+///     source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+/// };
+///
+/// assert_eq!(ErrorChain(&error).to_string(), "file I/O error for \"a.rs\": gone");
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut text = self.0.to_string();
+        let mut cause = self.0.source();
+        while let Some(error) = cause {
+            let part = error.to_string();
+            if !text.contains(&part) {
+                text.push_str(": ");
+                text.push_str(&part);
+            }
+            cause = error.source();
+        }
+        f.write_str(&text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
     use crate::config::{FileExtension, FileName};
+    use crate::util::TRUNCATION_MARKER;
 
     #[test]
     fn test_all_servers_failed_to_init_error() {
@@ -2778,6 +2986,14 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied,
                 "access refused",
             )),
+            Error::FileIo {
+                path: PathBuf::from("a.rs"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+            },
+            Error::MalformedPath {
+                path: PathBuf::from("b.rs"),
+                source: std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a dir"),
+            },
         ];
         for err in errors {
             let mut chain = vec![err.to_string()];
@@ -2786,15 +3002,35 @@ mod tests {
                 chain.push(cause.to_string());
                 source = cause.source();
             }
-            for pair in chain.windows(2) {
+            for [parent, cause] in chain.array_windows() {
                 assert!(
-                    !pair[0].contains(&pair[1]),
-                    "'{}' repeats its source '{}'",
-                    pair[0],
-                    pair[1]
+                    !parent.contains(cause),
+                    "'{parent}' repeats its source '{cause}'"
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_error_chain_joins_causes_once() {
+        let not_found = || std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let file_io = Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: not_found(),
+        };
+        let spawn = Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::new("x").unwrap(),
+            source: not_found(),
+        };
+
+        assert_eq!(
+            ErrorChain(&file_io).to_string(),
+            "file I/O error for \"a.rs\": gone"
+        );
+        assert_eq!(
+            ErrorChain(&spawn).to_string(),
+            "failed to spawn LSP server 'x': gone"
+        );
     }
 
     #[test]
@@ -3100,7 +3336,7 @@ mod tests {
         let launcher = UntrustedRefusal::ProjectLauncher {
             command: ServerCommand::from_static("npx"),
             cause: LauncherRefusal::SelectsWorkspaceCode {
-                program: EchoedArgument::name("npx"),
+                program: EchoedPath::program("npx"),
                 trigger: LaunchTrigger::Always,
             },
         };
@@ -3621,5 +3857,54 @@ mod tests {
         };
         assert!(err.to_string().contains("/ws/mcpls.toml"));
         assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    #[test]
+    fn echoed_path_keeps_spaces_and_equals() {
+        let path = EchoedPath::new(Path::new("/tmp/out/no such dir/a=b/srv"));
+        assert_eq!(path.as_str(), "/tmp/out/no such dir/a=b/srv");
+    }
+
+    #[test]
+    fn echoed_path_never_cuts_an_escape_in_half() {
+        let escape = "\\u{202e}";
+        let hostile = "\u{202e}".repeat(MAX_ECHOED_PATH_BYTES);
+        let echoed = EchoedPath::new(Path::new(&hostile));
+        let kept = echoed
+            .as_str()
+            .strip_suffix(TRUNCATION_MARKER)
+            .expect("an over-long path is marked as truncated");
+        assert!(kept.len() <= MAX_ECHOED_PATH_BYTES);
+        assert!(
+            !kept.is_empty() && kept.len().is_multiple_of(escape.len()),
+            "{kept}"
+        );
+        assert_eq!(kept, escape.repeat(kept.len() / escape.len()));
+    }
+
+    #[test]
+    fn echoed_program_cuts_an_assignment_but_keeps_a_path() {
+        assert_eq!(EchoedPath::program("API_TOKEN=abc").as_str(), "API_TOKEN");
+        assert_eq!(EchoedPath::program("X=/tmp/secret").as_str(), "X");
+        assert_eq!(
+            EchoedPath::program("/tmp/out/a=b/srv").as_str(),
+            "/tmp/out/a=b/srv"
+        );
+        assert_eq!(EchoedPath::program("no such dir").as_str(), "no such dir");
+    }
+
+    #[test]
+    fn echoed_path_within_the_bound_is_not_marked() {
+        let path = "a".repeat(MAX_ECHOED_PATH_BYTES);
+        assert_eq!(EchoedPath::new(Path::new(&path)).as_str(), path);
+    }
+
+    #[test]
+    fn wrapped_program_refusals_name_the_program_its_launcher_starts() {
+        let program = EchoedPath::new(Path::new("/tmp/out/a=b"));
+        let text = UntrustedRefusal::WrappedProgramPathContainsEquals { program }.to_string();
+        assert!(text.contains("'/tmp/out/a=b'"), "{text}");
+        assert!(text.contains("the program '"), "{text}");
+        assert!(!text.contains("its launcher '/tmp"), "{text}");
     }
 }

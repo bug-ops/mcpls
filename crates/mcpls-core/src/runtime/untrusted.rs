@@ -7,21 +7,22 @@
 //! a spawn for it.
 
 use std::borrow::Cow;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::info;
 
-use crate::bridge::WorkspaceRoots;
+use crate::bridge::{WorkspaceRoots, lexically_normalize};
 use crate::config::{
-    BuiltinServer, LspServerConfig, MarkerScan, ServerCommand, ServerConfig, WorkspaceTrust,
-    login_home_dir,
+    BuiltinServer, EnvKey, HostOs, LspServerConfig, MarkerScan, ServerCommand, ServerConfig,
+    WorkspaceTrust, login_home_dir,
 };
 use crate::error::{
-    EchoedArgument, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure,
-    StartupFailure, UnanalyzableLaunch, UntrustedRefusal,
+    EchoedPath, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure, StartupFailure,
+    UntrustedRefusal,
 };
-use crate::lsp::command_path::{HostOs, ResolvedCommand};
+use crate::lsp::command_path::ResolvedCommand;
 use crate::lsp::tsserver_pin::UntrustedVetting;
 use crate::lsp::{
     self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
@@ -91,10 +92,15 @@ fn allowlist_refusal(
 fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
     launcher::analyze_launch(configured.command.as_str(), &configured.args)
         .err()
-        .map(|cause| UntrustedRefusal::ProjectLauncher {
-            command: configured.command.server_command().clone(),
-            cause,
-        })
+        .map(|cause| project_launcher(configured, cause))
+}
+
+/// The refusal of `config`'s launcher for `cause`.
+fn project_launcher(config: &LspServerConfig, cause: LauncherRefusal) -> UntrustedRefusal {
+    UntrustedRefusal::ProjectLauncher {
+        command: config.command.server_command().clone(),
+        cause,
+    }
 }
 
 /// The path `resolved` is spawned by, after untrusted mode vetted it.
@@ -137,32 +143,23 @@ fn vetted_wrapped_programs(
     boundary: &WorkspaceRoots,
     parent_env: &dyn ParentEnv,
 ) -> Result<Vec<(usize, String)>, UntrustedRefusal> {
-    let programs =
-        launcher::analyze_launch(effective.command.as_str(), &effective.args).map_err(|cause| {
-            UntrustedRefusal::ProjectLauncher {
-                command: effective.command.server_command().clone(),
-                cause,
-            }
-        })?;
+    let programs = launcher::analyze_launch(effective.command.as_str(), &effective.args)
+        .map_err(|cause| project_launcher(effective, cause))?;
     programs
         .indices()
         .iter()
         .map(|&index| {
             let program = effective.args.get(index).map_or("", String::as_str);
             let unresolved = || UntrustedRefusal::UnresolvedWrappedProgram {
-                program: EchoedArgument::name(program),
+                program: EchoedPath::program(program),
             };
             let resolved =
                 lsp::command_path::resolve_named(Path::new(program), effective, parent_env)
                     .ok_or_else(unresolved)?;
             let path = vetted_spawn_path(resolved, boundary)?;
             if path.contains('=') {
-                return Err(UntrustedRefusal::ProjectLauncher {
-                    command: effective.command.server_command().clone(),
-                    cause: LauncherRefusal::Unanalyzable {
-                        program: EchoedArgument::name(program),
-                        reason: UnanalyzableLaunch::PathContainsEquals,
-                    },
+                return Err(UntrustedRefusal::WrappedProgramPathContainsEquals {
+                    program: EchoedPath::program(program),
                 });
             }
             Ok((index, path))
@@ -230,21 +227,113 @@ fn harden_for_untrusted(
             *arg = program;
         }
     }
-    effective
-        .env
-        .insert(ManagedEnvVar::Path.name().to_owned(), path);
+    effective.env.insert(ManagedEnvVar::Path.key(), path);
     for (name, value) in home_env {
         effective.env.insert(name, value);
     }
     if host == HostOs::Windows {
         effective.env.insert(
-            ManagedEnvVar::NoDefaultCurrentDirectoryInExePath
-                .name()
-                .to_owned(),
+            ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.key(),
             "1".to_owned(),
         );
     }
     Ok(effective)
+}
+
+/// Extensions Windows starts as programs.
+const WINDOWS_EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "com", "bat", "cmd"];
+
+/// Whether `path` is a file `host` would start: an execute bit on Unix, and on
+/// Windows an extension it starts as a program.
+fn is_started_as_program(host: HostOs, path: &Path) -> bool {
+    host.is_executable_file(path)
+        && (host == HostOs::Other
+            || path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| {
+                    WINDOWS_EXECUTABLE_EXTENSIONS
+                        .iter()
+                        .any(|known| extension.eq_ignore_ascii_case(known))
+                }))
+}
+
+/// The refusal for the text `candidate` of argument `index`, when it names an
+/// executable inside `boundary` as the child would resolve it.
+///
+/// A lookup that fails with permission denied fails closed when the path lies
+/// inside the boundary; any other failure means the text is not a file.
+fn argument_refusal(
+    index: usize,
+    candidate: &str,
+    boundary: &WorkspaceRoots,
+    working_dir: &ChildWorkingDir,
+    host: HostOs,
+) -> Option<UntrustedRefusal> {
+    let resolved = match working_dir {
+        ChildWorkingDir::Fixed(dir) => dir.join(candidate),
+        ChildWorkingDir::Inherit => PathBuf::from(candidate),
+    };
+    let siblings = (host == HostOs::Windows && resolved.extension().is_none())
+        .then(|| {
+            WINDOWS_EXECUTABLE_EXTENSIONS
+                .iter()
+                .map(|extension| resolved.with_added_extension(extension))
+        })
+        .into_iter()
+        .flatten();
+    std::iter::once(resolved.clone())
+        .chain(siblings)
+        .find_map(|path| path_refusal(index, &path, boundary, host))
+}
+
+/// The refusal for `resolved`, one spelling of argument `index`.
+fn path_refusal(
+    index: usize,
+    resolved: &Path,
+    boundary: &WorkspaceRoots,
+    host: HostOs,
+) -> Option<UntrustedRefusal> {
+    match dunce::canonicalize(resolved) {
+        Ok(canonical) => (is_started_as_program(host, &canonical)
+            && boundary.contains_canonical(&canonical))
+        .then_some(UntrustedRefusal::WorkspaceExecutableArgument {
+            index,
+            executable: canonical,
+        }),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            let path = lexically_normalize(resolved);
+            boundary
+                .admits_lexically(&path)
+                .then_some(UntrustedRefusal::UnreadableWorkspaceArgument { index, path })
+        }
+        Err(_) => None,
+    }
+}
+
+/// Refuses a configured argument that names an executable file inside
+/// `boundary`, whichever launcher precedes it, so a wrapper missing from the
+/// launcher table cannot start a workspace program.
+///
+/// Each argument is judged as a path, and so is the text after its first `=`
+/// (`--exec=<path>`). A file that is not executable, a directory and text that
+/// is no file are admitted.
+fn refuse_workspace_executable_arguments(
+    args: &[String],
+    boundary: &WorkspaceRoots,
+    working_dir: &ChildWorkingDir,
+    host: HostOs,
+) -> Result<(), UntrustedRefusal> {
+    for (index, arg) in args.iter().enumerate() {
+        let after_equals = arg.split_once('=').map(|(_, value)| value);
+        let candidates = std::iter::once(arg.as_str()).chain(after_equals);
+        for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
+            if let Some(refusal) = argument_refusal(index, candidate, boundary, working_dir, host) {
+                return Err(refusal);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The home-directory variables untrusted mode sets for a server that does
@@ -261,14 +350,14 @@ fn home_overrides(
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
     parent_env: &dyn ParentEnv,
-) -> Result<Vec<(String, String)>, UntrustedRefusal> {
+) -> Result<Vec<(EnvKey, String)>, UntrustedRefusal> {
     let host = effective.env.host();
     let unset = HomeVariable::ALL
         .into_iter()
         .filter(|variable| !effective.env.contains_key(variable.name()));
     if let Some(login_home) = login_home.and_then(Path::to_str) {
         return Ok(unset
-            .map(|variable| (variable.name().to_owned(), login_home.to_owned()))
+            .map(|variable| (ManagedEnvVar::from(variable).key(), login_home.to_owned()))
             .collect());
     }
     for variable in unset {
@@ -351,10 +440,7 @@ pub fn plan_server_starts(
     roots: &WorkspaceRoots,
     redactions: &Arc<Redactions>,
 ) -> StartPlan {
-    let untrusted = matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_));
-    let login_home = untrusted.then(login_home_dir).flatten();
-    let boundary =
-        untrusted.then(|| roots.untrusted_boundary(&config.workspace.roots, login_home.as_deref()));
+    let mode = PlanMode::of(config, roots);
     let markers = MarkerScan::collect(
         roots.canonical(),
         &config.lsp_servers,
@@ -370,14 +456,7 @@ pub fn plan_server_starts(
             continue;
         }
 
-        let admitted = admit(
-            config,
-            lsp_config,
-            roots,
-            boundary.as_ref(),
-            login_home.as_deref(),
-            redactions,
-        );
+        let admitted = admit(config, lsp_config, roots, &mode, redactions);
         match admitted {
             Ok(init) => plan.admitted.push(init),
             Err((command, refusal)) => plan.refused.push(refused(lsp_config, command, refusal)),
@@ -386,15 +465,39 @@ pub fn plan_server_starts(
     plan
 }
 
+/// Whether a plan runs servers as configured or vets them for an untrusted
+/// workspace.
+enum PlanMode {
+    Trusted,
+    Untrusted {
+        /// The directories no executable or working directory may lie in.
+        boundary: WorkspaceRoots,
+        /// The login home directory, when known.
+        login_home: Option<PathBuf>,
+    },
+}
+
+impl PlanMode {
+    fn of(config: &ServerConfig, roots: &WorkspaceRoots) -> Self {
+        if matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_)) {
+            let login_home = login_home_dir();
+            let boundary = roots.untrusted_boundary(&config.workspace.roots, login_home.as_deref());
+            Self::Untrusted {
+                boundary,
+                login_home,
+            }
+        } else {
+            Self::Trusted
+        }
+    }
+}
+
 /// The init config for `lsp_config`, or the refusal and the command it names.
-///
-/// `boundary` is `Some` exactly in untrusted mode.
 fn admit(
     config: &ServerConfig,
     lsp_config: &LspServerConfig,
     roots: &WorkspaceRoots,
-    boundary: Option<&WorkspaceRoots>,
-    login_home: Option<&Path>,
+    mode: &PlanMode,
     redactions: &Arc<Redactions>,
 ) -> Result<ServerInitConfig, (ServerCommand, UntrustedRefusal)> {
     let configured_command = lsp_config.command.server_command();
@@ -402,26 +505,36 @@ fn admit(
     if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
         return Err(configured(refusal));
     }
-    if boundary.is_some()
+    if matches!(mode, PlanMode::Untrusted { .. })
         && let Some(refusal) = launcher_refusal(lsp_config)
     {
         return Err(configured(refusal));
     }
 
     let selected = tsserver_pin::with_selected_typescript_server(lsp_config, roots, process_env);
-    let (effective, working_dir) = match boundary {
-        None => (selected.into_owned(), ChildWorkingDir::Inherit),
-        Some(boundary) => {
+    let (effective, working_dir, vetting) = match mode {
+        PlanMode::Trusted => (selected.into_owned(), ChildWorkingDir::Inherit, None),
+        PlanMode::Untrusted {
+            boundary,
+            login_home,
+        } => {
+            let login_home = login_home.as_deref();
             let hardened = harden_for_untrusted(selected, boundary, login_home, &process_env)
                 .map_err(configured)?;
             let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
-            (hardened, working_dir)
+            refuse_workspace_executable_arguments(
+                &lsp_config.args,
+                boundary,
+                &working_dir,
+                lsp_config.env.host(),
+            )
+            .map_err(configured)?;
+            let vetting = UntrustedVetting::new(boundary.clone(), configured_command.clone());
+            (hardened, working_dir, Some(vetting))
         }
     };
     let command = effective.command.server_command().clone();
     let plan = tsserver_pin::plan_typescript(effective, process_env);
-    let vetting = boundary
-        .map(|boundary| UntrustedVetting::new(boundary.clone(), configured_command.clone()));
     if let Some(vetting) = &vetting {
         plan.vet_untrusted(vetting)
             .map_err(|refusal| (command, refusal))?;
@@ -671,6 +784,46 @@ mod plan_tests {
     }
 
     #[test]
+    fn windows_arguments_without_an_extension_reach_their_program_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tmp = dunce::canonicalize(dir.path()).unwrap();
+        let (workspace, outside) = (tmp.join("ws"), tmp.join("outside"));
+        std::fs::create_dir_all(workspace.join("bin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for sibling in ["srv.exe", "tool.cmd", "conf.json"] {
+            std::fs::write(workspace.join("bin").join(sibling), "").unwrap();
+        }
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
+        let cwd = ChildWorkingDir::Fixed(outside);
+        let refuse = |arg: &Path, host| {
+            refuse_workspace_executable_arguments(
+                &[arg.to_string_lossy().into_owned()],
+                &roots,
+                &cwd,
+                host,
+            )
+        };
+
+        for stem in ["srv", "tool"] {
+            let bare = workspace.join("bin").join(stem);
+            std::assert_matches!(
+                refuse(&bare, HostOs::Windows),
+                Err(UntrustedRefusal::WorkspaceExecutableArgument { index: 0, .. }),
+                "{bare:?}"
+            );
+            assert_eq!(refuse(&bare, HostOs::Other), Ok(()), "{bare:?}");
+        }
+        for admitted in ["conf", "missing"] {
+            let path = workspace.join("bin").join(admitted);
+            assert_eq!(refuse(&path, HostOs::Windows), Ok(()), "{path:?}");
+        }
+        assert_eq!(
+            refuse(&workspace.join("bin/conf.json"), HostOs::Windows),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn plan_trusted_runs_no_executable_check() {
         let (dir, roots) = rust_workspace();
         let mut config = LspServerConfig::rust_analyzer();
@@ -743,9 +896,10 @@ mod plan_tests {
 
         fn rust_with_path(path: &Path) -> LspServerConfig {
             let mut config = rust_with("rust-analyzer");
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                ManagedEnvVar::Path.key(),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -872,9 +1026,10 @@ mod plan_tests {
                 fx.outside.clone(),
             ])
             .unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                ManagedEnvVar::Path.key(),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
@@ -936,7 +1091,7 @@ mod plan_tests {
             executable(&exe);
             let mut config = rust_with(exe.to_str().unwrap());
             config.env.insert(
-                "PATH".into(),
+                ManagedEnvVar::Path.key(),
                 fx.workspace.join("bin").to_string_lossy().into_owned(),
             );
 
@@ -1144,9 +1299,10 @@ mod plan_tests {
                 Path::new("/bin"),
             ])
             .unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -1430,7 +1586,7 @@ mod plan_tests {
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             let mut config = rust_on(HostOs::Windows, exe.to_str().unwrap());
             config.env.insert(
-                "nodefaultcurrentdirectoryinexepath".to_owned(),
+                EnvKey::from_static("nodefaultcurrentdirectoryinexepath"),
                 "0".to_owned(),
             );
 
@@ -1449,7 +1605,7 @@ mod plan_tests {
                 hardened
                     .env
                     .iter()
-                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .filter(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
                     .count(),
                 1
             );
@@ -1613,9 +1769,10 @@ mod plan_tests {
         fn wrapped_launch(fx: &Fixture, wrapper: &str, args: &[&str]) -> LspServerConfig {
             let mut config = rust_launched_by(fx.outside.join(wrapper).to_str().unwrap(), args);
             let path = std::env::join_paths([&fx.outside, &fx.workspace.join("bin")]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -1689,9 +1846,10 @@ mod plan_tests {
             executable(&fx.workspace.join("bin/srv"));
             let mut config = wrapped_launch(&fx, "nice", &["srv"]);
             let path = std::env::join_paths([&fx.workspace.join("bin"), &fx.outside]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
@@ -1710,21 +1868,237 @@ mod plan_tests {
             executable(&odd.join("srv"));
             let mut config = wrapped_launch(&fx, "env", &["srv"]);
             let path = std::env::join_paths([&odd, &fx.outside]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
             std::assert_matches!(
                 refusal_of(&plan),
-                Some(UntrustedRefusal::ProjectLauncher {
-                    cause: LauncherRefusal::Unanalyzable {
-                        reason: UnanalyzableLaunch::PathContainsEquals,
-                        ..
-                    },
-                    ..
+                Some(UntrustedRefusal::WrappedProgramPathContainsEquals { .. })
+            );
+        }
+
+        fn argument_refusal_of(plan: &StartPlan) -> Option<(usize, PathBuf)> {
+            match refusal_of(plan)? {
+                UntrustedRefusal::WorkspaceExecutableArgument { index, executable } => {
+                    Some((*index, executable.clone()))
+                }
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_an_unlisted_wrapper_started_workspace_program() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun", "sandbox-exec", "lockf", "login"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let srv = srv.to_str().unwrap();
+            for (wrapper, args, index) in [
+                ("xcrun", vec![srv], 0),
+                (
+                    "sandbox-exec",
+                    vec!["-p", "(version 1)(allow default)", srv],
+                    2,
+                ),
+                ("lockf", vec!["-k", "/tmp/x.lock", srv], 2),
+                ("login", vec!["-fq", "user", srv], 2),
+            ] {
+                let plan = plan_allowing_rust(wrapped_launch(&fx, wrapper, &args), &fx);
+
+                assert!(plan.admitted.is_empty(), "{wrapper}");
+                assert_eq!(
+                    argument_refusal_of(&plan),
+                    Some((index, dunce::canonicalize(srv).unwrap())),
+                    "{wrapper}"
+                );
+            }
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_workspace_program_glued_with_equals() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let glued = format!("--exec={}", srv.display());
+
+            let plan = plan_allowing_rust(wrapped_launch(&fx, "xcrun", &["-v", &glued]), &fx);
+
+            assert_eq!(
+                argument_refusal_of(&plan),
+                Some((1, dunce::canonicalize(&srv).unwrap()))
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_symlink_outside_that_reaches_a_workspace_executable() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let link = fx.outside.join("link");
+            std::os::unix::fs::symlink(&srv, &link).unwrap();
+
+            let plan =
+                plan_allowing_rust(wrapped_launch(&fx, "xcrun", &[link.to_str().unwrap()]), &fx);
+
+            assert_eq!(
+                argument_refusal_of(&plan),
+                Some((0, dunce::canonicalize(&srv).unwrap()))
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_admits_arguments_that_are_not_workspace_executables() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun", "tool"]);
+            let data = fx.workspace.join("conf.json");
+            std::fs::write(&data, "{}").unwrap();
+            let link = fx.workspace.join("bin/tool-link");
+            std::os::unix::fs::symlink(fx.outside.join("tool"), &link).unwrap();
+            let directory = fx.workspace.join("bin");
+            let missing = fx.workspace.join("bin/missing");
+            for arg in [&data, &link, &directory, &missing] {
+                let plan = plan_allowing_rust(
+                    wrapped_launch(&fx, "xcrun", &["--config", arg.to_str().unwrap()]),
+                    &fx,
+                );
+
+                assert_eq!(plan.admitted.len(), 1, "{arg:?}");
+            }
+        }
+
+        #[test]
+        fn plan_trusted_does_not_check_arguments_for_workspace_executables() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let config = wrapped_launch(&fx, "xcrun", &[srv.to_str().unwrap()]);
+
+            let plan = plan(
+                &config_with(vec![config], WorkspaceTrust::Trusted),
+                &fx.roots,
+            );
+
+            assert_eq!(plan.admitted.len(), 1);
+        }
+
+        #[test]
+        fn plan_untrusted_fails_closed_on_an_unreadable_workspace_argument() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let locked = fx.workspace.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
+            let hidden = locked.join("srv");
+            let unreadable_outside = fx.outside.join("locked");
+            std::fs::create_dir_all(&unreadable_outside).unwrap();
+            std::fs::set_permissions(&unreadable_outside, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+
+            let inside = plan_allowing_rust(
+                wrapped_launch(&fx, "xcrun", &[hidden.to_str().unwrap()]),
+                &fx,
+            );
+            let outside = plan_allowing_rust(
+                wrapped_launch(
+                    &fx,
+                    "xcrun",
+                    &[unreadable_outside.join("srv").to_str().unwrap()],
+                ),
+                &fx,
+            );
+
+            for dir in [&locked, &unreadable_outside] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::assert_matches!(
+                refusal_of(&inside),
+                Some(UntrustedRefusal::UnreadableWorkspaceArgument { index: 0, .. })
+            );
+            assert_eq!(outside.admitted.len(), 1);
+        }
+
+        #[test]
+        fn a_relative_argument_is_judged_from_the_working_directory() {
+            let fx = fixture();
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let args = vec!["../ws/bin/srv".to_owned()];
+
+            let refusal = refuse_workspace_executable_arguments(
+                &args,
+                &fx.roots,
+                &ChildWorkingDir::Fixed(fx.outside.clone()),
+                HostOs::Other,
+            );
+
+            assert_eq!(
+                refusal,
+                Err(UntrustedRefusal::WorkspaceExecutableArgument {
+                    index: 0,
+                    executable: dunce::canonicalize(&srv).unwrap()
                 })
+            );
+        }
+
+        #[test]
+        fn windows_starts_only_files_with_a_program_extension() {
+            let fx = fixture();
+            let tool = fx.workspace.join("srv.exe");
+            let data = fx.workspace.join("conf.json");
+            std::fs::write(&tool, "").unwrap();
+            std::fs::write(&data, "").unwrap();
+
+            assert!(is_started_as_program(HostOs::Windows, &tool));
+            assert!(!is_started_as_program(HostOs::Windows, &data));
+        }
+
+        #[test]
+        fn plan_untrusted_echoes_the_whole_path_of_an_unresolved_wrapped_program() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice"]);
+            let missing = fx.outside.join("no such dir/srv");
+
+            let plan = plan_allowing_rust(
+                wrapped_launch(&fx, "nice", &[missing.to_str().unwrap()]),
+                &fx,
+            );
+
+            let Some(UntrustedRefusal::UnresolvedWrappedProgram { program }) = refusal_of(&plan)
+            else {
+                panic!("expected an unresolved wrapped program");
+            };
+            assert_eq!(program.as_str(), missing.to_str().unwrap());
+        }
+
+        #[test]
+        fn plan_untrusted_echoes_the_whole_path_of_a_wrapped_program_containing_equals() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "a=b"]);
+            let odd = fx.outside.join("a=b");
+
+            let plan =
+                plan_allowing_rust(wrapped_launch(&fx, "nice", &[odd.to_str().unwrap()]), &fx);
+
+            let Some(refusal @ UntrustedRefusal::WrappedProgramPathContainsEquals { program }) =
+                refusal_of(&plan)
+            else {
+                panic!("expected a path containing '='");
+            };
+            assert_eq!(program.as_str(), odd.to_str().unwrap());
+            assert!(
+                refusal.to_string().contains("its launcher starts"),
+                "{refusal}"
             );
         }
 
@@ -1738,7 +2112,7 @@ mod plan_tests {
             assert_eq!(
                 refusal_of(&plan),
                 Some(&UntrustedRefusal::UnresolvedWrappedProgram {
-                    program: EchoedArgument::name("missing-srv")
+                    program: EchoedPath::new(Path::new("missing-srv"))
                 })
             );
         }
@@ -2294,7 +2668,9 @@ mod refusal_spawn_tests {
         );
         let mut case = case;
         let path = format!("{}:/usr/bin:/bin", case.workspace.join("bin").display());
-        case.config.lsp_servers[0].env.insert("PATH".into(), path);
+        case.config.lsp_servers[0]
+            .env
+            .insert(crate::config::EnvKey::from_static("PATH"), path);
         (case, interpreter_marker)
     }
 

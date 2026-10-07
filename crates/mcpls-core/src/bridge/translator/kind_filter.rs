@@ -66,6 +66,51 @@ pub trait KindFilter: sealed::Sealed + Copy {
     fn schema() -> Schema;
 }
 
+/// Implements [`KindFilter`] for a closed set of kinds with an `ALL` array and
+/// a canonical `as_str`, so every such filter parses, spells and documents its
+/// values the same way.
+macro_rules! closed_kind_filter {
+    ($filter:ty, $schema_name:literal) => {
+        impl $filter {
+            /// The spellings the schema documents and the rejection message
+            /// lists: the canonical ones in lowercase, which parsing accepts
+            /// like any case.
+            fn spellings() -> Vec<String> {
+                Self::ALL
+                    .iter()
+                    .map(|kind| kind.as_str().to_ascii_lowercase())
+                    .collect()
+            }
+        }
+
+        impl super::kind_filter::sealed::Sealed for $filter {}
+
+        impl super::kind_filter::KindFilter for $filter {
+            const SCHEMA_NAME: &'static str = $schema_name;
+
+            fn parse(text: &str) -> Option<Self> {
+                Self::ALL
+                    .into_iter()
+                    .find(|kind| kind.as_str().eq_ignore_ascii_case(text))
+            }
+
+            fn canonical(self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed(self.as_str())
+            }
+
+            fn valid_values() -> String {
+                format!("{:?}", Self::spellings())
+            }
+
+            fn schema() -> schemars::Schema {
+                schemars::json_schema!({"type": "string", "enum": Self::spellings()})
+            }
+        }
+    };
+}
+
+pub(super) use closed_kind_filter;
+
 /// A `kind_filter` spelling that names no known kind, kept as written for the
 /// error message; at most [`MAX_SYMBOL_NAME_BYTES`] long.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,34 +242,31 @@ pub enum CodeActionKindFilter {
     RefactorExtract,
     /// `refactor.inline`.
     RefactorInline,
+    /// `refactor.move`.
+    RefactorMove,
     /// `refactor.rewrite`.
     RefactorRewrite,
     /// `source`.
     Source,
     /// `source.organizeImports`.
     SourceOrganizeImports,
+    /// `source.fixAll`.
+    SourceFixAll,
 }
 
 impl CodeActionKindFilter {
     /// Every kind, in documentation order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::QuickFix,
         Self::Refactor,
         Self::RefactorExtract,
         Self::RefactorInline,
+        Self::RefactorMove,
         Self::RefactorRewrite,
         Self::Source,
         Self::SourceOrganizeImports,
+        Self::SourceFixAll,
     ];
-
-    /// The spellings the schema documents and the rejection message lists:
-    /// the canonical ones in lowercase, which parsing accepts like any case.
-    fn spellings() -> Vec<String> {
-        Self::ALL
-            .iter()
-            .map(|kind| kind.as_str().to_ascii_lowercase())
-            .collect()
-    }
 
     /// The canonical LSP spelling.
     #[must_use]
@@ -234,36 +276,32 @@ impl CodeActionKindFilter {
             Self::Refactor => "refactor",
             Self::RefactorExtract => "refactor.extract",
             Self::RefactorInline => "refactor.inline",
+            Self::RefactorMove => "refactor.move",
             Self::RefactorRewrite => "refactor.rewrite",
             Self::Source => "source",
             Self::SourceOrganizeImports => "source.organizeImports",
+            Self::SourceFixAll => "source.fixAll",
         }
     }
 }
 
-impl sealed::Sealed for CodeActionKindFilter {}
-
-impl KindFilter for CodeActionKindFilter {
-    const SCHEMA_NAME: &'static str = "CodeActionKindFilter";
-
-    fn parse(text: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|kind| kind.as_str().eq_ignore_ascii_case(text))
-    }
-
-    fn canonical(self) -> Cow<'static, str> {
-        Cow::Borrowed(self.as_str())
-    }
-
-    fn valid_values() -> String {
-        format!("{:?}", Self::spellings())
-    }
-
-    fn schema() -> Schema {
-        schemars::json_schema!({"type": "string", "enum": Self::spellings()})
+impl From<CodeActionKindFilter> for lsp_types::CodeActionKind {
+    fn from(filter: CodeActionKindFilter) -> Self {
+        match filter {
+            CodeActionKindFilter::QuickFix => Self::QuickFix,
+            CodeActionKindFilter::Refactor => Self::Refactor,
+            CodeActionKindFilter::RefactorExtract => Self::RefactorExtract,
+            CodeActionKindFilter::RefactorInline => Self::RefactorInline,
+            CodeActionKindFilter::RefactorMove => Self::RefactorMove,
+            CodeActionKindFilter::RefactorRewrite => Self::RefactorRewrite,
+            CodeActionKindFilter::Source => Self::Source,
+            CodeActionKindFilter::SourceOrganizeImports => Self::SourceOrganizeImports,
+            CodeActionKindFilter::SourceFixAll => Self::SourceFixAll,
+        }
     }
 }
+
+closed_kind_filter!(CodeActionKindFilter, "CodeActionKindFilter");
 
 /// A symbol kind a `workspace_symbol_search` filter can name, by name or by its
 /// numeric LSP value.
@@ -331,6 +369,18 @@ impl KindFilter for SymbolKindFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_every_code_action_kind_converts_to_its_canonical_lsp_spelling() {
+        for kind in CodeActionKindFilter::ALL {
+            assert_eq!(
+                String::from(lsp_types::CodeActionKind::from(kind)),
+                kind.as_str()
+            );
+        }
+        assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::SourceFixAll));
+        assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::RefactorMove));
+    }
 
     type CodeAction = KindFilterInput<CodeActionKindFilter>;
     type Symbol = KindFilterInput<SymbolKindFilter>;
@@ -531,9 +581,11 @@ mod tests {
                 "refactor",
                 "refactor.extract",
                 "refactor.inline",
+                "refactor.move",
                 "refactor.rewrite",
                 "source",
                 "source.organizeimports",
+                "source.fixall",
             ]
         );
         let symbols = SymbolKindFilter::schema();

@@ -18,17 +18,43 @@ use crate::config::SizeLimit;
 /// A byte count that went over its limit.
 ///
 /// The one shape of every "too large" error, so each reader reports the same
-/// two numbers and converts it without re-spelling the fields.
+/// two numbers and converts it without re-spelling the fields. Only
+/// [`Self::check`] and [`Self::check_limit`] build one, so `size` is always
+/// above `max`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{Error, SizeExceeded};
+///
+/// fn oversize(error: &Error) -> Option<&SizeExceeded> {
+///     match error {
+///         Error::FileSizeLimitExceeded(exceeded) => Some(exceeded),
+///         _ => None,
+///     }
+/// }
+/// # let _ = oversize;
+/// ```
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 #[error("{size} bytes exceed the limit of {max} bytes")]
 pub struct SizeExceeded {
-    /// The size found, in bytes.
-    pub size: u64,
-    /// The limit that was exceeded, in bytes.
-    pub max: NonZeroU64,
+    pub(crate) size: u64,
+    pub(crate) max: NonZeroU64,
 }
 
 impl SizeExceeded {
+    /// The size found, in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The limit that was exceeded, in bytes; always below [`Self::size`].
+    #[must_use]
+    pub const fn max(&self) -> NonZeroU64 {
+        self.max
+    }
+
     /// Checks `size` against `max`.
     ///
     /// # Errors
@@ -201,15 +227,30 @@ pub fn read_regular_file_bounded(
     Ok(RegularFile::open(path)?.read_bounded(max)?)
 }
 
+/// Byte-length threshold for the LSP error message forwarded to the MCP
+/// caller in [`crate::error::Error::LspServerError`] (#313).
+///
+/// Deliberately much larger than [`crate::util::MAX_LOG_STRING_BYTES`]
+/// (used for this same error message in [`crate::lsp::LspClient::request`]'s own log
+/// line): a legitimate LSP error (e.g. a verbose rust-analyzer
+/// type-mismatch diagnostic reported through an error response) can run
+/// into the low kilobytes, and that detail is useful to the calling model --
+/// a log line should stay terse, but a truncated-to-200-bytes error handed
+/// to the model would cut off real content on every longer-but-honest
+/// error. Still far below #311's 256 KiB cache-entry cap: this string is
+/// echoed directly into the MCP tool result / model context, not merely
+/// cached.
+pub const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
+
 /// Marker appended to a truncated string; the returned string can be up to
 /// `max_bytes + TRUNCATION_MARKER.len()` bytes, not exactly `max_bytes`.
-const TRUNCATION_MARKER: &str = "... (truncated)";
+pub const TRUNCATION_MARKER: &str = "... (truncated)";
 
 /// Byte-length threshold for truncating an attacker-influenceable string
 /// (an LSP server's error message, a malformed protocol line, ...) before
 /// passing it to `truncate_str`/`truncate_string` for a single log line.
 /// Shared by every call site with this purpose so they don't each pick their
-/// own value -- see `lsp::client::MAX_ERROR_MESSAGE_CALLER_BYTES` for the
+/// own value -- see [`MAX_ERROR_MESSAGE_CALLER_BYTES`] for the
 /// separate, deliberately larger budget for text forwarded to the MCP
 /// caller rather than logged.
 pub const MAX_LOG_STRING_BYTES: usize = 200;
@@ -254,6 +295,24 @@ pub fn truncate_string(mut s: String, max_bytes: usize) -> String {
     s.truncate(cut);
     s.push_str(TRUNCATION_MARKER);
     s
+}
+
+/// `text` with control and deceptive characters escaped, then bounded to
+/// `max_bytes` of escaped text, so a client- or server-controlled string can be
+/// echoed in an error. The cut falls between escaped characters, so an escape
+/// sequence is never split; [`TRUNCATION_MARKER`] follows a cut.
+pub fn escape_bounded(text: &str, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(text.len().min(max_bytes));
+    let mut buffer = [0; 4];
+    for c in text.chars() {
+        let escaped = escape_control(c.encode_utf8(&mut buffer));
+        if bounded.len().saturating_add(escaped.len()) > max_bytes {
+            bounded.push_str(TRUNCATION_MARKER);
+            break;
+        }
+        bounded.push_str(&escaped);
+    }
+    bounded
 }
 
 /// Characters that forge or reorder text without being visible: zero-width
@@ -624,6 +683,14 @@ mod tests {
 
     fn size(max: u64) -> SizeLimit {
         SizeLimit::from_static(max)
+    }
+
+    #[test]
+    fn size_exceeded_exposes_both_numbers_through_accessors() {
+        let max = NonZeroU64::new(4).unwrap();
+        let exceeded = SizeExceeded::check(9, max).unwrap_err();
+
+        assert_eq!((exceeded.size(), exceeded.max()), (9, max));
     }
 
     #[test]
