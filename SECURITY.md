@@ -268,6 +268,9 @@ What the mode does not cover:
   (refused only for the TypeScript server) pick versions from workspace files;
   Go switches toolchains from `go.mod`. The executable check sees only the
   launcher, and the launcher list is best-effort.
+- The argument check (see Launcher) runs once, when the server is planned. A
+  restart or respawn reuses the admitted configuration, so a file in `args`
+  that becomes executable afterwards is not caught.
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not

@@ -137,7 +137,7 @@ SO THAT I do not infer protection against interpreter arguments
 | FR-002 | THE SYSTEM SHALL resolve an argument for FR-001 against the spawn working directory (`ChildWorkingDir::Fixed`), following symlinks, so a relative argument and a symlink into the workspace are judged by the file the child would reach. | must |
 | FR-003 | WHEN an argument is not an existing file, is a directory, or is a file without an execute permission bit (Windows: without an executable extension), THE SYSTEM SHALL NOT refuse it under FR-001. | must |
 | FR-004 | WHEN an argument has the form `--option=<path>` or `-X<path>` THE SYSTEM SHALL NOT split it for FR-001 unless approach A or C requires it. Decision: the part after the first `=` is also a candidate path. | must |
-| FR-005 | THE SYSTEM SHALL apply FR-001 only in untrusted mode, to the argument list as configured, before any rewrite, and again on restart and respawn through the same plan so no spawn path skips it. | must |
+| FR-005 | THE SYSTEM SHALL apply FR-001 only in untrusted mode, to the argument list as configured, before any rewrite, when the plan admits the server. Restart and respawn reuse the admitted configuration without re-planning, so the check is not repeated at spawn time: a refused server never becomes a `ServerInitConfig` and cannot be launched, but a file that becomes executable after planning is not caught (as with the server executable itself). | must |
 | FR-006 | WHEN FR-001 refuses a server THE SYSTEM SHALL surface the refusal through the existing `UntrustedRefusal` path (startup failure, routing rebound, `Error::ServerFailedToStart` naming `--allow-server <id>` is not offered as an override). | must |
 | FR-007 | THE SYSTEM SHALL keep the wrapper table's behavior for listed wrappers unchanged (option parsing, absolute-path rewrite, `=` refusal). | must |
 | FR-008 | (not implemented: the backstop covers these wrappers) WHERE approach A or C is chosen THE SYSTEM SHALL add `xcrun`, `sandbox-exec`, `lockf`, `taskpolicy`, `login` and `command` to the closed table with a closed option grammar each. | won't |
@@ -187,7 +187,7 @@ SO THAT I do not infer protection against interpreter arguments
 | SC-002 | Controls `nice`, `script`, `chroot`, `sudo`, `strace`, `unshare`, `xargs` | unchanged outcome |
 | SC-003 | Non-executable workspace data file in `args` | admitted |
 | SC-004 | Trusted mode with the same configs | unchanged, admitted |
-| SC-005 | Restart and respawn after a refusal | no spawn |
+| SC-005 | Restart and respawn after a refusal | no spawn (a refused server has no init config; admitted servers are not re-checked) |
 
 ## 8. Agent Boundaries
 
