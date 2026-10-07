@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release workflow selects the stable Rust toolchain explicitly instead of the action-pinned 1.98.1 (#758)
+
 ## [0.7.0] - 2026-10-07
 
 ### Added
