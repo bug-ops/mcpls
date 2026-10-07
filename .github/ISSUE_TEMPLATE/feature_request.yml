@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest an enhancement or a new capability
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: The problem or limitation this would address, and who it affects.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What you want to happen. For a new tool, name the LSP method it maps to.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you tried.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, examples, or related issues.

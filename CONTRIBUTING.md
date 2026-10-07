@@ -4,7 +4,7 @@ Thank you for your interest in contributing to mcpls! This document provides gui
 
 ## Code of Conduct
 
-This project follows the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct). Please be respectful and constructive in all interactions.
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). Please be respectful and constructive in all interactions. Accessibility barriers in output or documentation are welcome as issues; see [ACCESSIBILITY.md](ACCESSIBILITY.md).
 
 ## Getting Started
 

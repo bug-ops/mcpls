@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/bug-ops/mcpls/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue. See SECURITY.md.
+  - name: Documentation
+    url: https://bug-ops.github.io/mcpls/
+    about: Read the mcpls book, including the troubleshooting chapter, before filing an issue.

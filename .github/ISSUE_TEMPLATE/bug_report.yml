@@ -1,0 +1,91 @@
+name: Bug report
+description: Report incorrect or unexpected behavior in mcpls
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [troubleshooting chapter](https://bug-ops.github.io/mcpls/guide/troubleshooting.html) and existing issues first.
+        Do not report security vulnerabilities here. Use [private vulnerability reporting](https://github.com/bug-ops/mcpls/security/advisories/new) instead.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened and why it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: A minimal sequence that triggers the problem, including the tool call and its arguments.
+      placeholder: |
+        1. Start mcpls with ...
+        2. Call the `get_hover` tool with ...
+        3. Observe ...
+
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: mcpls version
+      description: Output of `mcpls --version`, or the commit if built from source.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: language-server
+    attributes:
+      label: Language server and version
+      description: For example rust-analyzer or pyright with its version. Write "not applicable" if no server is involved.
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio
+        - http
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: The client and version that calls mcpls.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Relevant parts of your `mcpls.toml`. Remove secrets and private paths.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and evidence
+      description: Output from running with `MCPLS_LOG=debug`, plus any other relevant excerpts.
+      render: text

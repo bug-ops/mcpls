@@ -102,6 +102,10 @@ cargo nextest run --workspace --all-features
 
 Requires Rust 1.99 or later (edition 2024). The book lives in [`book/`](book/) and is built with [mdBook](https://rust-lang.github.io/mdBook/). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Community
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Accessibility of the output and documentation is described in [ACCESSIBILITY.md](ACCESSIBILITY.md).
+
 ## License
 
 Dual-licensed under [Apache 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
