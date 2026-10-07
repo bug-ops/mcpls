@@ -172,7 +172,8 @@ enforces the following, and nothing more:
   `unshare`, `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`:
   they change the user, root, directory or environment, or take optional
   arguments) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
-  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle` and `dotnet`. `npx` runs
+  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle`, `dotnet`, `pipenv`,
+  `pixi`, `swift`, `stack` and `cabal`. `npx` runs
   `./node_modules/.bin/<name>` from the working directory before anything else
   and reads a workspace `.npmrc`, so the planted package would run. `env` is
   unwrapped; `env -S`, `env -P`, a `PATH=` assignment and a relative program that `env -C`

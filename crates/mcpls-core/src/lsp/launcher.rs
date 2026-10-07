@@ -111,7 +111,21 @@ const RUNNERS: &[(&str, LaunchRule)] = &[
     ("pdm", LaunchRule::Subcommands(&[RunnerSubcommand::Run])),
     ("hatch", LaunchRule::Subcommands(&[RunnerSubcommand::Run])),
     ("bundle", LaunchRule::Subcommands(&[RunnerSubcommand::Exec])),
-    ("dotnet", LaunchRule::Subcommands(&[RunnerSubcommand::Tool])),
+    (
+        "dotnet",
+        LaunchRule::Subcommands(&[RunnerSubcommand::Run, RunnerSubcommand::Tool]),
+    ),
+    ("pipenv", LaunchRule::Subcommands(&[RunnerSubcommand::Run])),
+    ("pixi", LaunchRule::Subcommands(&[RunnerSubcommand::Run])),
+    ("swift", LaunchRule::Subcommands(&[RunnerSubcommand::Run])),
+    (
+        "stack",
+        LaunchRule::Subcommands(&[RunnerSubcommand::Run, RunnerSubcommand::Exec]),
+    ),
+    (
+        "cabal",
+        LaunchRule::Subcommands(&[RunnerSubcommand::Run, RunnerSubcommand::Exec]),
+    ),
 ];
 
 /// The command-string grammar a shell speaks.
@@ -1948,5 +1962,28 @@ mod tests {
             assert!(!launches("node", args), "{args:?}");
         }
         assert!(!launches("python3", &["--import=data:x", "srv.py"]));
+    }
+
+    #[test]
+    fn run_subcommands_of_more_toolchains_are_refused() {
+        for (command, subcommand) in [
+            ("dotnet", RunnerSubcommand::Run),
+            ("pipenv", RunnerSubcommand::Run),
+            ("pixi", RunnerSubcommand::Run),
+            ("swift", RunnerSubcommand::Run),
+            ("stack", RunnerSubcommand::Run),
+            ("stack", RunnerSubcommand::Exec),
+            ("cabal", RunnerSubcommand::Run),
+            ("cabal", RunnerSubcommand::Exec),
+        ] {
+            assert_eq!(
+                analyze(command, &[subcommand.as_str(), "server"]).unwrap_err(),
+                selects(command, LaunchTrigger::Subcommand(subcommand)),
+                "{command} {subcommand}"
+            );
+            assert!(!launches(command, &["--version"]), "{command}");
+        }
+        assert!(!launches("dotnet", &["build"]));
+        assert!(!launches("swift", &["build"]));
     }
 }
