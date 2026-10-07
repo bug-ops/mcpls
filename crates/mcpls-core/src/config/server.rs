@@ -17,7 +17,7 @@ use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
-use super::server_env::ServerEnv;
+use super::server_env::{EnvKey, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::impl_text_newtype;
 use crate::bridge::IndexingPolicy;
@@ -526,7 +526,7 @@ struct RawLspServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    env: BTreeMap<EnvKey, String>,
     #[serde(default)]
     file_patterns: Vec<String>,
     #[serde(default)]
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         let mut env = ServerEnv::default();
-        env.insert("RUST_LOG".to_string(), "debug".to_string());
+        env.insert(EnvKey::from_static("RUST_LOG"), "debug".to_string());
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),

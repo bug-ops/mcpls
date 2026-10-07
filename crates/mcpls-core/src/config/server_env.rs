@@ -1,8 +1,79 @@
 //! The environment overrides of a configured server.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use super::text_newtype::impl_text_newtype;
 use crate::lsp::HostOs;
+
+/// Why a string is not a valid [`EnvKey`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidEnvKey {
+    /// The name was empty.
+    #[error("environment variable name cannot be empty")]
+    Empty,
+    /// The name contained `=`, which separates a name from its value, or a NUL.
+    #[error("environment variable name cannot contain '=' or NUL")]
+    ForbiddenChar,
+}
+
+const fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let mut rest = key.as_bytes();
+    while let [byte, tail @ ..] = rest {
+        if matches!(byte, b'=' | 0) {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+const fn check_env_key(key: &str) -> Result<(), InvalidEnvKey> {
+    if key.is_empty() {
+        Err(InvalidEnvKey::Empty)
+    } else if is_valid_env_key(key) {
+        Ok(())
+    } else {
+        Err(InvalidEnvKey::ForbiddenChar)
+    }
+}
+
+/// The name of an environment variable: non-empty, with no `=` and no NUL, so
+/// the operating system accepts it as one.
+///
+/// Deserializes from a TOML string and rejects any other name at load time.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::EnvKey;
+///
+/// assert_eq!(EnvKey::new("RUST_LOG").unwrap(), "RUST_LOG");
+/// assert!(EnvKey::new("").is_err());
+/// assert!(EnvKey::new("A=B").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EnvKey(Cow<'static, str>);
+
+impl AsRef<std::ffi::OsStr> for EnvKey {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.as_str().as_ref()
+    }
+}
+
+impl_text_newtype!(
+    EnvKey,
+    InvalidEnvKey,
+    checked = check_env_key,
+    valid = is_valid_env_key,
+    "environment variable name"
+);
 
 /// Two keys of one `env` table name the same variable on the host.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -11,42 +82,56 @@ use crate::lsp::HostOs;
 )]
 pub struct DuplicateEnvKey {
     /// The key seen first.
-    pub first: String,
+    pub first: EnvKey,
     /// The key that collides with it.
-    pub second: String,
+    pub second: EnvKey,
+}
+
+/// A variable name as a host compares it: the key a table is indexed by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HostKey(String);
+
+impl HostKey {
+    fn of(name: &str, host: HostOs) -> Self {
+        Self(match host {
+            HostOs::Windows => name.to_ascii_lowercase(),
+            HostOs::Other => name.to_owned(),
+        })
+    }
 }
 
 /// Environment variable overrides for a server process.
 ///
 /// Holds at most one key per variable as the host compares names (exactly on
-/// Unix, ASCII-case-insensitively on Windows), so a lookup or a write cannot
-/// meet two spellings of one variable and mcpls resolves the same value the
-/// child process sees. The host is fixed at construction, so a table built
-/// for one host cannot be read or extended as another. Keys come in through
+/// Unix, ASCII-case-insensitively on Windows): the table is indexed by the
+/// host's comparison of the name, so a lookup or a write cannot meet two
+/// spellings of one variable and mcpls resolves the same value the child
+/// process sees. The host is fixed at construction, so a table built for one
+/// host cannot be read or extended as another. Keys come in through
 /// [`Self::from_entries`], which rejects collisions, or [`Self::insert`],
 /// which replaces them.
 ///
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::ServerEnv;
+/// use mcpls_core::config::{EnvKey, ServerEnv};
 /// use mcpls_core::lsp::HostOs;
 ///
 /// let mut env = ServerEnv::new(HostOs::Windows);
-/// env.insert("Path".to_owned(), "/a".to_owned());
+/// env.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());
 /// assert_eq!(env.get("PATH"), Some("/a"));
 ///
-/// env.insert("PATH".to_owned(), "/b".to_owned());
+/// env.insert(EnvKey::new("PATH").unwrap(), "/b".to_owned());
 /// assert_eq!(env.len(), 1);
 ///
 /// let mut other = ServerEnv::new(HostOs::Other);
-/// other.insert("Path".to_owned(), "/a".to_owned());
+/// other.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());
 /// assert_eq!(other.get("PATH"), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEnv {
     host: HostOs,
-    vars: BTreeMap<String, String>,
+    vars: BTreeMap<HostKey, (EnvKey, String)>,
 }
 
 impl Default for ServerEnv {
@@ -71,18 +156,18 @@ impl ServerEnv {
     ///
     /// [`DuplicateEnvKey`] when two keys name one variable on `host`.
     pub fn from_entries(
-        entries: impl IntoIterator<Item = (String, String)>,
+        entries: impl IntoIterator<Item = (EnvKey, String)>,
         host: HostOs,
     ) -> Result<Self, DuplicateEnvKey> {
         let mut env = Self::new(host);
         for (key, value) in entries {
-            if let Some(first) = env.key_of(&key) {
+            if let Some((first, _)) = env.vars.get(&HostKey::of(key.as_str(), host)) {
                 return Err(DuplicateEnvKey {
-                    first: first.to_owned(),
+                    first: first.clone(),
                     second: key,
                 });
             }
-            env.vars.insert(key, value);
+            env.insert(key, value);
         }
         Ok(env)
     }
@@ -96,29 +181,27 @@ impl ServerEnv {
     /// The value of `key`, looked up as the table's host compares names.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.key_of(key)
-            .and_then(|stored| self.vars.get(stored))
-            .map(String::as_str)
+        self.vars
+            .get(&HostKey::of(key, self.host))
+            .map(|(_, value)| value.as_str())
     }
 
     /// Whether `key` is set, as the table's host compares names.
     #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.key_of(key).is_some()
+        self.vars.contains_key(&HostKey::of(key, self.host))
     }
 
-    /// Sets `key`, replacing every spelling of it that the table's host
-    /// treats as the same variable.
-    pub fn insert(&mut self, key: String, value: String) {
-        while let Some(stored) = self.key_of(&key).map(str::to_owned) {
-            self.vars.remove(&stored);
-        }
-        self.vars.insert(key, value);
+    /// Sets `key`, replacing the spelling of it that the table's host treats
+    /// as the same variable.
+    pub fn insert(&mut self, key: EnvKey, value: String) {
+        self.vars
+            .insert(HostKey::of(key.as_str(), self.host), (key, value));
     }
 
-    /// The entries, ordered by key.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.vars.iter()
+    /// The entries, ordered by the host's comparison of the name.
+    pub fn iter(&self) -> impl Iterator<Item = (&EnvKey, &String)> {
+        self.vars.values().map(|(key, value)| (key, value))
     }
 
     /// The number of variables set.
@@ -132,26 +215,11 @@ impl ServerEnv {
     pub fn is_empty(&self) -> bool {
         self.vars.is_empty()
     }
-
-    /// The stored spelling that the table's host treats as `key`, an exact one first.
-    fn key_of(&self, key: &str) -> Option<&str> {
-        if let Some((stored, _)) = self.vars.get_key_value(key) {
-            return Some(stored);
-        }
-        match self.host {
-            HostOs::Windows => self
-                .vars
-                .keys()
-                .find(|stored| stored.eq_ignore_ascii_case(key))
-                .map(String::as_str),
-            HostOs::Other => None,
-        }
-    }
 }
 
-impl From<ServerEnv> for BTreeMap<String, String> {
+impl From<ServerEnv> for BTreeMap<EnvKey, String> {
     fn from(env: ServerEnv) -> Self {
-        env.vars
+        env.vars.into_values().collect()
     }
 }
 
@@ -159,11 +227,37 @@ impl From<ServerEnv> for BTreeMap<String, String> {
 mod tests {
     use super::*;
 
-    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn key(name: &str) -> EnvKey {
+        EnvKey::new(name).unwrap()
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(EnvKey, String)> {
         pairs
             .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .map(|(name, value)| (key(name), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn env_key_rejects_what_the_os_would() {
+        assert_eq!(EnvKey::new(""), Err(InvalidEnvKey::Empty));
+        assert_eq!(EnvKey::new("A=B"), Err(InvalidEnvKey::ForbiddenChar));
+        assert_eq!(EnvKey::new("A\0B"), Err(InvalidEnvKey::ForbiddenChar));
+        assert!(EnvKey::new("Mixed_Case1").is_ok());
+        assert_eq!(EnvKey::from_static("PATH"), "PATH");
+    }
+
+    #[test]
+    fn env_key_is_checked_when_a_config_is_deserialized() {
+        #[derive(Debug, Deserialize)]
+        struct Holder {
+            env: BTreeMap<EnvKey, String>,
+        }
+
+        let holder: Holder = toml::from_str("[env]\nA = \"1\"").unwrap();
+        assert_eq!(holder.env.len(), 1);
+        assert!(toml::from_str::<Holder>("[env]\n\"A=B\" = \"1\"").is_err());
+        assert!(toml::from_str::<Holder>("[env]\n\"\" = \"1\"").is_err());
     }
 
     /// #691: lookups compare names as the host does, for every variable the
@@ -191,14 +285,14 @@ mod tests {
     fn insert_replaces_every_alias_on_windows_and_only_the_exact_key_elsewhere() {
         let mut windows =
             ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Windows).unwrap();
-        windows.insert("PATH".to_owned(), "b".to_owned());
+        windows.insert(key("PATH"), "b".to_owned());
         assert_eq!(
             windows.iter().collect::<Vec<_>>(),
-            [(&"PATH".to_owned(), &"b".to_owned())]
+            [(&key("PATH"), &"b".to_owned())]
         );
 
         let mut other = ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Other).unwrap();
-        other.insert("PATH".to_owned(), "b".to_owned());
+        other.insert(key("PATH"), "b".to_owned());
         assert_eq!(other.len(), 2);
         assert_eq!(other.get("Path"), Some("a"));
     }

@@ -15,8 +15,8 @@ use tracing::info;
 
 use crate::bridge::{WorkspaceRoots, lexically_normalize};
 use crate::config::{
-    BuiltinServer, LspServerConfig, MarkerScan, ServerCommand, ServerConfig, WorkspaceTrust,
-    login_home_dir,
+    BuiltinServer, EnvKey, LspServerConfig, MarkerScan, ServerCommand, ServerConfig,
+    WorkspaceTrust, login_home_dir,
 };
 use crate::error::{
     EchoedPath, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure, StartupFailure,
@@ -227,17 +227,13 @@ fn harden_for_untrusted(
             *arg = program;
         }
     }
-    effective
-        .env
-        .insert(ManagedEnvVar::Path.name().to_owned(), path);
+    effective.env.insert(ManagedEnvVar::Path.key(), path);
     for (name, value) in home_env {
         effective.env.insert(name, value);
     }
     if host == HostOs::Windows {
         effective.env.insert(
-            ManagedEnvVar::NoDefaultCurrentDirectoryInExePath
-                .name()
-                .to_owned(),
+            ManagedEnvVar::NoDefaultCurrentDirectoryInExePath.key(),
             "1".to_owned(),
         );
     }
@@ -334,14 +330,14 @@ fn home_overrides(
     boundary: &WorkspaceRoots,
     login_home: Option<&Path>,
     parent_env: &dyn ParentEnv,
-) -> Result<Vec<(String, String)>, UntrustedRefusal> {
+) -> Result<Vec<(EnvKey, String)>, UntrustedRefusal> {
     let host = effective.env.host();
     let unset = HomeVariable::ALL
         .into_iter()
         .filter(|variable| !effective.env.contains_key(variable.name()));
     if let Some(login_home) = login_home.and_then(Path::to_str) {
         return Ok(unset
-            .map(|variable| (variable.name().to_owned(), login_home.to_owned()))
+            .map(|variable| (ManagedEnvVar::from(variable).key(), login_home.to_owned()))
             .collect());
     }
     for variable in unset {
@@ -840,9 +836,10 @@ mod plan_tests {
 
         fn rust_with_path(path: &Path) -> LspServerConfig {
             let mut config = rust_with("rust-analyzer");
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                ManagedEnvVar::Path.key(),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -969,9 +966,10 @@ mod plan_tests {
                 fx.outside.clone(),
             ])
             .unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                ManagedEnvVar::Path.key(),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
@@ -1033,7 +1031,7 @@ mod plan_tests {
             executable(&exe);
             let mut config = rust_with(exe.to_str().unwrap());
             config.env.insert(
-                "PATH".into(),
+                ManagedEnvVar::Path.key(),
                 fx.workspace.join("bin").to_string_lossy().into_owned(),
             );
 
@@ -1241,9 +1239,10 @@ mod plan_tests {
                 Path::new("/bin"),
             ])
             .unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -1527,7 +1526,7 @@ mod plan_tests {
             let boundary = WorkspaceRoots::from_paths(std::slice::from_ref(&fx.workspace)).unwrap();
             let mut config = rust_on(HostOs::Windows, exe.to_str().unwrap());
             config.env.insert(
-                "nodefaultcurrentdirectoryinexepath".to_owned(),
+                EnvKey::from_static("nodefaultcurrentdirectoryinexepath"),
                 "0".to_owned(),
             );
 
@@ -1546,7 +1545,7 @@ mod plan_tests {
                 hardened
                     .env
                     .iter()
-                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .filter(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
                     .count(),
                 1
             );
@@ -1710,9 +1709,10 @@ mod plan_tests {
         fn wrapped_launch(fx: &Fixture, wrapper: &str, args: &[&str]) -> LspServerConfig {
             let mut config = rust_launched_by(fx.outside.join(wrapper).to_str().unwrap(), args);
             let path = std::env::join_paths([&fx.outside, &fx.workspace.join("bin")]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
             config
         }
 
@@ -1786,9 +1786,10 @@ mod plan_tests {
             executable(&fx.workspace.join("bin/srv"));
             let mut config = wrapped_launch(&fx, "nice", &["srv"]);
             let path = std::env::join_paths([&fx.workspace.join("bin"), &fx.outside]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
@@ -1807,9 +1808,10 @@ mod plan_tests {
             executable(&odd.join("srv"));
             let mut config = wrapped_launch(&fx, "env", &["srv"]);
             let path = std::env::join_paths([&odd, &fx.outside]).unwrap();
-            config
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
 
             let plan = plan_allowing_rust(config, &fx);
 
@@ -2602,7 +2604,9 @@ mod refusal_spawn_tests {
         );
         let mut case = case;
         let path = format!("{}:/usr/bin:/bin", case.workspace.join("bin").display());
-        case.config.lsp_servers[0].env.insert("PATH".into(), path);
+        case.config.lsp_servers[0]
+            .env
+            .insert(crate::config::EnvKey::from_static("PATH"), path);
         (case, interpreter_marker)
     }
 

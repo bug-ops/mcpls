@@ -283,9 +283,10 @@ mod tests {
             let root = dunce::canonicalize(dir.path()).unwrap();
             executable(&root.join("bin/tool"));
             let mut config = config("tool");
-            config
-                .env
-                .insert("PATH".into(), root.join("bin").to_str().unwrap().into());
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                root.join("bin").to_str().unwrap().into(),
+            );
             let resolved = resolve_command(&config, |_| Some(OsString::from("/nonexistent")));
             assert_eq!(resolved.map(|r| r.canonical), Some(root.join("bin/tool")));
         }

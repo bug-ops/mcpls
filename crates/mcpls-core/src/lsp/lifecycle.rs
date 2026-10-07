@@ -1759,7 +1759,10 @@ mod tests {
         });
 
         let mut env = crate::config::ServerEnv::default();
-        env.insert("PYTHONPATH".to_string(), "/usr/lib".to_string());
+        env.insert(
+            crate::config::EnvKey::from_static("PYTHONPATH"),
+            "/usr/lib".to_string(),
+        );
 
         let config = ServerInitConfig::new(
             LspServerConfig {
@@ -2190,14 +2193,14 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
         );
-        config
-            .server_config
-            .env
-            .insert("OTHER_VALUE".to_string(), "bravo-secret-222".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("OTHER_VALUE"),
+            "bravo-secret-222".to_string(),
+        );
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "s3cr3t-value".to_string(),
+        );
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
             "bravo-secret-222".to_owned(),
@@ -2220,13 +2223,13 @@ echo 'fatal: bad toolchain' >&2
             "echo \"token=$API_TOKEN toolchain=$RUSTUP_TOOLCHAIN\" >&2\nexit 1\n",
         );
         config.server_config.env.insert(
-            "RUSTUP_TOOLCHAIN".to_string(),
+            crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
             "nightly-2024-01-01".to_string(),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "s3cr3t-value".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "s3cr3t-value".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2308,10 +2311,10 @@ sleep 5
             .server_config
             .args
             .push("--api-key=SuperSecretArg456".to_string());
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let mut server = LspServer::spawn(config).await.unwrap();
         let mut rx = server.take_notification_rx();
@@ -2345,10 +2348,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2369,10 +2372,10 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .env
-            .insert("API_TOKEN".to_string(), "SuperSecretValue123".to_string());
+        config.server_config.env.insert(
+            crate::config::EnvKey::from_static("API_TOKEN"),
+            "SuperSecretValue123".to_string(),
+        );
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2752,7 +2755,10 @@ sleep 5
         let on = |host| {
             let mut config = bare_server_config(HashMap::new());
             config.env = crate::config::ServerEnv::from_entries(
-                [("Path".to_string(), "/over".to_string())],
+                [(
+                    crate::config::EnvKey::from_static("Path"),
+                    "/over".to_string(),
+                )],
                 host,
             )
             .unwrap();
@@ -2765,7 +2771,7 @@ sleep 5
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only
     /// `command`/`args`/`env` matter.
-    fn bare_server_config(env: HashMap<String, String>) -> LspServerConfig {
+    fn bare_server_config(env: HashMap<crate::config::EnvKey, String>) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
@@ -2931,7 +2937,7 @@ sleep 5
     fn test_build_command_includes_configured_env_vars() {
         let mut env = HashMap::new();
         env.insert(
-            "MCPLS_TEST_CONFIGURED".to_string(),
+            crate::config::EnvKey::from_static("MCPLS_TEST_CONFIGURED"),
             "from-server-config".to_string(),
         );
         let config = bare_server_config(env);
@@ -2951,7 +2957,10 @@ sleep 5
     #[test]
     fn test_build_command_configured_env_overrides_allowlisted_var() {
         let mut env = HashMap::new();
-        env.insert("PATH".to_string(), "/configured/override/path".to_string());
+        env.insert(
+            crate::config::EnvKey::from_static("PATH"),
+            "/configured/override/path".to_string(),
+        );
         let config = bare_server_config(env);
         let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| {
             (key == "PATH").then(|| "/parent/bin".into())

@@ -1734,9 +1734,10 @@ mod tests {
     fn test_resolve_config_env_path_overrides_parent() {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
-        config
-            .env
-            .insert("PATH".into(), layout.bin.to_str().unwrap().into());
+        config.env.insert(
+            crate::config::EnvKey::from_static("PATH"),
+            layout.bin.to_str().unwrap().into(),
+        );
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }

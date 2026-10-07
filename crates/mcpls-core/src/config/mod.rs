@@ -49,7 +49,7 @@ pub use server::{
     BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
     ServerCommand, ServerHeuristics, ServerSelection,
 };
-pub use server_env::{DuplicateEnvKey, ServerEnv};
+pub use server_env::{DuplicateEnvKey, EnvKey, InvalidEnvKey, ServerEnv};
 pub use settings::{InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;
