@@ -243,8 +243,8 @@ impl PublishWriter {
             .saturating_add(bytes)
             <= limits.max_bytes
             && (!is_new || state.pending.len() < limits.max_pending);
-        state.withdraw(&key);
         state.compact_order(limits.max_pending);
+        state.withdraw(&key);
         if fits {
             state.bytes = state.bytes.saturating_add(bytes);
             if is_new {
@@ -551,6 +551,32 @@ mod tests {
         }
 
         assert!(lock_std(&writer.shared.state).order.len() <= 16);
+    }
+
+    #[tokio::test]
+    async fn replacement_after_order_compaction_is_still_delivered() {
+        let one = bytes_of(0, "x");
+        let (writer, mut reader) = mailbox(small(4, one * 2));
+        for n in 0..16 {
+            writer.publish(publish_of(n, "x"));
+            writer.publish(publish_of(n, &"y".repeat(one * 4)));
+        }
+        writer.publish(publish_of(100, "x"));
+        writer.publish(publish_of(100, "z"));
+        drop(writer);
+
+        let mut delivered = None;
+        while let Some(delivery) = reader.recv().await {
+            if let PublishDelivery::Publish(params) = delivery {
+                delivered = Some(params);
+            }
+        }
+        let delivered = delivered.expect("the replaced publish must reach the reader");
+        assert_eq!(delivered.uri, uri(100));
+        assert_eq!(
+            delivered.diagnostics.first().map(|d| d.message.clone()),
+            Some("z".to_owned().into())
+        );
     }
 
     #[tokio::test]

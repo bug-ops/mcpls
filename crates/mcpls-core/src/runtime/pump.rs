@@ -442,7 +442,7 @@ impl Pump {
             .iter()
             .map(|uri| Publication {
                 uri,
-                kind: PublicationKind::Diagnostics,
+                kind: PublicationKind::Lost,
             })
             .collect();
         let Some(resolved) = self.resolve(&publications, lifecycle).await else {
