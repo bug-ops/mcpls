@@ -216,7 +216,8 @@ enforces the following, and nothing more:
   are admitted, and so is a program given by bare name, which the sanitized
   `PATH` already keeps out of the workspace. An argument that lies inside the
   workspace and cannot be read (permission denied) is refused as well. An
-  executable data file passed in `args` is therefore refused. A resolved wrapped-program path
+  executable data file passed in `args` is therefore refused. On a file system where every file has the execute bit (WSL
+  drvfs, exFAT, SMB shares) every workspace file in `args` is refused. A resolved wrapped-program path
   that contains `=` is refused, because `env` would read it as an assignment. The list matches the command's
   file stem and arguments and is best-effort: the trusted configuration is the
   boundary, so install the server globally and give its absolute path as
