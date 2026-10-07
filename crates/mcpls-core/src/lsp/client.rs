@@ -1460,7 +1460,7 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 /// into [`Error`], so `?` does not compile and the choice cannot be skipped.
 #[derive(Debug)]
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
-pub struct UnclassifiedError(Option<Box<Unclassified>>);
+pub struct UnclassifiedError(Box<Unclassified>);
 
 /// An error response from the server, kept as the [`Error::LspServerError`] it
 /// becomes so a caller can classify it, and constructible from nothing else.
@@ -1556,30 +1556,26 @@ fn log_handled_error(method: &str, id: &RequestId, code: i32, message: &str) {
 
 impl UnclassifiedError {
     fn logged(error: Error) -> Self {
-        Self(Some(Box::new(Unclassified::Logged(error))))
+        Self(Box::new(Unclassified::Logged(error)))
     }
 
     fn server_response(response: ServerErrorResponse, method: &str, id: RequestId) -> Self {
-        Self(Some(Box::new(Unclassified::ServerResponse {
+        Self(Box::new(Unclassified::ServerResponse {
             response,
             method: method.to_owned(),
             id,
-        })))
+        }))
     }
 
+    /// Hands over the state, leaving a logged placeholder behind so that the
+    /// `Drop` below has nothing left to report.
     fn take(mut self) -> Unclassified {
-        self.0.take().map_or_else(
-            || unreachable!("an UnclassifiedError holds its error until classified"),
-            |inner| *inner,
-        )
+        std::mem::replace(&mut *self.0, Unclassified::Logged(Error::ServerTerminated))
     }
 
     /// The wrapped error, for classification before logging.
     pub(crate) fn error(&self) -> &Error {
-        self.0.as_ref().map_or_else(
-            || unreachable!("an UnclassifiedError holds its error until classified"),
-            |inner| inner.error(),
-        )
+        self.0.error()
     }
 
     /// The error returned to the caller as a failure; a server error response
@@ -1599,9 +1595,8 @@ impl UnclassifiedError {
 /// `.ok()`, `let _ =` or an ignoring match arm cannot hide it.
 impl Drop for UnclassifiedError {
     fn drop(&mut self) {
-        if let Some(inner) = self.0.take() {
-            drop(inner.finish(log_surfaced_error));
-        }
+        let inner = std::mem::replace(&mut *self.0, Unclassified::Logged(Error::ServerTerminated));
+        drop(inner.finish(log_surfaced_error));
     }
 }
 
