@@ -2660,6 +2660,67 @@ mod burst_tests {
         assert_eq!(warnings, 1);
     }
 
+    /// #726: a lost mark is placed even when its path cannot be resolved
+    /// (persistent transient filesystem error), so the file reads evicted
+    /// instead of keeping stale content.
+    #[tokio::test]
+    async fn test_lost_mark_survives_a_transient_path_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        let failing: Arc<bridge::CanonicalizeFn> =
+            Arc::new(|_: &std::path::Path| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        let published = bridge::path_to_uri(&root.join("kept.rs")).unwrap();
+        let lost = bridge::path_to_uri(&root.join("lost.rs")).unwrap();
+        let (messages_tx, messages_rx) = mpsc::channel(4);
+        let (sink, publish_rx) = NotificationSink::with_limits(
+            messages_tx,
+            MailboxLimits {
+                max_pending: 1,
+                max_bytes: usize::MAX,
+            },
+        );
+        for uri in [&published, &lost] {
+            sink.publishes().publish(PublishDiagnosticsParams {
+                uri: uri.clone(),
+                diagnostics: vec![Diagnostic {
+                    message: "error".to_owned().into(),
+                    ..Diagnostic::default()
+                }],
+                version: None,
+            });
+        }
+        drop(sink);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        drop(lifecycle_tx);
+        let cache = make_cache();
+
+        let pump = tokio::spawn(diagnostics_pump_with_resolver(
+            ServerId::from_static("rust"),
+            NotificationInbox::new(messages_rx, publish_rx),
+            lifecycle_rx,
+            CancellationToken::new(),
+            watch::channel(DiagnosticsRole::Authoritative).1,
+            None,
+            shared_over(
+                &cache,
+                WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
+            ),
+            PublishedPathResolver::with_canonicalizer(failing),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), pump)
+            .await
+            .expect("the pump must end once the mailbox is drained and closed")
+            .unwrap();
+
+        assert_eq!(
+            cache
+                .lock()
+                .await
+                .availability(&lost, Some(&ServerId::from_static("rust"))),
+            DiagnosticsAvailability::Evicted
+        );
+    }
+
     /// #696: a pump started for a respawned server shares the role sender, so
     /// a role recomputed afterwards reaches it.
     #[test]
