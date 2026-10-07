@@ -22,6 +22,7 @@ use crate::lsp::types::{
 };
 use crate::lsp::{DropCounter, DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
+use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;
 
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
@@ -110,21 +111,6 @@ pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
     "textDocument/documentSymbol",
     "workspace/symbol",
 ];
-
-/// Byte-length threshold for the LSP error message forwarded to the MCP
-/// caller in [`Error::LspServerError`] (#313).
-///
-/// Deliberately much larger than [`crate::util::MAX_LOG_STRING_BYTES`]
-/// (used for this same error message in [`LspClient::request`]'s own log
-/// line): a legitimate LSP error (e.g. a verbose rust-analyzer
-/// type-mismatch diagnostic reported through an error response) can run
-/// into the low kilobytes, and that detail is useful to the calling model --
-/// a log line should stay terse, but a truncated-to-200-bytes error handed
-/// to the model would cut off real content on every longer-but-honest
-/// error. Still far below #311's 256 KiB cache-entry cap: this string is
-/// echoed directly into the MCP tool result / model context, not merely
-/// cached.
-pub const MAX_ERROR_MESSAGE_CALLER_BYTES: usize = 4 * 1024;
 
 /// Upper bound on the effective timeout for completion requests, regardless
 /// of `request_timeout_seconds`.

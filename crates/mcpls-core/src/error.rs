@@ -19,11 +19,10 @@ use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
     LanguageId, ServerCommand, ServerId, ToolKind, UnsupportedFilePattern,
 };
-use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 pub use crate::util::SizeExceeded;
-use crate::util::{TRUNCATION_MARKER, escape_control, truncate_str};
+use crate::util::{MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded, escape_control, truncate_str};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -281,7 +280,7 @@ impl EchoedArgument {
         let name = arg
             .split_once(|c: char| c == '=' || c.is_whitespace())
             .map_or(arg, |(name, _)| name);
-        Self(bounded_escaped(name, MAX_SYMBOL_NAME_BYTES))
+        Self(escape_bounded(name, MAX_SYMBOL_NAME_BYTES))
     }
 
     /// The echoed text.
@@ -289,23 +288,6 @@ impl EchoedArgument {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-/// `text` with control and deceptive characters escaped, then bounded to
-/// `max_bytes` of escaped text. The cut falls between escaped characters, so
-/// an escape sequence is never split.
-fn bounded_escaped(text: &str, max_bytes: usize) -> String {
-    let mut bounded = String::with_capacity(text.len().min(max_bytes));
-    let mut buffer = [0; 4];
-    for c in text.chars() {
-        let escaped = escape_control(c.encode_utf8(&mut buffer));
-        if bounded.len().saturating_add(escaped.len()) > max_bytes {
-            bounded.push_str(TRUNCATION_MARKER);
-            break;
-        }
-        bounded.push_str(&escaped);
-    }
-    bounded
 }
 
 /// Most bytes of a workspace-controlled path shown in a refusal.
@@ -335,7 +317,7 @@ impl EchoedPath {
     /// The whole of `path`, escaped and bounded.
     #[must_use]
     pub fn new(path: &Path) -> Self {
-        Self(bounded_escaped(
+        Self(escape_bounded(
             &path.to_string_lossy(),
             MAX_ECHOED_PATH_BYTES,
         ))
@@ -1447,7 +1429,8 @@ impl fmt::Display for EarlyExitDetail<'_> {
     }
 }
 
-/// A background task whose failure surfaces as [`Error::TaskFailed`].
+/// A background task whose failure surfaces as [`Error::TaskFailed`] or is
+/// reported by its supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackgroundTask {
@@ -1463,6 +1446,8 @@ pub enum BackgroundTask {
     FileOpen,
     /// Planning which configured servers to start, on the blocking pool.
     ServerPlanning,
+    /// The reaper that expires idle HTTP sessions.
+    IdleSessionReaper,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -1474,6 +1459,7 @@ impl fmt::Display for BackgroundTask {
             Self::PathValidation => "path validation",
             Self::FileOpen => "file open",
             Self::ServerPlanning => "server start planning",
+            Self::IdleSessionReaper => "idle HTTP session reaper",
         })
     }
 }
@@ -2552,6 +2538,7 @@ mod tests {
 
     use super::*;
     use crate::config::{FileExtension, FileName};
+    use crate::util::TRUNCATION_MARKER;
 
     #[test]
     fn test_all_servers_failed_to_init_error() {

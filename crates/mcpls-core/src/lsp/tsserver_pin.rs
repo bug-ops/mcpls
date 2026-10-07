@@ -33,10 +33,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::{
-    BuiltinServer, CommandStem, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
+    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
-use crate::lsp::command_path::{HostOs, resolve_named};
+use crate::lsp::command_path::resolve_named;
 use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX};
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;

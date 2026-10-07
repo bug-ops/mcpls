@@ -15,11 +15,8 @@ mod transport;
 pub(crate) mod tsserver_pin;
 pub(crate) mod types;
 
-pub(crate) use client::{
-    CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, MAX_ERROR_MESSAGE_CALLER_BYTES, UnclassifiedError,
-};
+pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, UnclassifiedError};
 pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};
-pub use command_path::HostOs;
 pub(crate) use env::{ManagedEnvVar, ParentEnv, process_env};
 #[cfg(test)]
 #[cfg(unix)]
@@ -42,3 +39,7 @@ pub use types::{
     InboundMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LspNotification,
     RequestId,
 };
+
+pub use crate::config::HostOs;
+#[cfg(test)]
+pub(crate) use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;

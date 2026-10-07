@@ -30,6 +30,12 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// Logs `err` through the tracing subscriber and returns [`Self::Failure`].
+    fn failed(err: &impl std::fmt::Debug) -> Self {
+        tracing::error!(error = ?err, "mcpls exited with an error");
+        Self::Failure
+    }
+
     const fn exit_code(self) -> i32 {
         match self {
             Self::Success => 0,
@@ -47,7 +53,7 @@ fn main() {
     // must go straight to stderr.
     if let Err(err) = logging::init(&args.log_level, args.log_format()) {
         eprintln!("failed to initialize logging: {err:?}");
-        std::process::exit(1);
+        std::process::exit(Outcome::Failure.exit_code());
     }
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
@@ -56,10 +62,7 @@ fn main() {
     // must not run on an async worker.
     let config = match load_config(&args, config_origin, &trust) {
         Ok(config) => config,
-        Err(err) => {
-            tracing::error!(error = ?err, "mcpls exited with an error");
-            std::process::exit(Outcome::Failure.exit_code());
-        }
+        Err(err) => std::process::exit(Outcome::failed(&err).exit_code()),
     };
 
     let transport = transport(&args);
@@ -71,7 +74,7 @@ fn main() {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("failed to build the async runtime: {err:?}");
-            std::process::exit(1);
+            std::process::exit(Outcome::Failure.exit_code());
         }
     };
 
@@ -80,10 +83,7 @@ fn main() {
     let outcome = block_on_guarded(runtime, async {
         match run(config, transport).await {
             Ok(()) => Outcome::Success,
-            Err(err) => {
-                tracing::error!(error = ?err, "mcpls exited with an error");
-                Outcome::Failure
-            }
+            Err(err) => Outcome::failed(&err),
         }
     });
 

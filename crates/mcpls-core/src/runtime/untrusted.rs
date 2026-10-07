@@ -15,14 +15,14 @@ use tracing::info;
 
 use crate::bridge::{WorkspaceRoots, lexically_normalize};
 use crate::config::{
-    BuiltinServer, EnvKey, LspServerConfig, MarkerScan, ServerCommand, ServerConfig,
+    BuiltinServer, EnvKey, HostOs, LspServerConfig, MarkerScan, ServerCommand, ServerConfig,
     WorkspaceTrust, login_home_dir,
 };
 use crate::error::{
     EchoedPath, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure, StartupFailure,
     UntrustedRefusal,
 };
-use crate::lsp::command_path::{HostOs, ResolvedCommand};
+use crate::lsp::command_path::ResolvedCommand;
 use crate::lsp::tsserver_pin::UntrustedVetting;
 use crate::lsp::{
     self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,

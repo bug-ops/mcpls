@@ -16,8 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bridge::MAX_SYMBOL_NAME_BYTES;
-use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
-use crate::util::truncate_string;
+use crate::util::{MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
 
 /// Prefix rmcp's router maps to an `isError` tool result instead of a
 /// protocol error.
@@ -69,10 +68,10 @@ fn parse_arguments<P: DeserializeOwned>(arguments: Option<JsonObject>) -> Result
     Err(McpError::invalid_params(rejection_message(&error), None))
 }
 
-/// Formats the rejection, capped at `MAX_ERROR_MESSAGE_CALLER_BYTES`.
+/// Formats the rejection, escaped and capped at `MAX_ERROR_MESSAGE_CALLER_BYTES`.
 fn rejection_message(error: &serde_json::Error) -> String {
-    truncate_string(
-        format!("{DESERIALIZE_ERROR_PREFIX} {error}"),
+    escape_bounded(
+        &format!("{DESERIALIZE_ERROR_PREFIX} {error}"),
         MAX_ERROR_MESSAGE_CALLER_BYTES,
     )
 }

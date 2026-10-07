@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::host_os::HostOs;
 use super::text_newtype::impl_text_newtype;
-use crate::lsp::HostOs;
 
 /// Why a string is not a valid [`EnvKey`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
