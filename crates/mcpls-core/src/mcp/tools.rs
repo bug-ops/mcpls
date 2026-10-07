@@ -9,8 +9,8 @@ use crate::bridge::{
     CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, KindFilterField,
     KindFilterInput, LogLevel, MAX_NEW_NAME_LENGTH, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
     MAX_TRIGGER_CHARACTER_BYTES, NewName, Position, Position2D, Range, RestartTarget,
-    ResultContext, ServerIds, SymbolKindFilter, SymbolName, SymbolNameError, SymbolQuery,
-    SymbolTarget, TabSize,
+    ResultContext, ServerIds, ServerIdsError, SymbolKindFilter, SymbolName, SymbolNameError,
+    SymbolQuery, SymbolTarget, TabSize,
 };
 use crate::error::Error;
 
@@ -926,21 +926,29 @@ pub struct RestartServerParams {
     pub target: RestartTarget,
 }
 
+/// Why the selectors of a `restart_server` call do not name a set of servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RestartTargetError {
+    /// Both `servers` and `all` were given.
+    #[error("give either `servers` or `all`, not both")]
+    BothSelectors,
+    /// Neither `servers` nor `all: true` was given.
+    #[error("give `servers` (a non-empty list of server ids) or `all: true`")]
+    NoSelector,
+    /// The `servers` list is empty, too long or holds a bad id.
+    #[error(transparent)]
+    Servers(#[from] ServerIdsError),
+}
+
 impl TryFrom<RestartServerWire> for RestartServerParams {
-    type Error = String;
+    type Error = RestartTargetError;
 
     fn try_from(wire: RestartServerWire) -> Result<Self, Self::Error> {
         let target = match (wire.servers, wire.all) {
-            (Some(_), true) => return Err("give either `servers` or `all`, not both".to_string()),
-            (None, false) => {
-                return Err(
-                    "give `servers` (a non-empty list of server ids) or `all: true`".to_string(),
-                );
-            }
+            (Some(_), true) => return Err(RestartTargetError::BothSelectors),
+            (None, false) => return Err(RestartTargetError::NoSelector),
             (None, true) => RestartTarget::All,
-            (Some(ids), false) => {
-                RestartTarget::Servers(ServerIds::parse(ids).map_err(|e| e.to_string())?)
-            }
+            (Some(ids), false) => RestartTarget::Servers(ServerIds::parse(ids)?),
         };
         Ok(Self { target })
     }
@@ -1082,6 +1090,18 @@ mod tests {
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn restart_selector_errors_are_typed() {
+        let parse = |json: serde_json::Value| {
+            serde_json::from_value::<RestartServerParams>(json)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(parse(serde_json::json!({"servers": ["a"], "all": true})).contains("not both"));
+        assert!(parse(serde_json::json!({})).contains("or `all: true`"));
+        assert!(parse(serde_json::json!({"servers": []})).contains("must not be empty"));
     }
 
     #[test]
