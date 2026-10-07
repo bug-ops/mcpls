@@ -204,7 +204,7 @@ pub struct McplsServer {
     reason = "by-value `e` lets this be passed straight to `Result::map_err`"
 )]
 fn map_bridge_error(e: crate::error::Error) -> McpError {
-    let message = e.to_string();
+    let message = crate::error::ErrorChain(&e).to_string();
     match e.mcp_error_kind() {
         crate::error::McpErrorKind::InvalidParams => McpError::invalid_params(message, None),
         crate::error::McpErrorKind::InvalidPosition(raw) => {
@@ -2286,6 +2286,41 @@ mod tests {
                 assert!(!text.contains(&secret[..len]), "{len}: {text}");
             }
         }
+    }
+
+    /// #720: the error's `Display` no longer repeats its source, so the MCP
+    /// boundary renders the chain and the OS cause reaches the client once.
+    #[test]
+    fn test_map_bridge_error_carries_the_os_cause_once() {
+        let file_io = crate::error::Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        let mapped = map_bridge_error(file_io);
+        assert_eq!(
+            mapped.message.matches("no such file").count(),
+            1,
+            "{}",
+            mapped.message
+        );
+        assert!(mapped.message.contains("a.rs"), "{}", mapped.message);
+    }
+
+    /// #720: a secret carried by a chained cause is still hidden by the funnel.
+    #[test]
+    fn test_render_error_hides_secrets_in_the_rendered_chain() {
+        let redactions = two_server_redactions("bravo-secret-222");
+        let file_io = crate::error::Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: std::io::Error::other("denied for bravo-secret-222"),
+        };
+        let rendered = render_error(file_io, &redactions);
+        assert!(
+            !rendered.message.contains("bravo-secret-222"),
+            "{}",
+            rendered.message
+        );
+        assert!(rendered.message.contains("denied"), "{}", rendered.message);
     }
 
     /// #612: an embedder's client whose own set lacks another server's
