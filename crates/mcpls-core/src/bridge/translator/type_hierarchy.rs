@@ -1,17 +1,14 @@
 //! Type hierarchy prepare/supertypes/subtypes handlers.
 
-use lsp_types::{
-    PartialResultParams, TypeHierarchyItem, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, WorkDoneProgressParams,
-};
+use lsp_types::TypeHierarchyItem;
 
 use super::Translator;
 use super::dto::{CheckedHierarchyItem, Position, TypeHierarchyResult};
 use super::encoding_ctx::EncodingCtx;
-use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
+use super::hierarchy::hierarchy_item_to_mcp;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::Capability;
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -107,42 +104,24 @@ impl Translator {
         item: CheckedHierarchyItem,
         direction: WalkDirection,
     ) -> Result<TypeHierarchyResult> {
-        let uri = lsp_types::Uri::from(item.uri());
-        let path = self.parse_file_uri(&uri).await?;
-        let doc = self
-            .prepare_gated_document_for_path(
-                &path,
-                IndexingGate::Required(Capability::TypeHierarchy),
-            )
-            .await?;
-        let (server_id, client) = (doc.server_id(), doc.client());
-        let ctx = self.encoding_ctx(server_id);
-        let item: TypeHierarchyItem = hierarchy_item_to_lsp(item, doc.uri().clone(), &ctx).await;
-
-        let response = match direction {
+        let Positioned {
+            result: response,
+            ctx,
+            doc: _doc,
+        } = match direction {
             WalkDirection::Supertypes => {
-                client
-                    .request_typed::<lsp_types::TypeHierarchySupertypesRequest>(
-                        TypeHierarchySupertypesParams {
-                            item,
-                            work_done_progress_params: WorkDoneProgressParams::default(),
-                            partial_result_params: PartialResultParams::default(),
-                        },
-                        client.request_timeout(),
-                    )
-                    .await?
+                self.item_request::<lsp_types::TypeHierarchySupertypesRequest>(
+                    item,
+                    Capability::TypeHierarchy,
+                )
+                .await?
             }
             WalkDirection::Subtypes => {
-                client
-                    .request_typed::<lsp_types::TypeHierarchySubtypesRequest>(
-                        TypeHierarchySubtypesParams {
-                            item,
-                            work_done_progress_params: WorkDoneProgressParams::default(),
-                            partial_result_params: PartialResultParams::default(),
-                        },
-                        client.request_timeout(),
-                    )
-                    .await?
+                self.item_request::<lsp_types::TypeHierarchySubtypesRequest>(
+                    item,
+                    Capability::TypeHierarchy,
+                )
+                .await?
             }
         };
 

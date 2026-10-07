@@ -3,8 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use lsp_types::{
-    DocumentFormattingParams, DocumentRangeFormattingParams, FormattingOptions,
-    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+    DocumentFormattingParams, FormattingOptions, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 use tokio::task::JoinSet;
 
@@ -705,38 +704,24 @@ impl Translator {
         tab_size: TabSize,
         insert_spaces: bool,
     ) -> Result<FormatDocumentResult> {
-        let (start, end) = (range.range().start(), range.range().end());
-        let doc = self
-            .prepare_positioned_document(
+        let options = FormattingOptions {
+            tab_size: tab_size.get(),
+            insert_spaces,
+            ..Default::default()
+        };
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .range_request::<lsp_types::DocumentRangeFormattingRequest>(
                 &file_path,
                 IndexingGate::FileLocal(FileLocalCapability::FormatRange),
-                &[start, end],
+                range.range(),
+                options,
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let params = DocumentRangeFormattingParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: lsp_types::Range {
-                start: ctx.to_lsp(uri, start).await,
-                end: ctx.to_lsp(uri, end).await,
-            },
-            options: FormattingOptions {
-                tab_size: tab_size.get(),
-                insert_spaces,
-                ..Default::default()
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::DocumentRangeFormattingRequest>(
-                params,
-                client.request_timeout(),
-            )
-            .await?;
+        let response_uri = doc.uri().clone();
 
         Ok(FormatDocumentResult {
             edits: convert_text_edits(response.unwrap_or_default(), &ctx, &response_uri).await,
@@ -763,25 +748,6 @@ impl Translator {
         range: BoundedRange,
         kind_filter: Option<CodeActionKindFilter>,
     ) -> Result<CodeActionsResult> {
-        let (start, end) = (range.range().start(), range.range().end());
-
-        let doc = self
-            .prepare_positioned_document(
-                &file_path,
-                IndexingGate::Required(Capability::CodeActions),
-                &[start, end],
-            )
-            .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-
-        let range = lsp_types::Range {
-            start: ctx.to_lsp(uri, start).await,
-            end: ctx.to_lsp(uri, end).await,
-        };
-
-        // Build context with optional kind filter
         let only =
             kind_filter.map(|k| vec![lsp_types::CodeActionKind::from(k.as_str().to_owned())]);
 
@@ -789,23 +755,26 @@ impl Translator {
         // based on cursor position and its internal analysis state, not on the
         // passed diagnostics.  Passing stale cached diagnostics (which may lack
         // the internal `data` field ra uses for fix mapping) suppresses results.
-        let context_diagnostics: Vec<lsp_types::Diagnostic> = vec![];
-
-        let params = lsp_types::CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: lsp_types::CodeActionContext {
-                diagnostics: context_diagnostics,
-                only,
-                trigger_kind: Some(lsp_types::CodeActionTriggerKind::Invoked),
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
+        let context = lsp_types::CodeActionContext {
+            diagnostics: vec![],
+            only,
+            trigger_kind: Some(lsp_types::CodeActionTriggerKind::Invoked),
         };
 
-        let response = client
-            .request_typed::<lsp_types::CodeActionRequest>(params, client.request_timeout())
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .range_request::<lsp_types::CodeActionRequest>(
+                &file_path,
+                IndexingGate::Required(Capability::CodeActions),
+                range.range(),
+                context,
+            )
             .await?;
+        let (server_id, client) = (doc.server_id(), doc.client());
+        let response_uri = doc.uri().clone();
         let mut budget = ItemBudget::new();
         let mut entries = budget.admit(response.unwrap_or_default());
         let resolve_supported = self.code_action_resolve_supported(server_id);

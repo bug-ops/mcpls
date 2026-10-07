@@ -1,8 +1,6 @@
 //! Completions, signature help, and inlay hints handlers.
 
-use lsp_types::{
-    CompletionTriggerKind, InlayHintParams, TextDocumentIdentifier, WorkDoneProgressParams,
-};
+use lsp_types::CompletionTriggerKind;
 
 use super::Translator;
 use super::dto::{
@@ -265,26 +263,23 @@ impl Translator {
         file_path: ClientPath,
         range: PositionRange,
     ) -> Result<Indexed<InlayHintsResult>> {
-        let (start, end) = (range.start(), range.end());
-        let doc = self
-            .prepare_disclosed_document(&file_path, Capability::InlayHints, &[start, end])
+        let Positioned {
+            result:
+                Indexed {
+                    result: response,
+                    indexing,
+                },
+            ctx,
+            doc,
+        } = self
+            .disclosed_range_request::<lsp_types::InlayHintRequest>(
+                &file_path,
+                Capability::InlayHints,
+                range,
+                (),
+            )
             .await?;
         let uri = doc.uri();
-        let ctx = self.encoding_ctx(doc.server_id());
-
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: lsp_types::Range {
-                start: ctx.to_lsp(uri, start).await,
-                end: ctx.to_lsp(uri, end).await,
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-
-        let Indexed {
-            result: response,
-            indexing,
-        } = doc.request::<lsp_types::InlayHintRequest>(params).await?;
 
         let mut budget = ItemBudget::new();
         let lsp_hints = budget.admit(response.unwrap_or_default());

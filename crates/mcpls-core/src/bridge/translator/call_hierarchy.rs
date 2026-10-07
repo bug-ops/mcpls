@@ -1,9 +1,6 @@
 //! Call hierarchy prepare/incoming/outgoing handlers.
 
-use lsp_types::{
-    CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyOutgoingCallsParams,
-    PartialResultParams, WorkDoneProgressParams,
-};
+use lsp_types::CallHierarchyItem;
 
 use super::Translator;
 use super::dto::{
@@ -11,10 +8,10 @@ use super::dto::{
     IncomingCallsResult, OutgoingCall, OutgoingCallsResult, Position, PositionDegradation, Range,
 };
 use super::encoding_ctx::EncodingCtx;
-use super::hierarchy::{hierarchy_item_to_lsp, hierarchy_item_to_mcp};
+use super::hierarchy::hierarchy_item_to_mcp;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{Capability, PreparedDocument};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -169,69 +166,48 @@ impl Translator {
         item: CheckedHierarchyItem,
         direction: CallDirection,
     ) -> Result<CallWalk> {
-        // `gen-lsp-types`'s `Uri` is an opaque string wrapper with no validating
-        // parse, so constructing it is infallible; `parse_file_uri` still
-        // validates the `file://` scheme and rejects what it can't use.
-        let item_uri = lsp_types::Uri::from(item.uri());
-        // Same ToolKind/route as `handle_call_hierarchy_prepare`; gated through
-        // the same chokepoint as every whole-workspace tool (#423).
-        let path = self.parse_file_uri(&item_uri).await?;
-        let doc = self
-            .prepare_gated_document_for_path(
-                &path,
-                IndexingGate::Required(Capability::CallHierarchy),
-            )
-            .await?;
-        let (server_id, client) = (doc.server_id(), doc.client());
-        let ctx = self.encoding_ctx(server_id);
-        // The document's own canonical URI, not the client's raw string: the
-        // server must read the file mcpls validated, not a spelling
-        // (`sym/../f`) that resolves elsewhere on its side.
-        let source_uri = doc.uri().clone();
-        let lsp_item: CallHierarchyItem =
-            hierarchy_item_to_lsp(item, source_uri.clone(), &ctx).await;
-
-        let raw: Vec<RawCall> = match direction {
-            CallDirection::Incoming => client
-                .request_typed::<lsp_types::CallHierarchyIncomingCallsRequest>(
-                    CallHierarchyIncomingCallsParams {
-                        item: lsp_item,
-                        work_done_progress_params: WorkDoneProgressParams::default(),
-                        partial_result_params: PartialResultParams::default(),
-                    },
-                    client.request_timeout(),
-                )
-                .await?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|call| RawCall {
-                    // Per the LSP spec, `fromRanges` are ranges within the
-                    // *caller's* document, not the queried item's.
-                    ranges_uri: call.from.uri.clone(),
-                    peer: call.from,
-                    from_ranges: call.from_ranges,
-                })
-                .collect(),
-            CallDirection::Outgoing => client
-                .request_typed::<lsp_types::CallHierarchyOutgoingCallsRequest>(
-                    CallHierarchyOutgoingCallsParams {
-                        item: lsp_item,
-                        work_done_progress_params: WorkDoneProgressParams::default(),
-                        partial_result_params: PartialResultParams::default(),
-                    },
-                    client.request_timeout(),
-                )
-                .await?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|call| RawCall {
-                    // An outgoing call's `fromRanges` are ranges within the
-                    // *queried* item's own document, not the callee's.
-                    ranges_uri: source_uri.clone(),
-                    peer: call.to,
-                    from_ranges: call.from_ranges,
-                })
-                .collect(),
+        let (raw, ctx, _doc): (Vec<RawCall>, EncodingCtx, PreparedDocument) = match direction {
+            CallDirection::Incoming => {
+                let Positioned { result, ctx, doc } = self
+                    .item_request::<lsp_types::CallHierarchyIncomingCallsRequest>(
+                        item,
+                        Capability::CallHierarchy,
+                    )
+                    .await?;
+                let raw = result
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|call| RawCall {
+                        // Per the LSP spec, `fromRanges` are ranges within the
+                        // *caller's* document, not the queried item's.
+                        ranges_uri: call.from.uri.clone(),
+                        peer: call.from,
+                        from_ranges: call.from_ranges,
+                    })
+                    .collect();
+                (raw, ctx, doc)
+            }
+            CallDirection::Outgoing => {
+                let Positioned { result, ctx, doc } = self
+                    .item_request::<lsp_types::CallHierarchyOutgoingCallsRequest>(
+                        item,
+                        Capability::CallHierarchy,
+                    )
+                    .await?;
+                let source_uri = doc.uri().clone();
+                let raw = result
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|call| RawCall {
+                        // An outgoing call's `fromRanges` are ranges within the
+                        // *queried* item's own document, not the callee's.
+                        ranges_uri: source_uri.clone(),
+                        peer: call.to,
+                        from_ranges: call.from_ranges,
+                    })
+                    .collect();
+                (raw, ctx, doc)
+            }
         };
 
         // Not filtered to workspace roots -- see `handle_call_hierarchy_prepare`.

@@ -1408,7 +1408,7 @@
           "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
-          "description": "Locations of the definition.",
+          "description": "Locations found.",
           "items": {
             "$ref": "#/$defs/ContextualLocation"
           },
@@ -3658,7 +3658,7 @@
           "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
         },
         "locations": {
-          "description": "Locations of all references.",
+          "description": "Locations found.",
           "items": {
             "$ref": "#/$defs/ContextualLocation"
           },
@@ -5178,14 +5178,7 @@
           "type": "array"
         },
         "positions_degraded": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionDegradation"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "truncated": {
@@ -5631,14 +5624,7 @@
           "type": "array"
         },
         "positions_degraded": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionDegradation"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {
@@ -6095,14 +6081,7 @@
           "type": "array"
         },
         "positions_degraded": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PositionDegradation"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/PositionDegradation",
           "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
         },
         "resolved_symbol": {

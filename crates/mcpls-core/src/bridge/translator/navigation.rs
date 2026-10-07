@@ -482,13 +482,25 @@ impl Translator {
         Ok(result)
     }
 
-    async fn contextualize(
+    async fn contextualize_into(
         &self,
         normalized: NormalizedLocations,
         context: ResultContext,
-    ) -> Contextualized<Location> {
-        self.contextualize_locations(normalized.locations, context, normalized.positions_degraded)
-            .await
+    ) -> LocationsResult {
+        let truncated = normalized.truncated;
+        let Contextualized {
+            items: locations,
+            enrichment,
+            positions_degraded,
+        } = self
+            .contextualize_locations(normalized.locations, context, normalized.positions_degraded)
+            .await;
+        LocationsResult {
+            locations,
+            truncated,
+            positions_degraded,
+            enrichment,
+        }
     }
 
     /// Shared implementation of the go-to-X handlers (`textDocument/definition`,
@@ -547,19 +559,7 @@ impl Translator {
                 Capability::Definition,
             )
             .await?;
-        let truncated = normalized.truncated;
-        let Contextualized {
-            items: locations,
-            enrichment,
-            positions_degraded,
-        } = self.contextualize(normalized, context).await;
-
-        Ok(DefinitionResult {
-            locations,
-            truncated,
-            positions_degraded,
-            enrichment,
-        })
+        Ok(self.contextualize_into(normalized, context).await)
     }
 
     /// Handle references request.
@@ -593,19 +593,7 @@ impl Translator {
             .await?;
 
         let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;
-        let truncated = normalized.truncated;
-        let Contextualized {
-            items: locations,
-            enrichment,
-            positions_degraded,
-        } = self.contextualize(normalized, context).await;
-
-        Ok(ReferencesResult {
-            locations,
-            truncated,
-            positions_degraded,
-            enrichment,
-        })
+        Ok(self.contextualize_into(normalized, context).await)
     }
 
     /// Handle go-to-implementation request (`textDocument/implementation`).
@@ -631,19 +619,7 @@ impl Translator {
                 Capability::Implementation,
             )
             .await?;
-        let truncated = normalized.truncated;
-        let Contextualized {
-            items: locations,
-            enrichment,
-            positions_degraded,
-        } = self.contextualize(normalized, context).await;
-
-        Ok(LocationsResult {
-            locations,
-            truncated,
-            positions_degraded,
-            enrichment,
-        })
+        Ok(self.contextualize_into(normalized, context).await)
     }
 
     /// Handle go-to-type-definition request (`textDocument/typeDefinition`).
@@ -670,19 +646,7 @@ impl Translator {
                 Capability::TypeDefinition,
             )
             .await?;
-        let truncated = normalized.truncated;
-        let Contextualized {
-            items: locations,
-            enrichment,
-            positions_degraded,
-        } = self.contextualize(normalized, context).await;
-
-        Ok(LocationsResult {
-            locations,
-            truncated,
-            positions_degraded,
-            enrichment,
-        })
+        Ok(self.contextualize_into(normalized, context).await)
     }
 
     /// Handle go-to-declaration request (`textDocument/declaration`).
@@ -710,19 +674,7 @@ impl Translator {
                 Capability::Declaration,
             )
             .await?;
-        let truncated = normalized.truncated;
-        let Contextualized {
-            items: locations,
-            enrichment,
-            positions_degraded,
-        } = self.contextualize(normalized, context).await;
-
-        Ok(LocationsResult {
-            locations,
-            truncated,
-            positions_degraded,
-            enrichment,
-        })
+        Ok(self.contextualize_into(normalized, context).await)
     }
 }
 

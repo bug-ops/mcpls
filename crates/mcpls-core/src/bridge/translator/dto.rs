@@ -398,56 +398,6 @@ pub struct HoverResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// Result of a definition request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DefinitionResult {
-    /// Locations of the definition.
-    pub locations: Vec<ContextualLocation>,
-    /// Whether `locations` was capped below the LSP server's full response
-    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more locations
-    /// exist than are returned here. Omitted (defaults to `false`) when
-    /// serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
-    /// servers only); omitted when all are exact. Tells whether the queried position
-    /// or only the returned offsets are affected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "PositionDegradation")]
-    pub positions_degraded: Option<PositionDegradation>,
-    /// Set only when `context: "enclosing_symbol"` was requested and at least one
-    /// item was looked up: how many files were enriched or skipped, and whether
-    /// the file cap or time budget cut it short.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "EnrichmentSummary")]
-    pub enrichment: Option<EnrichmentSummary>,
-}
-
-/// Result of a references request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ReferencesResult {
-    /// Locations of all references.
-    pub locations: Vec<ContextualLocation>,
-    /// Whether `locations` was capped below the LSP server's full response
-    /// (see `MAX_NORMALIZED_LOCATIONS`, #474) -- if `true`, more references
-    /// exist than are returned here. Omitted (defaults to `false`) when
-    /// serialized.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    /// Set only when some `character` offsets in this result are inexact (non-UTF-16
-    /// servers only); omitted when all are exact. Tells whether the queried position
-    /// or only the returned offsets are affected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "PositionDegradation")]
-    pub positions_degraded: Option<PositionDegradation>,
-    /// Set only when `context: "enclosing_symbol"` was requested and at least one
-    /// item was looked up: how many files were enriched or skipped, and whether
-    /// the file cap or time budget cut it short.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "EnrichmentSummary")]
-    pub enrichment: Option<EnrichmentSummary>,
-}
-
 /// Diagnostic severity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -889,7 +839,8 @@ pub struct SignatureHelpResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// Result of a go-to-implementation or go-to-type-definition request.
+/// Locations answering a definition, references, implementation,
+/// type-definition or declaration request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocationsResult {
     /// Locations found.
@@ -904,6 +855,7 @@ pub struct LocationsResult {
     /// servers only); omitted when all are exact. Tells whether the queried position
     /// or only the returned offsets are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PositionDegradation")]
     pub positions_degraded: Option<PositionDegradation>,
     /// Set only when `context: "enclosing_symbol"` was requested and at least one
     /// item was looked up: how many files were enriched or skipped, and whether
@@ -912,6 +864,12 @@ pub struct LocationsResult {
     #[schemars(with = "EnrichmentSummary")]
     pub enrichment: Option<EnrichmentSummary>,
 }
+
+/// Result of a definition request.
+pub type DefinitionResult = LocationsResult;
+
+/// Result of a references request.
+pub type ReferencesResult = LocationsResult;
 
 /// A single inlay hint entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1416,30 +1374,6 @@ impl ServerText for HoverResult {
             positions_degraded: _,
         } = self;
         redactions.redact_in_place(contents);
-    }
-}
-
-impl ServerText for DefinitionResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            locations,
-            truncated: _,
-            positions_degraded: _,
-            enrichment: _,
-        } = self;
-        locations.redact_server_text(redactions);
-    }
-}
-
-impl ServerText for ReferencesResult {
-    fn redact_server_text(&mut self, redactions: &Redactions) {
-        let Self {
-            locations,
-            truncated: _,
-            positions_degraded: _,
-            enrichment: _,
-        } = self;
-        locations.redact_server_text(redactions);
     }
 }
 
