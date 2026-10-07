@@ -21,8 +21,8 @@ use std::path::Path;
 
 use crate::config::CommandStem;
 use crate::error::{
-    EchoedArgument, InlineFlag, LaunchTrigger, LauncherRefusal, OperandKind, RunnerSubcommand,
-    ShellFlag, UnanalyzableLaunch,
+    CmdSwitch, EchoedArgument, InlineFlag, LaunchTrigger, LauncherRefusal, LongCommandName,
+    OperandKind, PowerShellParameter, RunnerSubcommand, ShellFlag, UnanalyzableLaunch,
 };
 
 /// How a launcher's use selects workspace code.
@@ -114,27 +114,38 @@ const RUNNERS: &[(&str, LaunchRule)] = &[
     ("dotnet", LaunchRule::Subcommands(&[RunnerSubcommand::Tool])),
 ];
 
-const SHELLS: &[&str] = &[
-    "sh",
-    "bash",
-    "zsh",
-    "dash",
-    "ksh",
-    "fish",
-    "csh",
-    "tcsh",
-    "cmd",
-    "powershell",
-    "pwsh",
-    "ash",
-    "hush",
-    "mksh",
-    "oksh",
-    "yash",
-    "posh",
-    "elvish",
-    "nu",
-    "xonsh",
+/// The command-string grammar a shell speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellFamily {
+    /// `sh` and its relatives: `-c`, `--command`.
+    Posix,
+    /// `cmd`: `/c`, `/k`, `/r`.
+    Cmd,
+    /// `powershell` and `pwsh`: `-Command` and its prefixes.
+    PowerShell,
+}
+
+const SHELLS: &[(&str, ShellFamily)] = &[
+    ("sh", ShellFamily::Posix),
+    ("bash", ShellFamily::Posix),
+    ("zsh", ShellFamily::Posix),
+    ("dash", ShellFamily::Posix),
+    ("ksh", ShellFamily::Posix),
+    ("fish", ShellFamily::Posix),
+    ("csh", ShellFamily::Posix),
+    ("tcsh", ShellFamily::Posix),
+    ("cmd", ShellFamily::Cmd),
+    ("powershell", ShellFamily::PowerShell),
+    ("pwsh", ShellFamily::PowerShell),
+    ("ash", ShellFamily::Posix),
+    ("hush", ShellFamily::Posix),
+    ("mksh", ShellFamily::Posix),
+    ("oksh", ShellFamily::Posix),
+    ("yash", ShellFamily::Posix),
+    ("posh", ShellFamily::Posix),
+    ("elvish", ShellFamily::Posix),
+    ("nu", ShellFamily::Posix),
+    ("xonsh", ShellFamily::Posix),
 ];
 
 /// Whether `text` has the shape of the operand `kind`.
@@ -168,6 +179,40 @@ struct ExecWrapper {
     /// Single-dash words followed by a value (`arch -arch`).
     word_values: &'static [&'static str],
     operand: Option<OperandKind>,
+    /// What only `env` has on top of the common grammar.
+    env: Option<EnvHooks>,
+}
+
+/// The parts of `env`'s grammar the other wrappers lack: a lone `-` and
+/// `NAME=value` assignments before the command, an option that splits a string
+/// into arguments, and options that change the directory a relative program is
+/// looked up in. A value-taking short option must stand alone (`-u NAME`), so
+/// a value glued into a cluster (`-uNAME`, `-iC dir`) is refused.
+#[derive(Clone, Copy)]
+struct EnvHooks {
+    chdir: &'static [OptionName],
+    split_short: char,
+    split_long: &'static str,
+}
+
+/// A value-taking option, as the table spells it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptionName {
+    Short(char),
+    Long(&'static str),
+}
+
+/// How far an option reaches in the arguments, and which value-taking option
+/// it is.
+struct Step {
+    width: usize,
+    option: Option<OptionName>,
+}
+
+/// Where the command a wrapper starts is in its arguments.
+struct Invocation {
+    command: usize,
+    changes_directory: bool,
 }
 
 impl ExecWrapper {
@@ -181,21 +226,37 @@ impl ExecWrapper {
             word_flags: &[],
             word_values: &[],
             operand: None,
+            env: None,
         }
     }
 
-    /// The index in `args` of the command the wrapper starts.
-    fn command_index(&self, args: &[String]) -> Result<usize, UnanalyzableLaunch> {
+    /// Where the command the wrapper starts is in `args`.
+    fn command_index(&self, args: &[String]) -> Result<Invocation, UnanalyzableLaunch> {
         let mut index = 0;
+        let mut changes_directory = false;
         while let Some(arg) = args.get(index) {
             if arg == "--" {
                 index = index.saturating_add(1);
                 break;
             }
-            match self.option_width(args, index)? {
-                Some(width) => index = index.saturating_add(width),
-                None => break,
+            if arg == "-" && self.env.is_some() {
+                index = index.saturating_add(1);
+                if let Some(next) = args.get(index).filter(|next| next.starts_with('-')) {
+                    let letter = next.chars().nth(1).unwrap_or('-');
+                    return Err(UnanalyzableLaunch::UnknownOption(EchoedArgument::name(
+                        &format!("-{letter}"),
+                    )));
+                }
+                break;
             }
+            let Some(step) = self.option_width(args, index)? else {
+                break;
+            };
+            changes_directory |= step
+                .option
+                .zip(self.env)
+                .is_some_and(|(option, hooks)| hooks.chdir.contains(&option));
+            index = index.saturating_add(step.width);
         }
         if let Some(operand) = self.operand {
             if !args
@@ -206,8 +267,19 @@ impl ExecWrapper {
             }
             index = index.saturating_add(1);
         }
+        if self.env.is_some() {
+            while let Some((name, _)) = args.get(index).and_then(|arg| arg.split_once('=')) {
+                if name.eq_ignore_ascii_case("PATH") {
+                    return Err(UnanalyzableLaunch::PathAssignment);
+                }
+                index = index.saturating_add(1);
+            }
+        }
         args.get(index)
-            .map(|_| index)
+            .map(|_| Invocation {
+                command: index,
+                changes_directory,
+            })
             .ok_or(UnanalyzableLaunch::MissingCommand)
     }
 
@@ -217,29 +289,28 @@ impl ExecWrapper {
         &self,
         args: &[String],
         index: usize,
-    ) -> Result<Option<usize>, UnanalyzableLaunch> {
+    ) -> Result<Option<Step>, UnanalyzableLaunch> {
         let Some(arg) = args.get(index) else {
             return Ok(None);
         };
         let value_follows = || {
             if args.get(index.saturating_add(1)).is_some() {
-                Ok(Some(2))
+                Ok(2)
             } else {
                 Err(UnanalyzableLaunch::MissingValue(EchoedArgument::name(arg)))
             }
         };
+        let step = |width, option| Ok(Some(Step { width, option }));
         if arg.starts_with("--") {
-            let (name, attached) = arg
-                .split_once('=')
-                .map_or((arg.as_str(), false), |(name, _)| (name, true));
-            return if self.long_values.contains(&name) {
-                if attached {
-                    Ok(Some(1))
-                } else {
-                    value_follows()
-                }
+            let (name, attached) = long_name(arg);
+            if self.env.is_some_and(|hooks| hooks.split_long == name) {
+                return Err(UnanalyzableLaunch::SplitString);
+            }
+            return if let Some(&known) = self.long_values.iter().find(|long| **long == name) {
+                let width = if attached { 1 } else { value_follows()? };
+                step(width, Some(OptionName::Long(known)))
             } else if !attached && self.long_flags.contains(&name) {
-                Ok(Some(1))
+                step(1, None)
             } else {
                 Err(UnanalyzableLaunch::UnknownOption(EchoedArgument::name(arg)))
             };
@@ -248,25 +319,46 @@ impl ExecWrapper {
             return Ok(None);
         };
         if self.word_flags.contains(&arg.as_str()) {
-            return Ok(Some(1));
+            return step(1, None);
         }
         if self.word_values.contains(&arg.as_str()) {
-            return value_follows();
+            return step(value_follows()?, None);
         }
         for (offset, letter) in cluster.char_indices() {
             if self.short_flags.contains(&letter) {
                 continue;
             }
             if self.short_values.contains(&letter) {
+                if self.env.is_some() && cluster.len() > letter.len_utf8() {
+                    return Err(self.unknown_short(cluster, letter));
+                }
                 let glued = offset.saturating_add(letter.len_utf8()) < cluster.len();
-                return if glued { Ok(Some(1)) } else { value_follows() };
+                let width = if glued { 1 } else { value_follows()? };
+                return step(width, Some(OptionName::Short(letter)));
             }
-            return Err(UnanalyzableLaunch::UnknownOption(EchoedArgument::name(
-                &format!("-{letter}"),
-            )));
+            return Err(self.unknown_short(cluster, letter));
         }
-        Ok(Some(1))
+        step(1, None)
     }
+
+    /// The refusal for `letter` in `cluster`, which this grammar does not read:
+    /// a split string when `env`'s `-S` is anywhere in the cluster.
+    fn unknown_short(&self, cluster: &str, letter: char) -> UnanalyzableLaunch {
+        if self
+            .env
+            .is_some_and(|hooks| cluster.contains(hooks.split_short))
+        {
+            UnanalyzableLaunch::SplitString
+        } else {
+            UnanalyzableLaunch::UnknownOption(EchoedArgument::name(&format!("-{letter}")))
+        }
+    }
+}
+
+/// The name of a long option and whether a value is attached with `=`.
+fn long_name(arg: &str) -> (&str, bool) {
+    arg.split_once('=')
+        .map_or((arg, false), |(name, _)| (name, true))
 }
 
 /// Programs that start the command given in their own arguments, with options
@@ -312,6 +404,18 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
         word_flags: &["-32", "-64", "-x86_64", "-arm64", "-arm64e", "-i386"],
         word_values: &["-arch"],
         ..ExecWrapper::named(&["arch"])
+    },
+    ExecWrapper {
+        short_flags: &['i', '0', 'v'],
+        short_values: &['u', 'C'],
+        long_flags: &["--ignore-environment", "--null", "--debug"],
+        long_values: &["--unset", "--chdir"],
+        env: Some(EnvHooks {
+            chdir: &[OptionName::Short('C'), OptionName::Long("--chdir")],
+            split_short: 'S',
+            split_long: "--split-string",
+        }),
+        ..ExecWrapper::named(&["env", "genv"])
     },
 ];
 
@@ -368,7 +472,7 @@ impl InlineEval {
         if let Some(letter) = has_short_flag(arg, self.program_letters, self.value_letters) {
             return Some(InlineFlag::Short(letter));
         }
-        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        let (name, _) = long_name(arg);
         self.long
             .iter()
             .copied()
@@ -396,20 +500,8 @@ pub const NPM_SPECIFIER_PREFIX: &str = "npm:";
 /// Most wrappers followed before the launch is treated as unanalyzable.
 const MAX_WRAPPER_DEPTH: usize = 8;
 
-/// `env` and its Homebrew GNU spelling.
-const ENV_NAMES: &[&str] = &["env", "genv"];
-
 /// Binaries that run the applet named by their first argument.
 const MULTI_CALL_BINARIES: &[&str] = &["busybox", "toybox", "coreutils"];
-
-/// `env` long options that take no value.
-const ENV_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
-
-/// `env` long options that take a value, attached with `=` or separate.
-const ENV_LONG_OPTIONS_WITH_VALUE: &[&str] = &["--unset", "--chdir"];
-
-/// `env` short flags that take no value and may be clustered.
-const ENV_SHORT_FLAGS: &[char] = &['i', '0', 'v'];
 
 /// The indices into a launch's arguments of every program an exec wrapper or
 /// `env` starts, outermost first. `busybox` applets are not programs.
@@ -479,10 +571,6 @@ impl Analysis {
         depth: usize,
     ) -> Result<(), LauncherRefusal> {
         let stem = CommandStem::of(command);
-        if stem.is_any(ENV_NAMES) {
-            deepen(depth)?;
-            return self.env(command, args, base, depth);
-        }
         if let Some(wrapper) = EXEC_WRAPPERS
             .iter()
             .find(|wrapper| stem.is_any(wrapper.names))
@@ -491,10 +579,21 @@ impl Analysis {
             if args.is_empty() {
                 return Ok(());
             }
-            let index = wrapper
-                .command_index(args)
-                .map_err(|reason| unanalyzable(command, reason))?;
-            return self.start(command, args, index, base, depth);
+            let invocation = match wrapper.command_index(args) {
+                Err(UnanalyzableLaunch::MissingCommand) if wrapper.env.is_some() => return Ok(()),
+                other => other.map_err(|reason| unanalyzable(command, reason))?,
+            };
+            if invocation.changes_directory
+                && args
+                    .get(invocation.command)
+                    .is_some_and(|program| is_relative_path(program))
+            {
+                return Err(unanalyzable(
+                    command,
+                    UnanalyzableLaunch::RelativeProgramAfterChdir,
+                ));
+            }
+            return self.start(command, args, invocation.command, base, depth);
         }
         if stem.is_any(MULTI_CALL_BINARIES) {
             deepen(depth)?;
@@ -536,103 +635,6 @@ impl Analysis {
             depth.saturating_add(1),
         )
     }
-
-    /// Analyzes the command an `env` invocation starts. Anything that could
-    /// change which program runs or where it is looked up is refused as
-    /// unanalyzable: `-S`, `-P`, an option this list does not know, a
-    /// `-u`/`-C` value glued into a cluster, a `PATH=` assignment (it bypasses
-    /// the sanitized `PATH`), a relative program after `-C`/`--chdir`, or a
-    /// chain of more than [`MAX_WRAPPER_DEPTH`] wrappers.
-    fn env(
-        &mut self,
-        command: &str,
-        args: &[String],
-        base: usize,
-        depth: usize,
-    ) -> Result<(), LauncherRefusal> {
-        let refuse = |reason| unanalyzable(command, reason);
-        let value_follows = |index: usize, arg: &str| {
-            if args.get(index.saturating_add(1)).is_some() {
-                Ok(())
-            } else {
-                Err(refuse(UnanalyzableLaunch::MissingValue(
-                    EchoedArgument::name(arg),
-                )))
-            }
-        };
-        let mut changes_directory = false;
-        let mut index = 0;
-        while let Some(arg) = args.get(index) {
-            if arg == "--" {
-                index = index.saturating_add(1);
-                break;
-            }
-            if arg == "-" {
-                index = index.saturating_add(1);
-                if let Some(next) = args.get(index).filter(|next| next.starts_with('-')) {
-                    let letter = next.chars().nth(1).unwrap_or('-');
-                    return Err(refuse(UnanalyzableLaunch::UnknownOption(
-                        EchoedArgument::name(&format!("-{letter}")),
-                    )));
-                }
-                break;
-            }
-            if let Some(long) = arg.strip_prefix("--") {
-                let name = format!("--{}", long.split('=').next().unwrap_or_default());
-                if ENV_LONG_OPTIONS_WITH_VALUE.contains(&name.as_str()) {
-                    changes_directory |= name == "--chdir";
-                    if !long.contains('=') {
-                        value_follows(index, arg)?;
-                        index = index.saturating_add(1);
-                    }
-                } else if name == "--split-string" {
-                    return Err(refuse(UnanalyzableLaunch::SplitString));
-                } else if !ENV_LONG_FLAGS.contains(&name.as_str()) || long.contains('=') {
-                    return Err(refuse(UnanalyzableLaunch::UnknownOption(
-                        EchoedArgument::name(arg),
-                    )));
-                }
-            } else if let Some(cluster) = arg.strip_prefix('-') {
-                match cluster {
-                    "u" | "C" => {
-                        changes_directory |= cluster == "C";
-                        value_follows(index, arg)?;
-                        index = index.saturating_add(1);
-                    }
-                    _ => {
-                        if let Some(letter) = cluster
-                            .chars()
-                            .find(|letter| !ENV_SHORT_FLAGS.contains(letter))
-                        {
-                            return Err(refuse(if cluster.contains('S') {
-                                UnanalyzableLaunch::SplitString
-                            } else {
-                                UnanalyzableLaunch::UnknownOption(EchoedArgument::name(&format!(
-                                    "-{letter}"
-                                )))
-                            }));
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
-            index = index.saturating_add(1);
-        }
-        while let Some((name, _)) = args.get(index).and_then(|arg| arg.split_once('=')) {
-            if name.eq_ignore_ascii_case("PATH") {
-                return Err(refuse(UnanalyzableLaunch::PathAssignment));
-            }
-            index = index.saturating_add(1);
-        }
-        let Some(program) = args.get(index) else {
-            return Ok(());
-        };
-        if changes_directory && is_relative_path(program) {
-            return Err(refuse(UnanalyzableLaunch::RelativeProgramAfterChdir));
-        }
-        self.start(command, args, index, base, depth)
-    }
 }
 
 /// Whether `program` is looked up relative to the working directory: a path of
@@ -650,10 +652,10 @@ fn refuse_workspace_code(
     stem: &CommandStem,
     args: &[String],
 ) -> Result<(), LauncherRefusal> {
-    if SHELLS
+    if let Some((_, family)) = SHELLS
         .iter()
-        .any(|shell| is_interpreter(stem.as_str(), shell))
-        && let Some(flag) = args.iter().find_map(|arg| command_flag(stem.as_str(), arg))
+        .find(|(shell, _)| is_interpreter(stem.as_str(), shell))
+        && let Some(flag) = args.iter().find_map(|arg| command_flag(*family, arg))
     {
         return Err(selects(command, LaunchTrigger::CommandString(flag)));
     }
@@ -685,31 +687,42 @@ fn refuse_workspace_code(
 /// glued to the command, `/ccmd`), and the `-Command`, `-CommandWithArgs` and
 /// `-EncodedCommand` parameters of PowerShell, which accepts any prefix of them
 /// and the alias `-ec`. `cmd` and PowerShell compare case-insensitively.
-fn command_flag(shell: &str, arg: &str) -> Option<ShellFlag> {
+fn command_flag(family: ShellFamily, arg: &str) -> Option<ShellFlag> {
     let lowered = arg.to_ascii_lowercase();
-    match shell {
-        "cmd" => ["/c", "/k", "/r"]
-            .iter()
-            .any(|flag| lowered.starts_with(flag))
-            .then_some(ShellFlag::SlashC),
-        "powershell" | "pwsh" => lowered
+    match family {
+        ShellFamily::Cmd => [CmdSwitch::C, CmdSwitch::K, CmdSwitch::R]
+            .into_iter()
+            .find(|switch| lowered.starts_with(switch.as_str()))
+            .map(ShellFlag::SlashC),
+        ShellFamily::PowerShell => lowered
             .strip_prefix(['-', '/'])
-            .is_some_and(|name| {
-                name == "ec"
-                    || (!name.is_empty()
-                        && ["command", "commandwithargs", "encodedcommand"]
-                            .iter()
-                            .any(|parameter| parameter.starts_with(name)))
-            })
-            .then_some(ShellFlag::PowerShellCommand),
-        _ => {
-            if long_flag_matches(arg, &["--command", "--commands"]) {
-                Some(ShellFlag::LongCommand)
-            } else {
-                has_short_flag(arg, &['c'], &['o']).map(|_| ShellFlag::DashC)
-            }
-        }
+            .and_then(powershell_parameter)
+            .map(ShellFlag::PowerShell),
+        ShellFamily::Posix => [LongCommandName::Command, LongCommandName::Commands]
+            .into_iter()
+            .find(|name| long_flag_matches(arg, &[name.as_str()]))
+            .map(ShellFlag::LongCommand)
+            .or_else(|| has_short_flag(arg, &['c'], &['o']).map(|_| ShellFlag::DashC)),
     }
+}
+
+/// The PowerShell parameter a lowercased `-name` abbreviates.
+fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
+    const PARAMETERS: [(&str, PowerShellParameter); 3] = [
+        ("command", PowerShellParameter::Command),
+        ("commandwithargs", PowerShellParameter::CommandWithArgs),
+        ("encodedcommand", PowerShellParameter::EncodedCommand),
+    ];
+    if name == "ec" {
+        return Some(PowerShellParameter::EncodedCommand);
+    }
+    if name.is_empty() {
+        return None;
+    }
+    PARAMETERS
+        .iter()
+        .find(|(full, _)| full.starts_with(name))
+        .map(|&(_, parameter)| parameter)
 }
 
 /// The flag letter of `flags` that a single-dash argument reaches: whatever
@@ -731,8 +744,7 @@ fn has_short_flag(arg: &str, flags: &[char], value_letters: &[char]) -> Option<c
 
 /// Whether `arg` is one of the long `flags`, bare or with an `=value`.
 fn long_flag_matches(arg: &str, flags: &[&str]) -> bool {
-    let name = arg.split_once('=').map_or(arg, |(name, _)| name);
-    flags.contains(&name)
+    flags.contains(&long_name(arg).0)
 }
 
 /// Whether `stem` is the interpreter `name`, optionally followed by a version
@@ -847,7 +859,10 @@ mod tests {
         );
         assert_eq!(
             analyze("fish", &["--command=x"]).unwrap_err(),
-            selects("fish", LaunchTrigger::CommandString(ShellFlag::LongCommand))
+            selects(
+                "fish",
+                LaunchTrigger::CommandString(ShellFlag::LongCommand(LongCommandName::Command))
+            )
         );
         assert_eq!(
             analyze("bash", &["-lc", "x"]).unwrap_err(),
@@ -1078,10 +1093,20 @@ mod tests {
 
     #[test]
     fn cmd_command_flags_are_recognized_with_and_without_a_space() {
-        for flag in ["/c", "/C", "/k", "/r", "/ccmd", "/Cserver"] {
+        for (flag, switch) in [
+            ("/c", CmdSwitch::C),
+            ("/C", CmdSwitch::C),
+            ("/k", CmdSwitch::K),
+            ("/r", CmdSwitch::R),
+            ("/ccmd", CmdSwitch::C),
+            ("/Cserver", CmdSwitch::C),
+        ] {
             assert_eq!(
                 analyze("cmd", &[flag, "server"]).unwrap_err(),
-                selects("cmd", LaunchTrigger::CommandString(ShellFlag::SlashC)),
+                selects(
+                    "cmd",
+                    LaunchTrigger::CommandString(ShellFlag::SlashC(switch))
+                ),
                 "{flag}"
             );
         }
@@ -1170,7 +1195,7 @@ mod tests {
             analyze("powershell", &["-Command", "server"]).unwrap_err(),
             selects(
                 "powershell",
-                LaunchTrigger::CommandString(ShellFlag::PowerShellCommand)
+                LaunchTrigger::CommandString(ShellFlag::PowerShell(PowerShellParameter::Command))
             )
         );
         assert!(!launches("sh", &["server.sh"]));
@@ -1179,7 +1204,7 @@ mod tests {
 
     #[test]
     fn every_listed_shell_refuses_a_command_string() {
-        for shell in SHELLS {
+        for (shell, _) in SHELLS {
             let flag = if *shell == "cmd" { "/c" } else { "-c" };
             assert!(launches(shell, &[flag, "x"]), "{shell}");
             assert!(
@@ -1487,5 +1512,70 @@ mod tests {
             analyze("timeout", &["5", "sudo", "-u", "x", "srv"]).unwrap_err(),
             selects("sudo", LaunchTrigger::Always)
         );
+    }
+
+    #[test]
+    fn versioned_powershell_stems_use_the_powershell_grammar() {
+        for command in ["pwsh7", "PowerShell7.exe", "/opt/pwsh7.2", "powershell5"] {
+            for flag in ["-Command", "-c", "-ec", "/command"] {
+                assert!(launches(command, &[flag, "x"]), "{command} {flag}");
+            }
+            assert!(
+                !launches(command, &["-NoProfile", "server.ps1"]),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_spelling_that_matched() {
+        let trigger = |command, arg| match analyze(command, &[arg, "x"]) {
+            Err(LauncherRefusal::SelectsWorkspaceCode {
+                trigger: LaunchTrigger::CommandString(flag),
+                ..
+            }) => flag.to_string(),
+            other => panic!("expected a command string, got {other:?}"),
+        };
+        assert_eq!(trigger("cmd", "/k"), "/k");
+        assert_eq!(trigger("cmd", "/R"), "/r");
+        assert_eq!(trigger("nu", "--commands"), "--commands");
+        assert_eq!(trigger("nu", "--command=x"), "--command");
+        assert_eq!(trigger("pwsh", "-comm"), "-Command");
+        assert_eq!(trigger("pwsh", "-commandw"), "-CommandWithArgs");
+        assert_eq!(trigger("pwsh", "-ec"), "-EncodedCommand");
+        assert_eq!(trigger("pwsh", "-e"), "-EncodedCommand");
+    }
+
+    #[test]
+    fn env_and_the_other_wrappers_read_long_options_alike() {
+        for command in ["env", "nice"] {
+            let args = ["--bogus=1", "srv"];
+            assert!(
+                matches!(
+                    unanalyzable_reason(command, &args),
+                    UnanalyzableLaunch::UnknownOption(_)
+                ),
+                "{command}"
+            );
+        }
+        assert_eq!(analyze("env", &["--unset=A", "srv"]), Ok(vec![1]));
+        assert_eq!(analyze("nice", &["--adjustment=5", "srv"]), Ok(vec![1]));
+        assert_eq!(long_name("--a=b=c"), ("--a", true));
+        assert_eq!(long_name("--a"), ("--a", false));
+    }
+
+    #[test]
+    fn env_chdir_is_tracked_through_the_shared_parser() {
+        for args in [
+            &["--chdir=/d", "bin/srv"][..],
+            &["-i", "-C", "/d", "bin/srv"],
+        ] {
+            assert_eq!(
+                unanalyzable_reason("env", args),
+                UnanalyzableLaunch::RelativeProgramAfterChdir,
+                "{args:?}"
+            );
+        }
+        assert_eq!(analyze("env", &["-i", "bin/srv"]), Ok(vec![1]));
     }
 }

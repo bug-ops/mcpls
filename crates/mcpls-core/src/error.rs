@@ -362,27 +362,93 @@ impl fmt::Display for RunnerSubcommand {
     }
 }
 
-/// The flag that gives a shell a command string.
+/// The spelling of a long flag that gives a shell a command string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LongCommandName {
+    /// `--command`.
+    Command,
+    /// `--commands`.
+    Commands,
+}
+
+impl LongCommandName {
+    /// The flag as written on a command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "--command",
+            Self::Commands => "--commands",
+        }
+    }
+}
+
+/// A switch of `cmd` that gives it a command string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdSwitch {
+    /// `/c`.
+    C,
+    /// `/k`.
+    K,
+    /// `/r`.
+    R,
+}
+
+impl CmdSwitch {
+    /// The switch as written on a command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::C => "/c",
+            Self::K => "/k",
+            Self::R => "/r",
+        }
+    }
+}
+
+/// A PowerShell parameter that gives it a command, however abbreviated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerShellParameter {
+    /// `-Command`.
+    Command,
+    /// `-CommandWithArgs`.
+    CommandWithArgs,
+    /// `-EncodedCommand`.
+    EncodedCommand,
+}
+
+impl PowerShellParameter {
+    /// The full parameter name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "-Command",
+            Self::CommandWithArgs => "-CommandWithArgs",
+            Self::EncodedCommand => "-EncodedCommand",
+        }
+    }
+}
+
+/// The flag that gives a shell a command string, as the shell's family
+/// spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellFlag {
     /// `-c`, alone or inside a cluster such as `-lc`.
     DashC,
-    /// `--command` or `--commands`.
-    LongCommand,
+    /// A long flag such as `--command`.
+    LongCommand(LongCommandName),
     /// `cmd`'s `/c`, `/k` or `/r`.
-    SlashC,
-    /// PowerShell's `-Command`, `-CommandWithArgs`, `-EncodedCommand` or an
-    /// abbreviation of them.
-    PowerShellCommand,
+    SlashC(CmdSwitch),
+    /// A PowerShell parameter or an abbreviation or alias of it.
+    PowerShell(PowerShellParameter),
 }
 
 impl fmt::Display for ShellFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DashC => "-c",
-            Self::LongCommand => "--command",
-            Self::SlashC => "/c",
-            Self::PowerShellCommand => "-Command",
+            Self::LongCommand(name) => name.as_str(),
+            Self::SlashC(switch) => switch.as_str(),
+            Self::PowerShell(parameter) => parameter.as_str(),
         })
     }
 }

@@ -91,10 +91,15 @@ fn allowlist_refusal(
 fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
     launcher::analyze_launch(configured.command.as_str(), &configured.args)
         .err()
-        .map(|cause| UntrustedRefusal::ProjectLauncher {
-            command: configured.command.server_command().clone(),
-            cause,
-        })
+        .map(|cause| project_launcher(configured, cause))
+}
+
+/// The refusal of `config`'s launcher for `cause`.
+fn project_launcher(config: &LspServerConfig, cause: LauncherRefusal) -> UntrustedRefusal {
+    UntrustedRefusal::ProjectLauncher {
+        command: config.command.server_command().clone(),
+        cause,
+    }
 }
 
 /// The path `resolved` is spawned by, after untrusted mode vetted it.
@@ -137,13 +142,8 @@ fn vetted_wrapped_programs(
     boundary: &WorkspaceRoots,
     parent_env: &dyn ParentEnv,
 ) -> Result<Vec<(usize, String)>, UntrustedRefusal> {
-    let programs =
-        launcher::analyze_launch(effective.command.as_str(), &effective.args).map_err(|cause| {
-            UntrustedRefusal::ProjectLauncher {
-                command: effective.command.server_command().clone(),
-                cause,
-            }
-        })?;
+    let programs = launcher::analyze_launch(effective.command.as_str(), &effective.args)
+        .map_err(|cause| project_launcher(effective, cause))?;
     programs
         .indices()
         .iter()
@@ -157,13 +157,13 @@ fn vetted_wrapped_programs(
                     .ok_or_else(unresolved)?;
             let path = vetted_spawn_path(resolved, boundary)?;
             if path.contains('=') {
-                return Err(UntrustedRefusal::ProjectLauncher {
-                    command: effective.command.server_command().clone(),
-                    cause: LauncherRefusal::Unanalyzable {
+                return Err(project_launcher(
+                    effective,
+                    LauncherRefusal::Unanalyzable {
                         program: EchoedArgument::name(program),
                         reason: UnanalyzableLaunch::PathContainsEquals,
                     },
-                });
+                ));
             }
             Ok((index, path))
         })
@@ -351,10 +351,7 @@ pub fn plan_server_starts(
     roots: &WorkspaceRoots,
     redactions: &Arc<Redactions>,
 ) -> StartPlan {
-    let untrusted = matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_));
-    let login_home = untrusted.then(login_home_dir).flatten();
-    let boundary =
-        untrusted.then(|| roots.untrusted_boundary(&config.workspace.roots, login_home.as_deref()));
+    let mode = PlanMode::of(config, roots);
     let markers = MarkerScan::collect(
         roots.canonical(),
         &config.lsp_servers,
@@ -370,14 +367,7 @@ pub fn plan_server_starts(
             continue;
         }
 
-        let admitted = admit(
-            config,
-            lsp_config,
-            roots,
-            boundary.as_ref(),
-            login_home.as_deref(),
-            redactions,
-        );
+        let admitted = admit(config, lsp_config, roots, &mode, redactions);
         match admitted {
             Ok(init) => plan.admitted.push(init),
             Err((command, refusal)) => plan.refused.push(refused(lsp_config, command, refusal)),
@@ -386,15 +376,39 @@ pub fn plan_server_starts(
     plan
 }
 
+/// Whether a plan runs servers as configured or vets them for an untrusted
+/// workspace.
+enum PlanMode {
+    Trusted,
+    Untrusted {
+        /// The directories no executable or working directory may lie in.
+        boundary: WorkspaceRoots,
+        /// The login home directory, when known.
+        login_home: Option<PathBuf>,
+    },
+}
+
+impl PlanMode {
+    fn of(config: &ServerConfig, roots: &WorkspaceRoots) -> Self {
+        if matches!(config.workspace_trust, WorkspaceTrust::Untrusted(_)) {
+            let login_home = login_home_dir();
+            let boundary = roots.untrusted_boundary(&config.workspace.roots, login_home.as_deref());
+            Self::Untrusted {
+                boundary,
+                login_home,
+            }
+        } else {
+            Self::Trusted
+        }
+    }
+}
+
 /// The init config for `lsp_config`, or the refusal and the command it names.
-///
-/// `boundary` is `Some` exactly in untrusted mode.
 fn admit(
     config: &ServerConfig,
     lsp_config: &LspServerConfig,
     roots: &WorkspaceRoots,
-    boundary: Option<&WorkspaceRoots>,
-    login_home: Option<&Path>,
+    mode: &PlanMode,
     redactions: &Arc<Redactions>,
 ) -> Result<ServerInitConfig, (ServerCommand, UntrustedRefusal)> {
     let configured_command = lsp_config.command.server_command();
@@ -402,26 +416,29 @@ fn admit(
     if let Some(refusal) = allowlist_refusal(&config.workspace_trust, lsp_config) {
         return Err(configured(refusal));
     }
-    if boundary.is_some()
+    if matches!(mode, PlanMode::Untrusted { .. })
         && let Some(refusal) = launcher_refusal(lsp_config)
     {
         return Err(configured(refusal));
     }
 
     let selected = tsserver_pin::with_selected_typescript_server(lsp_config, roots, process_env);
-    let (effective, working_dir) = match boundary {
-        None => (selected.into_owned(), ChildWorkingDir::Inherit),
-        Some(boundary) => {
+    let (effective, working_dir, vetting) = match mode {
+        PlanMode::Trusted => (selected.into_owned(), ChildWorkingDir::Inherit, None),
+        PlanMode::Untrusted {
+            boundary,
+            login_home,
+        } => {
+            let login_home = login_home.as_deref();
             let hardened = harden_for_untrusted(selected, boundary, login_home, &process_env)
                 .map_err(configured)?;
             let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
-            (hardened, working_dir)
+            let vetting = UntrustedVetting::new(boundary.clone(), configured_command.clone());
+            (hardened, working_dir, Some(vetting))
         }
     };
     let command = effective.command.server_command().clone();
     let plan = tsserver_pin::plan_typescript(effective, process_env);
-    let vetting = boundary
-        .map(|boundary| UntrustedVetting::new(boundary.clone(), configured_command.clone()));
     if let Some(vetting) = &vetting {
         plan.vet_untrusted(vetting)
             .map_err(|refusal| (command, refusal))?;
