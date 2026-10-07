@@ -274,7 +274,27 @@ fn argument_refusal(
         ChildWorkingDir::Fixed(dir) => dir.join(candidate),
         ChildWorkingDir::Inherit => PathBuf::from(candidate),
     };
-    match dunce::canonicalize(&resolved) {
+    let siblings = (host == HostOs::Windows && resolved.extension().is_none())
+        .then(|| {
+            WINDOWS_EXECUTABLE_EXTENSIONS
+                .iter()
+                .map(|extension| resolved.with_added_extension(extension))
+        })
+        .into_iter()
+        .flatten();
+    std::iter::once(resolved.clone())
+        .chain(siblings)
+        .find_map(|path| path_refusal(index, &path, boundary, host))
+}
+
+/// The refusal for `resolved`, one spelling of argument `index`.
+fn path_refusal(
+    index: usize,
+    resolved: &Path,
+    boundary: &WorkspaceRoots,
+    host: HostOs,
+) -> Option<UntrustedRefusal> {
+    match dunce::canonicalize(resolved) {
         Ok(canonical) => (is_started_as_program(host, &canonical)
             && boundary.contains_canonical(&canonical))
         .then_some(UntrustedRefusal::WorkspaceExecutableArgument {
@@ -282,7 +302,7 @@ fn argument_refusal(
             executable: canonical,
         }),
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            let path = lexically_normalize(&resolved);
+            let path = lexically_normalize(resolved);
             boundary
                 .admits_lexically(&path)
                 .then_some(UntrustedRefusal::UnreadableWorkspaceArgument { index, path })
@@ -761,6 +781,46 @@ mod plan_tests {
         let plan = plan(&config, &roots);
 
         assert!(plan.admitted.is_empty() && plan.refused.is_empty());
+    }
+
+    #[test]
+    fn windows_arguments_without_an_extension_reach_their_program_siblings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tmp = dunce::canonicalize(dir.path()).unwrap();
+        let (workspace, outside) = (tmp.join("ws"), tmp.join("outside"));
+        std::fs::create_dir_all(workspace.join("bin")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        for sibling in ["srv.exe", "tool.cmd", "conf.json"] {
+            std::fs::write(workspace.join("bin").join(sibling), "").unwrap();
+        }
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
+        let cwd = ChildWorkingDir::Fixed(outside);
+        let refuse = |arg: &Path, host| {
+            refuse_workspace_executable_arguments(
+                &[arg.to_string_lossy().into_owned()],
+                &roots,
+                &cwd,
+                host,
+            )
+        };
+
+        for stem in ["srv", "tool"] {
+            let bare = workspace.join("bin").join(stem);
+            std::assert_matches!(
+                refuse(&bare, HostOs::Windows),
+                Err(UntrustedRefusal::WorkspaceExecutableArgument { index: 0, .. }),
+                "{bare:?}"
+            );
+            assert_eq!(refuse(&bare, HostOs::Other), Ok(()), "{bare:?}");
+        }
+        for admitted in ["conf", "missing"] {
+            let path = workspace.join("bin").join(admitted);
+            assert_eq!(refuse(&path, HostOs::Windows), Ok(()), "{path:?}");
+        }
+        assert_eq!(
+            refuse(&workspace.join("bin/conf.json"), HostOs::Windows),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1935,6 +1995,10 @@ mod plan_tests {
             let locked = fx.workspace.join("locked");
             std::fs::create_dir_all(&locked).unwrap();
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&locked).is_ok() {
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
             let hidden = locked.join("srv");
             let unreadable_outside = fx.outside.join("locked");
             std::fs::create_dir_all(&unreadable_outside).unwrap();

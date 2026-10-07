@@ -643,14 +643,14 @@ pub enum LauncherRefusal {
     /// A launcher selects workspace code.
     SelectsWorkspaceCode {
         /// The launcher's name.
-        program: EchoedArgument,
+        program: EchoedPath,
         /// What about it does.
         trigger: LaunchTrigger,
     },
     /// The launch cannot be analyzed, which untrusted mode treats as unsafe.
     Unanalyzable {
         /// The launcher's name.
-        program: EchoedArgument,
+        program: EchoedPath,
         /// Why it cannot be analyzed.
         reason: UnanalyzableLaunch,
     },
@@ -3336,7 +3336,7 @@ mod tests {
         let launcher = UntrustedRefusal::ProjectLauncher {
             command: ServerCommand::from_static("npx"),
             cause: LauncherRefusal::SelectsWorkspaceCode {
-                program: EchoedArgument::name("npx"),
+                program: EchoedPath::program("npx"),
                 trigger: LaunchTrigger::Always,
             },
         };

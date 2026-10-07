@@ -21,8 +21,9 @@ use std::path::Path;
 
 use crate::config::CommandStem;
 use crate::error::{
-    CmdSwitch, EchoedArgument, InlineFlag, LaunchTrigger, LauncherRefusal, LongCommandName,
-    OperandKind, PowerShellParameter, RunnerSubcommand, ShellFlag, UnanalyzableLaunch,
+    CmdSwitch, EchoedArgument, EchoedPath, InlineFlag, LaunchTrigger, LauncherRefusal,
+    LongCommandName, OperandKind, PowerShellParameter, RunnerSubcommand, ShellFlag,
+    UnanalyzableLaunch,
 };
 
 /// How a launcher's use selects workspace code.
@@ -465,6 +466,7 @@ const INLINE_EVAL: &[InlineEval] = &[
     InlineEval::new("python", &['c'], &['m', 'W', 'X', 'Q'], &[]),
     InlineEval {
         module_letters: &['M', 'm'],
+        debugger_letters: &['d'],
         ..InlineEval::new(
             "perl",
             &['e', 'E'],
@@ -505,6 +507,8 @@ struct InlineEval {
     /// Short flag letters whose value must be a module name with an optional
     /// import list: perl turns anything else into code (`-MPOSIX;code`).
     module_letters: &'static [char],
+    /// Short flag letters whose value is a debugger module (`perl -d:Mod`).
+    debugger_letters: &'static [char],
     /// Long flags whose value must not be a `data:` URL.
     data_url_flags: &'static [InlineFlag],
 }
@@ -517,8 +521,11 @@ impl InlineEval {
         let next = args.get(index.saturating_add(1)).map(String::as_str);
         let reached =
             |letter| self.program_letters.contains(&letter) || self.value_letters.contains(&letter);
-        if let Some((letter, rest)) = scan_short(arg, reached) {
+        if let Some((letter, rest)) = scan_short(arg, &['-'], reached) {
             if self.program_letters.contains(&letter) {
+                return Some(InlineFlag::Short(letter));
+            }
+            if self.debugger_letters.contains(&letter) && !is_debugger_spec(rest) {
                 return Some(InlineFlag::Short(letter));
             }
             let module = if rest.is_empty() { next } else { Some(rest) };
@@ -561,6 +568,7 @@ impl InlineEval {
             value_letters,
             long,
             module_letters: &[],
+            debugger_letters: &[],
             data_url_flags: &[],
         }
     }
@@ -614,14 +622,14 @@ pub fn analyze_launch(command: &str, args: &[String]) -> Result<WrappedPrograms,
 
 fn selects(command: &str, trigger: LaunchTrigger) -> LauncherRefusal {
     LauncherRefusal::SelectsWorkspaceCode {
-        program: EchoedArgument::name(command),
+        program: EchoedPath::program(command),
         trigger,
     }
 }
 
 fn unanalyzable(command: &str, reason: UnanalyzableLaunch) -> LauncherRefusal {
     LauncherRefusal::Unanalyzable {
-        program: EchoedArgument::name(command),
+        program: EchoedPath::program(command),
         reason,
     }
 }
@@ -796,6 +804,8 @@ fn command_flag(family: ShellFamily, arg: &str) -> Option<ShellFlag> {
             .map(ShellFlag::SlashC),
         ShellFamily::PowerShell => lowered
             .strip_prefix(['-', '/'])
+            .map(|name| name.strip_prefix('-').unwrap_or(name))
+            .map(|name| name.split([':', '=']).next().unwrap_or_default())
             .and_then(powershell_parameter)
             .map(ShellFlag::PowerShell),
         ShellFamily::Posix => grammar_flag(&POSIX_GRAMMAR, arg),
@@ -810,19 +820,24 @@ struct ShellGrammar {
     short: &'static [(char, ShellFlag)],
     /// Short letters that take a value, which ends the scan of a cluster.
     value_letters: &'static [char],
+    /// What a cluster starts with: `+c` sets the same option as `-c` in POSIX
+    /// shells.
+    prefixes: &'static [char],
     /// Long flags that do.
     long: &'static [LongCommandName],
 }
 
 const POSIX_GRAMMAR: ShellGrammar = ShellGrammar {
     short: &[('c', ShellFlag::DashC)],
-    value_letters: &['o'],
+    value_letters: &[],
+    prefixes: &['-', '+'],
     long: &[LongCommandName::Command, LongCommandName::Commands],
 };
 
 const FISH_GRAMMAR: ShellGrammar = ShellGrammar {
     short: &[('c', ShellFlag::DashC), ('C', ShellFlag::DashCapitalC)],
     value_letters: &['d', 'o', 'D', 'f', 'p'],
+    prefixes: &['-'],
     long: &[
         LongCommandName::Command,
         LongCommandName::Commands,
@@ -833,6 +848,7 @@ const FISH_GRAMMAR: ShellGrammar = ShellGrammar {
 const NU_GRAMMAR: ShellGrammar = ShellGrammar {
     short: &[('c', ShellFlag::DashC), ('e', ShellFlag::DashE)],
     value_letters: &['I'],
+    prefixes: &['-'],
     long: &[
         LongCommandName::Command,
         LongCommandName::Commands,
@@ -853,7 +869,7 @@ fn grammar_flag(grammar: &ShellGrammar, arg: &str) -> Option<ShellFlag> {
                 grammar.short.iter().any(|&(short, _)| short == letter)
                     || grammar.value_letters.contains(&letter)
             };
-            let (letter, _) = scan_short(arg, reached)?;
+            let (letter, _) = scan_short(arg, grammar.prefixes, reached)?;
             grammar
                 .short
                 .iter()
@@ -889,9 +905,13 @@ fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
 /// (`-0777e`, `-l0e`), and reading stops at the first letter that takes a value,
 /// since the rest of the argument is then that option's value (`-mcoverage`,
 /// `-rbundler/setup`).
-fn scan_short(arg: &str, reached: impl Fn(char) -> bool) -> Option<(char, &str)> {
+fn scan_short<'a>(
+    arg: &'a str,
+    prefixes: &[char],
+    reached: impl Fn(char) -> bool,
+) -> Option<(char, &'a str)> {
     let cluster = arg
-        .strip_prefix('-')
+        .strip_prefix(prefixes)
         .filter(|cluster| !cluster.starts_with('-'))?;
     let (offset, letter) = cluster
         .char_indices()
@@ -901,12 +921,25 @@ fn scan_short(arg: &str, reached: impl Fn(char) -> bool) -> Option<(char, &str)>
     Some((letter, rest.unwrap_or_default()))
 }
 
+/// Longest import list a perl `-M` value may carry.
+const MAX_IMPORT_LIST_BYTES: usize = 1024;
+
+/// Whether the rest of a perl `-d` cluster is empty, `t`, or a debugger
+/// module (`:Mod`, `t:Mod`).
+fn is_debugger_spec(rest: &str) -> bool {
+    let rest = rest.strip_prefix('t').unwrap_or(rest);
+    rest.is_empty() || rest.strip_prefix(':').is_some_and(is_module_spec)
+}
+
 /// Whether `value` is what perl accepts after `-M` or `-m` without turning it
 /// into code: an optional `-`, a module name and an optional `=import,list`,
 /// which perl quotes itself.
 fn is_module_spec(value: &str) -> bool {
     let spec = value.strip_prefix('-').unwrap_or(value);
-    let module = spec.split_once('=').map_or(spec, |(module, _)| module);
+    let (module, imports) = spec.split_once('=').unwrap_or((spec, ""));
+    if imports.len() > MAX_IMPORT_LIST_BYTES {
+        return false;
+    }
     let identifier = |part: &str| {
         part.chars()
             .next()
@@ -1971,5 +2004,74 @@ mod tests {
         }
         assert!(!launches("dotnet", &["build"]));
         assert!(!launches("swift", &["build"]));
+    }
+
+    #[test]
+    fn posix_shells_refuse_a_command_string_behind_an_option_cluster_or_plus() {
+        for shell in ["bash", "dash", "zsh", "ksh", "sh"] {
+            for args in [
+                &["-oc", "errexit", "x"][..],
+                &["-eoc", "errexit", "x"],
+                &["+c", "x"],
+                &["+ec", "x"],
+                &["-o", "errexit", "-c", "x"],
+            ] {
+                assert!(launches(shell, args), "{shell} {args:?}");
+            }
+            assert!(
+                !launches(shell, &["-o", "pipefail", "script.sh"]),
+                "{shell}"
+            );
+            assert!(!launches(shell, &["+e", "script.sh"]), "{shell}");
+            assert!(!launches(shell, &["+x", "script.sh"]), "{shell}");
+        }
+    }
+
+    #[test]
+    fn powershell_accepts_double_dash_and_attached_values() {
+        for flag in [
+            "--command",
+            "--c",
+            "--commandwithargs",
+            "--CommandWithArgs",
+            "/cwa",
+            "-CommandWithArgs",
+            "-command:x",
+            "-Command=x",
+            "--cwa",
+        ] {
+            assert!(launches("pwsh", &[flag, "x"]), "{flag}");
+        }
+        assert!(!launches("pwsh", &["-NoProfile", "server.ps1"]));
+    }
+
+    #[test]
+    fn perl_debugger_modules_must_be_module_names() {
+        for arg in ["-d:Mod;BEGIN{system(1)}", "-dt:Mod;x", "-dx", "-d:"] {
+            assert!(launches("perl", &[arg, "srv.pl"]), "{arg}");
+        }
+        for arg in ["-d", "-dt", "-d:Devel::NYTProf", "-dt:Foo=a,b"] {
+            assert!(!launches("perl", &[arg, "srv.pl"]), "{arg}");
+        }
+        let long = format!("-MFoo={}", "a".repeat(MAX_IMPORT_LIST_BYTES + 1));
+        assert!(launches("perl", &[&long, "srv.pl"]));
+        let fits = format!("-MFoo={}", "a".repeat(MAX_IMPORT_LIST_BYTES));
+        assert!(!launches("perl", &[&fits, "srv.pl"]));
+    }
+
+    #[test]
+    fn refusals_echo_the_whole_program_path() {
+        let Err(LauncherRefusal::SelectsWorkspaceCode { program, .. }) =
+            analyze("/opt/Program Files/PowerShell/pwsh", &["-c", "x"])
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(program.as_str(), "/opt/Program Files/PowerShell/pwsh");
+        let Err(LauncherRefusal::Unanalyzable { program, .. }) =
+            analyze("/opt/Program Files/env", &["-z", "srv"])
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(program.as_str(), "/opt/Program Files/env");
     }
 }
