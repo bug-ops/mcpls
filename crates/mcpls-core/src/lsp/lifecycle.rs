@@ -935,16 +935,12 @@ impl LspServer {
                     // CodeAction objects (not just legacy Command objects).
                     code_action_literal_support: Some(lsp_types::ClientCodeActionLiteralOptions {
                         code_action_kind: lsp_types::ClientCodeActionKindOptions {
-                            value_set: vec![
-                                lsp_types::CodeActionKind::Empty,
-                                lsp_types::CodeActionKind::QuickFix,
-                                lsp_types::CodeActionKind::Refactor,
-                                lsp_types::CodeActionKind::RefactorExtract,
-                                lsp_types::CodeActionKind::RefactorInline,
-                                lsp_types::CodeActionKind::RefactorRewrite,
-                                lsp_types::CodeActionKind::Source,
-                                lsp_types::CodeActionKind::SourceOrganizeImports,
-                            ],
+                            value_set: std::iter::once(lsp_types::CodeActionKind::Empty)
+                                .chain(
+                                    crate::bridge::CodeActionKindFilter::ALL
+                                        .map(lsp_types::CodeActionKind::from),
+                                )
+                                .collect(),
                         },
                     }),
                     ..Default::default()
