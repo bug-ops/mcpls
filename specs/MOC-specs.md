@@ -53,6 +53,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (135,500 B tools/list budget, #654 kind filter schemas, #705 closed input schemas) | #630; #654 |
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | draft | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
+| 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | draft | #749 |
 
 ## bridge
 
