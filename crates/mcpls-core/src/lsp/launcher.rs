@@ -1008,14 +1008,12 @@ mod tests {
     #[test]
     fn perl_clusters_with_digits_still_carry_an_inline_program() {
         for flags in ["-0777e", "-l0e", "-0e", "-l0777e", "-nle", "-pe", "-ne"] {
-            assert!(
-                matches!(
-                    analyze("perl", &[flags, "code"]),
-                    Err(LauncherRefusal::SelectsWorkspaceCode {
-                        trigger: LaunchTrigger::InlineProgram(InlineFlag::Short('e' | 'p')),
-                        ..
-                    })
-                ),
+            std::assert_matches!(
+                analyze("perl", &[flags, "code"]),
+                Err(LauncherRefusal::SelectsWorkspaceCode {
+                    trigger: LaunchTrigger::InlineProgram(InlineFlag::Short('e' | 'p')),
+                    ..
+                }),
                 "{flags}"
             );
         }
@@ -1160,11 +1158,9 @@ mod tests {
             &["-", "-u", "X", "srv"],
             &["-", "-i", "srv"],
         ] {
-            assert!(
-                matches!(
-                    unanalyzable_reason("env", args),
-                    UnanalyzableLaunch::UnknownOption(_)
-                ),
+            std::assert_matches!(
+                unanalyzable_reason("env", args),
+                UnanalyzableLaunch::UnknownOption(_),
                 "{args:?}"
             );
         }
@@ -1239,10 +1235,10 @@ mod tests {
             unanalyzable_reason("env", &["-i", "-u"]),
             UnanalyzableLaunch::MissingValue(EchoedArgument::name("-u"))
         );
-        assert!(matches!(
+        std::assert_matches!(
             unanalyzable_reason("env", &["--chdir"]),
             UnanalyzableLaunch::MissingValue(_)
-        ));
+        );
     }
 
     #[test]
@@ -1532,11 +1528,9 @@ mod tests {
             ("arch", &["-arm64=x", "srv"]),
             ("caffeinate", &["-z", "srv"]),
         ] {
-            assert!(
-                matches!(
-                    unanalyzable_reason(command, args),
-                    UnanalyzableLaunch::UnknownOption(_)
-                ),
+            std::assert_matches!(
+                unanalyzable_reason(command, args),
+                UnanalyzableLaunch::UnknownOption(_),
                 "{command} {args:?}"
             );
         }
@@ -1544,14 +1538,14 @@ mod tests {
 
     #[test]
     fn parsed_wrappers_refuse_a_missing_value_or_command() {
-        assert!(matches!(
+        std::assert_matches!(
             unanalyzable_reason("nice", &["-n"]),
             UnanalyzableLaunch::MissingValue(_)
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             unanalyzable_reason("arch", &["-arch"]),
             UnanalyzableLaunch::MissingValue(_)
-        ));
+        );
         for (command, args) in [
             ("nice", &["-n", "5"][..]),
             ("time", &["-p"]),
@@ -1733,11 +1727,9 @@ mod tests {
     fn env_and_the_other_wrappers_read_long_options_alike() {
         for command in ["env", "nice"] {
             let args = ["--bogus=1", "srv"];
-            assert!(
-                matches!(
-                    unanalyzable_reason(command, &args),
-                    UnanalyzableLaunch::UnknownOption(_)
-                ),
+            std::assert_matches!(
+                unanalyzable_reason(command, &args),
+                UnanalyzableLaunch::UnknownOption(_),
                 "{command}"
             );
         }
@@ -1867,11 +1859,9 @@ mod tests {
             "--coreutils-prog",
             "--coreutils-progx=env",
         ] {
-            assert!(
-                matches!(
-                    unanalyzable_reason("coreutils", &[arg, "srv"]),
-                    UnanalyzableLaunch::UnknownOption(_)
-                ),
+            std::assert_matches!(
+                unanalyzable_reason("coreutils", &[arg, "srv"]),
+                UnanalyzableLaunch::UnknownOption(_),
                 "{arg}"
             );
         }
@@ -1894,14 +1884,12 @@ mod tests {
             &["-M"],
             &["-lM-X;code", "script.pl"],
         ] {
-            assert!(
-                matches!(
-                    analyze("perl", args),
-                    Err(LauncherRefusal::SelectsWorkspaceCode {
-                        trigger: LaunchTrigger::InlineProgram(InlineFlag::Short('M' | 'm')),
-                        ..
-                    })
-                ),
+            std::assert_matches!(
+                analyze("perl", args),
+                Err(LauncherRefusal::SelectsWorkspaceCode {
+                    trigger: LaunchTrigger::InlineProgram(InlineFlag::Short('M' | 'm')),
+                    ..
+                }),
                 "{args:?}"
             );
         }
@@ -1932,18 +1920,16 @@ mod tests {
                 &["--experimental_loader=data:text/javascript,x", "srv.mjs"],
                 &["--import=  data:text/javascript,x", "srv.mjs"],
             ] {
-                assert!(
-                    matches!(
-                        analyze(command, args),
-                        Err(LauncherRefusal::SelectsWorkspaceCode {
-                            trigger: LaunchTrigger::InlineProgram(
-                                InlineFlag::Import
-                                    | InlineFlag::Loader
-                                    | InlineFlag::ExperimentalLoader
-                            ),
-                            ..
-                        })
-                    ),
+                std::assert_matches!(
+                    analyze(command, args),
+                    Err(LauncherRefusal::SelectsWorkspaceCode {
+                        trigger: LaunchTrigger::InlineProgram(
+                            InlineFlag::Import
+                                | InlineFlag::Loader
+                                | InlineFlag::ExperimentalLoader
+                        ),
+                        ..
+                    }),
                     "{command} {args:?}"
                 );
             }

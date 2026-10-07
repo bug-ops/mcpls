@@ -278,9 +278,8 @@ impl EchoedArgument {
     #[must_use]
     pub fn name(arg: &str) -> Self {
         let name = arg
-            .split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .unwrap_or_default();
+            .split_once(|c: char| c == '=' || c.is_whitespace())
+            .map_or(arg, |(name, _)| name);
         Self(bounded_escaped(name, MAX_SYMBOL_NAME_BYTES))
     }
 
