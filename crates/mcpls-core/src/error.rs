@@ -1973,7 +1973,7 @@ pub enum Error {
     /// (`WorkspaceRoots::validate`); the same IO kinds raised later, while
     /// reading or opening an already validated file, stay [`Error::FileIo`]
     /// because there they are environmental.
-    #[error("malformed file path {path:?}: {source}")]
+    #[error("malformed file path {path:?}")]
     MalformedPath {
         /// The path as supplied by the client.
         path: PathBuf,
@@ -1989,7 +1989,7 @@ pub enum Error {
     /// freshly supplied in this request or was tracked from an earlier one
     /// and has since been deleted/moved on disk -- is caller-fault; any
     /// other IO failure is not.
-    #[error("file I/O error for {path:?}: {source}")]
+    #[error("file I/O error for {path:?}")]
     FileIo {
         /// Path to the file.
         path: PathBuf,
@@ -2506,6 +2506,46 @@ impl Error {
 /// A specialized Result type for mcpls-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Renders an error followed by its causes, `outer: cause: root`, skipping a
+/// cause whose text the preceding text already contains.
+///
+/// An error type's own message names what failed and leaves the cause to
+/// [`std::error::Error::source`]; this is where a reader that wants the whole
+/// story (an MCP client, a log line) joins them once.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use mcpls_core::error::{Error, ErrorChain};
+///
+/// let error = Error::FileIo {
+///     path: PathBuf::from("a.rs"),
+///     source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+/// };
+///
+/// assert_eq!(ErrorChain(&error).to_string(), "file I/O error for \"a.rs\": gone");
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut text = self.0.to_string();
+        let mut cause = self.0.source();
+        while let Some(error) = cause {
+            let part = error.to_string();
+            if !text.contains(&part) {
+                text.push_str(": ");
+                text.push_str(&part);
+            }
+            cause = error.source();
+        }
+        f.write_str(&text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
@@ -2959,6 +2999,14 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied,
                 "access refused",
             )),
+            Error::FileIo {
+                path: PathBuf::from("a.rs"),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+            },
+            Error::MalformedPath {
+                path: PathBuf::from("b.rs"),
+                source: std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a dir"),
+            },
         ];
         for err in errors {
             let mut chain = vec![err.to_string()];
@@ -2967,15 +3015,35 @@ mod tests {
                 chain.push(cause.to_string());
                 source = cause.source();
             }
-            for pair in chain.windows(2) {
+            for [parent, cause] in chain.array_windows() {
                 assert!(
-                    !pair[0].contains(&pair[1]),
-                    "'{}' repeats its source '{}'",
-                    pair[0],
-                    pair[1]
+                    !parent.contains(cause),
+                    "'{parent}' repeats its source '{cause}'"
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_error_chain_joins_causes_once() {
+        let not_found = || std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let file_io = Error::FileIo {
+            path: PathBuf::from("a.rs"),
+            source: not_found(),
+        };
+        let spawn = Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::new("x").unwrap(),
+            source: not_found(),
+        };
+
+        assert_eq!(
+            ErrorChain(&file_io).to_string(),
+            "file I/O error for \"a.rs\": gone"
+        );
+        assert_eq!(
+            ErrorChain(&spawn).to_string(),
+            "failed to spawn LSP server 'x': gone"
+        );
     }
 
     #[test]
