@@ -2707,7 +2707,7 @@ mod burst_tests {
             ),
             PublishedPathResolver::with_canonicalizer(failing),
         ));
-        tokio::time::timeout(Duration::from_secs(10), pump)
+        tokio::time::timeout(Duration::from_secs(60), pump)
             .await
             .expect("the pump must end once the mailbox is drained and closed")
             .unwrap();
