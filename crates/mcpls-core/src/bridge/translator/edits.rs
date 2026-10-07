@@ -424,7 +424,7 @@ async fn convert_code_action(
     };
 
     let command = action.command.map(|cmd| {
-        let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+        let arguments = cmd.arguments.unwrap_or_default();
         CommandDescription {
             title: cmd.title,
             command: cmd.command,
@@ -770,7 +770,7 @@ impl Translator {
                     .await
                 }
                 lsp_types::CodeActionResponse::Command(cmd) => {
-                    let arguments = cmd.arguments.unwrap_or_else(Vec::new);
+                    let arguments = cmd.arguments.unwrap_or_default();
                     CodeAction {
                         title: cmd.title.clone(),
                         kind: None,

@@ -14,7 +14,6 @@ use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
-/// Extract hover contents as markdown string.
 /// Convert LSP `Documentation` to a plain string.
 fn extract_documentation(doc: lsp_types::Documentation) -> String {
     match doc {
@@ -146,10 +145,7 @@ impl Translator {
                     label: item.label,
                     kind: item.kind.map(lsp_kind_to_u32),
                     detail: item.detail,
-                    documentation: item.documentation.map(|doc| match doc {
-                        lsp_types::Documentation::String(s) => s,
-                        lsp_types::Documentation::MarkupContent(m) => m.value,
-                    }),
+                    documentation: item.documentation.map(extract_documentation),
                 })
                 .collect(),
             positions_degraded: ctx.positions_degraded(),
@@ -261,11 +257,9 @@ impl Translator {
             let position = ctx.to_mcp(uri, hint.position).await;
             let label = match hint.label {
                 lsp_types::Label::String(s) => s,
-                lsp_types::Label::InlayHintLabelPartList(parts) => parts
-                    .into_iter()
-                    .map(|p| p.value)
-                    .collect::<Vec<_>>()
-                    .concat(),
+                lsp_types::Label::InlayHintLabelPartList(parts) => {
+                    parts.into_iter().map(|p| p.value).collect::<String>()
+                }
             };
             let tooltip = hint.tooltip.map(|t| match t {
                 lsp_types::Tooltip::String(s) => s,

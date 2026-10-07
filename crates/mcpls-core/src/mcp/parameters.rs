@@ -5,7 +5,7 @@
 //! rmcp's schema and error contract but bounds that echo.
 
 use std::borrow::Cow;
-use std::fmt::{self, Write as _};
+use std::collections::HashSet;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::common::FromContextPart;
@@ -69,33 +69,12 @@ fn parse_arguments<P: DeserializeOwned>(arguments: Option<JsonObject>) -> Result
     Err(McpError::invalid_params(rejection_message(&error), None))
 }
 
-/// Formats the rejection without ever materializing more than the cap, since
-/// serde echoes client string values of any size.
+/// Formats the rejection, capped at `MAX_ERROR_MESSAGE_CALLER_BYTES`.
 fn rejection_message(error: &serde_json::Error) -> String {
-    let mut out = CappedWriter(String::new());
-    // Overflow is expected and handled by `truncate_string` below.
-    write!(out, "{DESERIALIZE_ERROR_PREFIX} {error}").unwrap_or_default();
-    truncate_string(out.0, MAX_ERROR_MESSAGE_CALLER_BYTES)
-}
-
-/// String sink that stops accepting text a few bytes past the message cap, so
-/// `truncate_string` still sees an over-long message and adds its marker.
-struct CappedWriter(String);
-
-impl CappedWriter {
-    const LIMIT: usize = MAX_ERROR_MESSAGE_CALLER_BYTES + char::MAX_LEN_UTF8;
-}
-
-impl fmt::Write for CappedWriter {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let room = Self::LIMIT.saturating_sub(self.0.len());
-        if text.len() <= room {
-            self.0.push_str(text);
-            return Ok(());
-        }
-        self.0.push_str(&text[..text.floor_char_boundary(room)]);
-        Err(fmt::Error)
-    }
+    truncate_string(
+        format!("{DESERIALIZE_ERROR_PREFIX} {error}"),
+        MAX_ERROR_MESSAGE_CALLER_BYTES,
+    )
 }
 
 /// Replaces every object key longer than `MAX_SYMBOL_NAME_BYTES`, at any
@@ -111,9 +90,17 @@ fn bound_keys(value: &mut Value) -> bool {
             if map.keys().any(|key| key.len() > MAX_SYMBOL_NAME_BYTES) {
                 changed = true;
                 let entries = std::mem::take(map);
+                let kept: HashSet<String> = entries
+                    .keys()
+                    .filter(|key| key.len() <= MAX_SYMBOL_NAME_BYTES)
+                    .cloned()
+                    .collect();
                 for (key, child) in entries {
                     let key = if key.len() > MAX_SYMBOL_NAME_BYTES {
-                        unused_name(map, key.len())
+                        unused_name(
+                            |name| map.contains_key(name) || kept.contains(name),
+                            key.len(),
+                        )
                     } else {
                         key
                     };
@@ -129,7 +116,7 @@ fn bound_keys(value: &mut Value) -> bool {
     }
 }
 
-fn unused_name(map: &JsonObject, len: usize) -> String {
+fn unused_name(is_taken: impl Fn(&str) -> bool, len: usize) -> String {
     let mut attempt = 1_usize;
     loop {
         let name = if attempt == 1 {
@@ -137,7 +124,7 @@ fn unused_name(map: &JsonObject, len: usize) -> String {
         } else {
             format!("<{len}-byte name #{attempt}>")
         };
-        if !map.contains_key(&name) {
+        if !is_taken(&name) {
             return name;
         }
         attempt = attempt.saturating_add(1);
@@ -238,6 +225,20 @@ mod tests {
         assert_eq!(keys.len(), 3, "{keys:?}");
         assert!(keys.contains(&format!("<{len}-byte name>")));
         assert!(keys.contains(&format!("<{len}-byte name #2>")));
+    }
+
+    #[test]
+    fn test_long_key_never_replaces_a_literal_key_of_the_placeholder_name() {
+        let len = MAX_SYMBOL_NAME_BYTES + 1;
+        let placeholder = format!("<{len}-byte name>");
+        let mut value = json!({});
+        value["!".repeat(len)] = json!("long");
+        value[placeholder.as_str()] = json!("literal");
+        assert!(bound_keys(&mut value));
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map[&placeholder], json!("literal"));
+        assert_eq!(map[&format!("<{len}-byte name #2>")], json!("long"));
     }
 
     #[test]

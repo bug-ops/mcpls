@@ -541,29 +541,7 @@ pub struct HoverResult {
 }
 
 /// Diagnostic severity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum DiagnosticSeverity {
-    /// Error diagnostic.
-    Error,
-    /// Warning diagnostic.
-    Warning,
-    /// Informational diagnostic.
-    Information,
-    /// Hint diagnostic.
-    Hint,
-}
-
-impl From<ReportedSeverity> for DiagnosticSeverity {
-    fn from(severity: ReportedSeverity) -> Self {
-        match severity {
-            ReportedSeverity::Error => Self::Error,
-            ReportedSeverity::Warning => Self::Warning,
-            ReportedSeverity::Information => Self::Information,
-            ReportedSeverity::Hint => Self::Hint,
-        }
-    }
-}
+pub type DiagnosticSeverity = ReportedSeverity;
 
 /// A single diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
