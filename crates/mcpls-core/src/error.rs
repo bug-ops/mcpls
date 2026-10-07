@@ -22,7 +22,8 @@ use crate::config::{
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
-use crate::util::{SizeExceeded, TRUNCATION_MARKER, escape_control, truncate_str};
+pub use crate::util::SizeExceeded;
+use crate::util::{TRUNCATION_MARKER, escape_control, truncate_str};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other

@@ -21,6 +21,20 @@ use crate::config::SizeLimit;
 /// two numbers and converts it without re-spelling the fields. Only
 /// [`Self::check`] and [`Self::check_limit`] build one, so `size` is always
 /// above `max`.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::{Error, SizeExceeded};
+///
+/// fn oversize(error: &Error) -> Option<&SizeExceeded> {
+///     match error {
+///         Error::FileSizeLimitExceeded(exceeded) => Some(exceeded),
+///         _ => None,
+///     }
+/// }
+/// # let _ = oversize;
+/// ```
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 #[error("{size} bytes exceed the limit of {max} bytes")]
 pub struct SizeExceeded {
