@@ -8,7 +8,7 @@
 //!
 //! The rules are best-effort. They match the command's file stem and its
 //! arguments, parse the options of a short list of exec wrappers (`nice`,
-//! `timeout`, ...) and of `env`, unwrap `busybox`, and give up on what cannot
+//! `timeout`, `env`, ...) and unwrap `busybox` applets, and give up on what cannot
 //! be analyzed (an option no table lists, a `PATH=` assignment, a shell or
 //! interpreter given a command string). Wrappers whose grammar is large or
 //! that change the root, the directory or the environment (`sudo`, `strace`,
@@ -123,6 +123,10 @@ enum ShellFamily {
     Cmd,
     /// `powershell` and `pwsh`: `-Command` and its prefixes.
     PowerShell,
+    /// `fish`: `-c` and `-C`, `--command` and `--init-command`.
+    Fish,
+    /// `nu`: `-c` and `-e`, `--commands` and `--execute`.
+    Nu,
 }
 
 const SHELLS: &[(&str, ShellFamily)] = &[
@@ -131,7 +135,7 @@ const SHELLS: &[(&str, ShellFamily)] = &[
     ("zsh", ShellFamily::Posix),
     ("dash", ShellFamily::Posix),
     ("ksh", ShellFamily::Posix),
-    ("fish", ShellFamily::Posix),
+    ("fish", ShellFamily::Fish),
     ("csh", ShellFamily::Posix),
     ("tcsh", ShellFamily::Posix),
     ("cmd", ShellFamily::Cmd),
@@ -144,7 +148,7 @@ const SHELLS: &[(&str, ShellFamily)] = &[
     ("yash", ShellFamily::Posix),
     ("posh", ShellFamily::Posix),
     ("elvish", ShellFamily::Posix),
-    ("nu", ShellFamily::Posix),
+    ("nu", ShellFamily::Nu),
     ("xonsh", ShellFamily::Posix),
 ];
 
@@ -423,8 +427,14 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
 /// flag letters and long flags that introduce it. A match is by stem prefix so
 /// `python3.12` counts as `python`.
 const INLINE_EVAL: &[InlineEval] = &[
-    InlineEval::new("node", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT),
-    InlineEval::new("bun", &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT),
+    InlineEval {
+        data_url_flags: DATA_URL_LOADERS,
+        ..InlineEval::new("node", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
+    },
+    InlineEval {
+        data_url_flags: DATA_URL_LOADERS,
+        ..InlineEval::new("bun", &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
+    },
     InlineEval::new("lua", &['e'], &['l'], &[]),
     InlineEval::new("rscript", &['e'], &[], &[]),
     InlineEval::new(
@@ -434,14 +444,20 @@ const INLINE_EVAL: &[InlineEval] = &[
         LONG_EVAL_PRINT,
     ),
     InlineEval::new("osascript", &['e'], &['l', 's'], &[]),
-    InlineEval::new("nodejs", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT),
+    InlineEval {
+        data_url_flags: DATA_URL_LOADERS,
+        ..InlineEval::new("nodejs", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
+    },
     InlineEval::new("python", &['c'], &['m', 'W', 'X', 'Q'], &[]),
-    InlineEval::new(
-        "perl",
-        &['e', 'E'],
-        &['I', 'M', 'm', 'x', 'i', 'F', 'C', 'd', 'D'],
-        &[],
-    ),
+    InlineEval {
+        module_letters: &['M', 'm'],
+        ..InlineEval::new(
+            "perl",
+            &['e', 'E'],
+            &['I', 'M', 'm', 'x', 'i', 'F', 'C', 'd', 'D'],
+            &[],
+        )
+    },
     InlineEval::new(
         "ruby",
         &['e'],
@@ -452,6 +468,14 @@ const INLINE_EVAL: &[InlineEval] = &[
 ];
 
 const LONG_EVAL_PRINT: &[InlineFlag] = &[InlineFlag::Eval, InlineFlag::Print];
+
+/// Long flags whose value is a module to load, which a `data:` URL turns into
+/// an inline program.
+const DATA_URL_LOADERS: &[InlineFlag] = &[
+    InlineFlag::Import,
+    InlineFlag::Loader,
+    InlineFlag::ExperimentalLoader,
+];
 
 /// How an interpreter is given a program on its command line.
 struct InlineEval {
@@ -464,19 +488,51 @@ struct InlineEval {
     value_letters: &'static [char],
     /// Long flags that introduce the program.
     long: &'static [InlineFlag],
+    /// Short flag letters whose value must be a module name with an optional
+    /// import list: perl turns anything else into code (`-MPOSIX;code`).
+    module_letters: &'static [char],
+    /// Long flags whose value must not be a `data:` URL.
+    data_url_flags: &'static [InlineFlag],
 }
 
 impl InlineEval {
-    /// The flag by which `arg` gives this interpreter an inline program.
-    fn flag_in(&self, arg: &str) -> Option<InlineFlag> {
-        if let Some(letter) = has_short_flag(arg, self.program_letters, self.value_letters) {
-            return Some(InlineFlag::Short(letter));
+    /// The flag by which `args[index]` gives this interpreter an inline
+    /// program, possibly through the argument that follows it.
+    fn flag_in(&self, args: &[String], index: usize) -> Option<InlineFlag> {
+        let arg = args.get(index)?;
+        let next = args.get(index.saturating_add(1)).map(String::as_str);
+        let reached =
+            |letter| self.program_letters.contains(&letter) || self.value_letters.contains(&letter);
+        if let Some((letter, rest)) = scan_short(arg, reached) {
+            if self.program_letters.contains(&letter) {
+                return Some(InlineFlag::Short(letter));
+            }
+            let module = if rest.is_empty() { next } else { Some(rest) };
+            if self.module_letters.contains(&letter) && !module.is_some_and(is_module_spec) {
+                return Some(InlineFlag::Short(letter));
+            }
         }
-        let (name, _) = long_name(arg);
-        self.long
+        let (name, attached) = long_name(arg);
+        if let Some(flag) = self
+            .long
             .iter()
             .copied()
             .find(|flag| flag.long_name() == Some(name))
+        {
+            return Some(flag);
+        }
+        let name = name.replace('_', "-");
+        let flag = self
+            .data_url_flags
+            .iter()
+            .copied()
+            .find(|flag| flag.long_name() == Some(name.as_str()))?;
+        let value = if attached {
+            arg.split_once('=').map(|(_, value)| value)
+        } else {
+            next
+        };
+        value.is_some_and(is_data_url).then_some(flag)
     }
 
     const fn new(
@@ -490,6 +546,8 @@ impl InlineEval {
             program_letters,
             value_letters,
             long,
+            module_letters: &[],
+            data_url_flags: &[],
         }
     }
 }
@@ -501,7 +559,14 @@ pub const NPM_SPECIFIER_PREFIX: &str = "npm:";
 const MAX_WRAPPER_DEPTH: usize = 8;
 
 /// Binaries that run the applet named by their first argument.
-const MULTI_CALL_BINARIES: &[&str] = &["busybox", "toybox", "coreutils"];
+const APPLET_BINARIES: &[&str] = &["busybox", "toybox"];
+
+/// The binary of GNU coreutils and uutils: GNU dispatches on
+/// `--coreutils-prog=NAME`, uutils on the bare applet name.
+const COREUTILS: &str = "coreutils";
+
+/// The option by which GNU `coreutils` names the applet to run.
+const COREUTILS_PROG: &str = "--coreutils-prog";
 
 /// The indices into a launch's arguments of every program an exec wrapper or
 /// `env` starts, outermost first. `busybox` applets are not programs.
@@ -595,10 +660,15 @@ impl Analysis {
             }
             return self.start(command, args, invocation.command, base, depth);
         }
-        if stem.is_any(MULTI_CALL_BINARIES) {
+        if stem.is_any(APPLET_BINARIES) || stem.is(COREUTILS) {
             deepen(depth)?;
-            let Some((applet, rest)) = args.split_first() else {
+            let Some((first, rest)) = args.split_first() else {
                 return Err(unanalyzable(command, UnanalyzableLaunch::MissingCommand));
+            };
+            let applet = if stem.is(COREUTILS) {
+                coreutils_applet(first).map_err(|reason| unanalyzable(command, reason))?
+            } else {
+                first
             };
             return self.command(
                 applet,
@@ -637,6 +707,22 @@ impl Analysis {
     }
 }
 
+/// The applet `coreutils` runs for its first argument: the value of
+/// `--coreutils-prog=`, or the argument itself for uutils. The shebang form
+/// and any other spelling of the option cannot be analyzed.
+fn coreutils_applet(first: &str) -> Result<&str, UnanalyzableLaunch> {
+    let Some(rest) = first.strip_prefix(COREUTILS_PROG) else {
+        return Ok(first);
+    };
+    match rest.strip_prefix('=') {
+        Some("") => Err(UnanalyzableLaunch::BlankProgram),
+        Some(applet) => Ok(applet),
+        None => Err(UnanalyzableLaunch::UnknownOption(EchoedArgument::name(
+            first,
+        ))),
+    }
+}
+
 /// Whether `program` is looked up relative to the working directory: a path of
 /// several components that is not absolute.
 fn is_relative_path(program: &str) -> bool {
@@ -662,7 +748,7 @@ fn refuse_workspace_code(
     if let Some(flag) = INLINE_EVAL
         .iter()
         .filter(|eval| is_interpreter(stem.as_str(), eval.name))
-        .find_map(|eval| args.iter().find_map(|arg| eval.flag_in(arg)))
+        .find_map(|eval| (0..args.len()).find_map(|index| eval.flag_in(args, index)))
     {
         return Err(selects(command, LaunchTrigger::InlineProgram(flag)));
     }
@@ -698,12 +784,68 @@ fn command_flag(family: ShellFamily, arg: &str) -> Option<ShellFlag> {
             .strip_prefix(['-', '/'])
             .and_then(powershell_parameter)
             .map(ShellFlag::PowerShell),
-        ShellFamily::Posix => [LongCommandName::Command, LongCommandName::Commands]
-            .into_iter()
-            .find(|name| long_flag_matches(arg, &[name.as_str()]))
-            .map(ShellFlag::LongCommand)
-            .or_else(|| has_short_flag(arg, &['c'], &['o']).map(|_| ShellFlag::DashC)),
+        ShellFamily::Posix => grammar_flag(&POSIX_GRAMMAR, arg),
+        ShellFamily::Fish => grammar_flag(&FISH_GRAMMAR, arg),
+        ShellFamily::Nu => grammar_flag(&NU_GRAMMAR, arg),
     }
+}
+
+/// The flags of a shell family that give it a command string.
+struct ShellGrammar {
+    /// Short letters that do, with the flag they spell.
+    short: &'static [(char, ShellFlag)],
+    /// Short letters that take a value, which ends the scan of a cluster.
+    value_letters: &'static [char],
+    /// Long flags that do.
+    long: &'static [LongCommandName],
+}
+
+const POSIX_GRAMMAR: ShellGrammar = ShellGrammar {
+    short: &[('c', ShellFlag::DashC)],
+    value_letters: &['o'],
+    long: &[LongCommandName::Command, LongCommandName::Commands],
+};
+
+const FISH_GRAMMAR: ShellGrammar = ShellGrammar {
+    short: &[('c', ShellFlag::DashC), ('C', ShellFlag::DashCapitalC)],
+    value_letters: &['d', 'o', 'D', 'f', 'p'],
+    long: &[
+        LongCommandName::Command,
+        LongCommandName::Commands,
+        LongCommandName::InitCommand,
+    ],
+};
+
+const NU_GRAMMAR: ShellGrammar = ShellGrammar {
+    short: &[('c', ShellFlag::DashC), ('e', ShellFlag::DashE)],
+    value_letters: &['I'],
+    long: &[
+        LongCommandName::Command,
+        LongCommandName::Commands,
+        LongCommandName::Execute,
+    ],
+};
+
+/// The flag of `grammar` that `arg` spells, in long form or reached by a short
+/// letter.
+fn grammar_flag(grammar: &ShellGrammar, arg: &str) -> Option<ShellFlag> {
+    grammar
+        .long
+        .iter()
+        .find(|name| long_flag_matches(arg, &[name.as_str()]))
+        .map(|&name| ShellFlag::LongCommand(name))
+        .or_else(|| {
+            let reached = |letter| {
+                grammar.short.iter().any(|&(short, _)| short == letter)
+                    || grammar.value_letters.contains(&letter)
+            };
+            let (letter, _) = scan_short(arg, reached)?;
+            grammar
+                .short
+                .iter()
+                .find(|&&(short, _)| short == letter)
+                .map(|&(_, flag)| flag)
+        })
 }
 
 /// The PowerShell parameter a lowercased `-name` abbreviates.
@@ -713,11 +855,11 @@ fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
         ("commandwithargs", PowerShellParameter::CommandWithArgs),
         ("encodedcommand", PowerShellParameter::EncodedCommand),
     ];
-    if name == "ec" {
-        return Some(PowerShellParameter::EncodedCommand);
-    }
-    if name.is_empty() {
-        return None;
+    match name {
+        "ec" => return Some(PowerShellParameter::EncodedCommand),
+        "cwa" => return Some(PowerShellParameter::CommandWithArgs),
+        "" => return None,
+        _ => {}
     }
     PARAMETERS
         .iter()
@@ -725,21 +867,48 @@ fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
         .map(|&(_, parameter)| parameter)
 }
 
-/// The flag letter of `flags` that a single-dash argument reaches: whatever
-/// follows such a letter is its value (`-c'code'`, `-ecode`), so the argument
-/// carries inline code. Letters are read in order, digits are skipped
-/// (`-0777e`, `-l0e`), and reading stops at the first letter in `value_letters`,
+/// The first letter of a single-dash cluster that `reached` accepts, with the
+/// rest of the cluster after it.
+///
+/// Whatever follows a flag letter is its value (`-c'code'`, `-ecode`), so the
+/// argument carries inline code. Letters are read in order, digits are skipped
+/// (`-0777e`, `-l0e`), and reading stops at the first letter that takes a value,
 /// since the rest of the argument is then that option's value (`-mcoverage`,
 /// `-rbundler/setup`).
-fn has_short_flag(arg: &str, flags: &[char], value_letters: &[char]) -> Option<char> {
+fn scan_short(arg: &str, reached: impl Fn(char) -> bool) -> Option<(char, &str)> {
     let cluster = arg
         .strip_prefix('-')
         .filter(|cluster| !cluster.starts_with('-'))?;
-    cluster
-        .chars()
-        .take_while(|letter| letter.is_alphanumeric())
-        .find(|letter| flags.contains(letter) || value_letters.contains(letter))
-        .filter(|letter| flags.contains(letter))
+    let (offset, letter) = cluster
+        .char_indices()
+        .take_while(|(_, letter)| letter.is_alphanumeric())
+        .find(|&(_, letter)| reached(letter))?;
+    let rest = cluster.get(offset.saturating_add(letter.len_utf8())..);
+    Some((letter, rest.unwrap_or_default()))
+}
+
+/// Whether `value` is what perl accepts after `-M` or `-m` without turning it
+/// into code: an optional `-`, a module name and an optional `=import,list`,
+/// which perl quotes itself.
+fn is_module_spec(value: &str) -> bool {
+    let spec = value.strip_prefix('-').unwrap_or(value);
+    let module = spec.split_once('=').map_or(spec, |(module, _)| module);
+    let identifier = |part: &str| {
+        part.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    module.split("::").all(identifier)
+}
+
+/// Whether `value` is a `data:` URL, whose scheme is case-insensitive and may
+/// follow leading control characters or spaces that URL parsing strips.
+fn is_data_url(value: &str) -> bool {
+    value
+        .trim_start_matches(|c: char| c.is_ascii_control() || c == ' ')
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
 }
 
 /// Whether `arg` is one of the long `flags`, bare or with an `=value`.
@@ -1577,5 +1746,207 @@ mod tests {
             );
         }
         assert_eq!(analyze("env", &["-i", "bin/srv"]), Ok(vec![1]));
+    }
+
+    #[test]
+    fn powershell_cwa_alias_is_refused() {
+        for command in ["pwsh", "pwsh7", "PowerShell7.exe"] {
+            assert_eq!(
+                analyze(command, &["-cwa", "& x"]).unwrap_err(),
+                selects(
+                    command,
+                    LaunchTrigger::CommandString(ShellFlag::PowerShell(
+                        PowerShellParameter::CommandWithArgs
+                    ))
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn fish_init_commands_are_refused_but_posix_capital_c_is_not() {
+        for (arg, flag) in [
+            ("-C", ShellFlag::DashCapitalC),
+            ("-Ccd /ws", ShellFlag::DashCapitalC),
+            ("-lC", ShellFlag::DashCapitalC),
+            (
+                "--init-command=cd /ws",
+                ShellFlag::LongCommand(LongCommandName::InitCommand),
+            ),
+            (
+                "--init-command",
+                ShellFlag::LongCommand(LongCommandName::InitCommand),
+            ),
+        ] {
+            assert_eq!(
+                analyze("fish", &[arg, "x"]).unwrap_err(),
+                selects("fish", LaunchTrigger::CommandString(flag)),
+                "{arg}"
+            );
+        }
+        for shell in ["bash", "sh", "zsh", "ksh"] {
+            assert!(!launches(shell, &["-C", "script.sh"]), "{shell}");
+            assert!(
+                !launches(shell, &["--init-command=x", "script.sh"]),
+                "{shell}"
+            );
+        }
+        assert!(!launches("fish", &["-N", "server.fish"]));
+        assert!(!launches("fish", &["-dcategory", "server.fish"]));
+    }
+
+    #[test]
+    fn nu_execute_is_refused_but_other_shells_keep_dash_e() {
+        for (arg, flag) in [
+            ("-e", ShellFlag::DashE),
+            ("-ecode", ShellFlag::DashE),
+            (
+                "--execute=^x",
+                ShellFlag::LongCommand(LongCommandName::Execute),
+            ),
+            (
+                "--execute",
+                ShellFlag::LongCommand(LongCommandName::Execute),
+            ),
+        ] {
+            assert_eq!(
+                analyze("nu", &[arg, "x"]).unwrap_err(),
+                selects("nu", LaunchTrigger::CommandString(flag)),
+                "{arg}"
+            );
+        }
+        assert!(!launches("bash", &["-e", "script.sh"]));
+        assert!(!launches("fish", &["--execute=x", "server.fish"]));
+        assert!(!launches("nu", &["-n", "server.nu"]));
+    }
+
+    #[test]
+    fn gnu_coreutils_dispatches_on_the_coreutils_prog_option() {
+        assert_eq!(
+            unanalyzable_reason("coreutils", &["--coreutils-prog=env", "-S", "srv"]),
+            UnanalyzableLaunch::SplitString
+        );
+        assert!(launches(
+            "coreutils",
+            &["--coreutils-prog=env", "PATH=/ws/bin", "srv"]
+        ));
+        assert!(launches(
+            "/usr/bin/coreutils",
+            &["--coreutils-prog=env", "sh", "-c", "x"]
+        ));
+        assert_eq!(
+            analyze("coreutils", &["--coreutils-prog=nice", "srv"]),
+            Ok(vec![1])
+        );
+        assert_eq!(
+            analyze("coreutils", &["--coreutils-prog=env", "FOO=1", "srv"]),
+            Ok(vec![2])
+        );
+        assert_eq!(analyze("coreutils", &["nice", "srv"]), Ok(vec![1]));
+    }
+
+    #[test]
+    fn coreutils_forms_that_cannot_be_analyzed_are_refused() {
+        for arg in [
+            "--coreutils-prog-shebang=env",
+            "--coreutils-prog",
+            "--coreutils-progx=env",
+        ] {
+            assert!(
+                matches!(
+                    unanalyzable_reason("coreutils", &[arg, "srv"]),
+                    UnanalyzableLaunch::UnknownOption(_)
+                ),
+                "{arg}"
+            );
+        }
+        assert_eq!(
+            unanalyzable_reason("coreutils", &["--coreutils-prog=", "srv"]),
+            UnanalyzableLaunch::BlankProgram
+        );
+        assert!(launches("busybox", &["env", "sh", "-c", "x"]));
+        assert!(launches("toybox", &["nice", "npx", "srv"]));
+    }
+
+    #[test]
+    fn perl_module_values_that_carry_code_are_refused() {
+        for args in [
+            &["-MPOSIX;do(q{/ws/Evil.pm})", "script.pl"][..],
+            &["-mPOSIX;system('x')", "script.pl"],
+            &["-M", "POSIX;system('x')", "script.pl"],
+            &["-MPOSIX qw(); system('x')", "script.pl"],
+            &["-M", "script.pl"],
+            &["-M"],
+            &["-lM-X;code", "script.pl"],
+        ] {
+            assert!(
+                matches!(
+                    analyze("perl", args),
+                    Err(LauncherRefusal::SelectsWorkspaceCode {
+                        trigger: LaunchTrigger::InlineProgram(InlineFlag::Short('M' | 'm')),
+                        ..
+                    })
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perl_module_values_that_are_modules_are_admitted() {
+        for args in [
+            &["-MPOSIX", "script.pl"][..],
+            &["-MList::Util=sum,max", "script.pl"],
+            &["-M-strict", "script.pl"],
+            &["-mFoo::Bar", "script.pl"],
+            &["-M", "POSIX", "script.pl"],
+            &["-Mstrict", "-Mwarnings", "script.pl"],
+        ] {
+            assert!(!launches("perl", args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn data_url_modules_given_to_node_flags_are_refused() {
+        for command in ["node", "nodejs", "node22", "bun"] {
+            for args in [
+                &["--import=data:text/javascript,x", "srv.mjs"][..],
+                &["--import", "data:text/javascript,x", "srv.mjs"],
+                &["--loader=DATA:text/javascript,x", "srv.mjs"],
+                &["--experimental-loader=data:text/javascript,x", "srv.mjs"],
+                &["--experimental_loader=data:text/javascript,x", "srv.mjs"],
+                &["--import=  data:text/javascript,x", "srv.mjs"],
+            ] {
+                assert!(
+                    matches!(
+                        analyze(command, args),
+                        Err(LauncherRefusal::SelectsWorkspaceCode {
+                            trigger: LaunchTrigger::InlineProgram(
+                                InlineFlag::Import
+                                    | InlineFlag::Loader
+                                    | InlineFlag::ExperimentalLoader
+                            ),
+                            ..
+                        })
+                    ),
+                    "{command} {args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_modules_that_are_not_data_urls_are_admitted() {
+        for args in [
+            &["--import=./register.mjs", "srv.mjs"][..],
+            &["--import", "file:///opt/register.mjs", "srv.mjs"],
+            &["--loader=ts-node/esm", "srv.ts"],
+            &["--import"],
+            &["--import=dat", "srv.mjs"],
+        ] {
+            assert!(!launches("node", args), "{args:?}");
+        }
+        assert!(!launches("python3", &["--import=data:x", "srv.py"]));
     }
 }

@@ -180,17 +180,23 @@ enforces the following, and nothing more:
   starts is resolved from mcpls' working directory and spawned by its absolute
   path). A command string
   cannot be analyzed either, so it is refused for these shells (`-c`, `--command`,
-  `--commands`, `/c`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
+  `--commands`, `/c`, `/k`, `/r`, PowerShell's `-Command`, `-CommandWithArgs`
+  (`-cwa`) and `-EncodedCommand`, fish's `-C` and `--init-command`, nushell's
+  `-e` and `--execute`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
   `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`,
   `powershell`, `pwsh` (also as a `busybox` applet, and with a version suffix such
   as `ksh93`), and for these interpreters given an inline program (`-e`, `-E`,
   `-c`, `-p`, `-r`, `--eval`, `--print`, also with the value glued on or after
   `=`): `node`, `nodejs`,
-  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`.
+  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`;
+  also a perl `-M` or `-m` value that is more than a module name and an import
+  list (`-MPOSIX;code`), and a `data:` URL given to `--import`, `--loader` or
+  `--experimental-loader` of `node`, `nodejs` and `bun`.
   The wrappers with a small option grammar (`time`, `nice`, `nohup`, `timeout`,
   `setsid`, `stdbuf`, `caffeinate`, `arch`, and `env`, also under their Homebrew GNU
   names `gtime`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`, `genv` and as `busybox`,
-  `toybox` or `coreutils` applets) are parsed against a closed table of their options: the first
+  `toybox` or `coreutils` applets, the last as `coreutils --coreutils-prog=NAME`
+  or, for uutils, the bare applet name; `--coreutils-prog-shebang=` is refused) are parsed against a closed table of their options: the first
   non-option after the options (and `timeout`'s duration) is the program they
   start, and what follows it belongs to that program. An option the table does
   not list, a missing value or command, and nesting deeper than 8 levels are

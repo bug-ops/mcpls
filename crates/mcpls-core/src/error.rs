@@ -424,6 +424,10 @@ pub enum LongCommandName {
     Command,
     /// `--commands`.
     Commands,
+    /// `--init-command`, which fish runs as a command string.
+    InitCommand,
+    /// `--execute`, which nushell runs as a command string.
+    Execute,
 }
 
 impl LongCommandName {
@@ -433,6 +437,8 @@ impl LongCommandName {
         match self {
             Self::Command => "--command",
             Self::Commands => "--commands",
+            Self::InitCommand => "--init-command",
+            Self::Execute => "--execute",
         }
     }
 }
@@ -489,6 +495,10 @@ impl PowerShellParameter {
 pub enum ShellFlag {
     /// `-c`, alone or inside a cluster such as `-lc`.
     DashC,
+    /// fish's `-C`, which runs an init command string.
+    DashCapitalC,
+    /// nushell's `-e`, which executes a command string.
+    DashE,
     /// A long flag such as `--command`.
     LongCommand(LongCommandName),
     /// `cmd`'s `/c`, `/k` or `/r`.
@@ -501,6 +511,8 @@ impl fmt::Display for ShellFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DashC => "-c",
+            Self::DashCapitalC => "-C",
+            Self::DashE => "-e",
             Self::LongCommand(name) => name.as_str(),
             Self::SlashC(switch) => switch.as_str(),
             Self::PowerShell(parameter) => parameter.as_str(),
@@ -517,6 +529,12 @@ pub enum InlineFlag {
     Eval,
     /// `--print`.
     Print,
+    /// `--import`, given a `data:` URL.
+    Import,
+    /// `--loader`, given a `data:` URL.
+    Loader,
+    /// `--experimental-loader`, given a `data:` URL.
+    ExperimentalLoader,
 }
 
 impl InlineFlag {
@@ -527,6 +545,9 @@ impl InlineFlag {
             Self::Short(_) => None,
             Self::Eval => Some("--eval"),
             Self::Print => Some("--print"),
+            Self::Import => Some("--import"),
+            Self::Loader => Some("--loader"),
+            Self::ExperimentalLoader => Some("--experimental-loader"),
         }
     }
 }
@@ -535,8 +556,9 @@ impl fmt::Display for InlineFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Short(letter) => write!(f, "-{letter}"),
-            Self::Eval => f.write_str("--eval"),
-            Self::Print => f.write_str("--print"),
+            Self::Eval | Self::Print | Self::Import | Self::Loader | Self::ExperimentalLoader => {
+                f.write_str(self.long_name().unwrap_or_default())
+            }
         }
     }
 }
