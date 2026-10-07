@@ -137,6 +137,22 @@ enum Flow {
     Stop,
 }
 
+/// A drained publication and whether its path is resolved first.
+enum BatchItem {
+    /// An admitted publication: its path is resolved before it is applied.
+    Resolve(BoundedPublish),
+    /// Anything else: applied as it is.
+    Skip(BoundedPublish),
+}
+
+impl BatchItem {
+    const fn publish(&self) -> &BoundedPublish {
+        match self {
+            Self::Resolve(publish) | Self::Skip(publish) => publish,
+        }
+    }
+}
+
 /// Everything one server's pump needs besides what it reads.
 struct Pump {
     server_id: ServerId,
@@ -368,18 +384,21 @@ impl Pump {
         lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
     ) -> Flow {
         let admission_role = *self.role_rx.borrow();
-        let items: Vec<(BoundedPublish, bool)> = batch
+        let items: Vec<BatchItem> = batch
             .into_iter()
             .map(|publish| {
-                let admitted =
-                    publication_admitted(publish.uri(), admission_role, &self.workspace_roots);
-                (publish, admitted)
+                if publication_admitted(publish.uri(), admission_role, &self.workspace_roots) {
+                    BatchItem::Resolve(publish)
+                } else {
+                    BatchItem::Skip(publish)
+                }
             })
             .collect();
         let publications: Vec<Publication<'_>> = items
             .iter()
-            .filter(|(_, admitted)| *admitted)
-            .map(|(publish, _)| Publication {
+            .filter(|item| matches!(item, BatchItem::Resolve(_)))
+            .map(BatchItem::publish)
+            .map(|publish| Publication {
                 uri: publish.uri(),
                 kind: if publish.diagnostics().as_slice().is_empty() {
                     PublicationKind::Clear
@@ -394,11 +413,10 @@ impl Pump {
         drop(publications);
         let mut resolved = resolved.into_iter();
 
-        for (publish, admitted) in items {
-            let published = if admitted {
-                resolved.next().flatten()
-            } else {
-                None
+        for item in items {
+            let (publish, published) = match item {
+                BatchItem::Resolve(publish) => (publish, resolved.next().flatten()),
+                BatchItem::Skip(publish) => (publish, None),
             };
             // Re-read after the (possibly slow) resolve: a demotion in the
             // meantime must stop caching and fan-out (#174 s8).
