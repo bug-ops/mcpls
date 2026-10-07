@@ -407,7 +407,14 @@ async fn every_positioned_tool_rejects_a_line_beyond_the_document() {
     );
     reject!("highlights", t.handle_document_highlights(file(), beyond));
     reject!("selection_range", t.handle_selection_range(file(), beyond));
-    reject!("rename", t.handle_rename(file(), beyond, "x".to_owned()));
+    reject!(
+        "rename",
+        t.handle_rename(
+            file(),
+            beyond,
+            crate::bridge::NewName::try_new("x").unwrap()
+        )
+    );
     reject!("prepare_rename", t.handle_prepare_rename(file(), beyond));
     reject!(
         "code_actions",

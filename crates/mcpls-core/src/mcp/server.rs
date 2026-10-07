@@ -2017,7 +2017,9 @@ mod tests {
 
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
-    use crate::bridge::{Capability, IndexingSignal, LogLevel, ResultContext, RouteSignals};
+    use crate::bridge::{
+        Capability, IndexingSignal, LogLevel, NewName, ResultContext, RouteSignals,
+    };
     use crate::config::{
         FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle, ServerCommand,
     };
@@ -2770,7 +2772,7 @@ mod tests {
                 server
                     .rename_symbol(Parameters(RenameParams {
                         target: position(line, character).into(),
-                        new_name: "x".into(),
+                        new_name: NewName::try_new("x").unwrap(),
                     }))
                     .await
                     .map(|_| ()),
@@ -3747,7 +3749,7 @@ mod tests {
                 character: 5,
             }
             .into(),
-            new_name: "new_name".to_string(),
+            new_name: NewName::try_new("new_name").unwrap(),
         });
 
         let result = server.rename_symbol(params).await;
@@ -6678,7 +6680,7 @@ sleep 0.3
             McpTool::RenameSymbol => server
                 .rename_symbol(Parameters(RenameParams {
                     target: position().into(),
-                    new_name: "renamed".to_string(),
+                    new_name: NewName::try_new("renamed").unwrap(),
                 }))
                 .await
                 .map(|_| ()),

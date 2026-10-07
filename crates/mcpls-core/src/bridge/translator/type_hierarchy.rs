@@ -8,7 +8,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::hierarchy_item_to_mcp;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::Capability;
+use super::routing::{Capability, DisclosedCapability};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -62,7 +62,7 @@ impl Translator {
             .disclosed_position_request::<lsp_types::TypeHierarchyPrepareRequest>(
                 &file_path,
                 position,
-                Capability::TypeHierarchy,
+                DisclosedCapability::TypeHierarchy,
                 (),
             )
             .await?;

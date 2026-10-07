@@ -4,15 +4,15 @@ use lsp_types::CompletionTriggerKind;
 
 use super::Translator;
 use super::dto::{
-    Completion, CompletionsResult, InlayHintEntry, InlayHintsResult, Position, PositionRange,
-    SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
+    Completion, CompletionTrigger, CompletionsResult, InlayHintEntry, InlayHintsResult, Position,
+    PositionRange, SignatureHelpResult, SignatureInfo, SignatureParameter, lsp_kind_to_u32,
 };
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, IndexingGate};
+use super::routing::{Capability, DisclosedCapability, IndexingGate};
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::bridge::{ClientPath, Indexed};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Extract hover contents as markdown string.
 /// Convert LSP `Documentation` to a plain string.
@@ -101,50 +101,23 @@ fn signature_parameters(
         .collect()
 }
 
-/// Maximum length, in bytes, of a `get_completions` `trigger` parameter.
-///
-/// The LSP spec defines `triggerCharacter` as a single character, but
-/// `CompletionsParams.trigger` is still an unbounded free-form `String`
-/// forwarded to the LSP server as `trigger_character` with no cap of its
-/// own (#309 M3) -- the same forwarding-without-a-cap shape `new_name` and
-/// `query` had. 8 bytes comfortably covers any single Unicode codepoint (at
-/// most 4 bytes in UTF-8) with margin, while still rejecting anything that
-/// isn't plausibly "one character".
-pub(super) const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
-
-/// Validate parameters for `handle_completions`.
-fn validate_completions_params(trigger: Option<&str>) -> Result<()> {
-    if let Some(trigger) = trigger
-        && trigger.len() > MAX_TRIGGER_CHARACTER_BYTES
-    {
-        return Err(Error::InvalidToolParams(format!(
-            "trigger too long: {} bytes (max {MAX_TRIGGER_CHARACTER_BYTES})",
-            trigger.len()
-        )));
-    }
-    Ok(())
-}
-
 impl Translator {
     /// Handle completions request.
     ///
     /// # Errors
     ///
-    /// Returns an error if `trigger` exceeds the maximum allowed length,
-    /// the LSP request fails, the file cannot be opened, the routed server
+    /// Returns an error if the LSP request fails, the file cannot be opened, the routed server
     /// does not advertise `completionProvider` support, or the server is
     /// still indexing the workspace (see `wait_for_indexing_ready`).
     pub async fn handle_completions(
         &self,
         file_path: ClientPath,
         position: Position,
-        trigger: Option<String>,
+        trigger: Option<CompletionTrigger>,
     ) -> Result<CompletionsResult> {
-        validate_completions_params(trigger.as_deref())?;
-
         let context = trigger.map(|trigger_char| lsp_types::CompletionContext {
             trigger_kind: CompletionTriggerKind::TriggerCharacter,
-            trigger_character: Some(trigger_char),
+            trigger_character: Some(trigger_char.into_string()),
         });
 
         let Positioned {
@@ -211,7 +184,7 @@ impl Translator {
             .disclosed_position_request::<lsp_types::SignatureHelpRequest>(
                 &file_path,
                 position,
-                Capability::SignatureHelp,
+                DisclosedCapability::SignatureHelp,
                 (),
             )
             .await?;
@@ -274,7 +247,7 @@ impl Translator {
         } = self
             .disclosed_range_request::<lsp_types::InlayHintRequest>(
                 &file_path,
-                Capability::InlayHints,
+                DisclosedCapability::InlayHints,
                 range,
                 (),
             )
@@ -327,26 +300,8 @@ mod tests {
     use crate::bridge::IndexingSignal;
     use crate::bridge::translator::testing::*;
     use crate::config::ServerId;
+    use crate::error::Error;
     use crate::test_lsp::client_path;
-
-    /// #309 M3: `trigger` has no cap of its own even though the LSP spec
-    /// defines it as a single character.
-    #[test]
-    fn test_validate_completions_params_rejects_oversized_trigger() {
-        let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
-        let result = validate_completions_params(Some(&trigger));
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
-    #[test]
-    fn test_validate_completions_params_accepts_typical_trigger_char() {
-        assert!(validate_completions_params(Some(".")).is_ok());
-    }
-
-    #[test]
-    fn test_validate_completions_params_accepts_none() {
-        assert!(validate_completions_params(None).is_ok());
-    }
 
     /// End-to-end: `handle_completions` must surface
     /// `Error::WorkspaceIndexing` -- not an empty result -- while the routed

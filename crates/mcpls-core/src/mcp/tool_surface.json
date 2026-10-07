@@ -891,6 +891,7 @@
         },
         "trigger": {
           "description": "Optional trigger character (e.g., '.', ':', '->').",
+          "maxLength": 8,
           "type": [
             "string",
             "null"
@@ -6778,6 +6779,7 @@
         },
         "new_name": {
           "description": "New name for the symbol.",
+          "maxLength": 1000,
           "type": "string"
         },
         "symbol_kind": {

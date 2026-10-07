@@ -71,8 +71,12 @@ enum IndexingWait {
 /// name-resolving tool cannot skip the indexing wait by accident.
 ///
 /// This only covers call sites that actually go through
-/// `prepare_gated_document` -- two production handlers bypass that
-/// chokepoint entirely and so make no `IndexingGate` decision at all:
+/// `prepare_gated_document`. The disclosed tools open through
+/// `prepare_disclosed_document`, which takes a [`DisclosedCapability`] and
+/// answers with an `Indexed` result, and `require_routed_capability` only
+/// checks a capability without opening anything. Two further production
+/// handlers bypass the chokepoint entirely and so make no `IndexingGate`
+/// decision at all:
 /// - `handle_workspace_symbol` (`workspace_symbol_search`) has no per-file
 ///   document to resolve or open (it resolves via `resolve_any` instead), so
 ///   it cannot be routed through this chokepoint as-is. Whether/how to gate
@@ -150,6 +154,32 @@ impl From<FileLocalCapability> for Capability {
             FileLocalCapability::DocumentHighlights => Self::DocumentHighlights,
             FileLocalCapability::FormatDocument => Self::FormatDocument,
             FileLocalCapability::FormatRange => Self::FormatRange,
+        }
+    }
+}
+
+/// The capabilities of the name-resolving tools that must not stall a cold
+/// start: they open through [`Translator::prepare_disclosed_document`], which
+/// never waits for indexing, so only these four can reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DisclosedCapability {
+    /// [`Capability::SignatureHelp`].
+    SignatureHelp,
+    /// [`Capability::InlayHints`].
+    InlayHints,
+    /// [`Capability::CallHierarchy`].
+    CallHierarchy,
+    /// [`Capability::TypeHierarchy`].
+    TypeHierarchy,
+}
+
+impl From<DisclosedCapability> for Capability {
+    fn from(capability: DisclosedCapability) -> Self {
+        match capability {
+            DisclosedCapability::SignatureHelp => Self::SignatureHelp,
+            DisclosedCapability::InlayHints => Self::InlayHints,
+            DisclosedCapability::CallHierarchy => Self::CallHierarchy,
+            DisclosedCapability::TypeHierarchy => Self::TypeHierarchy,
         }
     }
 }
@@ -1147,8 +1177,8 @@ impl Translator {
     /// instead of waiting for it, after the capability gate and the line check
     /// of every one of `positions`.
     ///
-    /// Takes a bare [`Capability`] rather than an [`IndexingGate`]: it never
-    /// waits, and [`IndexingGate::FileLocal`] is reserved for file-local tools.
+    /// Takes a [`DisclosedCapability`] rather than an [`IndexingGate`]: it never
+    /// waits, so only the tools that disclose indexing can reach it.
     ///
     /// # Errors
     ///
@@ -1157,9 +1187,10 @@ impl Translator {
     pub(super) async fn prepare_disclosed_document(
         &self,
         file_path: &ClientPath,
-        capability: Capability,
+        capability: DisclosedCapability,
         positions: &[Position],
     ) -> Result<DisclosedDocument<'_>> {
+        let capability = Capability::from(capability);
         let (server_id, client, validated_path) = self
             .resolve_validated_client_for_file(file_path, capability.tool_kind())
             .await?;
@@ -1413,9 +1444,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::assist::MAX_TRIGGER_CHARACTER_BYTES;
     use crate::bridge::translator::dto::Position;
-    use crate::bridge::translator::edits::MAX_NEW_NAME_LENGTH;
     use crate::bridge::translator::testing::*;
     use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
@@ -3052,7 +3081,11 @@ mod tests {
         // rename is claimed by neither server -> NoServerForTool, checked
         // first so it can't be masked by either server's wire state.
         let rename_result = translator
-            .handle_rename(file.clone(), pos(1, 1), "renamed".to_string())
+            .handle_rename(
+                file.clone(),
+                pos(1, 1),
+                crate::bridge::NewName::try_new("renamed").unwrap(),
+            )
             .await;
         assert_matches!(
             rename_result,
@@ -3149,20 +3182,6 @@ mod tests {
         );
     }
 
-    /// #309: an oversized `new_name` must be rejected before any server
-    /// routing is attempted, so no LSP server needs to be registered here.
-    #[tokio::test]
-    async fn test_handle_rename_rejects_oversized_new_name() {
-        let translator = Translator::new();
-        let new_name = "a".repeat(MAX_NEW_NAME_LENGTH + 1);
-
-        let result = translator
-            .handle_rename(client_path("/main.rs"), Position::at(1, 1), new_name)
-            .await;
-
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
     #[tokio::test]
     async fn test_handle_rename_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
@@ -3180,7 +3199,7 @@ mod tests {
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                "renamed".to_string(),
+                crate::bridge::NewName::try_new("renamed").unwrap(),
             )
             .await;
 
@@ -3515,20 +3534,6 @@ mod tests {
         );
     }
 
-    /// #309 M3: an oversized `trigger` must be rejected before any server
-    /// routing is attempted.
-    #[tokio::test]
-    async fn test_handle_completions_rejects_oversized_trigger() {
-        let translator = Translator::new();
-        let trigger = "a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1);
-
-        let result = translator
-            .handle_completions(client_path("/main.rs"), Position::at(1, 1), Some(trigger))
-            .await;
-
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
-    }
-
     #[tokio::test]
     async fn test_handle_completions_blocked_when_capability_not_supported() {
         let dir = TempDir::new().unwrap();
@@ -3748,7 +3753,7 @@ mod tests {
                     .handle_rename(
                         client_path(path_str),
                         Position::at(1, 1),
-                        "renamed".to_string(),
+                        crate::bridge::NewName::try_new("renamed").unwrap(),
                     )
                     .await
             })

@@ -66,6 +66,51 @@ pub trait KindFilter: sealed::Sealed + Copy {
     fn schema() -> Schema;
 }
 
+/// Implements [`KindFilter`] for a closed set of kinds with an `ALL` array and
+/// a canonical `as_str`, so every such filter parses, spells and documents its
+/// values the same way.
+macro_rules! closed_kind_filter {
+    ($filter:ty, $schema_name:literal) => {
+        impl $filter {
+            /// The spellings the schema documents and the rejection message
+            /// lists: the canonical ones in lowercase, which parsing accepts
+            /// like any case.
+            fn spellings() -> Vec<String> {
+                Self::ALL
+                    .iter()
+                    .map(|kind| kind.as_str().to_ascii_lowercase())
+                    .collect()
+            }
+        }
+
+        impl super::kind_filter::sealed::Sealed for $filter {}
+
+        impl super::kind_filter::KindFilter for $filter {
+            const SCHEMA_NAME: &'static str = $schema_name;
+
+            fn parse(text: &str) -> Option<Self> {
+                Self::ALL
+                    .into_iter()
+                    .find(|kind| kind.as_str().eq_ignore_ascii_case(text))
+            }
+
+            fn canonical(self) -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed(self.as_str())
+            }
+
+            fn valid_values() -> String {
+                format!("{:?}", Self::spellings())
+            }
+
+            fn schema() -> schemars::Schema {
+                schemars::json_schema!({"type": "string", "enum": Self::spellings()})
+            }
+        }
+    };
+}
+
+pub(super) use closed_kind_filter;
+
 /// A `kind_filter` spelling that names no known kind, kept as written for the
 /// error message; at most [`MAX_SYMBOL_NAME_BYTES`] long.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,15 +262,6 @@ impl CodeActionKindFilter {
         Self::SourceOrganizeImports,
     ];
 
-    /// The spellings the schema documents and the rejection message lists:
-    /// the canonical ones in lowercase, which parsing accepts like any case.
-    fn spellings() -> Vec<String> {
-        Self::ALL
-            .iter()
-            .map(|kind| kind.as_str().to_ascii_lowercase())
-            .collect()
-    }
-
     /// The canonical LSP spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -241,29 +277,7 @@ impl CodeActionKindFilter {
     }
 }
 
-impl sealed::Sealed for CodeActionKindFilter {}
-
-impl KindFilter for CodeActionKindFilter {
-    const SCHEMA_NAME: &'static str = "CodeActionKindFilter";
-
-    fn parse(text: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|kind| kind.as_str().eq_ignore_ascii_case(text))
-    }
-
-    fn canonical(self) -> Cow<'static, str> {
-        Cow::Borrowed(self.as_str())
-    }
-
-    fn valid_values() -> String {
-        format!("{:?}", Self::spellings())
-    }
-
-    fn schema() -> Schema {
-        schemars::json_schema!({"type": "string", "enum": Self::spellings()})
-    }
-}
+closed_kind_filter!(CodeActionKindFilter, "CodeActionKindFilter");
 
 /// A symbol kind a `workspace_symbol_search` filter can name, by name or by its
 /// numeric LSP value.

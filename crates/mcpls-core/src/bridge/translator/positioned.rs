@@ -18,7 +18,7 @@ use super::Translator;
 use super::dto::{CheckedHierarchyItem, Position, PositionRange};
 use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::{LspHierarchyItem, hierarchy_item_to_lsp};
-use super::routing::{Capability, IndexingGate, PreparedDocument};
+use super::routing::{Capability, DisclosedCapability, IndexingGate, PreparedDocument};
 use crate::bridge::{ClientPath, Indexed, IndexingSignal};
 use crate::config::ServerId;
 use crate::error::Result;
@@ -480,7 +480,7 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
+        capability: DisclosedCapability,
         extra: <R::Params as FromPosition>::Extra,
     ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
     where
@@ -553,7 +553,7 @@ impl Translator {
     pub(super) async fn disclosed_range_request<R>(
         &self,
         file_path: &ClientPath,
-        capability: Capability,
+        capability: DisclosedCapability,
         range: PositionRange,
         extra: <R::Params as FromRange>::Extra,
     ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
