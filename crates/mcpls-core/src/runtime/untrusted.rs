@@ -18,8 +18,8 @@ use crate::config::{
     login_home_dir,
 };
 use crate::error::{
-    EchoedArgument, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure,
-    StartupFailure, UnanalyzableLaunch, UntrustedRefusal,
+    EchoedPath, HomeVariable, LauncherRefusal, ResolvedItem, ServerSpawnFailure, StartupFailure,
+    UntrustedRefusal,
 };
 use crate::lsp::command_path::{HostOs, ResolvedCommand};
 use crate::lsp::tsserver_pin::UntrustedVetting;
@@ -150,20 +150,16 @@ fn vetted_wrapped_programs(
         .map(|&index| {
             let program = effective.args.get(index).map_or("", String::as_str);
             let unresolved = || UntrustedRefusal::UnresolvedWrappedProgram {
-                program: EchoedArgument::name(program),
+                program: EchoedPath::program(program),
             };
             let resolved =
                 lsp::command_path::resolve_named(Path::new(program), effective, parent_env)
                     .ok_or_else(unresolved)?;
             let path = vetted_spawn_path(resolved, boundary)?;
             if path.contains('=') {
-                return Err(project_launcher(
-                    effective,
-                    LauncherRefusal::Unanalyzable {
-                        program: EchoedArgument::name(program),
-                        reason: UnanalyzableLaunch::PathContainsEquals,
-                    },
-                ));
+                return Err(UntrustedRefusal::WrappedProgramPathContainsEquals {
+                    program: EchoedPath::program(program),
+                });
             }
             Ok((index, path))
         })
@@ -1735,13 +1731,46 @@ mod plan_tests {
 
             std::assert_matches!(
                 refusal_of(&plan),
-                Some(UntrustedRefusal::ProjectLauncher {
-                    cause: LauncherRefusal::Unanalyzable {
-                        reason: UnanalyzableLaunch::PathContainsEquals,
-                        ..
-                    },
-                    ..
-                })
+                Some(UntrustedRefusal::WrappedProgramPathContainsEquals { .. })
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_echoes_the_whole_path_of_an_unresolved_wrapped_program() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice"]);
+            let missing = fx.outside.join("no such dir/srv");
+
+            let plan = plan_allowing_rust(
+                wrapped_launch(&fx, "nice", &[missing.to_str().unwrap()]),
+                &fx,
+            );
+
+            let Some(UntrustedRefusal::UnresolvedWrappedProgram { program }) = refusal_of(&plan)
+            else {
+                panic!("expected an unresolved wrapped program");
+            };
+            assert_eq!(program.as_str(), missing.to_str().unwrap());
+        }
+
+        #[test]
+        fn plan_untrusted_echoes_the_whole_path_of_a_wrapped_program_containing_equals() {
+            let fx = fixture();
+            outside_tools(&fx, &["nice", "a=b"]);
+            let odd = fx.outside.join("a=b");
+
+            let plan =
+                plan_allowing_rust(wrapped_launch(&fx, "nice", &[odd.to_str().unwrap()]), &fx);
+
+            let Some(refusal @ UntrustedRefusal::WrappedProgramPathContainsEquals { program }) =
+                refusal_of(&plan)
+            else {
+                panic!("expected a path containing '='");
+            };
+            assert_eq!(program.as_str(), odd.to_str().unwrap());
+            assert!(
+                refusal.to_string().contains("its launcher starts"),
+                "{refusal}"
             );
         }
 
@@ -1755,7 +1784,7 @@ mod plan_tests {
             assert_eq!(
                 refusal_of(&plan),
                 Some(&UntrustedRefusal::UnresolvedWrappedProgram {
-                    program: EchoedArgument::name("missing-srv")
+                    program: EchoedPath::new(Path::new("missing-srv"))
                 })
             );
         }

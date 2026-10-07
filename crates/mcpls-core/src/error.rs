@@ -22,9 +22,7 @@ use crate::config::{
 use crate::lsp::MAX_ERROR_MESSAGE_CALLER_BYTES;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
-use crate::util::{
-    SizeExceeded, escape_control, escape_control_owned, truncate_str, truncate_string,
-};
+use crate::util::{SizeExceeded, TRUNCATION_MARKER, escape_control, truncate_str};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -293,25 +291,82 @@ impl EchoedArgument {
     }
 }
 
-/// `text` with control and deceptive characters escaped, then bounded: escaping
-/// first, because it can multiply the length.
+/// `text` with control and deceptive characters escaped, then bounded to
+/// `max_bytes` of escaped text. The cut falls between escaped characters, so
+/// an escape sequence is never split.
 fn bounded_escaped(text: &str, max_bytes: usize) -> String {
-    truncate_string(escape_control_owned(text.to_owned()), max_bytes)
+    let mut bounded = String::with_capacity(text.len().min(max_bytes));
+    let mut buffer = [0; 4];
+    for c in text.chars() {
+        let escaped = escape_control(c.encode_utf8(&mut buffer));
+        if bounded.len().saturating_add(escaped.len()) > max_bytes {
+            bounded.push_str(TRUNCATION_MARKER);
+            break;
+        }
+        bounded.push_str(&escaped);
+    }
+    bounded
 }
 
 /// Most bytes of a workspace-controlled path shown in a refusal.
 const MAX_ECHOED_PATH_BYTES: usize = 1024;
 
-/// `Display` adapter for a path the workspace names (a symlink target's final
-/// component is its choice): bounded and escaped like [`EchoedArgument`].
-struct EchoedPath<'a>(&'a Path);
+/// A path the workspace names, shown whole, escaped and bounded.
+///
+/// The workspace names a program a launcher starts or a symlink target's final
+/// component. Unlike [`EchoedArgument`], the text is never cut at a space or an
+/// `=`, because a path is not an option with a value. It is bounded to
+/// [`MAX_ECHOED_PATH_BYTES`] of escaped text.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use mcpls_core::error::EchoedPath;
+///
+/// let path = EchoedPath::new(Path::new("/opt/my tools/a=b/srv"));
+/// assert_eq!(path.as_str(), "/opt/my tools/a=b/srv");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoedPath(String);
 
-impl fmt::Display for EchoedPath<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&bounded_escaped(
-            &self.0.display().to_string(),
+impl EchoedPath {
+    /// The whole of `path`, escaped and bounded.
+    #[must_use]
+    pub fn new(path: &Path) -> Self {
+        Self(bounded_escaped(
+            &path.to_string_lossy(),
             MAX_ECHOED_PATH_BYTES,
         ))
+    }
+
+    /// The program an argument names: its whole path, unless the text reads
+    /// as an assignment (an `=` before any path separator), which is cut at
+    /// the `=` like [`EchoedArgument`] so a value that is not a program is not
+    /// echoed.
+    #[must_use]
+    pub fn program(arg: &str) -> Self {
+        let assignment = arg
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.contains(std::path::is_separator));
+        if assignment {
+            Self(EchoedArgument::name(arg).0)
+        } else {
+            Self::new(Path::new(arg))
+        }
+    }
+
+    /// The echoed text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EchoedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -558,9 +613,6 @@ pub enum UnanalyzableLaunch {
     RelativeProgramAfterChdir,
     /// The program name is empty.
     BlankProgram,
-    /// The vetted path of a wrapped program contains `=`, which `env` would
-    /// read as an assignment.
-    PathContainsEquals,
 }
 
 impl fmt::Display for UnanalyzableLaunch {
@@ -576,9 +628,6 @@ impl fmt::Display for UnanalyzableLaunch {
                 f.write_str("it starts a relative program after changing directory")
             }
             Self::BlankProgram => f.write_str("the program name is empty"),
-            Self::PathContainsEquals => {
-                f.write_str("its resolved path contains '=', which env reads as an assignment")
-            }
         }
     }
 }
@@ -711,7 +760,13 @@ pub enum UntrustedRefusal {
     /// run.
     UnresolvedWrappedProgram {
         /// The wrapped program, as configured.
-        program: EchoedArgument,
+        program: EchoedPath,
+    },
+    /// The vetted path of a program an exec wrapper starts contains `=`, which
+    /// `env` would read as an assignment, so it cannot be passed on unchanged.
+    WrappedProgramPathContainsEquals {
+        /// The wrapped program, as configured.
+        program: EchoedPath,
     },
     /// The configured command starts the TypeScript server through a launcher
     /// that untrusted mode cannot pin to a binary outside the workspace.
@@ -749,7 +804,7 @@ impl fmt::Display for UntrustedRefusal {
             Self::WorkspaceExecutable { executable } => write!(
                 f,
                 "its executable {} lies inside the workspace, which untrusted mode never runs",
-                EchoedPath(executable)
+                EchoedPath::new(executable)
             ),
             Self::UnresolvedExecutable { command } => write!(
                 f,
@@ -774,19 +829,25 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its {variable}, {}, lies inside the workspace and the login home directory is \
                  unknown, so untrusted mode cannot give it a safe one",
-                EchoedPath(home)
+                EchoedPath::new(home)
             ),
             Self::WorkspaceTsserver { tsserver } => write!(
                 f,
                 "the tsserver it would use, {}, lies inside the workspace, which untrusted \
                  mode never runs",
-                EchoedPath(tsserver)
+                EchoedPath::new(tsserver)
             ),
             Self::ProjectLauncher { cause, .. } => cause.fmt(f),
             Self::UnresolvedWrappedProgram { program } => write!(
                 f,
                 "the program '{program}' its launcher starts was not found where the child \
                  would look it up, which untrusted mode requires"
+            ),
+            Self::WrappedProgramPathContainsEquals { program } => write!(
+                f,
+                "the program '{program}' its launcher starts resolves to a path containing \
+                 '=', which env reads as an assignment, so untrusted mode cannot pin it; give \
+                 a program whose path has no '='"
             ),
             Self::UnpinnedTypescriptLauncher { command } => write!(
                 f,
@@ -797,7 +858,7 @@ impl fmt::Display for UntrustedRefusal {
             Self::NonUtf8Path { what, path } => write!(
                 f,
                 "its {what}, {}, is not valid UTF-8, so untrusted mode cannot pass it on",
-                EchoedPath(path)
+                EchoedPath::new(path)
             ),
             Self::NoSafeWorkingDirectory => f.write_str(
                 "no directory outside the workspace is available to start it in, which \
@@ -877,6 +938,7 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::WorkspaceTsserver { .. }
                     | UntrustedRefusal::ProjectLauncher { .. }
                     | UntrustedRefusal::UnresolvedWrappedProgram { .. }
+                    | UntrustedRefusal::WrappedProgramPathContainsEquals { .. }
                     | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
                     | UntrustedRefusal::NonUtf8Path { .. }
                     | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
@@ -3687,5 +3749,54 @@ mod tests {
         };
         assert!(err.to_string().contains("/ws/mcpls.toml"));
         assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
+    }
+
+    #[test]
+    fn echoed_path_keeps_spaces_and_equals() {
+        let path = EchoedPath::new(Path::new("/tmp/out/no such dir/a=b/srv"));
+        assert_eq!(path.as_str(), "/tmp/out/no such dir/a=b/srv");
+    }
+
+    #[test]
+    fn echoed_path_never_cuts_an_escape_in_half() {
+        let escape = "\\u{202e}";
+        let hostile = "\u{202e}".repeat(MAX_ECHOED_PATH_BYTES);
+        let echoed = EchoedPath::new(Path::new(&hostile));
+        let kept = echoed
+            .as_str()
+            .strip_suffix(TRUNCATION_MARKER)
+            .expect("an over-long path is marked as truncated");
+        assert!(kept.len() <= MAX_ECHOED_PATH_BYTES);
+        assert!(
+            !kept.is_empty() && kept.len().is_multiple_of(escape.len()),
+            "{kept}"
+        );
+        assert_eq!(kept, escape.repeat(kept.len() / escape.len()));
+    }
+
+    #[test]
+    fn echoed_program_cuts_an_assignment_but_keeps_a_path() {
+        assert_eq!(EchoedPath::program("API_TOKEN=abc").as_str(), "API_TOKEN");
+        assert_eq!(EchoedPath::program("X=/tmp/secret").as_str(), "X");
+        assert_eq!(
+            EchoedPath::program("/tmp/out/a=b/srv").as_str(),
+            "/tmp/out/a=b/srv"
+        );
+        assert_eq!(EchoedPath::program("no such dir").as_str(), "no such dir");
+    }
+
+    #[test]
+    fn echoed_path_within_the_bound_is_not_marked() {
+        let path = "a".repeat(MAX_ECHOED_PATH_BYTES);
+        assert_eq!(EchoedPath::new(Path::new(&path)).as_str(), path);
+    }
+
+    #[test]
+    fn wrapped_program_refusals_name_the_program_its_launcher_starts() {
+        let program = EchoedPath::new(Path::new("/tmp/out/a=b"));
+        let text = UntrustedRefusal::WrappedProgramPathContainsEquals { program }.to_string();
+        assert!(text.contains("'/tmp/out/a=b'"), "{text}");
+        assert!(text.contains("the program '"), "{text}");
+        assert!(!text.contains("its launcher '/tmp"), "{text}");
     }
 }

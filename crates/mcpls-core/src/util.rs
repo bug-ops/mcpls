@@ -203,7 +203,7 @@ pub fn read_regular_file_bounded(
 
 /// Marker appended to a truncated string; the returned string can be up to
 /// `max_bytes + TRUNCATION_MARKER.len()` bytes, not exactly `max_bytes`.
-const TRUNCATION_MARKER: &str = "... (truncated)";
+pub const TRUNCATION_MARKER: &str = "... (truncated)";
 
 /// Byte-length threshold for truncating an attacker-influenceable string
 /// (an LSP server's error message, a malformed protocol line, ...) before
