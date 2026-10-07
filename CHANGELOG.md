@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bump the pinned `dtolnay/rust-toolchain` action so release builds install the current stable Rust instead of the runner's preinstalled 1.98.1 (#758)
 - Diagnostics: stale pushed errors no longer outlive a fresh pull, `publishDiagnostics` bursts are coalesced per file instead of dropped, lost publishes are marked `evicted`, symlink-spelled publishes are keyed canonically and notify subscribers, pulls are stored and notify `lsp-diagnostics://` subscribers, and startup failures are reported instead of an empty list (#532, #535, #552, #671, #708, #726, #739).
 - A language-server response or message that cannot be decoded fails only its own request; a panic in an init task, pump or handler is contained and reported (#528, #537, #644, #682).
 - Servers that wait for a configuration push, such as pyright, answer requests; an empty `settings` key is rejected and `workspace/configuration` answers non-object items with `null` (#610, #637).
