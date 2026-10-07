@@ -7,10 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
     CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, KindFilterField,
-    KindFilterInput, LogLevel, MAX_NEW_NAME_LENGTH, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
-    MAX_TRIGGER_CHARACTER_BYTES, NewName, Position, Position2D, Range, RestartTarget,
-    ResultContext, ServerIds, ServerIdsError, SymbolKindFilter, SymbolName, SymbolNameError,
-    SymbolQuery, SymbolTarget, TabSize,
+    KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NewName, Position,
+    Position2D, Range, RestartTarget, ResultContext, ServerIds, ServerIdsError, SymbolKindFilter,
+    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize,
 };
 use crate::error::Error;
 
@@ -454,8 +453,8 @@ target_wire! {
     /// Wire form of [`RenameParams`].
     #[schemars(description = "Parameters for renaming a symbol across the workspace.")]
     RenameWire {
-        #[schemars(description = "New name for the symbol.")]
-        #[schemars(with = "String", length(max = MAX_NEW_NAME_LENGTH))]
+        #[schemars(description = "New name for the symbol (non-blank, at most 1000 bytes).")]
+        #[schemars(with = "String")]
         new_name: NewName,
     }
 }
@@ -486,8 +485,10 @@ position_wire! {
     /// Wire form of [`CompletionsParams`].
     #[schemars(description = "Parameters for getting code completion suggestions.")]
     CompletionsWire {
-        #[schemars(description = "Optional trigger character (e.g., '.', ':', '->').")]
-        #[schemars(with = "Option<String>", length(max = MAX_TRIGGER_CHARACTER_BYTES))]
+        #[schemars(
+            description = "Optional trigger character (e.g., '.', ':', '->'), at most 8 bytes."
+        )]
+        #[schemars(with = "Option<String>")]
         trigger: Option<CompletionTrigger>,
     }
 }
@@ -987,6 +988,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::bridge::{MAX_NEW_NAME_LENGTH, MAX_TRIGGER_CHARACTER_BYTES};
 
     #[test]
     fn restart_params_accept_servers_or_all() {

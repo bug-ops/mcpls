@@ -892,8 +892,7 @@
           "type": "integer"
         },
         "trigger": {
-          "description": "Optional trigger character (e.g., '.', ':', '->').",
-          "maxLength": 8,
+          "description": "Optional trigger character (e.g., '.', ':', '->'), at most 8 bytes.",
           "type": [
             "string",
             "null"
@@ -6780,8 +6779,7 @@
           ]
         },
         "new_name": {
-          "description": "New name for the symbol.",
-          "maxLength": 1000,
+          "description": "New name for the symbol (non-blank, at most 1000 bytes).",
           "type": "string"
         },
         "symbol_kind": {
