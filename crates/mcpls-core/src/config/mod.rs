@@ -3,6 +3,7 @@
 //! This module provides configuration structures for MCPLS,
 //! including LSP server definitions and workspace settings.
 
+mod bounded_number;
 mod bounded_secs;
 mod command_stem;
 mod language;

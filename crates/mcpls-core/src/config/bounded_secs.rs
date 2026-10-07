@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::bounded_number::impl_bounded_number;
 use super::limits::MAX_TIMEOUT_SECONDS;
 use crate::bridge::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_SETTLE,
@@ -78,36 +79,15 @@ impl<const MIN: u64, const MAX: u64> BoundedSecs<MIN, MAX> {
     }
 }
 
-impl<const MIN: u64, const MAX: u64> TryFrom<u64> for BoundedSecs<MIN, MAX> {
-    type Error = InvalidSecs;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl<const MIN: u64, const MAX: u64> From<BoundedSecs<MIN, MAX>> for u64 {
-    fn from(secs: BoundedSecs<MIN, MAX>) -> Self {
-        secs.get()
-    }
-}
+impl_bounded_number!(
+    @convert [const MIN: u64, const MAX: u64] BoundedSecs<MIN, MAX>, u64, InvalidSecs,
+    |secs: BoundedSecs<MIN, MAX>| secs.get()
+);
 
 /// A server handshake or request timeout: 1 to [`MAX_TIMEOUT_SECONDS`] seconds.
 pub type TimeoutSecs = BoundedSecs<1, MAX_TIMEOUT_SECONDS>;
 
-impl TimeoutSecs {
-    /// Thirty seconds.
-    pub const DEFAULT: Self = match Self::new(30) {
-        Ok(secs) => secs,
-        Err(_) => panic!("the default timeout must be in range"),
-    };
-}
-
-impl Default for TimeoutSecs {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+impl_bounded_number!(@default TimeoutSecs, 30, "Thirty seconds.");
 
 /// How long a whole-workspace query waits for indexing readiness: strictly
 /// between `PROGRESS_SETTLE` and `INDEXING_STALENESS_BOUND`.
@@ -118,19 +98,11 @@ impl Default for TimeoutSecs {
 pub type IndexingReadyTimeoutSecs =
     BoundedSecs<{ PROGRESS_SETTLE.as_secs() + 1 }, { INDEXING_STALENESS_BOUND.as_secs() - 1 }>;
 
-impl IndexingReadyTimeoutSecs {
-    /// The built-in default, `DEFAULT_INDEXING_READY_TIMEOUT_SECS`.
-    pub const DEFAULT: Self = match Self::new(DEFAULT_INDEXING_READY_TIMEOUT_SECS) {
-        Ok(secs) => secs,
-        Err(_) => panic!("the default indexing-ready timeout must be in range"),
-    };
-}
-
-impl Default for IndexingReadyTimeoutSecs {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+impl_bounded_number!(
+    @default IndexingReadyTimeoutSecs,
+    DEFAULT_INDEXING_READY_TIMEOUT_SECS,
+    "The built-in default, `DEFAULT_INDEXING_READY_TIMEOUT_SECS`."
+);
 
 #[cfg(test)]
 mod tests {

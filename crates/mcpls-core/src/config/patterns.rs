@@ -63,38 +63,21 @@ impl InvalidProjectMarker {
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectMarker(Cow<'static, str>);
 
-impl ProjectMarker {
-    /// Builds a marker from a literal, checked at compile time when evaluated
-    /// in a `const` context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `marker` is not a valid marker.
-    #[must_use]
-    pub const fn from_static(marker: &'static str) -> Self {
-        assert!(
-            InvalidProjectMarker::check(marker).is_none(),
-            "invalid project marker"
-        );
-        Self(Cow::Borrowed(marker))
-    }
-
-    /// Builds a marker from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidProjectMarker`] if `marker` is not exactly one file
-    /// name.
-    pub fn new(marker: impl Into<String>) -> Result<Self, InvalidProjectMarker> {
-        let marker = marker.into();
-        if let Some(reason) = InvalidProjectMarker::check(&marker) {
-            return Err(reason);
-        }
-        Ok(Self(Cow::Owned(marker)))
-    }
+const fn is_valid_project_marker(marker: &str) -> bool {
+    InvalidProjectMarker::check(marker).is_none()
 }
 
-impl_text_newtype!(ProjectMarker, InvalidProjectMarker);
+fn check_project_marker(marker: &str) -> Result<(), InvalidProjectMarker> {
+    InvalidProjectMarker::check(marker).map_or(Ok(()), Err)
+}
+
+impl_text_newtype!(
+    ProjectMarker,
+    InvalidProjectMarker,
+    checked = check_project_marker,
+    valid = is_valid_project_marker,
+    "project marker"
+);
 
 /// Why a string is not a valid [`FileExtension`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,42 +159,28 @@ fn offender_at(token: &str, index: usize) -> char {
 #[serde(try_from = "String", into = "String")]
 pub struct FileExtension(Cow<'static, str>);
 
-impl FileExtension {
-    /// Builds an extension from an ASCII literal, checked at compile time when
-    /// evaluated in a `const` context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `extension` is not a valid extension.
-    #[must_use]
-    pub const fn from_static(extension: &'static str) -> Self {
-        assert!(
-            first_token_fault(extension).is_none(),
-            "invalid file extension"
-        );
-        Self(Cow::Borrowed(extension))
-    }
+const fn is_valid_file_extension(extension: &str) -> bool {
+    first_token_fault(extension).is_none()
+}
 
-    /// Builds an extension from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidFileExtension`] naming the first rule `extension`
-    /// breaks.
-    pub fn new(extension: impl Into<String>) -> Result<Self, InvalidFileExtension> {
-        let extension = extension.into();
-        match first_token_fault(&extension) {
-            None => Ok(Self(Cow::Owned(extension))),
-            Some(TokenFault::Empty) => Err(InvalidFileExtension::Empty),
-            Some(TokenFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
-            Some(TokenFault::InvalidByteAt(index)) => Err(InvalidFileExtension::InvalidChar(
-                offender_at(&extension, index),
-            )),
-        }
+fn check_file_extension(extension: &str) -> Result<(), InvalidFileExtension> {
+    match first_token_fault(extension) {
+        None => Ok(()),
+        Some(TokenFault::Empty) => Err(InvalidFileExtension::Empty),
+        Some(TokenFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
+        Some(TokenFault::InvalidByteAt(index)) => Err(InvalidFileExtension::InvalidChar(
+            offender_at(extension, index),
+        )),
     }
 }
 
-impl_text_newtype!(FileExtension, InvalidFileExtension);
+impl_text_newtype!(
+    FileExtension,
+    InvalidFileExtension,
+    checked = check_file_extension,
+    valid = is_valid_file_extension,
+    "file extension"
+);
 
 /// Why a string is not a valid [`FileName`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,38 +214,28 @@ pub enum InvalidFileName {
 #[serde(try_from = "String", into = "String")]
 pub struct FileName(Cow<'static, str>);
 
-impl FileName {
-    /// Builds a name from an ASCII literal, checked at compile time when
-    /// evaluated in a `const` context.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `name` is not a valid file name.
-    #[must_use]
-    pub const fn from_static(name: &'static str) -> Self {
-        assert!(first_token_fault(name).is_none(), "invalid file name");
-        Self(Cow::Borrowed(name))
-    }
+const fn is_valid_file_name(name: &str) -> bool {
+    first_token_fault(name).is_none()
+}
 
-    /// Builds a name from any string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InvalidFileName`] naming the first rule `name` breaks.
-    pub fn new(name: impl Into<String>) -> Result<Self, InvalidFileName> {
-        let name = name.into();
-        match first_token_fault(&name) {
-            None => Ok(Self(Cow::Owned(name))),
-            Some(TokenFault::Empty) => Err(InvalidFileName::Empty),
-            Some(TokenFault::LeadingDot) => Err(InvalidFileName::InvalidChar('.')),
-            Some(TokenFault::InvalidByteAt(index)) => {
-                Err(InvalidFileName::InvalidChar(offender_at(&name, index)))
-            }
+fn check_file_name(name: &str) -> Result<(), InvalidFileName> {
+    match first_token_fault(name) {
+        None => Ok(()),
+        Some(TokenFault::Empty) => Err(InvalidFileName::Empty),
+        Some(TokenFault::LeadingDot) => Err(InvalidFileName::InvalidChar('.')),
+        Some(TokenFault::InvalidByteAt(index)) => {
+            Err(InvalidFileName::InvalidChar(offender_at(name, index)))
         }
     }
 }
 
-impl_text_newtype!(FileName, InvalidFileName);
+impl_text_newtype!(
+    FileName,
+    InvalidFileName,
+    checked = check_file_name,
+    valid = is_valid_file_name,
+    "file name"
+);
 
 /// A `file_patterns` entry that cannot be mapped to a file extension or name.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]

@@ -18,17 +18,29 @@ use crate::config::SizeLimit;
 /// A byte count that went over its limit.
 ///
 /// The one shape of every "too large" error, so each reader reports the same
-/// two numbers and converts it without re-spelling the fields.
+/// two numbers and converts it without re-spelling the fields. Only
+/// [`Self::check`] and [`Self::check_limit`] build one, so `size` is always
+/// above `max`.
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 #[error("{size} bytes exceed the limit of {max} bytes")]
 pub struct SizeExceeded {
-    /// The size found, in bytes.
-    pub size: u64,
-    /// The limit that was exceeded, in bytes.
-    pub max: NonZeroU64,
+    pub(crate) size: u64,
+    pub(crate) max: NonZeroU64,
 }
 
 impl SizeExceeded {
+    /// The size found, in bytes.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The limit that was exceeded, in bytes; always below [`Self::size`].
+    #[must_use]
+    pub const fn max(&self) -> NonZeroU64 {
+        self.max
+    }
+
     /// Checks `size` against `max`.
     ///
     /// # Errors
@@ -624,6 +636,14 @@ mod tests {
 
     fn size(max: u64) -> SizeLimit {
         SizeLimit::from_static(max)
+    }
+
+    #[test]
+    fn size_exceeded_exposes_both_numbers_through_accessors() {
+        let max = NonZeroU64::new(4).unwrap();
+        let exceeded = SizeExceeded::check(9, max).unwrap_err();
+
+        assert_eq!((exceeded.size(), exceeded.max()), (9, max));
     }
 
     #[test]
