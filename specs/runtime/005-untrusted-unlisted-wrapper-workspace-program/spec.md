@@ -9,7 +9,7 @@ tags:
   - security
   - hardening
 created: 2026-10-06
-status: draft
+status: accepted
 related:
   - "[[constitution]]"
   - "[[runtime/003-workspace-supplied-code-execution/spec|runtime/003-workspace-supplied-code-execution]]"
@@ -81,8 +81,8 @@ inside a workspace root that the child would start, whichever wrapper precedes i
 | False refusals | none | an argument that is an executable file in the workspace but only data | same as B |
 | Program given by bare name resolved from the child `PATH` | covered by the table's resolution | not covered | covered for listed wrappers |
 
-[NEEDS CLARIFICATION: choose A, B or C. Recommendation: C, with B as the generic floor and the
-table kept only where it also resolves bare names and rewrites to the vetted absolute path.]
+**Decision:** approach C-minimal. The generic backstop (B) is added and the wrapper table stays
+unchanged; FR-008 is not implemented because the backstop covers the reproduced wrappers.
 
 ### Out of Scope
 
@@ -136,11 +136,11 @@ SO THAT I do not infer protection against interpreter arguments
 | FR-001 | WHEN untrusted mode plans an allowed server and any element of `args` resolves, as the child would resolve it, to an existing executable file whose canonical path lies inside a workspace root, THE SYSTEM SHALL refuse the server as `WorkspaceExecutable` and name the argument's index and resolved path, never its surrounding values. | must |
 | FR-002 | THE SYSTEM SHALL resolve an argument for FR-001 against the spawn working directory (`ChildWorkingDir::Fixed`), following symlinks, so a relative argument and a symlink into the workspace are judged by the file the child would reach. | must |
 | FR-003 | WHEN an argument is not an existing file, is a directory, or is a file without an execute permission bit (Windows: without an executable extension), THE SYSTEM SHALL NOT refuse it under FR-001. | must |
-| FR-004 | WHEN an argument has the form `--option=<path>` or `-X<path>` THE SYSTEM SHALL NOT split it for FR-001 unless approach A or C requires it. [NEEDS CLARIFICATION: treat the part after the first `=` as a candidate path? It catches `--exec=<ws>/srv` forms at the cost of more false positives.] | should |
+| FR-004 | WHEN an argument has the form `--option=<path>` or `-X<path>` THE SYSTEM SHALL NOT split it for FR-001 unless approach A or C requires it. Decision: the part after the first `=` is also a candidate path. | must |
 | FR-005 | THE SYSTEM SHALL apply FR-001 only in untrusted mode, to the argument list as configured, before any rewrite, and again on restart and respawn through the same plan so no spawn path skips it. | must |
 | FR-006 | WHEN FR-001 refuses a server THE SYSTEM SHALL surface the refusal through the existing `UntrustedRefusal` path (startup failure, routing rebound, `Error::ServerFailedToStart` naming `--allow-server <id>` is not offered as an override). | must |
 | FR-007 | THE SYSTEM SHALL keep the wrapper table's behavior for listed wrappers unchanged (option parsing, absolute-path rewrite, `=` refusal). | must |
-| FR-008 | WHERE approach A or C is chosen THE SYSTEM SHALL add `xcrun`, `sandbox-exec`, `lockf`, `taskpolicy`, `login` and `command` to the closed table with a closed option grammar each. [NEEDS CLARIFICATION: `login -fq <user> <prog>` and `sandbox-exec -p <profile>` option grammars; refuse `login` and `sandbox-exec` outright instead?] | should |
+| FR-008 | (not implemented: the backstop covers these wrappers) WHERE approach A or C is chosen THE SYSTEM SHALL add `xcrun`, `sandbox-exec`, `lockf`, `taskpolicy`, `login` and `command` to the closed table with a closed option grammar each. | won't |
 | FR-009 | THE SYSTEM SHALL bound the filesystem work: at most one metadata lookup per argument and no directory traversal. | must |
 | FR-010 | THE SYSTEM SHALL update `SECURITY.md` and add a `CHANGELOG.md` `[Unreleased]` entry marked breaking. | must |
 
@@ -149,7 +149,7 @@ SO THAT I do not infer protection against interpreter arguments
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Security | The check runs on the canonical path and mirrors `lsp/command_path.rs` resolution, so symlink and `..` forms are judged by target. |
-| NFR-002 | Security | A lookup error other than not-found (permission denied on a workspace path) refuses the server; fail closed. [NEEDS CLARIFICATION: confirm fail-closed for unreadable candidates.] |
+| NFR-002 | Security | A lookup error other than not-found (permission denied on a workspace path) refuses the server only when the lexically normalized path lies inside the workspace boundary (fail closed); any other lookup error means the text is not a candidate. |
 | NFR-003 | Compatibility | Trusted mode behavior and the tool surface are unchanged. Untrusted-mode refusals are breaking for configs passing an executable workspace file as data. |
 | NFR-004 | Performance | Planning cost is O(number of args) metadata calls; no impact on request latency. |
 | NFR-005 | Portability | Tests run on Linux, macOS and Windows; fake executables use `.exe` names on Windows. |
@@ -159,7 +159,8 @@ SO THAT I do not infer protection against interpreter arguments
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `UntrustedRefusal::WorkspaceExecutable` | Existing refusal for an executable inside a root | resolved path; [NEEDS CLARIFICATION: add an argument index or reuse the variant as is] |
+| `UntrustedRefusal::WorkspaceExecutableArgument` | Refusal for an argument that is an executable inside a root | argument index, canonical path |
+| `UntrustedRefusal::UnreadableWorkspaceArgument` | Refusal for an argument inside a root that cannot be read (permission denied) | argument index, normalized path |
 | Candidate argument | An element of `args` examined by the backstop | index, resolved canonical path, is-executable flag |
 
 ## 6. Edge Cases and Error Handling
@@ -207,20 +208,19 @@ SO THAT I do not infer protection against interpreter arguments
 
 ## 9. Open Questions
 
-> [!question]
-> - [NEEDS CLARIFICATION: issue number and PR link for CHANGELOG (each entry ends with a PR link).]
-> - [NEEDS CLARIFICATION: approach A, B or C (section 1).]
-> - [NEEDS CLARIFICATION: FR-004 option-glued paths.]
-> - [NEEDS CLARIFICATION: NFR-002 fail-closed on unreadable candidates.]
-> - [NEEDS CLARIFICATION: are executable data files in `args` a realistic configuration for any built-in server? If none, the false-positive cost is accepted.]
-> - [NEEDS CLARIFICATION: should the backstop also look inside the arguments of a listed wrapper's program (after the wrapper), or only at top-level `args`?]
+> [!success] Resolved
+> - Approach: C-minimal (the generic backstop, the wrapper table unchanged).
+> - FR-004: the text after the first `=` is also checked.
+> - NFR-002: fail closed only on permission denied inside the boundary; any other lookup error is not a candidate.
+> - Executable data files in `args`: the false-positive cost is accepted and documented.
+> - Scope: the backstop covers all top-level `args` as configured, not the arguments of a listed wrapper's program.
 
 ## 10. Documentation Impact
 
 - `SECURITY.md` (Launcher bullet): replace "is admitted without unwrapping it, so the program it starts is not checked" with the backstop semantics: any argument resolving to an executable file inside the workspace refuses the server; non-executable data paths are admitted; a program given by bare name and interpreter scripts without an execute bit remain uncovered. Keep the closed-list wording for shells and interpreters.
 - `SECURITY.md` "What the mode does not cover": narrow "Interpreter arguments" to non-executable scripts.
 - `CHANGELOG.md` `[Unreleased]`: one line, marked **Breaking:**, ending with the PR link.
-- `book/` untrusted-mode chapter: mirror the SECURITY.md change. [NEEDS CLARIFICATION: chapter path]
+- `book/src/advanced/untrusted-mode.md`: mirror the SECURITY.md change.
 
 ## 11. See Also
 

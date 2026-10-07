@@ -755,6 +755,23 @@ pub enum UntrustedRefusal {
         /// What about the launch the analysis refused.
         cause: LauncherRefusal,
     },
+    /// An argument of the configured command names an executable file inside
+    /// the workspace, which whatever launcher precedes it would start.
+    WorkspaceExecutableArgument {
+        /// The position of the argument in the configured `args`.
+        index: usize,
+        /// The canonical path of the executable.
+        executable: PathBuf,
+    },
+    /// An argument of the configured command lies inside the workspace and
+    /// cannot be read, so untrusted mode cannot tell whether it is an
+    /// executable.
+    UnreadableWorkspaceArgument {
+        /// The position of the argument in the configured `args`.
+        index: usize,
+        /// The path the argument names, lexically normalized.
+        path: PathBuf,
+    },
     /// A program an exec wrapper or `env` starts was not found on a search
     /// path outside the workspace, so untrusted mode cannot tell what would
     /// run.
@@ -805,6 +822,18 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its executable {} lies inside the workspace, which untrusted mode never runs",
                 EchoedPath::new(executable)
+            ),
+            Self::WorkspaceExecutableArgument { index, executable } => write!(
+                f,
+                "its argument at index {index}, {}, is an executable inside the workspace, \
+                 which untrusted mode never runs",
+                EchoedPath::new(executable)
+            ),
+            Self::UnreadableWorkspaceArgument { index, path } => write!(
+                f,
+                "its argument at index {index}, {}, lies inside the workspace and cannot be \
+                 read, so untrusted mode cannot tell whether it is an executable",
+                EchoedPath::new(path)
             ),
             Self::UnresolvedExecutable { command } => write!(
                 f,
@@ -930,6 +959,8 @@ impl fmt::Display for FailedToStart<'_> {
                         write!(f, "; restart mcpls with `--allow-server {id}` to start it")
                     }
                     UntrustedRefusal::WorkspaceExecutable { .. }
+                    | UntrustedRefusal::WorkspaceExecutableArgument { .. }
+                    | UntrustedRefusal::UnreadableWorkspaceArgument { .. }
                     | UntrustedRefusal::UnresolvedExecutable { .. }
                     | UntrustedRefusal::AutoSelectionTarget { .. }
                     | UntrustedRefusal::WorkspaceHome { .. }

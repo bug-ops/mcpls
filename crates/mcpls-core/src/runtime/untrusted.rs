@@ -7,12 +7,13 @@
 //! a spawn for it.
 
 use std::borrow::Cow;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::info;
 
-use crate::bridge::WorkspaceRoots;
+use crate::bridge::{WorkspaceRoots, lexically_normalize};
 use crate::config::{
     BuiltinServer, LspServerConfig, MarkerScan, ServerCommand, ServerConfig, WorkspaceTrust,
     login_home_dir,
@@ -243,6 +244,82 @@ fn harden_for_untrusted(
     Ok(effective)
 }
 
+/// Extensions Windows starts as programs.
+const WINDOWS_EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "com", "bat", "cmd"];
+
+/// Whether `path` is a file `host` would start: an execute bit on Unix, and on
+/// Windows an extension it starts as a program.
+fn is_started_as_program(host: HostOs, path: &Path) -> bool {
+    host.is_executable_file(path)
+        && (host == HostOs::Other
+            || path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| {
+                    WINDOWS_EXECUTABLE_EXTENSIONS
+                        .iter()
+                        .any(|known| extension.eq_ignore_ascii_case(known))
+                }))
+}
+
+/// The refusal for the text `candidate` of argument `index`, when it names an
+/// executable inside `boundary` as the child would resolve it.
+///
+/// A lookup that fails with permission denied fails closed when the path lies
+/// inside the boundary; any other failure means the text is not a file.
+fn argument_refusal(
+    index: usize,
+    candidate: &str,
+    boundary: &WorkspaceRoots,
+    working_dir: &ChildWorkingDir,
+    host: HostOs,
+) -> Option<UntrustedRefusal> {
+    let resolved = match working_dir {
+        ChildWorkingDir::Fixed(dir) => dir.join(candidate),
+        ChildWorkingDir::Inherit => PathBuf::from(candidate),
+    };
+    match dunce::canonicalize(&resolved) {
+        Ok(canonical) => (is_started_as_program(host, &canonical)
+            && boundary.contains_canonical(&canonical))
+        .then_some(UntrustedRefusal::WorkspaceExecutableArgument {
+            index,
+            executable: canonical,
+        }),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            let path = lexically_normalize(&resolved);
+            boundary
+                .admits_lexically(&path)
+                .then_some(UntrustedRefusal::UnreadableWorkspaceArgument { index, path })
+        }
+        Err(_) => None,
+    }
+}
+
+/// Refuses a configured argument that names an executable file inside
+/// `boundary`, whichever launcher precedes it, so a wrapper missing from the
+/// launcher table cannot start a workspace program.
+///
+/// Each argument is judged as a path, and so is the text after its first `=`
+/// (`--exec=<path>`). A file that is not executable, a directory and text that
+/// is no file are admitted.
+fn refuse_workspace_executable_arguments(
+    args: &[String],
+    boundary: &WorkspaceRoots,
+    working_dir: &ChildWorkingDir,
+    host: HostOs,
+) -> Result<(), UntrustedRefusal> {
+    for (index, arg) in args.iter().enumerate() {
+        let after_equals = arg.split_once('=').map(|(_, value)| value);
+        let candidates = std::iter::once(arg.as_str()).chain(after_equals);
+        for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
+            if let Some(refusal) = argument_refusal(index, candidate, boundary, working_dir, host) {
+                return Err(refusal);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The home-directory variables untrusted mode sets for a server that does
 /// not set them itself: the login home, so a `HOME` or `USERPROFILE` that
 /// names the workspace cannot steer rustup, cargo or npm configuration.
@@ -429,6 +506,13 @@ fn admit(
             let hardened = harden_for_untrusted(selected, boundary, login_home, &process_env)
                 .map_err(configured)?;
             let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
+            refuse_workspace_executable_arguments(
+                &lsp_config.args,
+                boundary,
+                &working_dir,
+                lsp_config.env.host(),
+            )
+            .map_err(configured)?;
             let vetting = UntrustedVetting::new(boundary.clone(), configured_command.clone());
             (hardened, working_dir, Some(vetting))
         }
@@ -1733,6 +1817,184 @@ mod plan_tests {
                 refusal_of(&plan),
                 Some(UntrustedRefusal::WrappedProgramPathContainsEquals { .. })
             );
+        }
+
+        fn argument_refusal_of(plan: &StartPlan) -> Option<(usize, PathBuf)> {
+            match refusal_of(plan)? {
+                UntrustedRefusal::WorkspaceExecutableArgument { index, executable } => {
+                    Some((*index, executable.clone()))
+                }
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_an_unlisted_wrapper_started_workspace_program() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun", "sandbox-exec", "lockf", "login"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let srv = srv.to_str().unwrap();
+            for (wrapper, args, index) in [
+                ("xcrun", vec![srv], 0),
+                (
+                    "sandbox-exec",
+                    vec!["-p", "(version 1)(allow default)", srv],
+                    2,
+                ),
+                ("lockf", vec!["-k", "/tmp/x.lock", srv], 2),
+                ("login", vec!["-fq", "user", srv], 2),
+            ] {
+                let plan = plan_allowing_rust(wrapped_launch(&fx, wrapper, &args), &fx);
+
+                assert!(plan.admitted.is_empty(), "{wrapper}");
+                assert_eq!(
+                    argument_refusal_of(&plan),
+                    Some((index, dunce::canonicalize(srv).unwrap())),
+                    "{wrapper}"
+                );
+            }
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_workspace_program_glued_with_equals() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let glued = format!("--exec={}", srv.display());
+
+            let plan = plan_allowing_rust(wrapped_launch(&fx, "xcrun", &["-v", &glued]), &fx);
+
+            assert_eq!(
+                argument_refusal_of(&plan),
+                Some((1, dunce::canonicalize(&srv).unwrap()))
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_symlink_outside_that_reaches_a_workspace_executable() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let link = fx.outside.join("link");
+            std::os::unix::fs::symlink(&srv, &link).unwrap();
+
+            let plan =
+                plan_allowing_rust(wrapped_launch(&fx, "xcrun", &[link.to_str().unwrap()]), &fx);
+
+            assert_eq!(
+                argument_refusal_of(&plan),
+                Some((0, dunce::canonicalize(&srv).unwrap()))
+            );
+        }
+
+        #[test]
+        fn plan_untrusted_admits_arguments_that_are_not_workspace_executables() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun", "tool"]);
+            let data = fx.workspace.join("conf.json");
+            std::fs::write(&data, "{}").unwrap();
+            let link = fx.workspace.join("bin/tool-link");
+            std::os::unix::fs::symlink(fx.outside.join("tool"), &link).unwrap();
+            let directory = fx.workspace.join("bin");
+            let missing = fx.workspace.join("bin/missing");
+            for arg in [&data, &link, &directory, &missing] {
+                let plan = plan_allowing_rust(
+                    wrapped_launch(&fx, "xcrun", &["--config", arg.to_str().unwrap()]),
+                    &fx,
+                );
+
+                assert_eq!(plan.admitted.len(), 1, "{arg:?}");
+            }
+        }
+
+        #[test]
+        fn plan_trusted_does_not_check_arguments_for_workspace_executables() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let config = wrapped_launch(&fx, "xcrun", &[srv.to_str().unwrap()]);
+
+            let plan = plan(
+                &config_with(vec![config], WorkspaceTrust::Trusted),
+                &fx.roots,
+            );
+
+            assert_eq!(plan.admitted.len(), 1);
+        }
+
+        #[test]
+        fn plan_untrusted_fails_closed_on_an_unreadable_workspace_argument() {
+            let fx = fixture();
+            outside_tools(&fx, &["xcrun"]);
+            let locked = fx.workspace.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let hidden = locked.join("srv");
+            let unreadable_outside = fx.outside.join("locked");
+            std::fs::create_dir_all(&unreadable_outside).unwrap();
+            std::fs::set_permissions(&unreadable_outside, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+
+            let inside = plan_allowing_rust(
+                wrapped_launch(&fx, "xcrun", &[hidden.to_str().unwrap()]),
+                &fx,
+            );
+            let outside = plan_allowing_rust(
+                wrapped_launch(
+                    &fx,
+                    "xcrun",
+                    &[unreadable_outside.join("srv").to_str().unwrap()],
+                ),
+                &fx,
+            );
+
+            for dir in [&locked, &unreadable_outside] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::assert_matches!(
+                refusal_of(&inside),
+                Some(UntrustedRefusal::UnreadableWorkspaceArgument { index: 0, .. })
+            );
+            assert_eq!(outside.admitted.len(), 1);
+        }
+
+        #[test]
+        fn a_relative_argument_is_judged_from_the_working_directory() {
+            let fx = fixture();
+            let srv = fx.workspace.join("bin/srv");
+            executable(&srv);
+            let args = vec!["../ws/bin/srv".to_owned()];
+
+            let refusal = refuse_workspace_executable_arguments(
+                &args,
+                &fx.roots,
+                &ChildWorkingDir::Fixed(fx.outside.clone()),
+                HostOs::Other,
+            );
+
+            assert_eq!(
+                refusal,
+                Err(UntrustedRefusal::WorkspaceExecutableArgument {
+                    index: 0,
+                    executable: dunce::canonicalize(&srv).unwrap()
+                })
+            );
+        }
+
+        #[test]
+        fn windows_starts_only_files_with_a_program_extension() {
+            let fx = fixture();
+            let tool = fx.workspace.join("srv.exe");
+            let data = fx.workspace.join("conf.json");
+            std::fs::write(&tool, "").unwrap();
+            std::fs::write(&data, "").unwrap();
+
+            assert!(is_started_as_program(HostOs::Windows, &tool));
+            assert!(!is_started_as_program(HostOs::Windows, &data));
         }
 
         #[test]

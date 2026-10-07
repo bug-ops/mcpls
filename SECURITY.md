@@ -199,8 +199,17 @@ enforces the following, and nothing more:
   and replaced by its absolute path, as the server's own executable is. `deno lsp`
   is allowed. These lists are closed, not exhaustive: a shell, interpreter or
   wrapper that is not named here (`numactl`, `prlimit`, `ltrace`, `valgrind`,
-  `firejail`, `sg`, `run-parts`) is admitted without unwrapping it, so the program it starts is not
-  checked, and its command string is unexamined. A resolved wrapped-program path
+  `firejail`, `sg`, `run-parts`, `xcrun`, `sandbox-exec`) is admitted without
+  unwrapping it, and its command string is unexamined. Whichever launcher
+  precedes it, though, a server is refused when an argument of its `command`
+  (or the text after the first `=` of one, as in `--exec=<path>`), resolved
+  against the directory the server starts in with symlinks followed, is an
+  executable file inside the workspace; a file without an execute bit (on
+  Windows, without a program extension), a directory and text that is no file
+  are admitted, and so is a program given by bare name, which the sanitized
+  `PATH` already keeps out of the workspace. An argument that lies inside the
+  workspace and cannot be read (permission denied) is refused as well. An
+  executable data file passed in `args` is therefore refused. A resolved wrapped-program path
   that contains `=` is refused, because `env` would read it as an assignment. The list matches the command's
   file stem and arguments and is best-effort: the trusted configuration is the
   boundary, so install the server globally and give its absolute path as
@@ -222,8 +231,10 @@ enforces the following, and nothing more:
 
 What the mode does not cover:
 
-- Interpreter arguments: `node <workspace>/cli.mjs` runs workspace code, and
-  only the `node` executable is checked.
+- Interpreter arguments that are not executable files: `node
+  <workspace>/cli.mjs` runs workspace code, and only the `node` executable is
+  checked, unless `cli.mjs` has an execute bit (any executable file named in
+  `args` is refused, see Launcher).
 - With no configured `workspace.roots`, the working directory is the checkout
   unless it is `/` or the login home. With no account entry, or a `$HOME` that
   differs from it and equals the working directory, binaries under it (such as
