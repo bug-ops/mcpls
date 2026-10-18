@@ -3084,7 +3084,7 @@ mod tests {
             .handle_rename(
                 file.clone(),
                 pos(1, 1),
-                crate::bridge::NewName::try_new("renamed").unwrap(),
+                crate::bridge::NewName::new("renamed").unwrap(),
             )
             .await;
         assert_matches!(
@@ -3199,7 +3199,7 @@ mod tests {
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                crate::bridge::NewName::try_new("renamed").unwrap(),
+                crate::bridge::NewName::new("renamed").unwrap(),
             )
             .await;
 
@@ -3753,7 +3753,7 @@ mod tests {
                     .handle_rename(
                         client_path(path_str),
                         Position::at(1, 1),
-                        crate::bridge::NewName::try_new("renamed").unwrap(),
+                        crate::bridge::NewName::new("renamed").unwrap(),
                     )
                     .await
             })

@@ -1,14 +1,12 @@
 //! Folding range handler.
 
-use lsp_types::{
-    FoldingRangeParams, PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
-};
 use tracing::debug;
 
 use super::Translator;
 use super::dto::{FoldingKind, FoldingKindFilter, FoldingRangesResult, FoldingRegion};
 use super::encoding_ctx::EncodingCtx;
 use super::navigation::ItemBudget;
+use super::positioned::document_request;
 use super::routing::{FileLocalCapability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
@@ -107,19 +105,10 @@ impl Translator {
                 IndexingGate::FileLocal(FileLocalCapability::FoldingRange),
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
+        let ctx = self.encoding_ctx(doc.server_id());
+        let response_uri = doc.uri().clone();
 
-        let params = FoldingRangeParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::FoldingRangeRequest>(params, client.request_timeout())
-            .await?;
+        let response = document_request::<lsp_types::FoldingRangeRequest>(&doc, ()).await?;
 
         let mut budget = ItemBudget::new();
         let admitted = budget.admit(select(response.unwrap_or_default(), filter));

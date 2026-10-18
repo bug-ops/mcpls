@@ -63,19 +63,15 @@ impl InvalidProjectMarker {
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectMarker(Cow<'static, str>);
 
-const fn is_valid_project_marker(marker: &str) -> bool {
-    InvalidProjectMarker::check(marker).is_none()
-}
-
-fn check_project_marker(marker: &str) -> Result<(), InvalidProjectMarker> {
-    InvalidProjectMarker::check(marker).map_or(Ok(()), Err)
+const fn keep_project_marker_fault(_: &str, fault: InvalidProjectMarker) -> InvalidProjectMarker {
+    fault
 }
 
 impl_text_newtype!(
     ProjectMarker,
     InvalidProjectMarker,
-    checked = check_project_marker,
-    valid = is_valid_project_marker,
+    fault = InvalidProjectMarker::check,
+    explain = keep_project_marker_fault,
     "project marker"
 );
 
@@ -159,26 +155,21 @@ fn offender_at(token: &str, index: usize) -> char {
 #[serde(try_from = "String", into = "String")]
 pub struct FileExtension(Cow<'static, str>);
 
-const fn is_valid_file_extension(extension: &str) -> bool {
-    first_token_fault(extension).is_none()
-}
-
-fn check_file_extension(extension: &str) -> Result<(), InvalidFileExtension> {
-    match first_token_fault(extension) {
-        None => Ok(()),
-        Some(TokenFault::Empty) => Err(InvalidFileExtension::Empty),
-        Some(TokenFault::LeadingDot) => Err(InvalidFileExtension::LeadingDot),
-        Some(TokenFault::InvalidByteAt(index)) => Err(InvalidFileExtension::InvalidChar(
-            offender_at(extension, index),
-        )),
+fn explain_file_extension(extension: &str, fault: TokenFault) -> InvalidFileExtension {
+    match fault {
+        TokenFault::Empty => InvalidFileExtension::Empty,
+        TokenFault::LeadingDot => InvalidFileExtension::LeadingDot,
+        TokenFault::InvalidByteAt(index) => {
+            InvalidFileExtension::InvalidChar(offender_at(extension, index))
+        }
     }
 }
 
 impl_text_newtype!(
     FileExtension,
     InvalidFileExtension,
-    checked = check_file_extension,
-    valid = is_valid_file_extension,
+    fault = first_token_fault,
+    explain = explain_file_extension,
     "file extension"
 );
 
@@ -214,26 +205,19 @@ pub enum InvalidFileName {
 #[serde(try_from = "String", into = "String")]
 pub struct FileName(Cow<'static, str>);
 
-const fn is_valid_file_name(name: &str) -> bool {
-    first_token_fault(name).is_none()
-}
-
-fn check_file_name(name: &str) -> Result<(), InvalidFileName> {
-    match first_token_fault(name) {
-        None => Ok(()),
-        Some(TokenFault::Empty) => Err(InvalidFileName::Empty),
-        Some(TokenFault::LeadingDot) => Err(InvalidFileName::InvalidChar('.')),
-        Some(TokenFault::InvalidByteAt(index)) => {
-            Err(InvalidFileName::InvalidChar(offender_at(name, index)))
-        }
+fn explain_file_name(name: &str, fault: TokenFault) -> InvalidFileName {
+    match fault {
+        TokenFault::Empty => InvalidFileName::Empty,
+        TokenFault::LeadingDot => InvalidFileName::InvalidChar('.'),
+        TokenFault::InvalidByteAt(index) => InvalidFileName::InvalidChar(offender_at(name, index)),
     }
 }
 
 impl_text_newtype!(
     FileName,
     InvalidFileName,
-    checked = check_file_name,
-    valid = is_valid_file_name,
+    fault = first_token_fault,
+    explain = explain_file_name,
     "file name"
 );
 

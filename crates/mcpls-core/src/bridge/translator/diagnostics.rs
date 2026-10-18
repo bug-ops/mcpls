@@ -3,10 +3,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use lsp_types::{
-    DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, Uri,
-    WorkDoneProgressParams,
-};
+use lsp_types::{DocumentDiagnosticParams, Uri};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -18,6 +15,7 @@ use super::dto::{
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
+use super::positioned::document_request_classified;
 use super::pull_support::{PullProbe, PullSupport};
 use super::routing::PreparedDocument;
 use crate::bridge::encoding::PositionEncoding;
@@ -438,21 +436,12 @@ impl Translator {
             return PullAttempt::PushOnly;
         }
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let params = DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
         let sent_with = if support == PullSupport::Probing {
             self.pull_probe_of(server_id)
         } else {
             PullProbe::default()
         };
-        let response = client
-            .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
-            .await;
+        let response = document_request_classified::<PullDiagnosticRequest>(doc, ()).await;
         match response {
             Ok(response) => {
                 if support == PullSupport::Probing {
@@ -702,6 +691,7 @@ mod tests {
     use std::time::Duration;
     use std::{assert_matches, fs};
 
+    use lsp_types::{PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams};
     use tempfile::TempDir;
     use tokio::io::BufReader;
     use tokio::time::timeout;

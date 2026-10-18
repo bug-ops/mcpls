@@ -64,7 +64,7 @@ mod type_hierarchy;
 
 pub use addressing::{
     AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
-    ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
+    ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 pub use dto::*;

@@ -705,20 +705,13 @@ impl McplsServer {
     )]
     async fn get_hover(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(target): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<HoverResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Hover,
-                    |file_path, position| translator.handle_hover(file_path, position),
-                )
-                .await,
-        )
+        self.addressed(target, AddressableTool::Hover, |file_path, position| {
+            translator.handle_hover(file_path, position)
+        })
+        .await
     }
 
     /// Get the definition location of a symbol.
@@ -728,25 +721,15 @@ impl McplsServer {
     )]
     async fn get_definition(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Definition,
-                    |file_path, position| {
-                        translator.handle_definition(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::Definition,
+            |file_path, position| translator.handle_definition(file_path, position, context),
         )
+        .await
     }
 
     /// Find all references to a symbol.
@@ -757,30 +740,20 @@ impl McplsServer {
     async fn get_references(
         &self,
         Parameters(ReferencesParams {
-            target: SymbolTargetParams { file_path, target },
+            target,
             include_declaration,
             context,
         }): Parameters<ReferencesParams>,
     ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::References,
-                    |file_path, position| {
-                        translator.handle_references(
-                            file_path,
-                            position,
-                            include_declaration,
-                            context,
-                        )
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::References,
+            |file_path, position| {
+                translator.handle_references(file_path, position, include_declaration, context)
+            },
         )
+        .await
     }
 
     /// Get diagnostics for a file.
@@ -852,23 +825,13 @@ impl McplsServer {
     )]
     async fn rename_symbol(
         &self,
-        Parameters(RenameParams {
-            target: SymbolTargetParams { file_path, target },
-            new_name,
-        }): Parameters<RenameParams>,
+        Parameters(RenameParams { target, new_name }): Parameters<RenameParams>,
     ) -> Result<Json<Addressed<RenameResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Rename,
-                    |file_path, position| translator.handle_rename(file_path, position, new_name),
-                )
-                .await,
-        )
+        self.addressed(target, AddressableTool::Rename, |file_path, position| {
+            translator.handle_rename(file_path, position, new_name)
+        })
+        .await
     }
 
     /// Get code completion suggestions.
@@ -993,23 +956,16 @@ impl McplsServer {
     )]
     async fn prepare_call_hierarchy(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(target): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Indexed<Addressed<CallHierarchyPrepareResult>>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::PrepareCallHierarchy,
-                    |file_path, position| {
-                        translator.handle_call_hierarchy_prepare(file_path, position)
-                    },
-                )
-                .await
-                .map(hoist_indexing),
+        self.addressed_as(
+            target,
+            AddressableTool::PrepareCallHierarchy,
+            |file_path, position| translator.handle_call_hierarchy_prepare(file_path, position),
+            hoist_indexing,
         )
+        .await
     }
 
     /// Get incoming calls (callers).
@@ -1318,25 +1274,15 @@ impl McplsServer {
     )]
     async fn go_to_implementation(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Implementation,
-                    |file_path, position| {
-                        translator.handle_implementation(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::Implementation,
+            |file_path, position| translator.handle_implementation(file_path, position, context),
         )
+        .await
     }
 
     /// Go to type definition location.
@@ -1346,25 +1292,15 @@ impl McplsServer {
     )]
     async fn go_to_type_definition(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::TypeDefinition,
-                    |file_path, position| {
-                        translator.handle_type_definition(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::TypeDefinition,
+            |file_path, position| translator.handle_type_definition(file_path, position, context),
         )
+        .await
     }
 
     /// Go to declaration location.
@@ -1470,6 +1406,47 @@ impl McplsServer {
     /// [`render_error`] with the secrets of every live server.
     fn render_error(&self, error: crate::error::Error) -> McpError {
         render_error(error, &self.context.translator.server_text_redactions())
+    }
+
+    /// Runs a name-addressable tool: parses the target, resolves a name to a
+    /// position, calls `call` there and wraps the answer with the resolved
+    /// symbol.
+    async fn addressed<T, F, Fut>(
+        &self,
+        target: SymbolTargetParams,
+        tool: AddressableTool,
+        call: F,
+    ) -> Result<Json<Addressed<T>>, McpError>
+    where
+        Addressed<T>: Serialize + JsonSchema + ServerText,
+        F: FnOnce(ClientPath, Position) -> Fut,
+        Fut: Future<Output = crate::error::Result<T>>,
+    {
+        self.addressed_as(target, tool, call, std::convert::identity)
+            .await
+    }
+
+    /// As [`Self::addressed`], reshaping the addressed answer with `finish`
+    /// before it is returned.
+    async fn addressed_as<T, O, F, Fut>(
+        &self,
+        SymbolTargetParams { file_path, target }: SymbolTargetParams,
+        tool: AddressableTool,
+        call: F,
+        finish: fn(Addressed<T>) -> O,
+    ) -> Result<Json<O>, McpError>
+    where
+        O: Serialize + JsonSchema + ServerText,
+        F: FnOnce(ClientPath, Position) -> Fut,
+        Fut: Future<Output = crate::error::Result<T>>,
+    {
+        let (file_path, target) = parse_target(file_path, target)?;
+        let answer = self
+            .context
+            .translator
+            .with_resolved_target(file_path, target, tool, call)
+            .await;
+        self.structured_result(answer.map(finish))
     }
 
     /// [`to_structured_tool_result`] with the secrets of every live server
@@ -2822,7 +2799,7 @@ mod tests {
                 server
                     .rename_symbol(Parameters(RenameParams {
                         target: position(line, character).into(),
-                        new_name: NewName::try_new("x").unwrap(),
+                        new_name: NewName::new("x").unwrap(),
                     }))
                     .await
                     .map(|_| ()),
@@ -3799,7 +3776,7 @@ mod tests {
                 character: 5,
             }
             .into(),
-            new_name: NewName::try_new("new_name").unwrap(),
+            new_name: NewName::new("new_name").unwrap(),
         });
 
         let result = server.rename_symbol(params).await;
@@ -6730,7 +6707,7 @@ sleep 0.3
             McpTool::RenameSymbol => server
                 .rename_symbol(Parameters(RenameParams {
                     target: position().into(),
-                    new_name: NewName::try_new("renamed").unwrap(),
+                    new_name: NewName::new("renamed").unwrap(),
                 }))
                 .await
                 .map(|_| ()),

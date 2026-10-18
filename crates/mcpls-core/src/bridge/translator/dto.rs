@@ -10,6 +10,8 @@ use thiserror::Error;
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
 use super::kind_filter::{self, KindFilter};
 use crate::bridge::notifications::ReportedSeverity;
+use crate::config::text_newtype::impl_text_newtype;
+use crate::config::{BoundedText, InvalidBoundedText};
 use crate::redaction::{Redactions, ServerText};
 
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
@@ -51,18 +53,58 @@ pub enum InvalidPosition {
 /// No real identifier approaches this length in any language mcpls targets.
 pub const MAX_NEW_NAME_LENGTH: usize = 1_000;
 
-/// Why [`NewName::try_new`] rejected a name.
+/// The client-supplied text fields that are validated as bounded text, named
+/// as they are on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextField {
+    /// `new_name` of `rename_symbol`.
+    NewName,
+    /// `trigger` of `get_completions`.
+    Trigger,
+    /// `symbol_name` of a name-addressed tool.
+    SymbolName,
+    /// `container` of a name-addressed tool.
+    Container,
+}
+
+impl std::fmt::Display for TextField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NewName => "new_name",
+            Self::Trigger => "trigger",
+            Self::SymbolName => "symbol_name",
+            Self::Container => "container",
+        })
+    }
+}
+
+/// Why a client-supplied text field was rejected, and which one.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{NewName, TextField};
+/// use mcpls_core::config::InvalidBoundedText;
+///
+/// let error = NewName::new("  ").unwrap_err();
+/// assert_eq!(error.field, TextField::NewName);
+/// assert_eq!(error.reason, InvalidBoundedText::Blank);
+/// assert_eq!(error.to_string(), "`new_name` cannot be empty");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum InvalidNewName {
-    /// The name is empty or only whitespace.
-    #[error("new_name must not be blank")]
-    Blank,
-    /// The name is longer than [`MAX_NEW_NAME_LENGTH`].
-    #[error("new_name too long: {len} bytes (max {MAX_NEW_NAME_LENGTH})")]
-    TooLong {
-        /// The name's length in bytes.
-        len: usize,
-    },
+#[error("`{field}` {reason}")]
+pub struct InvalidTextField {
+    /// The field that was rejected.
+    pub field: TextField,
+    /// The rule it broke.
+    pub reason: InvalidBoundedText,
+}
+
+impl InvalidTextField {
+    /// Tags a rejection with the `field` it was raised for.
+    pub(crate) fn of(field: TextField) -> impl Fn(InvalidBoundedText) -> Self {
+        move |reason| Self { field, reason }
+    }
 }
 
 /// The name a `rename_symbol` call renames to: non-blank and at most
@@ -72,53 +114,38 @@ pub enum InvalidNewName {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::bridge::{InvalidNewName, NewName};
+/// use mcpls_core::bridge::NewName;
+/// use mcpls_core::config::InvalidBoundedText;
 ///
-/// assert_eq!(NewName::try_new("renamed")?.as_str(), "renamed");
-/// assert_eq!(NewName::try_new("  "), Err(InvalidNewName::Blank));
-/// # Ok::<(), InvalidNewName>(())
+/// assert_eq!(NewName::new("renamed")?.as_str(), "renamed");
+/// assert_eq!(NewName::new("  ").unwrap_err().reason, InvalidBoundedText::Blank);
+/// # Ok::<(), mcpls_core::bridge::InvalidTextField>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
-pub struct NewName(String);
+pub struct NewName(BoundedText<MAX_NEW_NAME_LENGTH>);
 
 impl NewName {
     /// Validates `raw` as given; surrounding whitespace is kept.
     ///
     /// # Errors
     ///
-    /// [`InvalidNewName::Blank`] or [`InvalidNewName::TooLong`].
-    pub fn try_new(raw: impl Into<String>) -> Result<Self, InvalidNewName> {
-        let raw = raw.into();
-        if raw.trim().is_empty() {
-            return Err(InvalidNewName::Blank);
-        }
-        if raw.len() > MAX_NEW_NAME_LENGTH {
-            return Err(InvalidNewName::TooLong { len: raw.len() });
-        }
-        Ok(Self(raw))
-    }
-
-    /// The name text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// [`InvalidTextField`] naming `new_name` when `raw` is blank or longer
+    /// than [`MAX_NEW_NAME_LENGTH`].
+    pub fn new(raw: impl Into<String>) -> Result<Self, InvalidTextField> {
+        BoundedText::new(raw)
+            .map(Self)
+            .map_err(InvalidTextField::of(TextField::NewName))
     }
 
     /// The name text, owned.
     #[must_use]
     pub fn into_string(self) -> String {
-        self.0
+        String::from(self)
     }
 }
 
-impl TryFrom<String> for NewName {
-    type Error = InvalidNewName;
-
-    fn try_from(raw: String) -> Result<Self, Self::Error> {
-        Self::try_new(raw)
-    }
-}
+impl_text_newtype!(NewName, InvalidTextField);
 
 /// Longest accepted `get_completions` `trigger`, in bytes.
 ///
@@ -128,49 +155,50 @@ impl TryFrom<String> for NewName {
 /// trigger.
 pub const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
 
-/// A `get_completions` trigger longer than [`MAX_TRIGGER_CHARACTER_BYTES`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("trigger too long: {len} bytes (max {MAX_TRIGGER_CHARACTER_BYTES})")]
-pub struct InvalidCompletionTrigger {
-    /// The trigger's length in bytes.
-    pub len: usize,
-}
-
-/// The text that triggered a completion request, bounded to
-/// [`MAX_TRIGGER_CHARACTER_BYTES`].
+/// The text that triggered a completion request: not empty and at most
+/// [`MAX_TRIGGER_CHARACTER_BYTES`] bytes.
+///
+/// Whitespace is a valid trigger (a space triggers completion in some
+/// languages), so only the empty string is refused, not a blank one.
 ///
 /// # Examples
 ///
 /// ```
 /// use mcpls_core::bridge::CompletionTrigger;
+/// use mcpls_core::config::InvalidBoundedText;
 ///
-/// assert_eq!(CompletionTrigger::try_new("->")?.as_str(), "->");
-/// assert!(CompletionTrigger::try_new("123456789").is_err());
-/// # Ok::<(), mcpls_core::bridge::InvalidCompletionTrigger>(())
+/// assert_eq!(CompletionTrigger::new("->")?.as_str(), "->");
+/// assert!(CompletionTrigger::new(" ").is_ok());
+/// assert_eq!(CompletionTrigger::new("").unwrap_err().reason, InvalidBoundedText::Blank);
+/// assert!(CompletionTrigger::new("123456789").is_err());
+/// # Ok::<(), mcpls_core::bridge::InvalidTextField>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct CompletionTrigger(String);
 
 impl CompletionTrigger {
-    /// Validates the length of `raw`.
+    /// Validates `raw`.
     ///
     /// # Errors
     ///
-    /// [`InvalidCompletionTrigger`] when `raw` exceeds
+    /// [`InvalidTextField`] naming `trigger` when `raw` is empty or exceeds
     /// [`MAX_TRIGGER_CHARACTER_BYTES`].
-    pub fn try_new(raw: impl Into<String>) -> Result<Self, InvalidCompletionTrigger> {
+    pub fn new(raw: impl Into<String>) -> Result<Self, InvalidTextField> {
         let raw = raw.into();
-        if raw.len() > MAX_TRIGGER_CHARACTER_BYTES {
-            return Err(InvalidCompletionTrigger { len: raw.len() });
-        }
-        Ok(Self(raw))
-    }
-
-    /// The trigger text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+        let fault = if raw.is_empty() {
+            Some(InvalidBoundedText::Blank)
+        } else if raw.len() > MAX_TRIGGER_CHARACTER_BYTES {
+            Some(InvalidBoundedText::TooLong {
+                len: raw.len(),
+                max: MAX_TRIGGER_CHARACTER_BYTES,
+            })
+        } else {
+            None
+        };
+        fault.map_or(Ok(Self(raw)), |reason| {
+            Err(InvalidTextField::of(TextField::Trigger)(reason))
+        })
     }
 
     /// The trigger text, owned.
@@ -180,13 +208,7 @@ impl CompletionTrigger {
     }
 }
 
-impl TryFrom<String> for CompletionTrigger {
-    type Error = InvalidCompletionTrigger;
-
-    fn try_from(raw: String) -> Result<Self, Self::Error> {
-        Self::try_new(raw)
-    }
-}
+impl_text_newtype!(CompletionTrigger, InvalidTextField);
 
 /// Largest tab size a client may request for formatting.
 pub const MAX_TAB_SIZE: u32 = 32;
@@ -1970,6 +1992,40 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn test_text_fields_report_the_field_and_the_rule() {
+        let blank = NewName::new("  ").unwrap_err();
+        assert_eq!(blank.to_string(), "`new_name` cannot be empty");
+
+        let long = NewName::new("x".repeat(MAX_NEW_NAME_LENGTH + 1)).unwrap_err();
+        assert_eq!(
+            long.reason,
+            InvalidBoundedText::TooLong {
+                len: MAX_NEW_NAME_LENGTH + 1,
+                max: MAX_NEW_NAME_LENGTH,
+            }
+        );
+        assert_eq!(
+            NewName::new(" keeps spaces ").unwrap().as_str(),
+            " keeps spaces "
+        );
+
+        let empty = CompletionTrigger::new("").unwrap_err();
+        assert_eq!(empty.field, TextField::Trigger);
+        assert_eq!(empty.reason, InvalidBoundedText::Blank);
+        assert_eq!(CompletionTrigger::new(" ").unwrap().as_str(), " ");
+        assert!(CompletionTrigger::new("x".repeat(MAX_TRIGGER_CHARACTER_BYTES)).is_ok());
+        assert_eq!(
+            CompletionTrigger::new("x".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1))
+                .unwrap_err()
+                .reason,
+            InvalidBoundedText::TooLong {
+                len: MAX_TRIGGER_CHARACTER_BYTES + 1,
+                max: MAX_TRIGGER_CHARACTER_BYTES,
+            }
+        );
+    }
 
     const SECRET: &str = "SuperSecretValue123";
 

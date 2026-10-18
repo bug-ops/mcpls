@@ -11,7 +11,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::hierarchy_item_to_mcp;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, DisclosedCapability, PreparedDocument};
+use super::routing::PreparedDocument;
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -73,7 +73,6 @@ impl Translator {
             .disclosed_position_request::<lsp_types::CallHierarchyPrepareRequest>(
                 &file_path,
                 position,
-                DisclosedCapability::CallHierarchy,
                 (),
             )
             .await?;
@@ -169,10 +168,7 @@ impl Translator {
         let (raw, ctx, _doc): (Vec<RawCall>, EncodingCtx, PreparedDocument) = match direction {
             CallDirection::Incoming => {
                 let Positioned { result, ctx, doc } = self
-                    .item_request::<lsp_types::CallHierarchyIncomingCallsRequest>(
-                        item,
-                        Capability::CallHierarchy,
-                    )
+                    .item_request::<lsp_types::CallHierarchyIncomingCallsRequest>(item)
                     .await?;
                 let raw = result
                     .unwrap_or_default()
@@ -189,10 +185,7 @@ impl Translator {
             }
             CallDirection::Outgoing => {
                 let Positioned { result, ctx, doc } = self
-                    .item_request::<lsp_types::CallHierarchyOutgoingCallsRequest>(
-                        item,
-                        Capability::CallHierarchy,
-                    )
+                    .item_request::<lsp_types::CallHierarchyOutgoingCallsRequest>(item)
                     .await?;
                 let source_uri = doc.uri().clone();
                 let raw = result

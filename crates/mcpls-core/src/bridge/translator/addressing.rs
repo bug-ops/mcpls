@@ -19,6 +19,8 @@ use super::routing::Capability;
 use crate::bridge::ClientPath;
 use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
 use crate::bridge::state::uri_to_path;
+use crate::config::text_newtype::impl_text_newtype;
+use crate::config::{BoundedText, InvalidBoundedText};
 use crate::error::{Error, Result, SymbolCandidate, SymbolResolutionData};
 use crate::redaction::{Redactions, ServerText};
 
@@ -37,17 +39,6 @@ const MAX_WINDOW_LINES: u32 = 500;
 /// Lines of the document scanned to tell "referenced" from "absent".
 const MAX_SCAN_LINES: usize = 50_000;
 
-/// Why [`SymbolName::try_new`] rejected a name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum SymbolNameError {
-    /// The name is empty or only whitespace.
-    #[error("symbol names must not be blank")]
-    Blank,
-    /// The name is longer than [`MAX_SYMBOL_NAME_BYTES`].
-    #[error("symbol names must be at most {MAX_SYMBOL_NAME_BYTES} bytes")]
-    TooLong,
-}
-
 /// A validated symbol or container name: surrounding whitespace trimmed,
 /// non-blank and bounded.
 ///
@@ -56,12 +47,12 @@ pub enum SymbolNameError {
 /// ```
 /// use mcpls_core::bridge::SymbolName;
 ///
-/// assert_eq!(SymbolName::try_new("parse_config").unwrap().as_str(), "parse_config");
-/// assert_eq!(SymbolName::try_new(" parse_config ").unwrap().as_str(), "parse_config");
-/// assert!(SymbolName::try_new("  ").is_err());
+/// assert_eq!(SymbolName::new("parse_config").unwrap().as_str(), "parse_config");
+/// assert_eq!(SymbolName::new(" parse_config ").unwrap().as_str(), "parse_config");
+/// assert!(SymbolName::new("  ").is_err());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SymbolName(String);
+pub struct SymbolName(BoundedText<MAX_SYMBOL_NAME_BYTES>);
 
 impl SymbolName {
     /// Validate `raw` after trimming surrounding whitespace, which is not
@@ -69,25 +60,14 @@ impl SymbolName {
     ///
     /// # Errors
     ///
-    /// [`SymbolNameError::Blank`] or [`SymbolNameError::TooLong`] (judged on
-    /// the trimmed text).
-    pub fn try_new(raw: impl Into<String>) -> std::result::Result<Self, SymbolNameError> {
-        let raw = raw.into().trim().to_string();
-        if raw.is_empty() {
-            return Err(SymbolNameError::Blank);
-        }
-        if raw.len() > MAX_SYMBOL_NAME_BYTES {
-            return Err(SymbolNameError::TooLong);
-        }
-        Ok(Self(raw))
-    }
-
-    /// The name text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// [`InvalidBoundedText`] when the trimmed text is blank or longer than
+    /// [`MAX_SYMBOL_NAME_BYTES`].
+    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, InvalidBoundedText> {
+        BoundedText::new(raw.into().trim()).map(Self)
     }
 }
+
+impl_text_newtype!(SymbolName, InvalidBoundedText);
 
 /// A symbol named by the caller, optionally narrowed by kind and container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,22 +712,25 @@ mod tests {
 
     fn query(name: &str, kind: Option<SymbolKind>, container: Option<&str>) -> SymbolQuery {
         SymbolQuery {
-            name: SymbolName::try_new(name).unwrap(),
+            name: SymbolName::new(name).unwrap(),
             kind,
-            container: container.map(|c| SymbolName::try_new(c).unwrap()),
+            container: container.map(|c| SymbolName::new(c).unwrap()),
         }
     }
 
     #[test]
     fn symbol_names_reject_blank_and_oversized_text() {
-        assert_eq!(SymbolName::try_new("  parse ").unwrap().as_str(), "parse");
-        assert_eq!(SymbolName::try_new(""), Err(SymbolNameError::Blank));
-        assert_eq!(SymbolName::try_new(" \t"), Err(SymbolNameError::Blank));
+        assert_eq!(SymbolName::new("  parse ").unwrap().as_str(), "parse");
+        assert_eq!(SymbolName::new(""), Err(InvalidBoundedText::Blank));
+        assert_eq!(SymbolName::new(" \t"), Err(InvalidBoundedText::Blank));
         assert_eq!(
-            SymbolName::try_new("x".repeat(MAX_SYMBOL_NAME_BYTES + 1)),
-            Err(SymbolNameError::TooLong)
+            SymbolName::new("x".repeat(MAX_SYMBOL_NAME_BYTES + 1)),
+            Err(InvalidBoundedText::TooLong {
+                len: MAX_SYMBOL_NAME_BYTES + 1,
+                max: MAX_SYMBOL_NAME_BYTES
+            })
         );
-        assert!(SymbolName::try_new("x".repeat(MAX_SYMBOL_NAME_BYTES)).is_ok());
+        assert!(SymbolName::new("x".repeat(MAX_SYMBOL_NAME_BYTES)).is_ok());
     }
 
     #[test]
@@ -995,9 +978,9 @@ mod resolver_tests {
 
     fn query_target(name: &str, kind: Option<SymbolKind>, container: Option<&str>) -> SymbolTarget {
         SymbolTarget::Name(SymbolQuery {
-            name: SymbolName::try_new(name).unwrap(),
+            name: SymbolName::new(name).unwrap(),
             kind,
-            container: container.map(|c| SymbolName::try_new(c).unwrap()),
+            container: container.map(|c| SymbolName::new(c).unwrap()),
         })
     }
 

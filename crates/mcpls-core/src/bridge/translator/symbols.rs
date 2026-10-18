@@ -1,8 +1,8 @@
 //! Document symbols and workspace symbol search handlers.
 
 use lsp_types::{
-    DocumentSymbol, DocumentSymbolParams, PartialResultParams, TextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceSymbolParams as LspWorkspaceSymbolParams,
+    DocumentSymbol, PartialResultParams, WorkDoneProgressParams,
+    WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 
 use super::Translator;
@@ -13,6 +13,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
+use super::positioned::document_request;
 use super::routing::{
     Capability, FileLocalCapability, IndexingGate, PreparedDocument, WorkspaceRouteLookup,
     lookup_workspace_route,
@@ -201,17 +202,7 @@ impl Translator {
         doc: PreparedDocument,
     ) -> Result<FetchedSymbols> {
         let ctx = self.encoding_ctx(doc.server_id());
-        let params = DocumentSymbolParams {
-            text_document: TextDocumentIdentifier {
-                uri: doc.uri().clone(),
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-        let client = doc.client();
-        let response = client
-            .request_typed::<lsp_types::DocumentSymbolRequest>(params, client.request_timeout())
-            .await?;
+        let response = document_request::<lsp_types::DocumentSymbolRequest>(&doc, ()).await?;
         Ok(FetchedSymbols { doc, ctx, response })
     }
 

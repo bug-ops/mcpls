@@ -13,7 +13,7 @@ use super::dto::{
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
-use super::positioned::{FromPosition, Positioned};
+use super::positioned::{FromPosition, GotoRequest, Positioned};
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
@@ -520,10 +520,9 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
     ) -> Result<NormalizedLocations>
     where
-        R: lsp_types::Request<Result = Option<T>>,
+        R: GotoRequest + lsp_types::Request<Result = Option<T>>,
         R::Params: FromPosition<Extra = ()>,
         T: GotoResponse,
     {
@@ -532,7 +531,12 @@ impl Translator {
             ctx,
             doc: _doc,
         } = self
-            .position_request::<R>(file_path, position, IndexingGate::Required(capability), ())
+            .position_request::<R>(
+                file_path,
+                position,
+                IndexingGate::Required(R::CAPABILITY),
+                (),
+            )
             .await?;
 
         Ok(goto_response_to_locations(response, &ctx).await)
@@ -553,11 +557,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<DefinitionResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DefinitionRequest, _>(
-                &file_path,
-                position,
-                Capability::Definition,
-            )
+            .handle_goto::<lsp_types::DefinitionRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -613,11 +613,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::ImplementationRequest, _>(
-                &file_path,
-                position,
-                Capability::Implementation,
-            )
+            .handle_goto::<lsp_types::ImplementationRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -640,11 +636,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
-                &file_path,
-                position,
-                Capability::TypeDefinition,
-            )
+            .handle_goto::<lsp_types::TypeDefinitionRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -668,11 +660,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DeclarationRequest, _>(
-                &file_path,
-                position,
-                Capability::Declaration,
-            )
+            .handle_goto::<lsp_types::DeclarationRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
