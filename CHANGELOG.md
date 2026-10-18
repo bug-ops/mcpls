@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `get_completions` rejects an empty `trigger` while parsing (#745) (#778).
+- A known MCP method with undecodable params answers `-32602` instead of `-32601` (#750) (#778).
+- Client-supplied paths, resource URIs, pagination cursors and method names are escaped and bounded in error messages (#749) (#778).
+- A JSON-RPC response carrying both `result` and `error` keeps the error code, so a `-32801` still retries (#737) (#778).
+- A lost-publish batch re-checks the diagnostics role after resolving, announces only files whose view changed, and republished files are delivered in arrival order (#742) (#778).
+- A lost mark under a lexical fallback path marks the symlinked file's entry, the mailbox byte budget counts URI bytes, the dropped-frame log escapes the method, and Windows environment variable names fold case over the Basic Multilingual Plane only (#738) (#778).
+
+### Changed
+
+- Error variants no longer repeat their source in `Display`, and `ErrorChain` renders every cause once (#735) (#778).
+- A diagnostics list is serialized once per publish; its size is recorded when it is bounded (#743) (#778).
+- Whole-document requests and the name-addressed tools share one request path each (`FromDocument`, `addressed`) (#746) (#778).
+- **Breaking:** `LspServer::spawn` returns `SpawnedServer { server, lanes }`, `ServerStartOutcome::Started` holds a `SpawnedServer`, and the `take_*` receivers are gone (#744) (#778).
+- **Breaking:** `NewName`, `CompletionTrigger` and `SymbolName` use `new` instead of `try_new` and report `InvalidTextField`/`TextField`; `InvalidNewName`, `InvalidCompletionTrigger` and `SymbolNameError` are removed, and an empty `trigger` is invalid (#745) (#778).
+- **Breaking:** `Error::ServerNotFound` renames `source` to `io`, and the `Display` of `McpServerStart`, `TaskFailed`, `HttpBind`, `Json`, `ServerSpawnFailed` and `ConfigError::UnsupportedFilePattern` no longer includes the cause; use `ErrorChain` (#735) (#778).
+- **Breaking:** the `DefinitionResult`, `ReferencesResult` and `DiagnosticSeverity` aliases, `Translator::is_document_open` (now `open_state`), the `lsp::HostOs` re-export and `Serialize` on `JsonRpcResponse` are removed, and the launcher detail enums are `#[non_exhaustive]` (#748) (#778).
+
 ## [0.7.0] - 2026-10-07
 
 ### Added

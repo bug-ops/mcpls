@@ -9,7 +9,7 @@ use super::dto::{
 };
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, DisclosedCapability, IndexingGate};
+use super::routing::{Capability, IndexingGate};
 use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
@@ -177,12 +177,7 @@ impl Translator {
             ctx,
             doc: _doc,
         } = self
-            .disclosed_position_request::<lsp_types::SignatureHelpRequest>(
-                &file_path,
-                position,
-                DisclosedCapability::SignatureHelp,
-                (),
-            )
+            .disclosed_position_request::<lsp_types::SignatureHelpRequest>(&file_path, position, ())
             .await?;
 
         let result = match response {
@@ -241,12 +236,7 @@ impl Translator {
             ctx,
             doc,
         } = self
-            .disclosed_range_request::<lsp_types::InlayHintRequest>(
-                &file_path,
-                DisclosedCapability::InlayHints,
-                range,
-                (),
-            )
+            .disclosed_range_request::<lsp_types::InlayHintRequest>(&file_path, range, ())
             .await?;
         let uri = doc.uri();
 

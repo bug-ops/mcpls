@@ -8,6 +8,9 @@
 ///   `DEFAULT` (documented by `$doc`), `Default`, `TryFrom<$prim>` and
 ///   `From<$ty> for $prim`, where `$into` is a closure from the value to
 ///   `$prim`.
+/// - `$ty, $prim, infallible, default = $default, $doc, into = $into` is the
+///   form for a type whose `const fn new(prim) -> Self` accepts every value: it
+///   generates `DEFAULT`, `Default`, `From<$prim>` and `From<$ty> for $prim`.
 /// - `@default $ty, $default, $doc` generates only `DEFAULT` and `Default`.
 /// - `@convert [generics] $ty, $prim, $err, $into` generates only the
 ///   conversions, for a generic type.
@@ -41,6 +44,30 @@ macro_rules! impl_bounded_number {
         }
 
         impl<$($gen)*> ::std::convert::From<$ty> for $prim {
+            fn from(value: $ty) -> Self {
+                ($into)(value)
+            }
+        }
+    };
+    ($ty:ty, $prim:ty, infallible, default = $default:expr, $doc:literal, into = $into:expr) => {
+        impl $ty {
+            #[doc = $doc]
+            pub const DEFAULT: Self = Self::new($default);
+        }
+
+        impl ::std::default::Default for $ty {
+            fn default() -> Self {
+                Self::DEFAULT
+            }
+        }
+
+        impl ::std::convert::From<$prim> for $ty {
+            fn from(value: $prim) -> Self {
+                Self::new(value)
+            }
+        }
+
+        impl ::std::convert::From<$ty> for $prim {
             fn from(value: $ty) -> Self {
                 ($into)(value)
             }

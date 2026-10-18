@@ -195,7 +195,7 @@ impl<K: KindFilter> KindFilterInput<K> {
             ))),
             Self::Rejected(Rejection::Unknown(rejected)) => Err(Error::InvalidToolParams(format!(
                 "Invalid {field}: '{}'. Valid values: {}",
-                rejected.as_str(),
+                crate::util::escape_bounded(rejected.as_str(), MAX_SYMBOL_NAME_BYTES),
                 K::valid_values()
             ))),
         }
@@ -380,6 +380,28 @@ mod tests {
         }
         assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::SourceFixAll));
         assert!(CodeActionKindFilter::ALL.contains(&CodeActionKindFilter::RefactorMove));
+    }
+
+    /// A variant added without an arm here does not compile; one left out of
+    /// `ALL` breaks the contiguous ranks asserted below.
+    #[test]
+    fn test_code_action_all_lists_every_variant_once_in_order() {
+        const fn rank(kind: CodeActionKindFilter) -> usize {
+            match kind {
+                CodeActionKindFilter::QuickFix => 0,
+                CodeActionKindFilter::Refactor => 1,
+                CodeActionKindFilter::RefactorExtract => 2,
+                CodeActionKindFilter::RefactorInline => 3,
+                CodeActionKindFilter::RefactorMove => 4,
+                CodeActionKindFilter::RefactorRewrite => 5,
+                CodeActionKindFilter::Source => 6,
+                CodeActionKindFilter::SourceOrganizeImports => 7,
+                CodeActionKindFilter::SourceFixAll => 8,
+            }
+        }
+        let ranks: Vec<usize> = CodeActionKindFilter::ALL.map(rank).to_vec();
+        assert_eq!(ranks, (0..ranks.len()).collect::<Vec<_>>());
+        assert_eq!(rank(CodeActionKindFilter::SourceFixAll) + 1, ranks.len());
     }
 
     type CodeAction = KindFilterInput<CodeActionKindFilter>;

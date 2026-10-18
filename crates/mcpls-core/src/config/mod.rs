@@ -17,7 +17,7 @@ mod routing;
 mod server;
 mod server_env;
 mod settings;
-mod text_newtype;
+pub(crate) mod text_newtype;
 mod trust;
 mod workspace_root;
 

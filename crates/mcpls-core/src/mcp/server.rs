@@ -12,11 +12,11 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, Implementation, ListResourcesResult,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
-    ServerConfig as RmcpServerConfig, SubscribeRequestParams, SubscriptionFilter, ToolAnnotations,
-    UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult, ErrorCode,
+    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerConfig as RmcpServerConfig, SubscribeRequestParams,
+    SubscriptionFilter, ToolAnnotations, UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use super::custom_request;
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
 use super::schema_shape::shape_tool_schemas;
@@ -42,18 +43,19 @@ use crate::bridge::resources::{
 };
 use crate::bridge::{
     AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
-    ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
-    DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
-    DocumentHighlightsResult, DocumentSymbolsResult, DocumentVersion, FoldingRangesResult,
+    ClientPath, CodeActionsResult, CompletionsResult, DiagnosticInfo, DiagnosticsAvailability,
+    DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult, DocumentHighlightsResult,
+    DocumentOpenState, DocumentSymbolsResult, DocumentVersion, FoldingRangesResult,
     FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, Indexed,
     InlayHintsResult, KindFilter, KindFilterField, KindFilterInput, LocationsResult,
     NotificationCache, OutgoingCallsResult, Position, PositionEncoding, PositionRange,
-    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, RouteSignals,
-    SelectionRangesResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    PrepareRenameResult, RenameResult, RestartServerResult, RouteSignals, SelectionRangesResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator,
+    TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
+use crate::util::{MAX_ECHOED_NAME_BYTES, escape_bounded};
 
 /// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
 const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
@@ -382,7 +384,13 @@ fn paginate_resource_paths<'a>(
 
     let start = match cursor {
         Some(c) => c.parse::<usize>().map_err(|_| {
-            McpError::invalid_params(format!("invalid pagination cursor: {c}"), None)
+            McpError::invalid_params(
+                format!(
+                    "invalid pagination cursor: {}",
+                    escape_bounded(c, MAX_ECHOED_NAME_BYTES)
+                ),
+                None,
+            )
         })?,
         None => 0,
     };
@@ -466,19 +474,6 @@ struct ResourceDiagnosticsResponse {
     signals: RouteSignals,
 }
 
-/// Whether a file is currently open through `DocumentTracker`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentState {
-    Open,
-    NotOpen,
-}
-
-impl DocumentState {
-    const fn of(open: bool) -> Self {
-        if open { Self::Open } else { Self::NotOpen }
-    }
-}
-
 impl ResourceDiagnosticsResponse {
     /// Builds `read_resource`'s response for a file. `tracked` is true when the
     /// file is open (`document`) *or* the diagnostics cache already holds an
@@ -489,13 +484,13 @@ impl ResourceDiagnosticsResponse {
     /// `tracked: false` while `diagnostics` is still non-empty, contradicting
     /// the documented "untracked implies empty diagnostics" contract.
     fn new(
-        document: DocumentState,
+        document: DocumentOpenState,
         entry: Option<&DiagnosticInfo>,
         availability: DiagnosticsAvailability,
         signals: RouteSignals,
     ) -> Self {
         Self {
-            tracked: document == DocumentState::Open || entry.is_some(),
+            tracked: document == DocumentOpenState::Open || entry.is_some(),
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
             availability,
@@ -705,20 +700,13 @@ impl McplsServer {
     )]
     async fn get_hover(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(target): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Addressed<HoverResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Hover,
-                    |file_path, position| translator.handle_hover(file_path, position),
-                )
-                .await,
-        )
+        self.addressed(target, AddressableTool::Hover, |file_path, position| {
+            translator.handle_hover(file_path, position)
+        })
+        .await
     }
 
     /// Get the definition location of a symbol.
@@ -728,25 +716,15 @@ impl McplsServer {
     )]
     async fn get_definition(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
-    ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Definition,
-                    |file_path, position| {
-                        translator.handle_definition(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::Definition,
+            |file_path, position| translator.handle_definition(file_path, position, context),
         )
+        .await
     }
 
     /// Find all references to a symbol.
@@ -757,30 +735,20 @@ impl McplsServer {
     async fn get_references(
         &self,
         Parameters(ReferencesParams {
-            target: SymbolTargetParams { file_path, target },
+            target,
             include_declaration,
             context,
         }): Parameters<ReferencesParams>,
-    ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::References,
-                    |file_path, position| {
-                        translator.handle_references(
-                            file_path,
-                            position,
-                            include_declaration,
-                            context,
-                        )
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::References,
+            |file_path, position| {
+                translator.handle_references(file_path, position, include_declaration, context)
+            },
         )
+        .await
     }
 
     /// Get diagnostics for a file.
@@ -852,23 +820,13 @@ impl McplsServer {
     )]
     async fn rename_symbol(
         &self,
-        Parameters(RenameParams {
-            target: SymbolTargetParams { file_path, target },
-            new_name,
-        }): Parameters<RenameParams>,
+        Parameters(RenameParams { target, new_name }): Parameters<RenameParams>,
     ) -> Result<Json<Addressed<RenameResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Rename,
-                    |file_path, position| translator.handle_rename(file_path, position, new_name),
-                )
-                .await,
-        )
+        self.addressed(target, AddressableTool::Rename, |file_path, position| {
+            translator.handle_rename(file_path, position, new_name)
+        })
+        .await
     }
 
     /// Get code completion suggestions.
@@ -993,23 +951,16 @@ impl McplsServer {
     )]
     async fn prepare_call_hierarchy(
         &self,
-        Parameters(SymbolTargetParams { file_path, target }): Parameters<SymbolTargetParams>,
+        Parameters(target): Parameters<SymbolTargetParams>,
     ) -> Result<Json<Indexed<Addressed<CallHierarchyPrepareResult>>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::PrepareCallHierarchy,
-                    |file_path, position| {
-                        translator.handle_call_hierarchy_prepare(file_path, position)
-                    },
-                )
-                .await
-                .map(hoist_indexing),
+        self.addressed_as(
+            target,
+            AddressableTool::PrepareCallHierarchy,
+            |file_path, position| translator.handle_call_hierarchy_prepare(file_path, position),
+            hoist_indexing,
         )
+        .await
     }
 
     /// Get incoming calls (callers).
@@ -1318,25 +1269,15 @@ impl McplsServer {
     )]
     async fn go_to_implementation(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::Implementation,
-                    |file_path, position| {
-                        translator.handle_implementation(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::Implementation,
+            |file_path, position| translator.handle_implementation(file_path, position, context),
         )
+        .await
     }
 
     /// Go to type definition location.
@@ -1346,25 +1287,15 @@ impl McplsServer {
     )]
     async fn go_to_type_definition(
         &self,
-        Parameters(NavigationParams {
-            target: SymbolTargetParams { file_path, target },
-            context,
-        }): Parameters<NavigationParams>,
+        Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
     ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
-        let (file_path, target) = parse_target(file_path, target)?;
         let translator = &self.context.translator;
-        self.structured_result(
-            translator
-                .with_resolved_target(
-                    file_path,
-                    target,
-                    AddressableTool::TypeDefinition,
-                    |file_path, position| {
-                        translator.handle_type_definition(file_path, position, context)
-                    },
-                )
-                .await,
+        self.addressed(
+            target,
+            AddressableTool::TypeDefinition,
+            |file_path, position| translator.handle_type_definition(file_path, position, context),
         )
+        .await
     }
 
     /// Go to declaration location.
@@ -1472,6 +1403,47 @@ impl McplsServer {
         render_error(error, &self.context.translator.server_text_redactions())
     }
 
+    /// Runs a name-addressable tool: parses the target, resolves a name to a
+    /// position, calls `call` there and wraps the answer with the resolved
+    /// symbol.
+    async fn addressed<T, F, Fut>(
+        &self,
+        target: SymbolTargetParams,
+        tool: AddressableTool,
+        call: F,
+    ) -> Result<Json<Addressed<T>>, McpError>
+    where
+        Addressed<T>: Serialize + JsonSchema + ServerText,
+        F: FnOnce(ClientPath, Position) -> Fut,
+        Fut: Future<Output = crate::error::Result<T>>,
+    {
+        self.addressed_as(target, tool, call, std::convert::identity)
+            .await
+    }
+
+    /// As [`Self::addressed`], reshaping the addressed answer with `finish`
+    /// before it is returned.
+    async fn addressed_as<T, O, F, Fut>(
+        &self,
+        SymbolTargetParams { file_path, target }: SymbolTargetParams,
+        tool: AddressableTool,
+        call: F,
+        finish: fn(Addressed<T>) -> O,
+    ) -> Result<Json<O>, McpError>
+    where
+        O: Serialize + JsonSchema + ServerText,
+        F: FnOnce(ClientPath, Position) -> Fut,
+        Fut: Future<Output = crate::error::Result<T>>,
+    {
+        let (file_path, target) = parse_target(file_path, target)?;
+        let answer = self
+            .context
+            .translator
+            .with_resolved_target(file_path, target, tool, call)
+            .await;
+        self.structured_result(answer.map(finish))
+    }
+
     /// [`to_structured_tool_result`] with the secrets of every live server
     /// hidden from the result's display prose.
     fn structured_result<T: Serialize + JsonSchema + ServerText>(
@@ -1496,11 +1468,7 @@ impl McplsServer {
         // lock is released, since `diagnostics_pump` needs the same lock.
         let diag_info = snapshot.sources.merge();
         Ok(ResourceDiagnosticsResponse::new(
-            DocumentState::of(
-                self.context
-                    .translator
-                    .is_document_open(validated_path.as_path()),
-            ),
+            self.context.translator.open_state(validated_path.as_path()),
             diag_info.as_ref(),
             snapshot.availability,
             snapshot.signals,
@@ -1680,6 +1648,27 @@ const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Erro
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McplsServer {
+    /// The SDK default answers every undecodable request with "method not
+    /// found" and the method name; see `custom_request::answer`.
+    ///
+    /// The session kind follows rmcp's rule through its public API: a session
+    /// is legacy (opened with `initialize`) unless its protocol version has no
+    /// `initialize`. rmcp's own check also looks at whether the session was
+    /// opened by `server/discover`, which is not public; a session opened
+    /// without `initialize` whose request declares a pre-2026-07-28 version in
+    /// `_meta` is therefore read as legacy here.
+    // TODO(#776): reject a well-formed repeated `initialize` with -32600
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        let legacy = context
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize());
+        Err(custom_request::answer(&request, legacy))
+    }
+
     async fn list_resources(
         &self,
         request: Option<rmcp::model::PaginatedRequestParams>,
@@ -2306,6 +2295,23 @@ mod tests {
         assert!(mapped.message.contains("a.rs"), "{}", mapped.message);
     }
 
+    /// #735: a spawn failure's OS cause reaches the client once, though it is
+    /// no longer part of the variant's own message.
+    #[test]
+    fn test_map_bridge_error_carries_the_spawn_cause_once() {
+        let spawn = crate::error::Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
+            source: std::io::Error::other("exec format error"),
+        };
+        let mapped = map_bridge_error(spawn);
+        assert_eq!(
+            mapped.message.matches("exec format error").count(),
+            1,
+            "{}",
+            mapped.message
+        );
+    }
+
     /// #720: a secret carried by a chained cause is still hidden by the funnel.
     #[test]
     fn test_render_error_hides_secrets_in_the_rendered_chain() {
@@ -2730,7 +2736,7 @@ mod tests {
         assert_eq!(pulled["indexing_in_progress"], false);
 
         let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -2805,7 +2811,7 @@ mod tests {
                 server
                     .rename_symbol(Parameters(RenameParams {
                         target: position(line, character).into(),
-                        new_name: NewName::try_new("x").unwrap(),
+                        new_name: NewName::new("x").unwrap(),
                     }))
                     .await
                     .map(|_| ()),
@@ -2867,7 +2873,7 @@ mod tests {
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     },
                 )),
             }));
@@ -3660,7 +3666,7 @@ mod tests {
         })
         .unwrap();
         let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             signals,
@@ -3782,7 +3788,7 @@ mod tests {
                 character: 5,
             }
             .into(),
-            new_name: NewName::try_new("new_name").unwrap(),
+            new_name: NewName::new("new_name").unwrap(),
         });
 
         let result = server.rename_symbol(params).await;
@@ -4659,7 +4665,7 @@ sleep 0.3
             std::sync::Arc::default(),
         );
 
-        let seed = LspServer::spawn(config).await.unwrap();
+        let seed = LspServer::spawn(config).await.unwrap().server;
 
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
@@ -4796,7 +4802,7 @@ sleep 0.3
             command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                 command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }]);
         translator.rebind_router(&std::collections::HashSet::new());
@@ -5299,7 +5305,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5318,7 +5324,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5356,7 +5362,7 @@ sleep 0.3
             data: None,
         }]);
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5372,7 +5378,7 @@ sleep 0.3
         assert_eq!(json["diagnostics"][0]["message"], "boom");
     }
 
-    /// A path `read_resource` never opened reports `is_document_open() == false`
+    /// A path `read_resource` never opened reports `open_state() == NotOpen`
     /// -- one of the two inputs `ResourceDiagnosticsResponse::new` ORs together.
     #[tokio::test]
     async fn test_read_resource_untracked_path_is_not_open() {
@@ -5380,14 +5386,14 @@ sleep 0.3
         let tracked = server
             .context
             .translator
-            .is_document_open(std::path::Path::new("/never/opened.rs"));
-        assert!(!tracked);
+            .open_state(std::path::Path::new("/never/opened.rs"));
+        assert_eq!(tracked, DocumentOpenState::NotOpen);
     }
 
     #[test]
     fn test_resource_diagnostics_response_new_neither_open_nor_cached_is_untracked() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5399,7 +5405,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_open_but_uncached_is_tracked() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5438,7 +5444,7 @@ sleep 0.3
         }]);
 
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5457,7 +5463,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_flags_push_degraded() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {
@@ -5477,7 +5483,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_flags_indexing_in_progress() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {
@@ -5639,6 +5645,16 @@ sleep 0.3
         server: McplsServer,
         params: serde_json::Value,
     ) -> serde_json::Value {
+        request_over_the_wire(server, "tools/call", params).await.0
+    }
+
+    /// As [`tools_call_over_the_wire`] for any `method`; also returns the
+    /// byte length of the response line.
+    async fn request_over_the_wire(
+        server: McplsServer,
+        method: &str,
+        params: serde_json::Value,
+    ) -> (serde_json::Value, usize) {
         use rmcp::ServiceExt as _;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
@@ -5673,20 +5689,135 @@ sleep 0.3
             .await
             .unwrap();
         let call = send(serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 1, "method": method,
             "params": params,
         }));
         client_write.write_all(call.as_bytes()).await.unwrap();
 
-        let response = loop {
-            let line = lines.next_line().await.unwrap().unwrap();
-            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if message["id"] == 1 {
-                break message;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["id"] == 1 {
+                    break (message, line.len());
+                }
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no response to {method}"));
         serving.abort();
         response
+    }
+
+    /// #750: a served method whose params do not decode is `-32602`, a method
+    /// mcpls does not serve stays `-32601`.
+    #[tokio::test]
+    async fn test_undecodable_requests_are_invalid_params_over_the_wire() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        for (method, params, code) in [
+            (
+                "tools/call",
+                serde_json::json!({"name": "get_hover", "arguments": []}),
+                -32602,
+            ),
+            ("tools/call", serde_json::json!({"name": 5}), -32602),
+            ("tools/call", serde_json::json!({}), -32602),
+            ("resources/read", serde_json::json!({}), -32602),
+            ("resources/read", serde_json::json!({"uri": 5}), -32602),
+            ("resources/subscribe", serde_json::json!({}), -32602),
+            ("resources/unsubscribe", serde_json::json!({}), -32602),
+            ("initialize", serde_json::json!({}), -32602),
+            ("foo/bar", serde_json::json!({}), -32601),
+        ] {
+            let (response, _) =
+                request_over_the_wire(server_over(workspace.path()), method, params.clone()).await;
+
+            assert_eq!(
+                response["error"]["code"], code,
+                "{method} {params}: {response}"
+            );
+            if code == -32602 {
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.starts_with(&format!("invalid params for `{method}`: ")),
+                    "{message:.120}"
+                );
+            }
+        }
+    }
+
+    /// #749: a 1 MiB client string echoed in an error leaves the response
+    /// within the message cap plus the envelope, the code unchanged.
+    #[tokio::test]
+    async fn test_oversized_client_strings_stay_bounded_in_error_responses() {
+        const ENVELOPE: usize = 512;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = workspace.path().display().to_string();
+        let big = "Z".repeat(1 << 20);
+        let hover = |file_path: String| {
+            (
+                "tools/call".to_owned(),
+                serde_json::json!({
+                    "name": "get_hover",
+                    "arguments": {"file_path": file_path, "line": 1, "character": 1},
+                }),
+                -32602,
+            )
+        };
+        let call =
+            |method: &str, params: serde_json::Value, code: i64| (method.to_owned(), params, code);
+        let rows = [
+            hover(if cfg!(windows) {
+                format!(r"C:\{big}")
+            } else {
+                format!("/{big}")
+            }),
+            hover(format!("{root}/{}", "a".repeat(5000))),
+            hover(format!("{root}/{}", "a".repeat(300_000))),
+            call(
+                "resources/read",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call("resources/read", serde_json::json!({"uri": big}), -32602),
+            call(
+                "resources/read",
+                serde_json::json!({"uri": format!("lsp-diagnostics:///{big}")}),
+                -32602,
+            ),
+            call(
+                "resources/subscribe",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call(
+                "resources/unsubscribe",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call("resources/list", serde_json::json!({"cursor": big}), -32602),
+            call(&format!("x/{big}"), serde_json::json!({}), -32601),
+        ];
+        for (index, (method, params, code)) in rows.into_iter().enumerate() {
+            let (response, len) =
+                request_over_the_wire(server_over(workspace.path()), &method, params).await;
+
+            assert_eq!(response["error"]["code"], code, "{response}");
+            assert!(
+                len <= crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES + ENVELOPE,
+                "{len} bytes for {method:.40}"
+            );
+            // Rows 1 and 2 are file names whose error text depends on the OS.
+            if !matches!(index, 1 | 2) {
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(crate::util::TRUNCATION_MARKER)),
+                    "no truncation marker in {:.200}",
+                    response.to_string()
+                );
+            }
+        }
     }
 
     /// #575: a malformed `file_path` is reported as `-32602` by the real tool
@@ -6229,7 +6360,7 @@ sleep 0.3
                     command: ServerCommand::from_static("rust-analyzer"),
                     reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
                 translator.rebind_router(&HashSet::new());
@@ -6713,7 +6844,7 @@ sleep 0.3
             McpTool::RenameSymbol => server
                 .rename_symbol(Parameters(RenameParams {
                     target: position().into(),
-                    new_name: NewName::try_new("renamed").unwrap(),
+                    new_name: NewName::new("renamed").unwrap(),
                 }))
                 .await
                 .map(|_| ()),

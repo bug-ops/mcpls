@@ -19,28 +19,22 @@ pub enum InvalidEnvKey {
     ForbiddenChar,
 }
 
-const fn is_valid_env_key(key: &str) -> bool {
+const fn env_key_fault(key: &str) -> Option<InvalidEnvKey> {
     if key.is_empty() {
-        return false;
+        return Some(InvalidEnvKey::Empty);
     }
     let mut rest = key.as_bytes();
     while let [byte, tail @ ..] = rest {
         if matches!(byte, b'=' | 0) {
-            return false;
+            return Some(InvalidEnvKey::ForbiddenChar);
         }
         rest = tail;
     }
-    true
+    None
 }
 
-const fn check_env_key(key: &str) -> Result<(), InvalidEnvKey> {
-    if key.is_empty() {
-        Err(InvalidEnvKey::Empty)
-    } else if is_valid_env_key(key) {
-        Ok(())
-    } else {
-        Err(InvalidEnvKey::ForbiddenChar)
-    }
+const fn keep_env_key_fault(_: &str, fault: InvalidEnvKey) -> InvalidEnvKey {
+    fault
 }
 
 /// The name of an environment variable: non-empty, with no `=` and no NUL, so
@@ -70,8 +64,8 @@ impl AsRef<std::ffi::OsStr> for EnvKey {
 impl_text_newtype!(
     EnvKey,
     InvalidEnvKey,
-    checked = check_env_key,
-    valid = is_valid_env_key,
+    fault = env_key_fault,
+    explain = keep_env_key_fault,
     "environment variable name"
 );
 
@@ -94,16 +88,31 @@ struct HostKey(String);
 impl HostKey {
     fn of(name: &str, host: HostOs) -> Self {
         Self(match host {
-            HostOs::Windows => name.to_ascii_lowercase(),
+            HostOs::Windows => name.chars().map(windows_fold).collect(),
             HostOs::Other => name.to_owned(),
         })
+    }
+}
+
+/// The character Windows compares `c` as, approximately: its Unicode
+/// uppercase (the full mapping, not the simple one) when that is a single
+/// character and both stay in the Basic Multilingual Plane, `c` itself
+/// otherwise. Windows folds names with a per-UTF-16-unit table, so a
+/// supplementary-plane letter or a mapping that expands (`ß` to `SS`) does not
+/// fold. A character whose full mapping expands but whose simple mapping is one
+/// character (U+1F80) is left unfolded here although Windows folds it.
+fn windows_fold(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(folded), None) if c.len_utf16() == 1 && folded.len_utf16() == 1 => folded,
+        _ => c,
     }
 }
 
 /// Environment variable overrides for a server process.
 ///
 /// Holds at most one key per variable as the host compares names (exactly on
-/// Unix, ASCII-case-insensitively on Windows): the table is indexed by the
+/// Unix, case-insensitively as Windows compares names): the table is indexed by the
 /// host's comparison of the name, so a lookup or a write cannot meet two
 /// spellings of one variable and mcpls resolves the same value the child
 /// process sees. The host is fixed at construction, so a table built for one
@@ -114,8 +123,7 @@ impl HostKey {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::{EnvKey, ServerEnv};
-/// use mcpls_core::lsp::HostOs;
+/// use mcpls_core::config::{EnvKey, HostOs, ServerEnv};
 ///
 /// let mut env = ServerEnv::new(HostOs::Windows);
 /// env.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());
@@ -315,6 +323,22 @@ mod tests {
         let env = ServerEnv::from_entries(entries(&[("Path", "a"), ("PATH", "b")]), HostOs::Other)
             .unwrap();
         assert_eq!(env.get("PATH"), Some("b"));
+    }
+
+    #[test]
+    fn windows_folds_letters_in_the_basic_plane_only() {
+        let key = |name: &str| HostKey::of(name, HostOs::Windows);
+        assert_eq!(key("\u{e9}"), key("\u{c9}"));
+        assert_eq!(key("Path"), key("PATH"));
+        assert_ne!(key("\u{10428}"), key("\u{10400}"));
+        assert_ne!(key("\u{df}"), key("SS"));
+        assert_eq!(key("\u{df}"), key("\u{df}"));
+    }
+
+    #[test]
+    fn other_hosts_compare_names_exactly() {
+        let key = |name: &str| HostKey::of(name, HostOs::Other);
+        assert_ne!(key("\u{e9}"), key("\u{c9}"));
     }
 
     #[test]

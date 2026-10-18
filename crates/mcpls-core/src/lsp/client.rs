@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{ErrorCodes, LspErrorCodes};
+use lsp_types::{ErrorCodes, LspErrorCodes, PublishDiagnosticsParams};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -325,6 +325,28 @@ impl Clone for LspClient {
             connection_id: self.connection_id,
         }
     }
+}
+
+/// Where an inbound notification goes; see [`LspClient::route`].
+#[derive(Debug)]
+enum Route {
+    /// The diagnostics mailbox.
+    Mailbox(PublishDiagnosticsParams),
+    /// The log and `showMessage` lane.
+    Messages(ServerMessage),
+    /// The lifecycle lane.
+    Lifecycle(LspNotification),
+    /// Nowhere: the notification is deliberately not forwarded.
+    Floor,
+}
+
+/// What became of a routed notification.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    /// Sent to its lane, or there was nothing to send.
+    Delivered,
+    /// The lane was full or closed and the frame was dropped.
+    Dropped(Lane),
 }
 
 /// Commands for client control.
@@ -1039,59 +1061,82 @@ impl LspClient {
         crate::util::truncate_str(message, crate::util::MAX_LOG_STRING_BYTES)
     }
 
-    /// Which of the two notification lanes (P3) `notification` belongs on,
-    /// or `None` if it must be dropped before reaching either.
+    /// Decides where `notification` goes: the diagnostics mailbox, the
+    /// log/`showMessage` lane, the lifecycle lane, or nowhere (the floor).
     ///
-    /// `notification_tx` (returned as `"notification"`) carries diagnostics/
-    /// log/showMessage; `lifecycle_tx` (returned as `"lifecycle"`) carries
-    /// `$/progress` `begin`/`end` frames and `Other` (which carries e.g.
-    /// rust-analyzer's `experimental/serverStatus`) -- splitting them means
-    /// a high-volume diagnostics publisher can never starve out a
-    /// low-volume readiness signal, or vice versa. The lane name is
-    /// returned alongside the sender purely for the drop-warning log at the
-    /// call site (Fix 6) -- it plays no role in routing.
+    /// The notification lane (diagnostics, log, `showMessage`) and the
+    /// lifecycle lane (`$/progress` `begin`/`end` frames and `Other`, which
+    /// carries e.g. rust-analyzer's `experimental/serverStatus`) are split so
+    /// a high-volume diagnostics publisher can never starve out a low-volume
+    /// readiness signal, or vice versa.
     ///
     /// A `$/progress` `report` frame -- the high-volume case a
     /// `report`-per-package emitter like gopls can produce -- is classified
     /// via [`crate::lsp::types::ProgressKind::from_value`] (shared with
-    /// `bridge::indexing::IndexingTracker::observe_progress` so the two
-    /// can't drift out of sync on which `kind`s are recognized -- Fix 9)
-    /// and dropped before it ever reaches either channel (S3). An
-    /// *unparseable* `$/progress` notification
-    /// (e.g. missing the mandatory `token` field) falls back to
-    /// `LspNotification::Other { method: "$/progress", .. }` at parse time
-    /// (`LspNotification::parse`) rather than `Progress`, so it must be
-    /// dropped here too by matching on `method` -- otherwise a server whose
-    /// `report` payloads fail to deserialize could bypass the `kind`-based
-    /// filter above entirely by sending malformed frames (security LOW /
-    /// M1).
-    /// Whether `notification` is handed to the log/lifecycle lanes, as opposed
-    /// to the diagnostics mailbox or the floor.
-    fn reaches_a_lane(
-        notification: &LspNotification,
-        has_sink: bool,
-        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
-    ) -> bool {
+    /// `bridge::indexing::IndexingTracker::observe_progress` so the two can't
+    /// drift out of sync on which `kind`s are recognized) and goes to the
+    /// floor. So does an *unparseable* `$/progress` notification (e.g.
+    /// missing the mandatory `token` field), which falls back to
+    /// `LspNotification::Other { method: "$/progress", .. }` at parse time:
+    /// otherwise a server whose `report` payloads fail to deserialize could
+    /// bypass the `kind`-based filter with malformed frames.
+    fn route(notification: LspNotification, has_sink: bool, has_lifecycle: bool) -> Route {
         match notification {
-            LspNotification::PublishDiagnostics(_) => false,
-            LspNotification::LogMessage(_) | LspNotification::ShowMessage(_) => has_sink,
-            other => Self::lifecycle_lane(other, lifecycle_tx).is_some(),
+            LspNotification::PublishDiagnostics(params) if has_sink => Route::Mailbox(params),
+            LspNotification::LogMessage(params) if has_sink => {
+                Route::Messages(ServerMessage::Log(params))
+            }
+            LspNotification::ShowMessage(params) if has_sink => {
+                Route::Messages(ServerMessage::Show(params))
+            }
+            LspNotification::Progress(params)
+                if has_lifecycle
+                    && crate::lsp::types::ProgressKind::from_value(&params.value).is_some() =>
+            {
+                Route::Lifecycle(LspNotification::Progress(params))
+            }
+            LspNotification::Other { method, params }
+                if has_lifecycle && method.as_ref() != "$/progress" =>
+            {
+                Route::Lifecycle(LspNotification::Other { method, params })
+            }
+            _ => Route::Floor,
         }
     }
 
-    fn lifecycle_lane<'a>(
-        notification: &LspNotification,
-        lifecycle_tx: Option<&'a mpsc::Sender<LspNotification>>,
-    ) -> Option<&'a mpsc::Sender<LspNotification>> {
-        match notification {
-            LspNotification::PublishDiagnostics(_)
-            | LspNotification::LogMessage(_)
-            | LspNotification::ShowMessage(_) => None,
-            LspNotification::Progress(params) => {
-                crate::lsp::types::ProgressKind::from_value(&params.value).and(lifecycle_tx)
+    /// Sends `route` to its lane. The mailbox coalesces per file and records
+    /// what it cannot hold, so a diagnostics burst is never dropped
+    /// unrecorded; the other lanes report a full or closed channel.
+    fn deliver(
+        route: Route,
+        notification_tx: Option<&NotificationSink>,
+        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+    ) -> Delivery {
+        let sent = |lane, sent: bool| {
+            if sent {
+                Delivery::Delivered
+            } else {
+                Delivery::Dropped(lane)
             }
-            LspNotification::Other { method, .. } if method.as_ref() == "$/progress" => None,
-            LspNotification::Other { .. } => lifecycle_tx,
+        };
+        match (route, notification_tx, lifecycle_tx) {
+            (Route::Mailbox(params), Some(sink), _) => {
+                debug!(
+                    "Forwarding diagnostics for {}: {} items",
+                    params.uri.as_ref(),
+                    params.diagnostics.len()
+                );
+                sink.publishes().publish(params);
+                Delivery::Delivered
+            }
+            (Route::Messages(message), Some(sink), _) => sent(
+                Lane::Notification,
+                sink.messages().try_send(message).is_ok(),
+            ),
+            (Route::Lifecycle(notification), _, Some(tx)) => {
+                sent(Lane::Lifecycle, tx.try_send(notification).is_ok())
+            }
+            _ => Delivery::Delivered,
         }
     }
 
@@ -1296,49 +1341,18 @@ impl LspClient {
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
                 Self::redact_notification(&mut typed, redactions);
 
+                let route = Self::route(typed, notification_tx.is_some(), lifecycle_tx.is_some());
                 if tracing::enabled!(tracing::Level::TRACE)
-                    && Self::reaches_a_lane(&typed, notification_tx.is_some(), lifecycle_tx)
+                    && matches!(route, Route::Messages(_) | Route::Lifecycle(_))
                 {
                     trace!(
                         "Forwarding notification: {}",
-                        redactions.apply(&format!("{typed:?}"))
+                        redactions.apply(&format!("{route:?}"))
                     );
                 }
 
-                // Diagnostics have their own delivery path: the mailbox coalesces
-                // per file and records what it cannot hold, so a burst is never
-                // dropped unrecorded.
-                let delivered = match typed {
-                    LspNotification::PublishDiagnostics(params) => {
-                        if let Some(sink) = notification_tx {
-                            debug!(
-                                "Forwarding diagnostics for {}: {} items",
-                                params.uri.as_ref(),
-                                params.diagnostics.len()
-                            );
-                            sink.publishes().publish(params);
-                        }
-                        return Ok(());
-                    }
-                    LspNotification::LogMessage(params) => notification_tx.map(|sink| {
-                        (
-                            Lane::Notification,
-                            sink.messages().try_send(ServerMessage::Log(params)).is_ok(),
-                        )
-                    }),
-                    LspNotification::ShowMessage(params) => notification_tx.map(|sink| {
-                        (
-                            Lane::Notification,
-                            sink.messages()
-                                .try_send(ServerMessage::Show(params))
-                                .is_ok(),
-                        )
-                    }),
-                    other => Self::lifecycle_lane(&other, lifecycle_tx)
-                        .map(|tx| (Lane::Lifecycle, tx.try_send(other).is_ok())),
-                };
-
-                if let Some((lane, false)) = delivered {
+                if let Delivery::Dropped(lane) = Self::deliver(route, notification_tx, lifecycle_tx)
+                {
                     DropLog::of(lane).record(&notification.method);
                 }
             }
@@ -1462,6 +1476,7 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
 pub struct UnclassifiedError(Box<Unclassified>);
 
+// TODO(#777): drop the OnceLock copy once LspServerError has a struct payload
 /// An error response from the server, kept as the [`Error::LspServerError`] it
 /// becomes so a caller can classify it, and constructible from nothing else.
 #[derive(Debug)]
@@ -2047,25 +2062,29 @@ mod tests {
         assert!(reply.get("error").is_none());
     }
 
+    fn progress(value: serde_json::Value) -> LspNotification {
+        LspNotification::Progress(lsp_types::ProgressParams {
+            token: lsp_types::ProgressToken::Int(1),
+            value,
+        })
+    }
+
+    fn other(method: &'static str) -> LspNotification {
+        LspNotification::Other {
+            method: std::borrow::Cow::Borrowed(method),
+            params: None,
+        }
+    }
+
     /// S3 (Fix 7): a `report`-kind `$/progress` frame must never be
     /// enqueued on either notification lane -- the actual mechanism
     /// protecting against a `report`-per-package emitter like gopls
     /// overrunning the bounded lifecycle channel.
     #[test]
-    fn test_report_progress_frame_reaches_neither_lane() {
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+    fn test_report_progress_frame_goes_to_the_floor() {
+        let report = progress(serde_json::json!({ "kind": "report", "percentage": 50 }));
 
-        let report = LspNotification::Progress(lsp_types::ProgressParams {
-            token: lsp_types::ProgressToken::Int(1),
-            value: serde_json::json!({ "kind": "report", "percentage": 50 }),
-        });
-
-        let destination = LspClient::lifecycle_lane(&report, Some(&lifecycle_tx));
-
-        assert!(
-            destination.is_none(),
-            "a report-kind frame must be dropped before reaching either lane"
-        );
+        assert_matches!(LspClient::route(report, true, true), Route::Floor);
     }
 
     /// Fix 3 / M1: an unparseable `$/progress` notification (e.g. missing
@@ -2075,19 +2094,10 @@ mod tests {
     /// lifecycle lane, or a server whose payloads fail to deserialize could
     /// bypass the kind-based filter entirely.
     #[test]
-    fn test_malformed_progress_other_reaches_neither_lane() {
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
-
-        let malformed = LspNotification::Other {
-            method: std::borrow::Cow::Borrowed("$/progress"),
-            params: None,
-        };
-
-        let destination = LspClient::lifecycle_lane(&malformed, Some(&lifecycle_tx));
-
-        assert!(
-            destination.is_none(),
-            "a malformed $/progress frame must be dropped, not routed to the lifecycle lane"
+    fn test_malformed_progress_other_goes_to_the_floor() {
+        assert_matches!(
+            LspClient::route(other("$/progress"), true, true),
+            Route::Floor
         );
     }
 
@@ -2097,19 +2107,75 @@ mod tests {
     /// the report/malformed filters must not have overcorrected.
     #[test]
     fn test_begin_and_other_notifications_reach_lifecycle_lane() {
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+        let begin = progress(serde_json::json!({ "kind": "begin", "title": "Indexing" }));
+        let end = progress(serde_json::json!({ "kind": "end" }));
 
-        let begin = LspNotification::Progress(lsp_types::ProgressParams {
-            token: lsp_types::ProgressToken::Int(1),
-            value: serde_json::json!({ "kind": "begin", "title": "Indexing" }),
-        });
-        assert!(LspClient::lifecycle_lane(&begin, Some(&lifecycle_tx)).is_some());
+        for notification in [begin, end, other("experimental/serverStatus")] {
+            assert_matches!(
+                LspClient::route(notification, true, true),
+                Route::Lifecycle(_)
+            );
+        }
+    }
 
-        let server_status = LspNotification::Other {
-            method: std::borrow::Cow::Borrowed("experimental/serverStatus"),
-            params: Some(serde_json::json!({ "quiescent": false })),
+    #[test]
+    fn test_route_covers_every_notification_shape() {
+        let publish = || {
+            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+                uri: lsp_types::Uri::from("file:///a.rs".to_owned()),
+                diagnostics: Vec::new(),
+                version: None,
+            })
         };
-        assert!(LspClient::lifecycle_lane(&server_status, Some(&lifecycle_tx)).is_some());
+        let log = || {
+            LspNotification::LogMessage(lsp_types::LogMessageParams {
+                kind: lsp_types::MessageType::Info,
+                message: "m".to_owned(),
+            })
+        };
+        let show = || {
+            LspNotification::ShowMessage(lsp_types::ShowMessageParams {
+                kind: lsp_types::MessageType::Info,
+                message: "m".to_owned(),
+            })
+        };
+
+        assert_matches!(LspClient::route(publish(), true, false), Route::Mailbox(_));
+        assert_matches!(
+            LspClient::route(log(), true, false),
+            Route::Messages(ServerMessage::Log(_))
+        );
+        assert_matches!(
+            LspClient::route(show(), true, false),
+            Route::Messages(ServerMessage::Show(_))
+        );
+        for notification in [publish(), log(), show()] {
+            assert_matches!(LspClient::route(notification, false, true), Route::Floor);
+        }
+        for notification in [
+            progress(serde_json::json!({ "kind": "begin" })),
+            other("experimental/serverStatus"),
+        ] {
+            assert_matches!(LspClient::route(notification, true, false), Route::Floor);
+        }
+    }
+
+    #[test]
+    fn test_deliver_reports_the_lane_that_dropped_a_frame() {
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        drop(lifecycle_rx);
+
+        let delivery = LspClient::deliver(
+            Route::Lifecycle(other("experimental/serverStatus")),
+            None,
+            Some(&lifecycle_tx),
+        );
+
+        assert_eq!(delivery, Delivery::Dropped(Lane::Lifecycle));
+        assert_eq!(
+            LspClient::deliver(Route::Floor, None, Some(&lifecycle_tx)),
+            Delivery::Delivered
+        );
     }
 
     #[test]
@@ -3164,6 +3230,56 @@ mod tests {
 
             let result = request_task.await.unwrap();
             assert_eq!(result.unwrap(), expected_result);
+        }
+
+        /// #737: a frame carrying both `result` and `error` keeps the server's
+        /// code, so a -32801 in it still triggers the retry.
+        #[tokio::test]
+        async fn test_retry_follows_the_error_of_a_frame_with_both_result_and_error() {
+            let (client, mut server) = fake_lsp_client();
+
+            let request_task = tokio::spawn(async move {
+                client
+                    .request::<_, Value>(
+                        "textDocument/hover",
+                        serde_json::json!({}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let first = read_framed_message(&mut reader).await;
+            let both = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": first["id"],
+                "result": null,
+                "error": {
+                    "code": i32::from(LspErrorCodes::ContentModified),
+                    "message": "content modified",
+                    "data": { "retriggerRequest": true },
+                },
+            })
+            .to_string();
+            let frame = format!("Content-Length: {}\r\n\r\n{both}", both.len());
+            server
+                .read_half_stdin
+                .write_all(frame.as_bytes())
+                .await
+                .unwrap();
+            server.read_half_stdin.flush().await.unwrap();
+
+            let second = read_framed_message(&mut reader).await;
+            assert_ne!(first["id"], second["id"]);
+            let expected = serde_json::json!({ "contents": "resolved on retry" });
+            write_success_response(
+                &mut server.read_half_stdin,
+                &second["id"].clone(),
+                expected.clone(),
+            )
+            .await;
+
+            assert_eq!(request_task.await.unwrap().unwrap(), expected);
         }
 
         #[tokio::test]

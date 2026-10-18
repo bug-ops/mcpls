@@ -11,9 +11,11 @@
 /// literal check is a subset of `new`'s. `$what` names the value in the
 /// `from_static` panic message.
 ///
-/// The `checked` form generates the same pair for a `Cow<'static, str>`
-/// newtype with its own rules: `$check` is a `fn(&str) -> Result<(), $err>`
-/// and `$valid` a `const fn(&str) -> bool` that agree on what is valid.
+/// The `fault` form generates the same pair for a `Cow<'static, str>`
+/// newtype with its own rules: `$fault` is a `const fn(&str) -> Option<F>`
+/// naming the first rule the text breaks, and `$explain` a
+/// `fn(&str, F) -> $err` that turns it into the error. One rule table serves
+/// both `from_static` and `new`, so they cannot disagree.
 ///
 /// The `@impl` form is the shared tail for a generic type, taking its generic
 /// parameters in brackets.
@@ -66,7 +68,7 @@ macro_rules! impl_text_newtype {
 
         impl_text_newtype!(@impl [] $ty, $err);
     };
-    ($ty:ident, $err:ident, checked = $check:path, valid = $valid:path, $what:literal) => {
+    ($ty:ident, $err:ident, fault = $fault:path, explain = $explain:path, $what:literal) => {
         impl $ty {
             /// Builds the value from a literal, checked at compile time when
             /// evaluated in a `const` context.
@@ -76,7 +78,7 @@ macro_rules! impl_text_newtype {
             /// Panics if the literal is not a valid value of this type.
             #[must_use]
             pub const fn from_static(text: &'static str) -> Self {
-                assert!($valid(text), concat!("invalid ", $what));
+                assert!($fault(text).is_none(), concat!("invalid ", $what));
                 Self(::std::borrow::Cow::Borrowed(text))
             }
 
@@ -87,7 +89,9 @@ macro_rules! impl_text_newtype {
             #[doc = concat!("Returns [`", stringify!($err), "`] naming the first rule `text` breaks.")]
             pub fn new(text: impl Into<String>) -> ::std::result::Result<Self, $err> {
                 let text = text.into();
-                $check(&text)?;
+                if let ::std::option::Option::Some(fault) = $fault(&text) {
+                    return ::std::result::Result::Err($explain(&text, fault));
+                }
                 Ok(Self(::std::borrow::Cow::Owned(text)))
             }
         }
@@ -102,7 +106,7 @@ macro_rules! impl_text_newtype {
             /// The validated text.
             #[must_use]
             pub fn as_str(&self) -> &str {
-                &self.0
+                ::std::convert::AsRef::<str>::as_ref(&self.0)
             }
         }
 
@@ -160,4 +164,4 @@ macro_rules! impl_text_newtype {
     };
 }
 
-pub(super) use impl_text_newtype;
+pub(crate) use impl_text_newtype;

@@ -7,11 +7,13 @@ use std::time::Duration;
 use lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionContext, CodeActionParams, CompletionContext, CompletionParams, DeclarationParams,
-    DefinitionParams, DocumentHighlightParams, DocumentRangeFormattingParams, FormattingOptions,
+    DefinitionParams, DocumentDiagnosticParams, DocumentFormattingParams, DocumentHighlightParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, FoldingRangeParams, FormattingOptions,
     HoverParams, ImplementationParams, InlayHintParams, PartialResultParams, PrepareRenameParams,
-    ReferenceContext, ReferenceParams, RenameParams, SignatureHelpParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, TypeDefinitionParams, TypeHierarchyPrepareParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, WorkDoneProgressParams,
+    ReferenceContext, ReferenceParams, RenameParams, SelectionRangeParams, SignatureHelpParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, TypeDefinitionParams,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams,
+    WorkDoneProgressParams,
 };
 
 use super::Translator;
@@ -153,6 +155,21 @@ impl FromPosition for SignatureHelpParams {
     }
 }
 
+impl RequestTimeout for SelectionRangeParams {}
+
+impl FromPosition for SelectionRangeParams {
+    type Extra = ();
+
+    fn from_position(text_document_position_params: TextDocumentPositionParams, (): ()) -> Self {
+        Self {
+            text_document: text_document_position_params.text_document,
+            positions: vec![text_document_position_params.position],
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
 impl RequestTimeout for RenameParams {}
 
 impl RequestTimeout for InlayHintParams {}
@@ -170,6 +187,132 @@ impl FromPosition for RenameParams {
             work_done_progress_params: WorkDoneProgressParams::default(),
         }
     }
+}
+
+/// LSP request params for a request about a whole document.
+///
+/// The whole-document counterpart of [`FromPosition`], implemented once per
+/// request so [`document_request`] builds each of them, and picks its timeout,
+/// through the same path.
+pub(super) trait FromDocument: RequestTimeout + Sized {
+    /// Request-specific input beyond the document (`()` when there is none).
+    type Extra;
+
+    /// Builds the params for `text_document`, defaulting the work-done and
+    /// partial-result progress fields.
+    fn from_document(text_document: TextDocumentIdentifier, extra: Self::Extra) -> Self;
+}
+
+impl RequestTimeout for FoldingRangeParams {}
+
+impl FromDocument for FoldingRangeParams {
+    type Extra = ();
+
+    fn from_document(text_document: TextDocumentIdentifier, (): ()) -> Self {
+        Self {
+            text_document,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
+impl RequestTimeout for DocumentSymbolParams {}
+
+impl FromDocument for DocumentSymbolParams {
+    type Extra = ();
+
+    fn from_document(text_document: TextDocumentIdentifier, (): ()) -> Self {
+        Self {
+            text_document,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
+impl RequestTimeout for DocumentDiagnosticParams {}
+
+impl FromDocument for DocumentDiagnosticParams {
+    type Extra = ();
+
+    fn from_document(text_document: TextDocumentIdentifier, (): ()) -> Self {
+        Self {
+            text_document,
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+}
+
+impl RequestTimeout for DocumentFormattingParams {}
+
+impl FromDocument for DocumentFormattingParams {
+    type Extra = FormattingOptions;
+
+    fn from_document(text_document: TextDocumentIdentifier, options: FormattingOptions) -> Self {
+        Self {
+            text_document,
+            options,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        }
+    }
+}
+
+/// The params of the whole-document request `R` for `doc` and the timeout they
+/// carry: the one place both are decided for [`document_request`] and
+/// [`document_request_classified`].
+fn document_call<R>(
+    doc: &PreparedDocument,
+    extra: <R::Params as FromDocument>::Extra,
+) -> (R::Params, Duration)
+where
+    R: lsp_types::Request,
+    R::Params: FromDocument,
+{
+    let params = R::Params::from_document(
+        TextDocumentIdentifier {
+            uri: doc.uri().clone(),
+        },
+        extra,
+    );
+    (params, <R::Params as RequestTimeout>::timeout(doc.client()))
+}
+
+/// Sends the whole-document request `R` for `doc` with the timeout its params
+/// carry.
+///
+/// # Errors
+///
+/// Returns an error if the LSP request fails.
+pub(super) async fn document_request<R>(
+    doc: &PreparedDocument,
+    extra: <R::Params as FromDocument>::Extra,
+) -> Result<R::Result>
+where
+    R: lsp_types::Request,
+    R::Params: FromDocument,
+{
+    let (params, timeout) = document_call::<R>(doc, extra);
+    doc.client().request_typed::<R>(params, timeout).await
+}
+
+/// As [`document_request`], but keeps the failure's classification for a
+/// caller that tells a server's rejection from an operational error.
+pub(super) async fn document_request_classified<R>(
+    doc: &PreparedDocument,
+    extra: <R::Params as FromDocument>::Extra,
+) -> std::result::Result<R::Result, UnclassifiedError>
+where
+    R: lsp_types::Request,
+    R::Params: FromDocument,
+{
+    let (params, timeout) = document_call::<R>(doc, extra);
+    doc.client()
+        .request_typed_classified::<R>(params, timeout)
+        .await
 }
 
 /// LSP request params built from a resolved document range.
@@ -273,6 +416,63 @@ from_item_with_partial!(
     CallHierarchyOutgoingCallsParams => lsp_types::CallHierarchyItem,
     TypeHierarchySupertypesParams => lsp_types::TypeHierarchyItem,
     TypeHierarchySubtypesParams => lsp_types::TypeHierarchyItem,
+);
+
+/// A request whose indexing state is disclosed rather than gated on, tied to
+/// the capability it needs so the two cannot be paired wrongly.
+pub(super) trait DisclosedRequest: lsp_types::Request {
+    /// The capability the routed server must advertise.
+    const CAPABILITY: DisclosedCapability;
+}
+
+macro_rules! disclosed_requests {
+    ($($request:ty => $capability:ident),+ $(,)?) => {$(
+        impl DisclosedRequest for $request {
+            const CAPABILITY: DisclosedCapability = DisclosedCapability::$capability;
+        }
+    )+};
+}
+
+disclosed_requests!(
+    lsp_types::SignatureHelpRequest => SignatureHelp,
+    lsp_types::InlayHintRequest => InlayHints,
+    lsp_types::CallHierarchyPrepareRequest => CallHierarchy,
+    lsp_types::TypeHierarchyPrepareRequest => TypeHierarchy,
+);
+
+/// A go-to-location request, tied to the capability it is gated on.
+pub(super) trait GotoRequest: lsp_types::Request {
+    /// The capability the routed server must advertise and index for.
+    const CAPABILITY: Capability;
+}
+
+/// A hierarchy-walking request over an item, tied to the capability it is
+/// gated on.
+pub(super) trait ItemRequest: lsp_types::Request {
+    /// The capability the routed server must advertise and index for.
+    const CAPABILITY: Capability;
+}
+
+macro_rules! capability_requests {
+    ($trait:ident: $($request:ty => $capability:ident),+ $(,)?) => {$(
+        impl $trait for $request {
+            const CAPABILITY: Capability = Capability::$capability;
+        }
+    )+};
+}
+
+capability_requests!(GotoRequest:
+    lsp_types::DefinitionRequest => Definition,
+    lsp_types::ImplementationRequest => Implementation,
+    lsp_types::TypeDefinitionRequest => TypeDefinition,
+    lsp_types::DeclarationRequest => Declaration,
+);
+
+capability_requests!(ItemRequest:
+    lsp_types::CallHierarchyIncomingCallsRequest => CallHierarchy,
+    lsp_types::CallHierarchyOutgoingCallsRequest => CallHierarchy,
+    lsp_types::TypeHierarchySupertypesRequest => TypeHierarchy,
+    lsp_types::TypeHierarchySubtypesRequest => TypeHierarchy,
 );
 
 /// A sent positioned request's result, with the encoding context and the
@@ -480,15 +680,14 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: DisclosedCapability,
         extra: <R::Params as FromPosition>::Extra,
     ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
     where
-        R: lsp_types::Request,
+        R: DisclosedRequest,
         R::Params: FromPosition,
     {
         let doc = self
-            .prepare_disclosed_document(file_path, capability, &[position])
+            .prepare_disclosed_document(file_path, R::CAPABILITY, &[position])
             .await?;
         let (ctx, params) = self
             .positioned_params::<R::Params>(doc.server_id(), doc.uri(), position, extra)
@@ -553,16 +752,15 @@ impl Translator {
     pub(super) async fn disclosed_range_request<R>(
         &self,
         file_path: &ClientPath,
-        capability: DisclosedCapability,
         range: PositionRange,
         extra: <R::Params as FromRange>::Extra,
     ) -> Result<Positioned<Indexed<R::Result>, DisclosedDocument<'_>>>
     where
-        R: lsp_types::Request,
+        R: DisclosedRequest,
         R::Params: FromRange,
     {
         let doc = self
-            .prepare_disclosed_document(file_path, capability, &[range.start(), range.end()])
+            .prepare_disclosed_document(file_path, R::CAPABILITY, &[range.start(), range.end()])
             .await?;
         let (ctx, params) = self
             .ranged_params::<R::Params>(doc.server_id(), doc.uri(), range, extra)
@@ -583,16 +781,15 @@ impl Translator {
     pub(super) async fn item_request<R>(
         &self,
         item: CheckedHierarchyItem,
-        capability: Capability,
     ) -> Result<Positioned<R::Result>>
     where
-        R: lsp_types::Request,
+        R: ItemRequest,
         R::Params: FromItem,
     {
         let item_uri = lsp_types::Uri::from(item.uri());
         let path = self.parse_file_uri(&item_uri).await?;
         let doc = self
-            .prepare_gated_document_for_path(&path, IndexingGate::Required(capability))
+            .prepare_gated_document_for_path(&path, IndexingGate::Required(R::CAPABILITY))
             .await?;
         let ctx = self.encoding_ctx(doc.server_id());
         let lsp_item = hierarchy_item_to_lsp(item, doc.uri().clone(), &ctx).await;
@@ -663,6 +860,59 @@ mod tests {
             },
         );
         assert_eq!(actions.range, range);
+    }
+
+    #[test]
+    fn test_from_document_builds_params_for_each_document_request() {
+        let document = position_params().text_document;
+
+        let folding = FoldingRangeParams::from_document(document.clone(), ());
+        assert_eq!(folding.text_document, document);
+
+        let symbols = DocumentSymbolParams::from_document(document.clone(), ());
+        assert_eq!(symbols.text_document, document);
+
+        let pull = DocumentDiagnosticParams::from_document(document.clone(), ());
+        assert_eq!(pull.text_document, document);
+        assert!(pull.identifier.is_none() && pull.previous_result_id.is_none());
+
+        let format = DocumentFormattingParams::from_document(
+            document.clone(),
+            FormattingOptions {
+                tab_size: 8,
+                insert_spaces: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(format.text_document, document);
+        assert_eq!(format.options.tab_size, 8);
+    }
+
+    #[test]
+    fn test_selection_range_params_carry_the_single_position() {
+        let params = SelectionRangeParams::from_position(position_params(), ());
+        assert_eq!(params.text_document, position_params().text_document);
+        assert_eq!(params.positions, [position_params().position]);
+    }
+
+    #[test]
+    fn test_request_kinds_are_tied_to_their_capability() {
+        assert_eq!(
+            <lsp_types::SignatureHelpRequest as DisclosedRequest>::CAPABILITY,
+            DisclosedCapability::SignatureHelp
+        );
+        assert_eq!(
+            <lsp_types::TypeHierarchyPrepareRequest as DisclosedRequest>::CAPABILITY,
+            DisclosedCapability::TypeHierarchy
+        );
+        assert_eq!(
+            <lsp_types::DeclarationRequest as GotoRequest>::CAPABILITY,
+            Capability::Declaration
+        );
+        assert_eq!(
+            <lsp_types::TypeHierarchySubtypesRequest as ItemRequest>::CAPABILITY,
+            Capability::TypeHierarchy
+        );
     }
 
     #[test]

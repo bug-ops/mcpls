@@ -2,9 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lsp_types::{
-    DocumentFormattingParams, FormattingOptions, TextDocumentIdentifier, WorkDoneProgressParams,
-};
+use lsp_types::FormattingOptions;
 use tokio::task::JoinSet;
 
 use super::Translator;
@@ -17,11 +15,11 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
-use super::positioned::Positioned;
+use super::positioned::{Positioned, document_request};
 use super::routing::{Capability, FileLocalCapability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
-use crate::error::{Error, McpErrorKind, Result};
+use crate::error::{Error, ErrorChain, McpErrorKind, Result};
 use crate::escape_control;
 use crate::lsp::{LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
@@ -311,7 +309,7 @@ async fn resolve_code_action(
             tracing::warn!(
                 %server_id,
                 title = %action.title,
-                error = %err,
+                error = %ErrorChain(&err),
                 "codeAction/resolve failed, returning action without edit"
             );
         }
@@ -641,23 +639,16 @@ impl Translator {
                 IndexingGate::FileLocal(FileLocalCapability::FormatDocument),
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
+        let ctx = self.encoding_ctx(doc.server_id());
+        let response_uri = doc.uri().clone();
 
-        let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            options: FormattingOptions {
-                tab_size: tab_size.get(),
-                insert_spaces,
-                ..Default::default()
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
+        let options = FormattingOptions {
+            tab_size: tab_size.get(),
+            insert_spaces,
+            ..Default::default()
         };
-
-        let response = client
-            .request_typed::<lsp_types::DocumentFormattingRequest>(params, client.request_timeout())
-            .await?;
+        let response =
+            document_request::<lsp_types::DocumentFormattingRequest>(&doc, options).await?;
 
         Ok(FormatDocumentResult {
             edits: convert_text_edits(response.unwrap_or_default(), &ctx, &response_uri).await,
@@ -800,9 +791,11 @@ impl Translator {
 mod tests {
     use std::{assert_matches, fs};
 
+    use lsp_types::TextDocumentIdentifier;
+
     use super::*;
     use crate::bridge::WorkspaceRoots;
-    use crate::bridge::translator::dto::DiagnosticSeverity;
+    use crate::bridge::notifications::ReportedSeverity;
     use crate::bridge::translator::testing::*;
     use crate::test_lsp::client_path;
 
@@ -848,7 +841,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        NewName::try_new("new_name").unwrap(),
+                        NewName::new("new_name").unwrap(),
                     )
                     .await
             })
@@ -957,7 +950,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        NewName::try_new("new_name").unwrap(),
+                        NewName::new("new_name").unwrap(),
                     )
                     .await
             })
@@ -1280,13 +1273,13 @@ mod tests {
         )
         .await;
         assert_eq!(result.diagnostics.len(), 4);
-        assert_matches!(result.diagnostics[0].severity, DiagnosticSeverity::Error);
-        assert_matches!(result.diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_matches!(result.diagnostics[0].severity, ReportedSeverity::Error);
+        assert_matches!(result.diagnostics[1].severity, ReportedSeverity::Warning);
         assert_matches!(
             result.diagnostics[2].severity,
-            DiagnosticSeverity::Information
+            ReportedSeverity::Information
         );
-        assert_matches!(result.diagnostics[3].severity, DiagnosticSeverity::Hint);
+        assert_matches!(result.diagnostics[3].severity, ReportedSeverity::Hint);
         assert_eq!(result.diagnostics[0].code, Some("1".to_string()));
         assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
     }
@@ -2847,7 +2840,7 @@ mod tests {
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 4),
-                NewName::try_new("new_name").unwrap(),
+                NewName::new("new_name").unwrap(),
             )
             .await
             .unwrap_err();
@@ -2898,7 +2891,7 @@ mod tests {
                     .handle_rename(
                         client_path(path),
                         Position::at(1, 4),
-                        NewName::try_new("new_name").unwrap(),
+                        NewName::new("new_name").unwrap(),
                     )
                     .await
             })

@@ -57,16 +57,17 @@ pub struct JsonRpcRequest {
 
 /// JSON-RPC 2.0 response message.
 ///
-/// Deserializing refuses a response that carries both `result` and `error`,
-/// and reads one that carries neither as a `null` result.
-#[derive(Debug, Clone, Serialize)]
+/// Deserializing keeps the `error` of a response that carries both `result`
+/// and `error` (so the server's code still drives the retry on -32801/-32802),
+/// and reads one that carries neither as a `null` result. Outbound replies use
+/// the outbound reply type instead.
+#[derive(Debug, Clone)]
 pub struct JsonRpcResponse {
     /// JSON-RPC version, always "2.0".
     pub jsonrpc: JsonRpcVersion,
     /// Request identifier.
     pub id: RequestId,
     /// How the request ended.
-    #[serde(flatten)]
     pub outcome: JsonRpcOutcome,
 }
 
@@ -94,8 +95,9 @@ impl<'de> Deserialize<'de> for JsonRpcResponse {
             error,
         } = Raw::deserialize(deserializer)?;
         let outcome = match (result, error) {
-            (Some(_), Some(_)) => {
-                return Err(de::Error::custom("response carries both result and error"));
+            (Some(_), Some(error)) => {
+                debug!("Response id={id:?} carries both result and error; keeping the error");
+                JsonRpcOutcome::Error(error)
             }
             (Some(result), None) => JsonRpcOutcome::Result(result),
             (None, Some(error)) => JsonRpcOutcome::Error(error),
@@ -278,7 +280,7 @@ pub enum LspNotification {
 /// payload (`ProgressParams::value` is `serde_json::Value`; `gen-lsp-types`
 /// 0.11.0 has no union type for it).
 ///
-/// Single source of truth for both `LspClient::lifecycle_lane` (routes
+/// Single source of truth for both `LspClient::route` (routes
 /// `begin`/`end` to the lifecycle lane, drops everything else) and
 /// `bridge::indexing::IndexingTracker::observe_progress` (the settle/latch
 /// transition) -- previously each read `value["kind"]` independently, so
@@ -504,10 +506,13 @@ mod tests {
     }
 
     #[test]
-    fn test_response_with_both_result_and_error_is_refused() {
-        let both = r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":1,"message":"x"}}"#;
+    fn test_response_with_both_result_and_error_keeps_the_error() {
+        let both =
+            r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32801,"message":"x"}}"#;
 
-        assert!(serde_json::from_str::<JsonRpcResponse>(both).is_err());
+        let response: JsonRpcResponse = serde_json::from_str(both).unwrap();
+
+        assert_matches!(response.outcome, JsonRpcOutcome::Error(error) if error.code == -32801);
     }
 
     #[test]

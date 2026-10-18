@@ -441,7 +441,7 @@ impl Pump {
         lost: &LostFiles,
         lifecycle: &mut Option<mpsc::Receiver<LspNotification>>,
     ) -> Flow {
-        if *self.role_rx.borrow() == DiagnosticsRole::Secondary {
+        if !self.role_rx.borrow().caches() {
             return Flow::Continue;
         }
         let uris: Vec<&lsp_types::Uri> = lost
@@ -460,23 +460,24 @@ impl Pump {
             return Flow::Stop;
         };
         drop(publications);
-        let files: Vec<bridge::DiagnosticsKey> = resolved
-            .into_iter()
-            .flatten()
-            .map(|published| bridge::DiagnosticsKey::of(published.canonical()))
-            .collect();
+        // Re-read after the (possibly slow) resolve, as `apply_batch` does: a
+        // demotion in the meantime must stop recording and fan-out (#174 s8).
+        if !self.role_rx.borrow().caches() {
+            return Flow::Continue;
+        }
+        let published: Vec<PublishedDiagnosticsUri> = resolved.into_iter().flatten().collect();
         let changed = self
             .notification_cache
             .lock()
             .await
-            .record_lost_files(&self.server_id, &files);
+            .record_lost_files(&self.server_id, &published);
         publish_invalidated(&self.subs, &changed).await;
         Flow::Continue
     }
 
     /// Marks that the mailbox lost more publishes than it could name.
     async fn apply_unnamed_loss(&self) -> Flow {
-        if *self.role_rx.borrow() != DiagnosticsRole::Secondary {
+        if self.role_rx.borrow().caches() {
             self.notification_cache
                 .lock()
                 .await
@@ -496,7 +497,7 @@ fn publication_admitted(
     role: DiagnosticsRole,
     workspace_roots: &WorkspaceRoots,
 ) -> bool {
-    role == DiagnosticsRole::Authoritative && workspace_roots.admits_uri(uri)
+    role.caches() && workspace_roots.admits_uri(uri)
 }
 
 /// Applies one drained publication; `published` is the resolution of one that
@@ -513,7 +514,7 @@ async fn apply_publish(
     // Only the server the router resolves `Diagnostics` to for this
     // notification's language caches (and notifies subscribers of) it
     // -- see #174 §8.
-    if role == DiagnosticsRole::Secondary {
+    if !role.caches() {
         return;
     }
     let (uri, version, diagnostics) = publish.into_parts();
@@ -2442,7 +2443,7 @@ mod pump_tests {
                     command: crate::config::ServerCommand::from_static("rust-analyzer"),
                     reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
             self.translator.rebind_router(&HashSet::new());
@@ -2719,6 +2720,78 @@ mod burst_tests {
                 .availability(&lost, Some(&ServerId::from_static("rust"))),
             DiagnosticsAvailability::Evicted
         );
+    }
+
+    /// #742: a demotion while the lost files are still resolving stops the
+    /// marks and the fan-out, as it does for a batch of publishes.
+    #[tokio::test]
+    async fn test_lost_batch_demotion_during_resolve_records_no_mark() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let (entered_tx, mut entered) = mpsc::unbounded_channel::<()>();
+        let slow: Arc<bridge::CanonicalizeFn> = Arc::new(move |p: &std::path::Path| {
+            entered_tx.send(()).ok();
+            gate.lock().map(|rx| rx.recv()).ok();
+            Ok(p.to_path_buf())
+        });
+        let kept = bridge::path_to_uri(&root.join("kept.rs")).unwrap();
+        let lost = bridge::path_to_uri(&root.join("lost.rs")).unwrap();
+        let (messages_tx, messages_rx) = mpsc::channel(4);
+        let (sink, publish_rx) = NotificationSink::with_limits(
+            messages_tx,
+            MailboxLimits {
+                max_pending: 1,
+                max_bytes: usize::MAX,
+            },
+        );
+        for uri in [&kept, &lost] {
+            sink.publishes().publish(PublishDiagnosticsParams {
+                uri: uri.clone(),
+                diagnostics: vec![Diagnostic {
+                    message: "error".to_owned().into(),
+                    ..Diagnostic::default()
+                }],
+                version: None,
+            });
+        }
+        drop(sink);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        drop(lifecycle_tx);
+        let cache = make_cache();
+        let (role_tx, role_rx) = watch::channel(DiagnosticsRole::Authoritative);
+
+        let pump = tokio::spawn(diagnostics_pump_with_resolver(
+            ServerId::from_static("rust"),
+            NotificationInbox::new(messages_rx, publish_rx),
+            lifecycle_rx,
+            CancellationToken::new(),
+            role_rx,
+            None,
+            shared_over(
+                &cache,
+                WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
+            ),
+            PublishedPathResolver::with_canonicalizer(slow),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), entered.recv())
+            .await
+            .expect("the pump must reach the resolver")
+            .expect("the resolver signals once");
+        role_tx.send(DiagnosticsRole::Secondary).unwrap();
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(60), pump)
+            .await
+            .expect("the pump must end once the mailbox is drained and closed")
+            .unwrap();
+
+        let server = ServerId::from_static("rust");
+        assert_ne!(
+            cache.lock().await.availability(&lost, Some(&server)),
+            DiagnosticsAvailability::Evicted
+        );
+        assert!(!cache.lock().await.has_diagnostics(&kept));
     }
 
     /// #696: a pump started for a respawned server shares the role sender, so

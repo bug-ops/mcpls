@@ -18,12 +18,12 @@ use self::servers::{Backend, Phase, Servers};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots};
+use crate::bridge::{DocumentOpenState, DocumentTracker, NotificationCache, WorkspaceRoots};
 use crate::config::{
     FilePattern, IndexingReadyTimeoutSecs, LanguageId, LanguageMap, ServerId, ServerSettlement,
     ToolKind, ToolRouter,
 };
-use crate::error::{ServerSpawnFailure, StartupFailure};
+use crate::error::{ErrorChain, ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspServer, ServerInitConfig};
 use crate::redaction::Redactions;
 use crate::util::lock_std;
@@ -64,7 +64,7 @@ mod type_hierarchy;
 
 pub use addressing::{
     AddressableTool, Addressed, MAX_SYMBOL_NAME_BYTES, PositionSource, ResolvedSymbol,
-    ResolvedTarget, SymbolName, SymbolNameError, SymbolQuery, SymbolTarget,
+    ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 pub use dto::*;
@@ -641,8 +641,8 @@ impl Translator {
 
     /// Whether a document is currently tracked as open.
     #[must_use]
-    pub fn is_document_open(&self, path: &Path) -> bool {
-        self.document_tracker.is_open(path)
+    pub fn open_state(&self, path: &Path) -> DocumentOpenState {
+        self.document_tracker.open_state(path)
     }
 
     /// The document tracker, shared with [`EncodingCtx`] so a cache-only
@@ -700,7 +700,7 @@ impl Translator {
                 match server.shutdown().await {
                     Ok(()) => tracing::debug!(%id, "LSP server shut down gracefully"),
                     Err(e) => tracing::warn!(
-                        %id, error = %e,
+                        %id, error = %ErrorChain(&e),
                         "LSP server shutdown failed, killing process instead"
                     ),
                 }
@@ -1145,7 +1145,7 @@ mod tests {
         translator.settle_failed(&ServerSpawnFailure {
             reason: StartupFailure::Spawn(std::sync::Arc::new(Error::ServerNotFound {
                 command: crate::config::ServerCommand::from_static("b"),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
             ..spawn_failure(&configs[1])
         });

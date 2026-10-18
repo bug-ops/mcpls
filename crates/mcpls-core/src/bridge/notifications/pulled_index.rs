@@ -44,6 +44,7 @@ pub enum ReportedSeverity {
 
 impl ReportedSeverity {
     /// The severity `diagnostic` is reported with.
+    #[must_use]
     pub const fn of(diagnostic: &LspDiagnostic) -> Self {
         match diagnostic.severity {
             Some(lsp_types::DiagnosticSeverity::Error) => Self::Error,

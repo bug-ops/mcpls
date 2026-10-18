@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 
 use crate::config::LspServerConfig;
-use crate::error::Error;
+use crate::error::{Error, ErrorChain};
 
 /// Shortest value redacted; shorter ones would match unrelated text.
 const MIN_SECRET_BYTES: usize = 8;
@@ -425,7 +425,7 @@ impl Redactions {
         if self.is_empty() {
             return error;
         }
-        match self.apply(&error.to_string()) {
+        match self.apply(&ErrorChain(&error).to_string()) {
             Cow::Borrowed(_) => error,
             Cow::Owned(redacted) => Error::LspProtocolError(RedactedText(redacted)),
         }
@@ -810,6 +810,22 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_error_redacts_a_secret_carried_only_by_the_source() {
+        let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
+        let leaking = Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
+            source: std::io::Error::other("bad token ghp_abcdefgh"),
+        };
+
+        let sanitized = set.sanitize_error(leaking);
+
+        let text = sanitized.to_string();
+        assert_matches!(sanitized, Error::LspProtocolError(_));
+        assert!(!text.contains("ghp_abcdefgh"), "{text}");
+        assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
+    }
+
+    #[test]
     fn test_apply_borrows_text_without_secrets() {
         let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
 
@@ -936,7 +952,7 @@ mod tests {
                     "nightly-2024-01-01".to_string(),
                 ),
             ],
-            crate::lsp::HostOs::CURRENT,
+            crate::config::HostOs::CURRENT,
         )
         .unwrap();
 

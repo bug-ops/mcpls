@@ -4,8 +4,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use mcpls_core::bridge::{
-    DefinitionResult, DiagnosticSeverity, DiagnosticsResult, DocumentSymbolsResult, HoverResult,
-    Position2D, ReferencesResult, Symbol,
+    DiagnosticsResult, DocumentSymbolsResult, HoverResult, LocationsResult, Position2D,
+    ReportedSeverity, Symbol,
 };
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use serde::Serialize;
@@ -182,7 +182,7 @@ impl Probe {
                 })
             }
             Self::Definition { uri_suffix, .. } => {
-                let definition: DefinitionResult = payload(result)?;
+                let definition: LocationsResult = payload(result)?;
                 expect(
                     definition
                         .locations
@@ -192,7 +192,7 @@ impl Probe {
                 )
             }
             Self::References { min_count, .. } => {
-                let references: ReferencesResult = payload(result)?;
+                let references: LocationsResult = payload(result)?;
                 expect(references.locations.len() >= *min_count, || {
                     format!(
                         "expected >= {min_count} references, got {}",
@@ -213,7 +213,7 @@ impl Probe {
                         let errors = diagnostics
                             .diagnostics
                             .iter()
-                            .filter(|d| d.severity == DiagnosticSeverity::Error)
+                            .filter(|d| d.severity == ReportedSeverity::Error)
                             .count();
                         expect(errors == 0, || format!("{errors} error diagnostics"))
                     }

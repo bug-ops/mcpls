@@ -40,6 +40,7 @@ use tracing::{debug, warn};
 use super::resources::{CanonicalForm, PublishedDiagnosticsUri};
 use super::workspace_roots::{CanonicalizeFn, Unresolved, canonicalize_existing_prefix};
 use super::{WorkspaceRoots, lexically_normalize, uri_to_path};
+use crate::error::ErrorChain;
 
 /// Maximum canonicalizations running concurrently for one resolver.
 pub const RESOLVE_CONCURRENCY: usize = 8;
@@ -314,8 +315,9 @@ impl PublishedPathResolver {
                 Err(e @ Unresolved::Transient(_)) => {
                     self.memo.note_failure(source.clone(), now);
                     debug!(
-                        "transient error resolving published path {}: {e}",
-                        source.display()
+                        "transient error resolving published path {}: {}",
+                        source.display(),
+                        ErrorChain(&e)
                     );
                     fresh.insert(source, Resolution::Transient);
                 }

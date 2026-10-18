@@ -3,10 +3,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use lsp_types::{
-    DocumentDiagnosticParams, PartialResultParams, TextDocumentIdentifier, Uri,
-    WorkDoneProgressParams,
-};
+use lsp_types::{DocumentDiagnosticParams, Uri};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -18,6 +15,7 @@ use super::dto::{
 };
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
+use super::positioned::document_request_classified;
 use super::pull_support::{PullProbe, PullSupport};
 use super::routing::PreparedDocument;
 use crate::bridge::encoding::PositionEncoding;
@@ -30,7 +28,7 @@ use crate::bridge::{
     NotificationCache, WorkspacePath, WorkspaceRoots, path_to_uri,
 };
 use crate::config::{ServerId, ToolKind};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorChain, Result};
 use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::lock_std;
 
@@ -438,21 +436,12 @@ impl Translator {
             return PullAttempt::PushOnly;
         }
         let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let params = DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
         let sent_with = if support == PullSupport::Probing {
             self.pull_probe_of(server_id)
         } else {
             PullProbe::default()
         };
-        let response = client
-            .request_typed_classified::<PullDiagnosticRequest>(params, client.request_timeout())
-            .await;
+        let response = document_request_classified::<PullDiagnosticRequest>(doc, ()).await;
         match response {
             Ok(response) => {
                 if support == PullSupport::Probing {
@@ -501,7 +490,7 @@ impl Translator {
             ProbeOutcome::Refuse => {
                 debug!(
                     %server_id,
-                    %error,
+                    error = %ErrorChain(&error),
                     "server advertises no diagnostic provider and refused a pull; \
                      answering from the push cache"
                 );
@@ -513,18 +502,18 @@ impl Translator {
                 if probe == Some(PullProbe::Refused) {
                     info!(
                         %server_id,
-                        %error,
+                        error = %ErrorChain(&error),
                         "server advertises no diagnostic provider and timed out on two pulls \
                          in a row; answering from the push cache until it is replaced \
                          (restart_server)"
                     );
                 } else {
-                    debug!(%server_id, %error, "probe pull timed out; answering from the push cache");
+                    debug!(%server_id, error = %ErrorChain(&error), "probe pull timed out; answering from the push cache");
                 }
             }
             ProbeOutcome::Transient => debug!(
                 %server_id,
-                %error,
+                error = %ErrorChain(&error),
                 "probe pull could not be answered right now; answering from the push cache"
             ),
         }
@@ -702,13 +691,14 @@ mod tests {
     use std::time::Duration;
     use std::{assert_matches, fs};
 
+    use lsp_types::{PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams};
     use tempfile::TempDir;
     use tokio::io::BufReader;
     use tokio::time::timeout;
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{DiagnosticSeverity, PositionDegradation};
+    use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{FileExtension, LanguageId, ServerId, ToolRouter};
     use crate::error::Error;
@@ -867,7 +857,7 @@ mod tests {
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
-        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_matches!(diags.diagnostics[0].severity, ReportedSeverity::Error);
         assert_eq!(diags.diagnostics[0].range.start.line, 1);
         assert_eq!(diags.diagnostics[0].range.start.character, 1);
     }
@@ -985,13 +975,10 @@ mod tests {
         )
         .await;
         assert_eq!(diags.diagnostics.len(), 4);
-        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
-        assert_matches!(diags.diagnostics[1].severity, DiagnosticSeverity::Warning);
-        assert_matches!(
-            diags.diagnostics[2].severity,
-            DiagnosticSeverity::Information
-        );
-        assert_matches!(diags.diagnostics[3].severity, DiagnosticSeverity::Hint);
+        assert_matches!(diags.diagnostics[0].severity, ReportedSeverity::Error);
+        assert_matches!(diags.diagnostics[1].severity, ReportedSeverity::Warning);
+        assert_matches!(diags.diagnostics[2].severity, ReportedSeverity::Information);
+        assert_matches!(diags.diagnostics[3].severity, ReportedSeverity::Hint);
     }
 
     #[tokio::test]

@@ -298,9 +298,6 @@ impl DocumentLimit {
     /// No limit.
     pub const UNLIMITED: Self = Self(None);
 
-    /// The built-in default, 100 documents.
-    pub const DEFAULT: Self = Self::new(100);
-
     /// A limit of `count` documents, where `0` means unlimited.
     #[must_use]
     pub const fn new(count: usize) -> Self {
@@ -314,23 +311,14 @@ impl DocumentLimit {
     }
 }
 
-impl Default for DocumentLimit {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl From<usize> for DocumentLimit {
-    fn from(count: usize) -> Self {
-        Self::new(count)
-    }
-}
-
-impl From<DocumentLimit> for usize {
-    fn from(limit: DocumentLimit) -> Self {
-        limit.0.map_or(0, NonZeroUsize::get)
-    }
-}
+impl_bounded_number!(
+    DocumentLimit,
+    usize,
+    infallible,
+    default = 100,
+    "The built-in default, 100 documents.",
+    into = |limit: DocumentLimit| limit.0.map_or(0, NonZeroUsize::get)
+);
 
 /// Why a string is not a valid [`BoundedText`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]

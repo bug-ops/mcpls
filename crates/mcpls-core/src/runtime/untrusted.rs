@@ -128,11 +128,10 @@ fn vetted_spawn_path(
         resolved.spawn
     };
     executable
-        .into_os_string()
         .into_string()
         .map_err(|path| UntrustedRefusal::NonUtf8Path {
             what: ResolvedItem::Executable,
-            path: PathBuf::from(path),
+            path,
         })
 }
 

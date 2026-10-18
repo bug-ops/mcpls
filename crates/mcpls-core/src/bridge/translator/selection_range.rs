@@ -1,12 +1,9 @@
 //! Selection range handler.
 
-use lsp_types::{
-    PartialResultParams, SelectionRangeParams, TextDocumentIdentifier, WorkDoneProgressParams,
-};
-
 use super::Translator;
 use super::dto::{MAX_SELECTION_CHAIN, Position, SelectionRangesResult};
 use super::navigation::ItemBudget;
+use super::positioned::Positioned;
 use super::routing::{FileLocalCapability, IndexingGate};
 use crate::bridge::ClientPath;
 use crate::error::Result;
@@ -48,28 +45,19 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
     ) -> Result<SelectionRangesResult> {
-        let doc = self
-            .prepare_positioned_document(
+        let Positioned {
+            result: response,
+            ctx,
+            doc,
+        } = self
+            .position_request::<lsp_types::SelectionRangeRequest>(
                 &file_path,
+                position,
                 IndexingGate::FileLocal(FileLocalCapability::SelectionRange),
-                &[position],
+                (),
             )
             .await?;
-        let (server_id, client, uri) = (doc.server_id(), doc.client(), doc.uri());
-        let ctx = self.encoding_ctx(server_id);
-        let response_uri = uri.clone();
-        let lsp_position = ctx.to_lsp(uri, position).await;
-
-        let params = SelectionRangeParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            positions: vec![lsp_position],
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = client
-            .request_typed::<lsp_types::SelectionRangeRequest>(params, client.request_timeout())
-            .await?;
+        let response_uri = doc.uri().clone();
 
         let (lsp_ranges, truncated) = response
             .and_then(|chains| chains.into_iter().next())

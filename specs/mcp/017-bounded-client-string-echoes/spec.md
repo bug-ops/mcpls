@@ -10,7 +10,7 @@ tags:
   - error-handling
   - logging
 created: 2026-10-07
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/011-client-path-boundary-parsing/spec|mcp/011-client-path-boundary-parsing]]"
@@ -83,9 +83,9 @@ protocol SDK's default `on_custom_request`.
 | Part | Where | Role |
 |------|-------|------|
 | `escape_bounded(text, max_bytes)` | `crates/mcpls-core/src/util.rs` | Escapes control and deceptive characters, then bounds the escaped text between characters and appends `TRUNCATION_MARKER` |
-| `EchoedPath` | `crates/mcpls-core/src/error.rs` | Typed echo of a path, bounded to `MAX_ECHOED_PATH_BYTES` (1024, currently private to `error.rs`) |
-| `EchoedArgument` | `crates/mcpls-core/src/error.rs` | Typed echo of an option or program name, bounded to `MAX_SYMBOL_NAME_BYTES` (256) |
-| `MAX_SYMBOL_NAME_BYTES` | `crates/mcpls-core/src/bridge/translator/addressing.rs` | 256-byte bound for a client name |
+| `EchoedPath` | `crates/mcpls-core/src/error.rs` | Typed echo of a path, bounded to `MAX_ECHOED_PATH_BYTES` (1024, in `util.rs`) |
+| `EchoedArgument` | `crates/mcpls-core/src/error.rs` | Typed echo of an option or program name, bounded to `MAX_ECHOED_NAME_BYTES` (256, in `util.rs`) |
+| `MAX_ECHOED_NAME_BYTES`, `MAX_ECHOED_PATH_BYTES` | `crates/mcpls-core/src/util.rs` | The two echo bounds, shared by `error.rs`, `bridge/` and `mcp/` |
 | `MAX_ERROR_MESSAGE_CALLER_BYTES` | `crates/mcpls-core/src/util.rs` | 4 KiB cap on a whole message forwarded to the caller |
 | `<N-byte name>` replacement | `crates/mcpls-core/src/mcp/parameters.rs` | Shows the original byte length instead of the text |
 
@@ -184,13 +184,13 @@ message or `data`.
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN an error message includes a client-supplied string THE SYSTEM SHALL escape control and deceptive characters and bound the escaped text, cutting between characters and ending the cut with `TRUNCATION_MARKER`, so the message length no longer depends on the input length beyond the bound | must |
-| FR-002 | THE bound SHALL reuse the existing helpers and constants: `escape_bounded` for the cut, `MAX_ECHOED_PATH_BYTES` (1024) for file paths and resource URIs, `MAX_SYMBOL_NAME_BYTES` (256) for a pagination cursor and a method name, and `MAX_ERROR_MESSAGE_CALLER_BYTES` (4 KiB) as the cap on the whole message; no second truncation routine and no new numeric limit SHALL be introduced unless a value above cannot serve, and then it is a named constant next to these | must |
+| FR-002 | THE bound SHALL reuse the existing helpers and constants: `escape_bounded` for the cut, `MAX_ECHOED_PATH_BYTES` (1024) for file paths and resource URIs, and `MAX_ECHOED_NAME_BYTES` (256) for a pagination cursor and a method name; each echo is bounded where it is rendered and no cap is applied to the whole message; no second truncation routine and no new numeric limit SHALL be introduced unless a value above cannot serve, and then it is a named constant next to these | must |
 | FR-003 | THE bound SHALL apply to the rendered text of each path-bearing error variant, namely `Error::FileIo`, `Error::MalformedPath`, `Error::PathOutsideWorkspace`, `Error::NotARegularFile` and `Error::NoWorkspaceRoots`, at one place per variant (its `Display`), so every consumer of the message (the JSON-RPC error, `ErrorChain`, logs) is bounded without a per-call-site edit | must |
 | FR-004 | THE bound SHALL apply to every `ResourceUriError` variant that carries client text (`InvalidPath`, `InvalidScheme`, `NotAFilePath`), including the nested text of the "non-empty authority" case, for `resources/read`, `resources/subscribe`, `resources/unsubscribe` and the URIs of `subscriptions/listen` | must |
 | FR-005 | WHEN `resources/list` receives a cursor that is not a page-start index THE SYSTEM SHALL report `invalid pagination cursor` with the cursor bounded per FR-002 | must |
 | FR-006 | WHEN a JSON-RPC request names a method the server does not implement THE SYSTEM SHALL answer `-32601` with a message that contains at most the bounded method name. The default handler of the protocol SDK echoes the method verbatim, so the handler SHALL override `on_custom_request` (or an equivalent hook) to apply FR-002; if no hook can bound it, the inheritance SHALL be documented in the spec's resolved questions and in `SECURITY.md` or the book | must |
 | FR-007 | THE JSON-RPC error `message` SHALL be the only place the echo is bounded: because the WARN line of the protocol layer prints the same `ErrorData`, bounding the message SHALL bound that log line; no mcpls-side log statement SHALL print an unbounded client string for these errors | must |
-| FR-008 | WHEN a client-supplied string is cut THE SYSTEM SHOULD make the original byte length visible next to the marker, in the manner of `<N-byte name>` in `mcp/016`, so a client can tell a cut value from a short one | should |
+| FR-008 | WHEN a client-supplied string is cut THE SYSTEM SHOULD make the original byte length visible next to the marker, in the manner of `<N-byte name>` in `mcp/016`, so a client can tell a cut value from a short one. Decided: not done; the truncation marker alone marks a cut value (see section 9) | should |
 | FR-009 | WHEN the client string is within its bound THE SYSTEM SHALL produce the same message text as before this change for ordinary printable input (US-004); the quoting of `{path:?}` in `MalformedPath` and `FileIo` SHALL be preserved | must |
 | FR-010 | THE stored value (`PathBuf`, `String`) carried by an error variant SHALL stay the whole client value where other code reads it (for example `Error::FileIo { path, .. }` used by classification); only the rendered text is bounded | must |
 | FR-011 | WHEN an echoed string contains control or deceptive format characters THE SYSTEM SHALL escape them exactly as `escape_control` does today, so existing escaping behavior is unchanged and the bound is measured on the escaped text | must |
@@ -204,7 +204,7 @@ message or `data`.
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Security | A request SHALL NOT be able to make mcpls emit an error response or WARN log line longer than the fixed bound plus a constant envelope; the ceiling is `MAX_ERROR_MESSAGE_CALLER_BYTES` for the message |
+| NFR-001 | Security | A request SHALL NOT be able to make mcpls emit an error response or WARN log line longer than the sum of its bounded echoes plus a constant envelope; the ceiling of one echo is its bound (`MAX_ECHOED_PATH_BYTES` or `MAX_ECHOED_NAME_BYTES`), and every response line of the FR-012 rows stays within `MAX_ERROR_MESSAGE_CALLER_BYTES` plus the envelope |
 | NFR-002 | Type safety | The bound SHALL be carried by a typed echo (in the manner of `EchoedPath` and `EchoedArgument`), not by an ad-hoc `String` truncation at call sites; an error variant that echoes client text SHOULD hold or render through that type |
 | NFR-003 | Simplicity | One bounding routine (`escape_bounded`) and the existing constants; no second scheme, no configuration key and no environment variable for the bound |
 | NFR-004 | Behavioural non-regression | Error codes, `McpErrorKind` classification, `data` payloads and the text of messages for input within the bound are unchanged |
@@ -276,15 +276,15 @@ No new persistent data. Entities touched:
 - Add an environment variable or config key for the bound.
 - Reference or copy another project's behavior in the spec text.
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-> [!question] Open
-> - [NEEDS CLARIFICATION: Should the original byte length be shown for every cut echo (FR-008)? `escape_bounded` appends only the marker today. Options: (a) extend `escape_bounded` so every caller, including `EchoedPath` and `EchoedArgument`, gains the length; (b) add a thin sibling that appends the length only for the new sites; (c) keep the marker only.]
-> - [NEEDS CLARIFICATION: Is one 1024-byte bound right for resource URIs, given that a URI is longer than its path through percent-encoding, or should URIs use a separate named constant?]
-> - [NEEDS CLARIFICATION: Should `MAX_ECHOED_PATH_BYTES` become `pub(crate)` in `util.rs` next to `escape_bounded`, so `bridge/` and `mcp/` use the same constant as `error.rs`?]
-> - [NEEDS CLARIFICATION: Does `on_custom_request` receive every unknown method of the pinned protocol SDK (3.5.1), including methods that fail to deserialize before reaching the handler? The reproduction shows the default handler, but a malformed envelope may take another path.]
-> - [NEEDS CLARIFICATION: Should `Error::InvalidToolParams(String)` and other `String`-carrying variants be audited in this change, or only the variants listed in section 1?]
-> - [NEEDS CLARIFICATION: Should the message-level cap `MAX_ERROR_MESSAGE_CALLER_BYTES` also be applied by `map_bridge_error` as a final guard, or is per-echo bounding enough?]
+- **Original length next to the marker (FR-008).** Not added. `escape_bounded` keeps appending only `TRUNCATION_MARKER`, so the refusal messages that use it (`EchoedPath`, `EchoedArgument`) do not change and one cut routine serves every echo.
+- **Bound for resource URIs.** One bound, `MAX_ECHOED_PATH_BYTES` (1024), for paths and URIs alike; a URI is measured on the escaped text like a path.
+- **Where the bounds live.** `MAX_ECHOED_PATH_BYTES` and `MAX_ECHOED_NAME_BYTES` are constants in `util.rs` next to `escape_bounded`; `error.rs`, `bridge/` and `mcp/` all use them, so `MAX_SYMBOL_NAME_BYTES` stays the bound of symbol names and kind filters only.
+- **Which requests reach `on_custom_request`.** Every request that does not decode into its typed form reaches the hook, including a served method with malformed params. A request whose `params` is not a JSON object (for example an array) is rejected earlier by the protocol layer as `-32600` with no echo. The override answers `-32601` with the escaped, bounded method name for a method mcpls does not serve, and `-32602` for a served method whose params do not decode (issue #750).
+- **Other `String` variants.** `Error::InvalidToolParams(String)` and the remaining `String`-carrying variants are not audited here; only the variants of section 1 are bounded.
+- **Test coverage of FR-012 and FR-013.** Partial. The FR-012 table runs in process over a duplex pipe with 1 MiB values for the tool path, three resource methods, the cursor and an unknown method, asserting the code, the response length and the marker; the two `.fk` file-name rows use `a` runs of 5000 and 300000 bytes and skip the marker assertion because the OS error text differs. FR-013 (at the bound, one byte over, a straddling character, control characters) is covered for the debug-quoted path and the path variants, and the resource URI, cursor and method name are covered by the 1 MiB rows only. A hierarchy item `uri` echoed by `parse_file_uri` is bounded too and has its own test.
+- **Final guard in `map_bridge_error`.** Not added; bounding each echo where it is rendered is enough, and the FR-012 table asserts the whole response.
 
 ## 10. Documentation Impact
 

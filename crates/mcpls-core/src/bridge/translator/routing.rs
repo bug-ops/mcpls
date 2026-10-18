@@ -11,9 +11,9 @@ use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, Workspace
 use crate::config::{
     FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
-use crate::error::{Error, Result, ServerSpawnFailure};
+use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
-use crate::util::lock_std;
+use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded, lock_std};
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1322,7 +1322,7 @@ impl Translator {
                         tracing::warn!(
                             %server_id,
                             path = %claim.path.display(),
-                            error = %err,
+                            error = %ErrorChain(&err),
                             "failed to notify evicted document's server of textDocument/didClose; \
                              dropping the close"
                         );
@@ -1423,7 +1423,7 @@ impl Translator {
         let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
             Error::InvalidToolParams(format!(
                 "Invalid URI, expected an absolute file:// URI but got: {}",
-                uri.as_ref()
+                escape_bounded(uri.as_ref(), MAX_ECHOED_PATH_BYTES)
             ))
         })?;
 
@@ -1535,7 +1535,7 @@ mod tests {
             command: ServerCommand::new(command).unwrap(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                 command: ServerCommand::new(command).unwrap(),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }
     }
@@ -3084,7 +3084,7 @@ mod tests {
             .handle_rename(
                 file.clone(),
                 pos(1, 1),
-                crate::bridge::NewName::try_new("renamed").unwrap(),
+                crate::bridge::NewName::new("renamed").unwrap(),
             )
             .await;
         assert_matches!(
@@ -3199,7 +3199,7 @@ mod tests {
             .handle_rename(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                crate::bridge::NewName::try_new("renamed").unwrap(),
+                crate::bridge::NewName::new("renamed").unwrap(),
             )
             .await;
 
@@ -3753,7 +3753,7 @@ mod tests {
                     .handle_rename(
                         client_path(path_str),
                         Position::at(1, 1),
-                        crate::bridge::NewName::try_new("renamed").unwrap(),
+                        crate::bridge::NewName::new("renamed").unwrap(),
                     )
                     .await
             })

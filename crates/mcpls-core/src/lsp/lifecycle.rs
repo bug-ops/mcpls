@@ -38,7 +38,7 @@ use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
 use crate::lsp::{
     CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
-    PublishReader, ServerMessage, process_env, tsserver_pin,
+    process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -464,9 +464,37 @@ impl ServerInitConfig {
 #[derive(Debug)]
 pub enum ServerStartOutcome {
     /// The server initialized and is ready to register.
-    Started(Box<LspServer>),
+    Started(Box<SpawnedServer>),
     /// The server failed to start.
     Failed(ServerSpawnFailure),
+}
+
+/// The two inbound notification lanes of a spawned server.
+///
+/// Handed out once, together with the server, by [`LspServer::spawn`]: a pump
+/// owns them from then on, so a lane cannot be taken twice or left behind.
+#[derive(Debug)]
+pub struct ServerLanes {
+    /// Diagnostics mailbox plus the log and `showMessage` frames
+    /// ([`crate::lsp::ServerMessage`]). `textDocument/publishDiagnostics` is coalesced per
+    /// file and a publish the mailbox cannot hold is reported as lost instead
+    /// of being dropped (see [`crate::lsp::PublishReader`]).
+    pub notifications: NotificationInbox,
+    /// The lifecycle lane: `$/progress` `begin`/`end` frames and unrecognized
+    /// notifications (which carry e.g. rust-analyzer's
+    /// `experimental/serverStatus`), kept separate from the notification lane
+    /// so a high-volume diagnostics publisher can never starve out a
+    /// workspace-readiness signal, or vice versa.
+    pub lifecycle: mpsc::Receiver<LspNotification>,
+}
+
+/// A freshly initialized server together with its inbound lanes.
+#[derive(Debug)]
+pub struct SpawnedServer {
+    /// The running server.
+    pub server: LspServer,
+    /// Its notification lanes, to be drained by a pump.
+    pub lanes: ServerLanes,
 }
 
 /// Managed LSP server instance with capabilities and encoding.
@@ -474,24 +502,6 @@ pub struct LspServer {
     client: LspClient,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
-    /// Receiver for the log and `showMessage` frames of the LSP server
-    /// ([`ServerMessage`]); diagnostics arrive on [`Self::publish_rx`].
-    /// Taken for a pump with [`Self::take_notification_inbox`].
-    notification_rx: mpsc::Receiver<ServerMessage>,
-    /// Receiver of the diagnostics mailbox: `textDocument/publishDiagnostics`
-    /// is coalesced per file and a publish it cannot hold is reported as lost
-    /// instead of being dropped (see [`PublishReader`]). Taken for a pump with
-    /// [`Self::take_notification_inbox`].
-    publish_rx: PublishReader,
-    /// Receiver for the lifecycle lane (P3): `$/progress` `begin`/`end`
-    /// frames and unrecognized notifications (which carry e.g.
-    /// rust-analyzer's `experimental/serverStatus`), kept separate from
-    /// [`Self::notification_rx`] so a high-volume diagnostics publisher can
-    /// never starve out a workspace-readiness signal, or vice versa.
-    ///
-    /// Extract this before registering the server -- see
-    /// [`Self::take_lifecycle_rx`].
-    lifecycle_rx: mpsc::Receiver<LspNotification>,
     /// Child process handle. Kept alive for process lifetime management and
     /// queried by [`Self::has_exited`] to detect a crash. [`LspServer::shutdown`]
     /// waits for it to exit after sending `exit`; otherwise, or if that wait
@@ -514,9 +524,6 @@ impl std::fmt::Debug for LspServer {
             .field("client", &self.client)
             .field("capabilities", &self.capabilities)
             .field("position_encoding", &self.position_encoding)
-            .field("notification_rx", &"<channel>")
-            .field("publish_rx", &"<mailbox>")
-            .field("lifecycle_rx", &"<channel>")
             .field("child", &"<process>")
             .field("id", &self.init_config.server_config.id())
             .finish()
@@ -553,34 +560,8 @@ impl LspServer {
         self.init_config = config;
     }
 
-    /// Take the notification receiver out of this server, replacing it with a dummy channel.
-    fn take_notification_rx(&mut self) -> tokio::sync::mpsc::Receiver<ServerMessage> {
-        let (_, dummy) = tokio::sync::mpsc::channel(1);
-        std::mem::replace(&mut self.notification_rx, dummy)
-    }
-
-    /// Take everything the notification lane delivers: the log/showMessage
-    /// receiver and the diagnostics mailbox, ready for a pump.
-    pub fn take_notification_inbox(&mut self) -> NotificationInbox {
-        NotificationInbox::new(self.take_notification_rx(), self.take_publish_rx())
-    }
-
-    /// Take the diagnostics mailbox out of this server, replacing it with a
-    /// closed one.
-    fn take_publish_rx(&mut self) -> PublishReader {
-        std::mem::replace(&mut self.publish_rx, PublishReader::closed())
-    }
-
-    /// Take the lifecycle receiver out of this server, replacing it with a
-    /// dummy channel -- the lifecycle-lane counterpart to
-    /// [`Self::take_notification_inbox`]. Extract this before registering the
-    /// server for a background pump task to drain.
-    pub fn take_lifecycle_rx(&mut self) -> tokio::sync::mpsc::Receiver<LspNotification> {
-        let (_, dummy) = tokio::sync::mpsc::channel(1);
-        std::mem::replace(&mut self.lifecycle_rx, dummy)
-    }
-
-    /// Spawn and initialize LSP server.
+    /// Spawn and initialize LSP server, returning it with its notification
+    /// lanes.
     ///
     /// This performs the complete initialization sequence:
     /// 1. Spawns the LSP server as a child process
@@ -599,7 +580,7 @@ impl LspServer {
     /// - Server returns error during initialization
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
-    pub async fn spawn(config: ServerInitConfig) -> Result<Self> {
+    pub async fn spawn(config: ServerInitConfig) -> Result<SpawnedServer> {
         let own = Redactions::for_server(config.server_config(), current_environment());
         let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));
         Self::log_spawn(config.server_config(), &redactions);
@@ -695,15 +676,18 @@ impl LspServer {
 
         info!("LSP server initialized successfully");
 
-        Ok(Self {
-            client,
-            capabilities,
-            position_encoding,
-            notification_rx,
-            publish_rx,
-            lifecycle_rx,
-            child: Some(child),
-            init_config: config,
+        Ok(SpawnedServer {
+            server: Self {
+                client,
+                capabilities,
+                position_encoding,
+                child: Some(child),
+                init_config: config,
+            },
+            lanes: ServerLanes {
+                notifications: NotificationInbox::new(notification_rx, publish_rx),
+                lifecycle: lifecycle_rx,
+            },
         })
     }
 
@@ -1283,7 +1267,7 @@ impl LspServer {
 /// ended; see [`LspServer::start_contained`].
 async fn contain(
     config: &ServerInitConfig,
-    start: impl std::future::Future<Output = Result<LspServer>>,
+    start: impl std::future::Future<Output = Result<SpawnedServer>>,
 ) -> ServerStartOutcome {
     let server_id = config.server_config.id();
     let language_id = config.server_config.language_id.clone();
@@ -1291,14 +1275,14 @@ async fn contain(
     let started = Instant::now();
 
     let reason = match crate::util::catch_panic(start).await {
-        Ok(Ok(server)) => {
+        Ok(Ok(spawned)) => {
             info!(
                 "Successfully spawned LSP server: {} ({}) in {:?}",
                 server_id,
                 command,
                 started.elapsed()
             );
-            return ServerStartOutcome::Started(Box::new(server));
+            return ServerStartOutcome::Started(Box::new(spawned));
         }
         Ok(Err(e)) => {
             tracing::error!(
@@ -1383,7 +1367,10 @@ async fn early_exit_status(child: &mut ServerProcess) -> Option<std::process::Ex
 /// message can carry PATH and install guidance.
 fn spawn_error(command: ServerCommand, source: std::io::Error) -> Error {
     if source.kind() == std::io::ErrorKind::NotFound {
-        Error::ServerNotFound { command, source }
+        Error::ServerNotFound {
+            command,
+            io: source,
+        }
     } else {
         Error::ServerSpawnFailed { command, source }
     }
@@ -1436,17 +1423,27 @@ pub fn fake_lsp_server() -> LspServer {
 pub fn fake_lsp_server_with_config(server_config: LspServerConfig) -> LspServer {
     let transport = crate::test_lsp::inert_transport();
     let client = LspClient::from_transport(server_config.clone(), transport);
-    let (_, mock_notification_rx) = mpsc::channel(1);
-    let (_, mock_lifecycle_rx) = mpsc::channel(1);
     LspServer {
         client,
         capabilities: lsp_types::ServerCapabilities::default(),
         position_encoding: PositionEncodingKind::UTF8,
-        notification_rx: mock_notification_rx,
-        publish_rx: PublishReader::closed(),
-        lifecycle_rx: mock_lifecycle_rx,
         child: None,
         init_config: crate::test_lsp::init_config_for(server_config),
+    }
+}
+
+/// [`fake_lsp_server_with_config`] with inert lanes, as [`LspServer::spawn`]
+/// returns it.
+#[cfg(test)]
+pub fn fake_spawned_server_with_config(server_config: LspServerConfig) -> SpawnedServer {
+    let (_, messages) = mpsc::channel(1);
+    let (_, lifecycle) = mpsc::channel(1);
+    SpawnedServer {
+        server: fake_lsp_server_with_config(server_config),
+        lanes: ServerLanes {
+            notifications: NotificationInbox::new(messages, crate::lsp::PublishReader::closed()),
+            lifecycle,
+        },
     }
 }
 
@@ -1491,16 +1488,11 @@ impl LspServer {
         position_encoding: PositionEncodingKind,
     ) -> Self {
         let client = LspClient::new(LspServerConfig::rust_analyzer());
-        let (_, notification_rx) = mpsc::channel(1);
-        let (_, lifecycle_rx) = mpsc::channel(1);
 
         Self {
             client,
             capabilities,
             position_encoding,
-            notification_rx,
-            publish_rx: PublishReader::closed(),
-            lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         }
@@ -1514,8 +1506,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::PositionEncoding;
-    use crate::config::{FilePattern, LanguageId, TimeoutSecs, ToolSet};
-    use crate::lsp::HostOs;
+    use crate::config::{FilePattern, HostOs, LanguageId, TimeoutSecs, ToolSet};
 
     #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
@@ -1844,16 +1835,11 @@ mod tests {
 
         let transport = LspTransport::new(mock_stdin, mock_stdout);
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-        let (_, mock_notification_rx) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
         let mut server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx,
-            publish_rx: PublishReader::closed(),
-            lifecycle_rx: mock_lifecycle_rx,
             child: Some(ServerProcess::from_unbound(mock_child)),
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
@@ -1897,15 +1883,10 @@ mod tests {
     async fn test_shutdown_reports_handshake_timeout_within_deadline() {
         let (client, _fake_server) = crate::test_lsp::fake_lsp_client();
         let probe = client.clone();
-        let (_, notification_rx) = mpsc::channel(1);
-        let (_, lifecycle_rx) = mpsc::channel(1);
         let server = LspServer {
             client,
             capabilities: lsp_types::ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            notification_rx,
-            publish_rx: PublishReader::closed(),
-            lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
@@ -1931,16 +1912,11 @@ mod tests {
 
         let transport = crate::test_lsp::inert_transport();
         let client = LspClient::from_transport(LspServerConfig::rust_analyzer(), transport);
-        let (_, mock_notification_rx) = mpsc::channel(1);
-        let (_, mock_lifecycle_rx) = mpsc::channel(1);
 
         let server = LspServer {
             client,
             capabilities: ServerCapabilities::default(),
             position_encoding: PositionEncodingKind::UTF8,
-            notification_rx: mock_notification_rx,
-            publish_rx: PublishReader::closed(),
-            lifecycle_rx: mock_lifecycle_rx,
             child: None,
             init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
         };
@@ -2316,8 +2292,11 @@ sleep 5
             "SuperSecretValue123".to_string(),
         );
 
-        let mut server = LspServer::spawn(config).await.unwrap();
-        let mut rx = server.take_notification_rx();
+        let SpawnedServer {
+            server: _server,
+            lanes,
+        } = LspServer::spawn(config).await.unwrap();
+        let mut rx = lanes.notifications.messages;
         let mut texts = Vec::new();
         for _ in 0..2 {
             let notification = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -2407,7 +2386,7 @@ sleep 5
             &crate::test_lsp::with_read_preamble(&script),
         );
 
-        let mut server = LspServer::spawn(config).await.unwrap();
+        let mut server = LspServer::spawn(config).await.unwrap().server;
 
         let flooded = tokio::time::timeout(Duration::from_secs(5), async {
             while !marker.exists() {

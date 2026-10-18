@@ -19,7 +19,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::bridge::{BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES};
-use crate::util::{WarnLimiter, lock_std};
+use crate::util::{MAX_LOG_STRING_BYTES, WarnLimiter, escape_bounded, lock_std};
 
 /// Most files with an undelivered publish; as many as the cache holds, so the
 /// mailbox is never the narrower bound.
@@ -99,7 +99,9 @@ impl BoundedPublish {
             version,
         } = params;
         let diagnostics = BoundedDiagnostics::new(&uri, diagnostics);
-        let bytes = diagnostics.buffered_bytes();
+        let bytes = diagnostics
+            .buffered_bytes()
+            .saturating_add(AsRef::<str>::as_ref(&uri).len());
         (
             Self {
                 uri,
@@ -177,14 +179,19 @@ pub enum ServerMessage {
 struct Pending {
     publish: BoundedPublish,
     bytes: usize,
+    /// Position in `State::order`; a replacement keeps it, a new publish of
+    /// a file whose earlier one was withdrawn gets a fresh one.
+    seq: u64,
 }
 
 #[derive(Debug, Default)]
 struct State {
     pending: HashMap<DiagnosticsKey, Pending>,
-    /// Arrival order of the keys of `pending`; a key whose publish was
-    /// withdrawn or already taken is skipped.
-    order: VecDeque<DiagnosticsKey>,
+    /// Arrival order of the pending publishes as `(key, seq)`; an entry whose
+    /// `seq` is not the pending publish's (withdrawn, taken or republished
+    /// later) is skipped.
+    order: VecDeque<(DiagnosticsKey, u64)>,
+    next_seq: u64,
     bytes: usize,
     lost: Vec<Uri>,
     lost_keys: HashSet<DiagnosticsKey>,
@@ -208,13 +215,20 @@ impl State {
         }
     }
 
-    /// Drops the keys of `order` that no longer have a pending publish once
-    /// they outnumber what the mailbox can hold twice over, so a stalled
+    fn is_current(&self, key: &DiagnosticsKey, seq: u64) -> bool {
+        self.pending
+            .get(key)
+            .is_some_and(|pending| pending.seq == seq)
+    }
+
+    /// Drops the entries of `order` that no longer match a pending publish
+    /// once they outnumber what the mailbox can hold twice over, so a stalled
     /// reader cannot make the queue grow with withdrawn files.
     fn compact_order(&mut self, max_pending: usize) {
         if self.order.len() > max_pending.saturating_mul(2).max(16) {
             let pending = &self.pending;
-            self.order.retain(|key| pending.contains_key(key));
+            self.order
+                .retain(|(key, seq)| pending.get(key).is_some_and(|pending| pending.seq == *seq));
         }
     }
 
@@ -224,7 +238,10 @@ impl State {
         if let Some(lost) = self.take_lost_files() {
             return Some(PublishDelivery::Lost(lost));
         }
-        while let Some(key) = self.order.pop_front() {
+        while let Some((key, seq)) = self.order.pop_front() {
+            if !self.is_current(&key, seq) {
+                continue;
+            }
             if let Some(pending) = self.pending.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(pending.bytes);
                 return Some(PublishDelivery::Publish(pending.publish));
@@ -307,11 +324,14 @@ impl PublishWriter {
             );
             return;
         }
-        let replaced_bytes = state.pending.get(&key).map(|pending| pending.bytes);
-        let is_new = replaced_bytes.is_none();
+        let replaced = state
+            .pending
+            .get(&key)
+            .map(|pending| (pending.bytes, pending.seq));
+        let is_new = replaced.is_none();
         let fits = state
             .bytes
-            .saturating_sub(replaced_bytes.unwrap_or(0))
+            .saturating_sub(replaced.map_or(0, |(bytes, _)| bytes))
             .saturating_add(bytes)
             <= limits.max_bytes
             && (!is_new || state.pending.len() < limits.max_pending);
@@ -319,10 +339,23 @@ impl PublishWriter {
         state.withdraw(&key);
         let warn_due = if fits {
             state.bytes = state.bytes.saturating_add(bytes);
-            if is_new {
-                state.order.push_back(key.clone());
-            }
-            state.pending.insert(key, Pending { publish, bytes });
+            let seq = replaced.map_or_else(
+                || {
+                    let seq = state.next_seq;
+                    state.next_seq = seq.saturating_add(1);
+                    state.order.push_back((key.clone(), seq));
+                    seq
+                },
+                |(_, seq)| seq,
+            );
+            state.pending.insert(
+                key,
+                Pending {
+                    publish,
+                    bytes,
+                    seq,
+                },
+            );
             None
         } else {
             let (uri, ..) = publish.into_parts();
@@ -509,6 +542,7 @@ impl DropLog {
     /// DEBUG only.
     pub fn record(&self, method: &str) {
         let lane = self.lane.name();
+        let method = escape_bounded(method, MAX_LOG_STRING_BYTES);
         debug!("dropping notification: lane={lane}, method={method}");
         let warn_due = lock_std(&self.drops).record(Instant::now());
         if let Some(suppressed) = warn_due {
@@ -544,8 +578,62 @@ mod tests {
     }
 
     fn bytes_of(n: usize, message: &str) -> usize {
-        let params = publish_of(n, message);
-        BoundedDiagnostics::new(&params.uri, params.diagnostics).buffered_bytes()
+        BoundedPublish::new(publish_of(n, message)).1
+    }
+
+    /// #738: the method of a dropped frame is escaped and bounded in the log.
+    #[test]
+    fn drop_log_escapes_and_bounds_the_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        DropLog::of(Lane::Notification).record(&format!("evil\nFORGED{}", "x".repeat(10_000)));
+        drop(guard);
+
+        let line = captured
+            .messages()
+            .into_iter()
+            .find(|message| message.contains("dropping notification"))
+            .expect("the drop is logged at debug");
+        assert!(!line.contains('\n'), "{line:.80}");
+        assert!(line.contains("evil\\nFORGED"), "{line:.80}");
+        assert!(line.len() < 2 * MAX_LOG_STRING_BYTES, "{}", line.len());
+    }
+
+    /// #738: the URI text counts toward the byte budget.
+    #[test]
+    fn publish_bytes_include_the_uri() {
+        let params = publish_of(1, "x");
+        let diagnostics = BoundedDiagnostics::new(&params.uri, params.diagnostics.clone());
+
+        assert_eq!(
+            bytes_of(1, "x"),
+            diagnostics.buffered_bytes() + "file:///ws/f1.rs".len()
+        );
+    }
+
+    /// #742: a republished file is delivered at its new arrival position, not
+    /// at the place a withdrawn publish held.
+    #[tokio::test]
+    async fn republished_file_follows_arrival_order_after_a_withdrawal() {
+        let one = bytes_of(1, "x");
+        let (writer, mut reader) = mailbox(small(10, one * 2 + one / 2));
+        writer.publish(publish_of(1, "x"));
+        writer.publish(publish_of(1, &"y".repeat(one * 4)));
+        writer.publish(publish_of(2, "x"));
+        writer.publish(publish_of(1, "x"));
+        drop(writer);
+
+        let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
+            panic!("expected the lost file first");
+        };
+        assert_eq!(lost.uris(), [uri(1)]);
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
+        assert!(reader.recv().await.is_none());
     }
 
     fn small(max_pending: usize, max_bytes: usize) -> MailboxLimits {

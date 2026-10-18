@@ -892,7 +892,7 @@
           "type": "integer"
         },
         "trigger": {
-          "description": "Optional trigger character (e.g., '.', ':', '->'), at most 8 bytes.",
+          "description": "Optional trigger character (e.g., '.', ':', '->'), 1 to 8 bytes.",
           "type": [
             "string",
             "null"

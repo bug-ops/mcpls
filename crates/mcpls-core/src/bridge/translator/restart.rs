@@ -24,7 +24,7 @@ use super::servers::{Backend, Phase};
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsKey, IndexingState};
 use crate::config::{LanguageId, ServerId};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorChain, Result};
 use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
 use crate::util::lock_std;
@@ -186,7 +186,7 @@ pub enum RestartFailure {
 
 impl RestartFailure {
     fn from_error(error: &Error) -> Self {
-        let message = error.to_string();
+        let message = ErrorChain(error).to_string();
         match error {
             Error::ServerNotFound { .. } | Error::ServerSpawnFailed { .. } => {
                 Self::SpawnFailed { message }
@@ -333,6 +333,24 @@ pub struct NotificationReceivers {
     pub(crate) pinned_tsserver: Option<std::path::PathBuf>,
 }
 
+impl NotificationReceivers {
+    /// The receivers a pump drains for a spawned server's `lanes`.
+    pub(crate) fn new(
+        lanes: crate::lsp::ServerLanes,
+        pinned_tsserver: Option<std::path::PathBuf>,
+    ) -> Self {
+        let crate::lsp::ServerLanes {
+            notifications,
+            lifecycle,
+        } = lanes;
+        Self {
+            notifications,
+            lifecycle,
+            pinned_tsserver,
+        }
+    }
+}
+
 /// How a respawned server's notifications are consumed.
 #[derive(Clone, Copy)]
 pub(super) enum NotificationRouting<'a> {
@@ -364,6 +382,11 @@ pub enum DiagnosticsRole {
 }
 
 impl DiagnosticsRole {
+    /// Whether the server's pushes are cached and announced.
+    pub(crate) const fn caches(self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+
     /// The role of a server that is, or is not, the language's diagnostics route.
     pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
         if is_diagnostics_route {
@@ -455,7 +478,7 @@ impl<'a> Deregistered<'a> {
             )
             .await;
         if let Err(error) = stopped {
-            tracing::warn!(id = %self.id, %error, "old LSP server did not stop cleanly; continuing with restart");
+            tracing::warn!(id = %self.id, error = %ErrorChain(&error), "old LSP server did not stop cleanly; continuing with restart");
         }
         Some(config)
     }
@@ -725,7 +748,7 @@ impl Translator {
         // Counted from completion too, so a slow restart cannot be chained at once.
         self.note_restart_attempt(id);
         if let Err(error) = respawned {
-            tracing::warn!(%id, %error, "LSP server restart failed");
+            tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart failed");
             self.invalidate_stopped_server(id, &language_id).await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::from_error(&error),
@@ -785,7 +808,7 @@ impl Translator {
         if let Some(server) = server
             && let Err(error) = server.shutdown().await
         {
-            tracing::warn!(%id, %error, "replacement LSP server shutdown failed");
+            tracing::warn!(%id, error = %ErrorChain(&error), "replacement LSP server shutdown failed");
         }
     }
 }
@@ -907,7 +930,7 @@ mod tests {
     fn spawn_errors_map_to_spawn_failed_and_the_rest_to_initialize_failed() {
         let not_found = Error::ServerNotFound {
             command: crate::config::ServerCommand::from_static("x"),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            io: std::io::Error::from(std::io::ErrorKind::NotFound),
         };
         assert_matches!(
             RestartFailure::from_error(&not_found),
@@ -917,6 +940,18 @@ mod tests {
             RestartFailure::from_error(&Error::Timeout(Duration::from_secs(5))),
             RestartFailure::InitializeFailed { .. }
         );
+    }
+
+    #[test]
+    fn restart_failure_keeps_the_os_cause() {
+        let spawn = Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::from_static("x"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        let RestartFailure::SpawnFailed { message } = RestartFailure::from_error(&spawn) else {
+            panic!("expected SpawnFailed");
+        };
+        assert_eq!(message, "failed to spawn LSP server 'x': permission denied");
     }
 
     #[cfg(unix)]
@@ -970,14 +1005,11 @@ mod tests {
                 WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
 
-            let mut server = crate::lsp::LspServer::spawn(stub_server_config("rust", script))
-                .await
-                .unwrap();
-            let receivers = NotificationReceivers {
-                notifications: server.take_notification_inbox(),
-                lifecycle: server.take_lifecycle_rx(),
-                pinned_tsserver: None,
-            };
+            let crate::lsp::SpawnedServer { server, lanes } =
+                crate::lsp::LspServer::spawn(stub_server_config("rust", script))
+                    .await
+                    .unwrap();
+            let receivers = NotificationReceivers::new(lanes, None);
             translator.register_server_complete(server);
 
             let wiring = PumpWiring::new(
@@ -1586,14 +1618,11 @@ mod tests {
                 let script_dir = dir.path().join(&name);
                 fs::create_dir(&script_dir).unwrap();
                 let script = write_protocol_server_script(&script_dir, &log, None);
-                let mut server = crate::lsp::LspServer::spawn(stub_server_config(&name, &script))
-                    .await
-                    .unwrap();
-                let receivers = NotificationReceivers {
-                    notifications: server.take_notification_inbox(),
-                    lifecycle: server.take_lifecycle_rx(),
-                    pinned_tsserver: None,
-                };
+                let crate::lsp::SpawnedServer { server, lanes } =
+                    crate::lsp::LspServer::spawn(stub_server_config(&name, &script))
+                        .await
+                        .unwrap();
+                let receivers = NotificationReceivers::new(lanes, None);
                 translator.register_server_complete(server);
                 let id = ServerId::new(name.as_str()).unwrap();
                 let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Secondary);

@@ -634,12 +634,8 @@ fn unanalyzable(command: &str, reason: UnanalyzableLaunch) -> LauncherRefusal {
     }
 }
 
-const fn deepen(depth: usize) -> Result<(), LauncherRefusal> {
-    if depth >= MAX_WRAPPER_DEPTH {
-        Err(LauncherRefusal::TooDeep)
-    } else {
-        Ok(())
-    }
+fn deepen(depth: usize) -> Result<(), LauncherRefusal> {
+    (depth < MAX_WRAPPER_DEPTH).ok_or(LauncherRefusal::TooDeep)
 }
 
 #[derive(Default)]
@@ -880,21 +876,19 @@ fn grammar_flag(grammar: &ShellGrammar, arg: &str) -> Option<ShellFlag> {
 
 /// The PowerShell parameter a lowercased `-name` abbreviates.
 fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
-    const PARAMETERS: [(&str, PowerShellParameter); 3] = [
-        ("command", PowerShellParameter::Command),
-        ("commandwithargs", PowerShellParameter::CommandWithArgs),
-        ("encodedcommand", PowerShellParameter::EncodedCommand),
-    ];
     match name {
         "ec" => return Some(PowerShellParameter::EncodedCommand),
         "cwa" => return Some(PowerShellParameter::CommandWithArgs),
         "" => return None,
         _ => {}
     }
-    PARAMETERS
-        .iter()
-        .find(|(full, _)| full.starts_with(name))
-        .map(|&(_, parameter)| parameter)
+    PowerShellParameter::ALL.into_iter().find(|parameter| {
+        parameter
+            .as_str()
+            .strip_prefix('-')
+            .and_then(|full| full.get(..name.len()))
+            .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    })
 }
 
 /// The first letter of a single-dash cluster that `reached` accepts, with the
@@ -984,7 +978,7 @@ fn is_duration(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::MAX_SYMBOL_NAME_BYTES;
+    use crate::util::MAX_ECHOED_NAME_BYTES;
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
@@ -1616,7 +1610,7 @@ mod tests {
 
     #[test]
     fn refusals_echo_only_bounded_names_never_values() {
-        let long = format!("--{}=secret", "a".repeat(2 * MAX_SYMBOL_NAME_BYTES));
+        let long = format!("--{}=secret", "a".repeat(2 * MAX_ECHOED_NAME_BYTES));
         let Err(LauncherRefusal::Unanalyzable {
             reason: UnanalyzableLaunch::UnknownOption(option),
             ..
@@ -1625,7 +1619,7 @@ mod tests {
             panic!("expected an unknown option");
         };
         assert!(!option.as_str().contains("secret"));
-        assert!(option.as_str().len() <= MAX_SYMBOL_NAME_BYTES + 64);
+        assert!(option.as_str().len() <= MAX_ECHOED_NAME_BYTES + 64);
 
         assert_eq!(EchoedArgument::name("API_TOKEN=abc").as_str(), "API_TOKEN");
         assert_eq!(EchoedArgument::name("srv --token abc").as_str(), "srv");

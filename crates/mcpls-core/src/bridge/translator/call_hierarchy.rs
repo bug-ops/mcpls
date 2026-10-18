@@ -11,7 +11,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::hierarchy::hierarchy_item_to_mcp;
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
-use super::routing::{Capability, DisclosedCapability, PreparedDocument};
+use super::routing::PreparedDocument;
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -73,7 +73,6 @@ impl Translator {
             .disclosed_position_request::<lsp_types::CallHierarchyPrepareRequest>(
                 &file_path,
                 position,
-                DisclosedCapability::CallHierarchy,
                 (),
             )
             .await?;
@@ -169,10 +168,7 @@ impl Translator {
         let (raw, ctx, _doc): (Vec<RawCall>, EncodingCtx, PreparedDocument) = match direction {
             CallDirection::Incoming => {
                 let Positioned { result, ctx, doc } = self
-                    .item_request::<lsp_types::CallHierarchyIncomingCallsRequest>(
-                        item,
-                        Capability::CallHierarchy,
-                    )
+                    .item_request::<lsp_types::CallHierarchyIncomingCallsRequest>(item)
                     .await?;
                 let raw = result
                     .unwrap_or_default()
@@ -189,10 +185,7 @@ impl Translator {
             }
             CallDirection::Outgoing => {
                 let Positioned { result, ctx, doc } = self
-                    .item_request::<lsp_types::CallHierarchyOutgoingCallsRequest>(
-                        item,
-                        Capability::CallHierarchy,
-                    )
+                    .item_request::<lsp_types::CallHierarchyOutgoingCallsRequest>(item)
                     .await?;
                 let source_uri = doc.uri().clone();
                 let raw = result
@@ -422,6 +415,46 @@ mod tests {
             "expected Error::FileIo from the canonicalize() failure now that Uri construction \
              cannot itself reject a malformed uri, got {result:?}"
         );
+    }
+
+    /// #749: a hierarchy item whose `uri` is not a `file:` URI is rejected
+    /// with a message that does not grow with the `uri`, and a control
+    /// character in it is escaped.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_bounds_the_echo_of_a_non_file_uri() {
+        let translator = Translator::new();
+        let uri = format!("x\n{}", "Z".repeat(1 << 20));
+        let item = serde_json::json!({
+            "name": "foo",
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            }
+        });
+
+        let result = translator
+            .handle_incoming_calls(checked_hierarchy_item(item))
+            .await;
+
+        let Err(Error::InvalidToolParams(message)) = result else {
+            panic!("expected InvalidToolParams, got {result:?}");
+        };
+        assert!(
+            message.len() <= 2 * crate::util::MAX_ECHOED_PATH_BYTES,
+            "{}",
+            message.len()
+        );
+        assert!(
+            message.ends_with(crate::util::TRUNCATION_MARKER),
+            "{message:.80}"
+        );
+        assert!(!message.contains('\n'));
     }
 
     /// As above, through `handle_outgoing_calls` -- same

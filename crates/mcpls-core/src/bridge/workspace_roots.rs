@@ -102,7 +102,7 @@ pub type CanonicalizeFn = dyn Fn(&Path) -> io::Result<PathBuf> + Send + Sync;
 #[derive(Debug, ThisError)]
 pub enum Unresolved {
     /// The filesystem failed in a way that may not repeat; never cached.
-    #[error("transient filesystem error: {0}")]
+    #[error("transient filesystem error")]
     Transient(#[source] io::Error),
     /// Not even the root of the path could be canonicalized.
     #[error("no ancestor of the path exists")]

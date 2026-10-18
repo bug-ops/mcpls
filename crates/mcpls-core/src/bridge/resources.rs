@@ -15,6 +15,7 @@ use url::Url;
 
 use super::state::{encode_rfc3986_path_chars, file_url, uri_to_path};
 use super::{ClientPath, InvalidClientPath, WorkspaceRoots};
+use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -43,23 +44,32 @@ pub(crate) const MAX_LISTEN_STREAMS: usize = 100;
 #[derive(Debug, Error)]
 pub enum ResourceUriError {
     /// The path is relative or contains non-UTF-8 components.
-    #[error("path must be absolute and valid UTF-8: {0}")]
+    #[error(
+        "path must be absolute and valid UTF-8: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     InvalidPath(String),
 
     /// The URI has the wrong scheme or malformed structure.
-    #[error("expected '{SCHEME}:///' prefix in URI: {0}")]
+    #[error(
+        "expected '{SCHEME}:///' prefix in URI: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     InvalidScheme(String),
 
     /// The URI is not parseable as a URL.
-    #[error("malformed resource URI: {0}")]
+    #[error("malformed resource URI")]
     UrlParse(#[source] url::ParseError),
 
     /// The URI does not name a filesystem path.
-    #[error("URI does not name a filesystem path: {0}")]
+    #[error(
+        "URI does not name a filesystem path: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     NotAFilePath(String),
 
     /// The decoded path is not an acceptable client path.
-    #[error("decoded URI path is not acceptable: {0}")]
+    #[error("decoded URI path is not acceptable")]
     ClientPath(#[source] InvalidClientPath),
 }
 
@@ -193,6 +203,8 @@ pub(crate) struct PublishedDiagnosticsUri {
     /// rather than the URI text so percent-encoding and drive-letter case
     /// cannot make a canonical spelling look like an alias.
     is_canonical: bool,
+    /// How the canonical path was obtained.
+    form: CanonicalForm,
 }
 
 /// How trustworthy the canonical path handed to
@@ -228,17 +240,33 @@ impl PublishedDiagnosticsUri {
             canonical,
             is_canonical: form == CanonicalForm::Resolved
                 && same_path(published_path, canonical_path),
+            form,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(source: lsp_types::Uri, canonical: lsp_types::Uri) -> Self {
-        let is_canonical = source == canonical;
+        Self::for_test_with_form(source, canonical, CanonicalForm::Resolved)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_form(
+        source: lsp_types::Uri,
+        canonical: lsp_types::Uri,
+        form: CanonicalForm,
+    ) -> Self {
+        let is_canonical = source == canonical && form == CanonicalForm::Resolved;
         Self {
             source,
             canonical,
             is_canonical,
+            form,
         }
+    }
+
+    /// Whether the canonical path came from the filesystem or stood in for it.
+    pub(crate) const fn form(&self) -> CanonicalForm {
+        self.form
     }
 
     /// Whether the server published under the canonical spelling of the path.

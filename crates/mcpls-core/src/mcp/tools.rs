@@ -6,10 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
-    CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, KindFilterField,
-    KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NewName, Position,
-    Position2D, Range, RestartTarget, ResultContext, ServerIds, ServerIdsError, SymbolKindFilter,
-    SymbolName, SymbolNameError, SymbolQuery, SymbolTarget, TabSize,
+    CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, InvalidTextField,
+    KindFilterField, KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
+    NewName, Position, Position2D, Range, RestartTarget, ResultContext, ServerIds, ServerIdsError,
+    SymbolKindFilter, SymbolName, SymbolQuery, SymbolTarget, TabSize, TextField,
 };
 use crate::error::Error;
 
@@ -117,7 +117,10 @@ macro_rules! target_wire {
             fn take_target(&mut self) -> Result<SymbolTargetParams, TargetAddressError> {
                 SymbolTargetParams::from_parts(
                     std::mem::take(&mut self.file_path),
-                    (self.line, self.character),
+                    PositionFields {
+                        line: self.line,
+                        character: self.character,
+                    },
                     self.symbol_name.take(),
                     self.symbol_kind.take(),
                     self.container.take(),
@@ -144,7 +147,33 @@ pub enum TargetAddressError {
     HalfPosition,
     /// The symbol name or container is blank or too long.
     #[error(transparent)]
-    Name(#[from] SymbolNameError),
+    Name(#[from] InvalidTextField),
+}
+
+/// The `line` and `character` fields of a call as the client wrote them,
+/// either of which may be absent.
+#[derive(Debug, Clone, Copy)]
+struct PositionFields {
+    line: Option<u32>,
+    character: Option<u32>,
+}
+
+/// A complete, still unchecked 1-based position.
+#[derive(Debug, Clone, Copy)]
+struct WirePosition {
+    line: u32,
+    character: u32,
+}
+
+impl PositionFields {
+    /// The position when both fields are given, `None` when neither is.
+    const fn complete(self) -> Result<Option<WirePosition>, TargetAddressError> {
+        match (self.line, self.character) {
+            (Some(line), Some(character)) => Ok(Some(WirePosition { line, character })),
+            (None, None) => Ok(None),
+            _ => Err(TargetAddressError::HalfPosition),
+        }
+    }
 }
 
 /// Shared position parameters (file path plus 1-based line/character) used by
@@ -264,26 +293,30 @@ impl SymbolTargetParams {
     /// symbol, or when a symbol name or container is blank or too long.
     fn from_parts(
         file_path: PathBuf,
-        position: (Option<u32>, Option<u32>),
+        position: PositionFields,
         symbol_name: Option<String>,
         symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
         container: Option<String>,
     ) -> Result<Self, TargetAddressError> {
-        let target = match (position, symbol_name) {
-            ((Some(line), Some(character)), None) => {
+        let target = match (position.complete()?, symbol_name) {
+            (Some(WirePosition { line, character }), None) => {
                 if symbol_kind.is_some() || container.is_some() {
                     return Err(TargetAddressError::QualifierWithoutName);
                 }
                 SymbolTargetInput::Position { line, character }
             }
-            ((None, None), Some(name)) => SymbolTargetInput::Name {
-                name: SymbolName::try_new(name)?,
+            (None, Some(name)) => SymbolTargetInput::Name {
+                name: SymbolName::new(name).map_err(InvalidTextField::of(TextField::SymbolName))?,
                 kind: symbol_kind,
-                container: container.map(SymbolName::try_new).transpose()?,
+                container: container
+                    .map(|container| {
+                        SymbolName::new(container)
+                            .map_err(InvalidTextField::of(TextField::Container))
+                    })
+                    .transpose()?,
             },
-            ((Some(_), Some(_)), Some(_)) => return Err(TargetAddressError::BothForms),
-            ((None, None), None) => return Err(TargetAddressError::NoForm),
-            _ => return Err(TargetAddressError::HalfPosition),
+            (Some(_), Some(_)) => return Err(TargetAddressError::BothForms),
+            (None, None) => return Err(TargetAddressError::NoForm),
         };
         Ok(Self { file_path, target })
     }
@@ -486,7 +519,7 @@ position_wire! {
     #[schemars(description = "Parameters for getting code completion suggestions.")]
     CompletionsWire {
         #[schemars(
-            description = "Optional trigger character (e.g., '.', ':', '->'), at most 8 bytes."
+            description = "Optional trigger character (e.g., '.', ':', '->'), 1 to 8 bytes."
         )]
         #[schemars(with = "Option<String>")]
         trigger: Option<CompletionTrigger>,
@@ -1120,7 +1153,7 @@ mod tests {
         );
         assert!(
             error(serde_json::json!({"file_path": "/a.rs", "symbol_name": " "}))
-                .contains("must not be blank")
+                .contains("`symbol_name` cannot be empty")
         );
     }
 
@@ -1139,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn completions_reject_an_oversized_trigger_while_parsing() {
+    fn completions_reject_an_empty_or_oversized_trigger_while_parsing() {
         let parse = |trigger: &str| {
             serde_json::from_value::<CompletionsParams>(serde_json::json!({
                 "file_path": "/a.rs", "line": 1, "character": 1, "trigger": trigger,
@@ -1149,6 +1182,9 @@ mod tests {
         assert!(parse("->").is_ok());
         assert!(parse(&"a".repeat(MAX_TRIGGER_CHARACTER_BYTES)).is_ok());
         assert!(parse(&"a".repeat(MAX_TRIGGER_CHARACTER_BYTES + 1)).is_err());
+        assert!(parse(" ").is_ok());
+        let empty = parse("").unwrap_err().to_string();
+        assert!(empty.contains("`trigger` cannot be empty"), "{empty}");
     }
 
     #[test]

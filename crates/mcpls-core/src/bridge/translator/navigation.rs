@@ -7,13 +7,10 @@ use lsp_types::ReferenceContext;
 use tokio::time::Instant;
 
 use super::Translator;
-use super::dto::{
-    DefinitionResult, HoverResult, Location, LocationsResult, Position, PositionDegradation,
-    ReferencesResult,
-};
+use super::dto::{HoverResult, Location, LocationsResult, Position, PositionDegradation};
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
-use super::positioned::{FromPosition, Positioned};
+use super::positioned::{FromPosition, GotoRequest, Positioned};
 use super::routing::{Capability, IndexingGate};
 use crate::bridge::indexing::{
     DEFAULT_INDEXING_READY_TIMEOUT_SECS, INDEXING_STALENESS_BOUND, PROGRESS_LATCH_IDLE,
@@ -520,10 +517,9 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        capability: Capability,
     ) -> Result<NormalizedLocations>
     where
-        R: lsp_types::Request<Result = Option<T>>,
+        R: GotoRequest + lsp_types::Request<Result = Option<T>>,
         R::Params: FromPosition<Extra = ()>,
         T: GotoResponse,
     {
@@ -532,7 +528,12 @@ impl Translator {
             ctx,
             doc: _doc,
         } = self
-            .position_request::<R>(file_path, position, IndexingGate::Required(capability), ())
+            .position_request::<R>(
+                file_path,
+                position,
+                IndexingGate::Required(R::CAPABILITY),
+                (),
+            )
             .await?;
 
         Ok(goto_response_to_locations(response, &ctx).await)
@@ -551,13 +552,9 @@ impl Translator {
         file_path: ClientPath,
         position: Position,
         context: ResultContext,
-    ) -> Result<DefinitionResult> {
+    ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DefinitionRequest, _>(
-                &file_path,
-                position,
-                Capability::Definition,
-            )
+            .handle_goto::<lsp_types::DefinitionRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -576,7 +573,7 @@ impl Translator {
         position: Position,
         include_declaration: bool,
         context: ResultContext,
-    ) -> Result<ReferencesResult> {
+    ) -> Result<LocationsResult> {
         let Positioned {
             result: response,
             ctx,
@@ -613,11 +610,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::ImplementationRequest, _>(
-                &file_path,
-                position,
-                Capability::Implementation,
-            )
+            .handle_goto::<lsp_types::ImplementationRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -640,11 +633,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
-                &file_path,
-                position,
-                Capability::TypeDefinition,
-            )
+            .handle_goto::<lsp_types::TypeDefinitionRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -668,11 +657,7 @@ impl Translator {
         context: ResultContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DeclarationRequest, _>(
-                &file_path,
-                position,
-                Capability::Declaration,
-            )
+            .handle_goto::<lsp_types::DeclarationRequest, _>(&file_path, position)
             .await?;
         Ok(self.contextualize_into(normalized, context).await)
     }
@@ -1594,7 +1579,7 @@ mod tests {
     /// Regression for #474/M4: `get_references`' tool description no longer
     /// promises "all" references, since a response past
     /// `MAX_NORMALIZED_LOCATIONS` is capped -- the client must be able to
-    /// detect that via `ReferencesResult::truncated` rather than silently
+    /// detect that via `LocationsResult::truncated` rather than silently
     /// receiving a partial result that looks complete.
     #[tokio::test]
     async fn test_handle_references_sets_truncated_flag_past_cap() {

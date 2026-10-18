@@ -18,7 +18,7 @@ use crate::bridge::{
 };
 use crate::config::{LanguageId, ServerId, ServerStartConcurrency};
 use crate::error::ServerSpawnFailure;
-use crate::lsp::{LspServer, ServerInitConfig, ServerStartOutcome};
+use crate::lsp::{LspServer, ServerInitConfig, ServerStartOutcome, SpawnedServer};
 use crate::mcp::SubscriptionRegistry;
 use crate::util::catch_panic;
 
@@ -270,19 +270,18 @@ struct StartupSettler<'a> {
 impl StartupSettler<'_> {
     async fn settle(&mut self, outcome: ServerStartOutcome) {
         match outcome {
-            ServerStartOutcome::Started(server) => self.settle_started(*server).await,
+            ServerStartOutcome::Started(spawned) => self.settle_started(*spawned).await,
             ServerStartOutcome::Failed(failure) => self.settle_failed(failure).await,
         }
     }
 
     /// Receivers and indexing policy are taken before the server is visible;
     /// cancel is re-checked right before registering.
-    async fn settle_started(&mut self, mut server: LspServer) {
+    async fn settle_started(&mut self, spawned: SpawnedServer) {
         if self.cancel.is_cancelled() {
             return;
         }
-        let notification_inbox = server.take_notification_inbox();
-        let lifecycle_rx = server.take_lifecycle_rx();
+        let SpawnedServer { server, lanes } = spawned;
         let pinned_tsserver = server.init_config().pinned_tsserver();
         let policy = server.init_config().server_config().indexing;
         let config_id = server.init_config().server_config().id();
@@ -309,11 +308,7 @@ impl StartupSettler<'_> {
         self.recompute_roles().await;
         let pump = self.pumps.spawn(supervised_pump(
             id.clone(),
-            NotificationReceivers {
-                notifications: notification_inbox,
-                lifecycle: lifecycle_rx,
-                pinned_tsserver,
-            },
+            NotificationReceivers::new(lanes, pinned_tsserver),
             self.cancel.clone(),
             role_rx,
             self.pump_shared.clone(),
@@ -489,7 +484,7 @@ mod settler_tests {
         settler.settle(failure_of(&explicit)).await;
         settler
             .settle(ServerStartOutcome::Started(Box::new(
-                crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                crate::lsp::fake_spawned_server_with_config(catch_all.clone()),
             )))
             .await;
 
@@ -513,7 +508,7 @@ mod settler_tests {
         let guard = cache.lock().await;
 
         let settle = settler.settle(ServerStartOutcome::Started(Box::new(
-            crate::lsp::fake_lsp_server_with_config(config.clone()),
+            crate::lsp::fake_spawned_server_with_config(config.clone()),
         )));
         let release = async {
             tokio::task::yield_now().await;
@@ -540,7 +535,7 @@ mod settler_tests {
 
         settler
             .settle(ServerStartOutcome::Started(Box::new(
-                crate::lsp::fake_lsp_server_with_config(config.clone()),
+                crate::lsp::fake_spawned_server_with_config(config.clone()),
             )))
             .await;
 
@@ -570,7 +565,7 @@ mod settler_tests {
 
         settler
             .settle(ServerStartOutcome::Started(Box::new(
-                crate::lsp::fake_lsp_server_with_config(catch_all.clone()),
+                crate::lsp::fake_spawned_server_with_config(catch_all.clone()),
             )))
             .await;
         let role =
