@@ -681,7 +681,7 @@ async fn test_diagnostics_no_errors() {
     let errors: Vec<_> = diag_json
         .diagnostics
         .iter()
-        .filter(|d| matches!(d.severity, mcpls_core::bridge::DiagnosticSeverity::Error))
+        .filter(|d| matches!(d.severity, mcpls_core::bridge::ReportedSeverity::Error))
         .collect();
 
     assert!(

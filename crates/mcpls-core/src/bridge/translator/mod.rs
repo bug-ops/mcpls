@@ -18,7 +18,7 @@ use self::servers::{Backend, Phase, Servers};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::state::ResourceLimits;
-use crate::bridge::{DocumentTracker, NotificationCache, WorkspaceRoots};
+use crate::bridge::{DocumentOpenState, DocumentTracker, NotificationCache, WorkspaceRoots};
 use crate::config::{
     FilePattern, IndexingReadyTimeoutSecs, LanguageId, LanguageMap, ServerId, ServerSettlement,
     ToolKind, ToolRouter,
@@ -641,8 +641,8 @@ impl Translator {
 
     /// Whether a document is currently tracked as open.
     #[must_use]
-    pub fn is_document_open(&self, path: &Path) -> bool {
-        self.document_tracker.is_open(path)
+    pub fn open_state(&self, path: &Path) -> DocumentOpenState {
+        self.document_tracker.open_state(path)
     }
 
     /// The document tracker, shared with [`EncodingCtx`] so a cache-only

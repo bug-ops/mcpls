@@ -577,6 +577,27 @@ pub enum LinePresence {
     },
 }
 
+/// Whether a file is currently open through [`DocumentTracker`].
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{DocumentOpenState, Translator};
+///
+/// let translator = Translator::new();
+/// assert_eq!(
+///     translator.open_state(std::path::Path::new("/ws/a.rs")),
+///     DocumentOpenState::NotOpen
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentOpenState {
+    /// The document is tracked as open.
+    Open,
+    /// The document is not tracked.
+    NotOpen,
+}
+
 /// Tracks document state across the workspace.
 ///
 /// Every method takes `&self`: the document map and the per-path locks used
@@ -693,10 +714,20 @@ impl DocumentTracker {
         }
     }
 
+    /// Whether a document is currently open.
+    #[must_use]
+    pub fn open_state(&self, path: &Path) -> DocumentOpenState {
+        if lock_std(&self.documents).contains_key(path) {
+            DocumentOpenState::Open
+        } else {
+            DocumentOpenState::NotOpen
+        }
+    }
+
     /// Check if a document is currently open.
     #[must_use]
     pub fn is_open(&self, path: &Path) -> bool {
-        lock_std(&self.documents).contains_key(path)
+        self.open_state(path) == DocumentOpenState::Open
     }
 
     /// Get a clone of the state of an open document.

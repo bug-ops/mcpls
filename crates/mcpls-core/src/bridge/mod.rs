@@ -31,29 +31,31 @@ pub(crate) use notifications::{
 };
 pub use notifications::{
     DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
-    ServerMessage, apply_lifecycle_notification,
+    ReportedSeverity, ServerMessage, apply_lifecycle_notification,
 };
 #[cfg(test)]
 pub(crate) use published_uri::resolve_one;
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use signals::{Indexed, IndexingSignal, RouteSignals};
-pub use state::{DocumentTracker, DocumentVersion, ResourceLimits, path_to_uri, uri_to_path};
+pub use state::{
+    DocumentOpenState, DocumentTracker, DocumentVersion, ResourceLimits, path_to_uri, uri_to_path,
+};
 pub(crate) use state::{InFlightGuard, LinePresence, Opening, try_path_to_uri};
 pub use translator::{
     AddressableTool, Addressed, BoundedRange, Capability, CheckedHierarchyItem,
     CodeActionKindFilter, Completion, CompletionTrigger, CompletionsResult, Contextual,
-    ContextualDiagnostic, ContextualLocation, DefinitionResult, Diagnostic, DiagnosticSeverity,
-    DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult,
-    DocumentChanges, DocumentDiagnosticsResult, DocumentHighlightEntry, DocumentHighlightKind,
+    ContextualDiagnostic, ContextualLocation, Diagnostic, DiagnosticsAnswer,
+    DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentChanges,
+    DocumentDiagnosticsResult, DocumentHighlightEntry, DocumentHighlightKind,
     DocumentHighlightsResult, DocumentSymbolsResult, DroppedEdits, EnclosingSymbol,
     EnclosingSymbolOutcome, EnrichmentSummary, FoldingKind, FoldingKindFilter, FoldingRangesResult,
     FoldingRegion, FormatDocumentResult, HierarchyItem, HoverResult, InvalidHierarchyItem,
     InvalidPosition, InvalidRange, InvalidTabSize, InvalidTextField, KindFilter, KindFilterField,
-    KindFilterInput, Location, MAX_COLLAPSED_TEXT_BYTES, MAX_NEW_NAME_LENGTH, MAX_POSITION_VALUE,
-    MAX_RANGE_LINES, MAX_RESTART_SERVER_IDS, MAX_SELECTION_CHAIN, MAX_SERVER_ID_BYTES,
-    MAX_SYMBOL_NAME_BYTES, MAX_TAB_SIZE, MAX_TRIGGER_CHARACTER_BYTES, NewName, NotComputedReason,
-    Position, Position2D, PositionDegradation, PositionRange, PositionSource, PrepareRenameOutcome,
-    PrepareRenameResult, Range, ReferencesResult, RejectedKindFilter, Rejection, RenameResult,
+    KindFilterInput, Location, LocationsResult, MAX_COLLAPSED_TEXT_BYTES, MAX_NEW_NAME_LENGTH,
+    MAX_POSITION_VALUE, MAX_RANGE_LINES, MAX_RESTART_SERVER_IDS, MAX_SELECTION_CHAIN,
+    MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES, MAX_TAB_SIZE, MAX_TRIGGER_CHARACTER_BYTES, NewName,
+    NotComputedReason, Position, Position2D, PositionDegradation, PositionRange, PositionSource,
+    PrepareRenameOutcome, PrepareRenameResult, Range, RejectedKindFilter, Rejection, RenameResult,
     ResolvedSymbol, ResolvedTarget, RestartFailure, RestartOutcome, RestartServerResult,
     RestartTarget, ResultContext, RouteSupport, SelectionRangesResult, ServerIds, ServerIdsError,
     ServerRestartEntry, Symbol, SymbolFidelity, SymbolKindFilter, SymbolName, SymbolQuery,
@@ -61,9 +63,9 @@ pub use translator::{
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,
-    InlayHintsResult, LocationsResult, NotificationReceivers, NotificationWiring,
-    OutgoingCallsResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    ToolSupportSnapshot, WorkspaceSymbolResult,
+    InlayHintsResult, NotificationReceivers, NotificationWiring, OutgoingCallsResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, ToolSupportSnapshot,
+    WorkspaceSymbolResult,
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};

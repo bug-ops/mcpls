@@ -795,7 +795,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::WorkspaceRoots;
-    use crate::bridge::translator::dto::DiagnosticSeverity;
+    use crate::bridge::notifications::ReportedSeverity;
     use crate::bridge::translator::testing::*;
     use crate::test_lsp::client_path;
 
@@ -1273,13 +1273,13 @@ mod tests {
         )
         .await;
         assert_eq!(result.diagnostics.len(), 4);
-        assert_matches!(result.diagnostics[0].severity, DiagnosticSeverity::Error);
-        assert_matches!(result.diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_matches!(result.diagnostics[0].severity, ReportedSeverity::Error);
+        assert_matches!(result.diagnostics[1].severity, ReportedSeverity::Warning);
         assert_matches!(
             result.diagnostics[2].severity,
-            DiagnosticSeverity::Information
+            ReportedSeverity::Information
         );
-        assert_matches!(result.diagnostics[3].severity, DiagnosticSeverity::Hint);
+        assert_matches!(result.diagnostics[3].severity, ReportedSeverity::Hint);
         assert_eq!(result.diagnostics[0].code, Some("1".to_string()));
         assert_eq!(result.diagnostics[1].code, Some("W001".to_string()));
     }

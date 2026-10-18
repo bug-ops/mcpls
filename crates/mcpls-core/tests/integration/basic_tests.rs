@@ -70,7 +70,7 @@ fn test_document_tracker_lazy_opening() {
 
     let test_file = rust_workspace_path().join("src/lib.rs");
     assert!(
-        !translator.is_document_open(&test_file),
+        translator.open_state(&test_file) == mcpls_core::bridge::DocumentOpenState::NotOpen,
         "Document should not be open initially"
     );
 }

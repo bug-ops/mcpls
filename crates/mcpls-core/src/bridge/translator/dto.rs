@@ -562,16 +562,13 @@ pub struct HoverResult {
     pub positions_degraded: Option<PositionDegradation>,
 }
 
-/// Diagnostic severity.
-pub type DiagnosticSeverity = ReportedSeverity;
-
 /// A single diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Diagnostic {
     /// Range where the diagnostic applies.
     pub range: Range,
     /// Severity of the diagnostic.
-    pub severity: DiagnosticSeverity,
+    pub severity: ReportedSeverity,
     /// Diagnostic message.
     pub message: String,
     /// Optional diagnostic code.
@@ -1006,12 +1003,6 @@ pub struct LocationsResult {
     #[schemars(with = "EnrichmentSummary")]
     pub enrichment: Option<EnrichmentSummary>,
 }
-
-/// Result of a definition request.
-pub type DefinitionResult = LocationsResult;
-
-/// Result of a references request.
-pub type ReferencesResult = LocationsResult;
 
 /// A single inlay hint entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2050,7 +2041,7 @@ mod tests {
             kind: None,
             diagnostics: vec![Diagnostic {
                 range: range(),
-                severity: DiagnosticSeverity::Error,
+                severity: ReportedSeverity::Error,
                 message: format!("bad {SECRET}"),
                 code: Some(format!("E-{SECRET}")),
             }],
@@ -2245,7 +2236,7 @@ mod tests {
         let mut result = DocumentDiagnosticsResult {
             diagnostics: vec![ContextualDiagnostic::from(Diagnostic {
                 range: range(),
-                severity: DiagnosticSeverity::Error,
+                severity: ReportedSeverity::Error,
                 message: format!("echo {SECRET}"),
                 code: None,
             })],

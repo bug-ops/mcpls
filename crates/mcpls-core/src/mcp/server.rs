@@ -43,15 +43,15 @@ use crate::bridge::resources::{
 };
 use crate::bridge::{
     AddressableTool, Addressed, BoundedRange, CallHierarchyPrepareResult, CheckedHierarchyItem,
-    ClientPath, CodeActionsResult, CompletionsResult, DefinitionResult, DiagnosticInfo,
-    DiagnosticsAvailability, DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult,
-    DocumentHighlightsResult, DocumentSymbolsResult, DocumentVersion, FoldingRangesResult,
+    ClientPath, CodeActionsResult, CompletionsResult, DiagnosticInfo, DiagnosticsAvailability,
+    DiagnosticsOrigin, DiagnosticsResult, DocumentDiagnosticsResult, DocumentHighlightsResult,
+    DocumentOpenState, DocumentSymbolsResult, DocumentVersion, FoldingRangesResult,
     FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, Indexed,
     InlayHintsResult, KindFilter, KindFilterField, KindFilterInput, LocationsResult,
     NotificationCache, OutgoingCallsResult, Position, PositionEncoding, PositionRange,
-    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, RouteSignals,
-    SelectionRangesResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    PrepareRenameResult, RenameResult, RestartServerResult, RouteSignals, SelectionRangesResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator,
+    TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -474,19 +474,6 @@ struct ResourceDiagnosticsResponse {
     signals: RouteSignals,
 }
 
-/// Whether a file is currently open through `DocumentTracker`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentState {
-    Open,
-    NotOpen,
-}
-
-impl DocumentState {
-    const fn of(open: bool) -> Self {
-        if open { Self::Open } else { Self::NotOpen }
-    }
-}
-
 impl ResourceDiagnosticsResponse {
     /// Builds `read_resource`'s response for a file. `tracked` is true when the
     /// file is open (`document`) *or* the diagnostics cache already holds an
@@ -497,13 +484,13 @@ impl ResourceDiagnosticsResponse {
     /// `tracked: false` while `diagnostics` is still non-empty, contradicting
     /// the documented "untracked implies empty diagnostics" contract.
     fn new(
-        document: DocumentState,
+        document: DocumentOpenState,
         entry: Option<&DiagnosticInfo>,
         availability: DiagnosticsAvailability,
         signals: RouteSignals,
     ) -> Self {
         Self {
-            tracked: document == DocumentState::Open || entry.is_some(),
+            tracked: document == DocumentOpenState::Open || entry.is_some(),
             version: entry.and_then(|e| e.version),
             diagnostics: entry.map_or_default(|e| e.diagnostics.clone()),
             availability,
@@ -730,7 +717,7 @@ impl McplsServer {
     async fn get_definition(
         &self,
         Parameters(NavigationParams { target, context }): Parameters<NavigationParams>,
-    ) -> Result<Json<Addressed<DefinitionResult>>, McpError> {
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let translator = &self.context.translator;
         self.addressed(
             target,
@@ -752,7 +739,7 @@ impl McplsServer {
             include_declaration,
             context,
         }): Parameters<ReferencesParams>,
-    ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
+    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
         let translator = &self.context.translator;
         self.addressed(
             target,
@@ -1481,11 +1468,7 @@ impl McplsServer {
         // lock is released, since `diagnostics_pump` needs the same lock.
         let diag_info = snapshot.sources.merge();
         Ok(ResourceDiagnosticsResponse::new(
-            DocumentState::of(
-                self.context
-                    .translator
-                    .is_document_open(validated_path.as_path()),
-            ),
+            self.context.translator.open_state(validated_path.as_path()),
             diag_info.as_ref(),
             snapshot.availability,
             snapshot.signals,
@@ -2752,7 +2735,7 @@ mod tests {
         assert_eq!(pulled["indexing_in_progress"], false);
 
         let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -3682,7 +3665,7 @@ mod tests {
         })
         .unwrap();
         let resource = serde_json::to_value(ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             signals,
@@ -5321,7 +5304,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_untracked_is_not_tracked_and_empty() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5340,7 +5323,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_tracked_but_no_cache_entry_is_clean() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5378,7 +5361,7 @@ sleep 0.3
             data: None,
         }]);
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5394,7 +5377,7 @@ sleep 0.3
         assert_eq!(json["diagnostics"][0]["message"], "boom");
     }
 
-    /// A path `read_resource` never opened reports `is_document_open() == false`
+    /// A path `read_resource` never opened reports `open_state() == NotOpen`
     /// -- one of the two inputs `ResourceDiagnosticsResponse::new` ORs together.
     #[tokio::test]
     async fn test_read_resource_untracked_path_is_not_open() {
@@ -5402,14 +5385,14 @@ sleep 0.3
         let tracked = server
             .context
             .translator
-            .is_document_open(std::path::Path::new("/never/opened.rs"));
-        assert!(!tracked);
+            .open_state(std::path::Path::new("/never/opened.rs"));
+        assert_eq!(tracked, DocumentOpenState::NotOpen);
     }
 
     #[test]
     fn test_resource_diagnostics_response_new_neither_open_nor_cached_is_untracked() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5421,7 +5404,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_open_but_uncached_is_tracked() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::Open,
+            DocumentOpenState::Open,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals::default(),
@@ -5460,7 +5443,7 @@ sleep 0.3
         }]);
 
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             Some(&entry),
             DiagnosticsAvailability::Published,
             RouteSignals::default(),
@@ -5479,7 +5462,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_flags_push_degraded() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {
@@ -5499,7 +5482,7 @@ sleep 0.3
     #[test]
     fn test_resource_diagnostics_response_new_flags_indexing_in_progress() {
         let response = ResourceDiagnosticsResponse::new(
-            DocumentState::NotOpen,
+            DocumentOpenState::NotOpen,
             None,
             DiagnosticsAvailability::Pending,
             RouteSignals {

@@ -698,7 +698,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::{DiagnosticSeverity, PositionDegradation};
+    use crate::bridge::translator::dto::PositionDegradation;
     use crate::bridge::translator::testing::*;
     use crate::config::{FileExtension, LanguageId, ServerId, ToolRouter};
     use crate::error::Error;
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(diags.diagnostics.len(), 1);
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
-        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_matches!(diags.diagnostics[0].severity, ReportedSeverity::Error);
         assert_eq!(diags.diagnostics[0].range.start.line, 1);
         assert_eq!(diags.diagnostics[0].range.start.character, 1);
     }
@@ -975,13 +975,10 @@ mod tests {
         )
         .await;
         assert_eq!(diags.diagnostics.len(), 4);
-        assert_matches!(diags.diagnostics[0].severity, DiagnosticSeverity::Error);
-        assert_matches!(diags.diagnostics[1].severity, DiagnosticSeverity::Warning);
-        assert_matches!(
-            diags.diagnostics[2].severity,
-            DiagnosticSeverity::Information
-        );
-        assert_matches!(diags.diagnostics[3].severity, DiagnosticSeverity::Hint);
+        assert_matches!(diags.diagnostics[0].severity, ReportedSeverity::Error);
+        assert_matches!(diags.diagnostics[1].severity, ReportedSeverity::Warning);
+        assert_matches!(diags.diagnostics[2].severity, ReportedSeverity::Information);
+        assert_matches!(diags.diagnostics[3].severity, ReportedSeverity::Hint);
     }
 
     #[tokio::test]
