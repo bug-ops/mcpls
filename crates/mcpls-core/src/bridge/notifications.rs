@@ -2448,7 +2448,7 @@ impl NotificationCache {
 /// process), so the two can't silently drift apart on which notification
 /// variants feed which `NotificationCache` method.
 ///
-/// Public because [`LspServer::take_lifecycle_rx`](crate::lsp::LspServer::take_lifecycle_rx)
+/// Public because [`ServerLanes::lifecycle`](crate::lsp::ServerLanes::lifecycle)
 /// is: whoever drains that receiver needs this as the sink that feeds the
 /// indexing state.
 ///

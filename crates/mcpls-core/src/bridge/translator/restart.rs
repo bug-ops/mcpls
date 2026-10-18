@@ -333,6 +333,24 @@ pub struct NotificationReceivers {
     pub(crate) pinned_tsserver: Option<std::path::PathBuf>,
 }
 
+impl NotificationReceivers {
+    /// The receivers a pump drains for a spawned server's `lanes`.
+    pub(crate) fn new(
+        lanes: crate::lsp::ServerLanes,
+        pinned_tsserver: Option<std::path::PathBuf>,
+    ) -> Self {
+        let crate::lsp::ServerLanes {
+            notifications,
+            lifecycle,
+        } = lanes;
+        Self {
+            notifications,
+            lifecycle,
+            pinned_tsserver,
+        }
+    }
+}
+
 /// How a respawned server's notifications are consumed.
 #[derive(Clone, Copy)]
 pub(super) enum NotificationRouting<'a> {
@@ -982,14 +1000,11 @@ mod tests {
                 WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
             );
 
-            let mut server = crate::lsp::LspServer::spawn(stub_server_config("rust", script))
-                .await
-                .unwrap();
-            let receivers = NotificationReceivers {
-                notifications: server.take_notification_inbox(),
-                lifecycle: server.take_lifecycle_rx(),
-                pinned_tsserver: None,
-            };
+            let crate::lsp::SpawnedServer { server, lanes } =
+                crate::lsp::LspServer::spawn(stub_server_config("rust", script))
+                    .await
+                    .unwrap();
+            let receivers = NotificationReceivers::new(lanes, None);
             translator.register_server_complete(server);
 
             let wiring = PumpWiring::new(
@@ -1598,14 +1613,11 @@ mod tests {
                 let script_dir = dir.path().join(&name);
                 fs::create_dir(&script_dir).unwrap();
                 let script = write_protocol_server_script(&script_dir, &log, None);
-                let mut server = crate::lsp::LspServer::spawn(stub_server_config(&name, &script))
-                    .await
-                    .unwrap();
-                let receivers = NotificationReceivers {
-                    notifications: server.take_notification_inbox(),
-                    lifecycle: server.take_lifecycle_rx(),
-                    pinned_tsserver: None,
-                };
+                let crate::lsp::SpawnedServer { server, lanes } =
+                    crate::lsp::LspServer::spawn(stub_server_config(&name, &script))
+                        .await
+                        .unwrap();
+                let receivers = NotificationReceivers::new(lanes, None);
                 translator.register_server_complete(server);
                 let id = ServerId::new(name.as_str()).unwrap();
                 let pump = wiring.spawn_pump(id.clone(), receivers, DiagnosticsRole::Secondary);

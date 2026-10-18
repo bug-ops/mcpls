@@ -114,8 +114,7 @@ impl HostKey {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::{EnvKey, ServerEnv};
-/// use mcpls_core::lsp::HostOs;
+/// use mcpls_core::config::{EnvKey, HostOs, ServerEnv};
 ///
 /// let mut env = ServerEnv::new(HostOs::Windows);
 /// env.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());

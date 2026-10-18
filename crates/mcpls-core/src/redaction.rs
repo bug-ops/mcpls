@@ -952,7 +952,7 @@ mod tests {
                     "nightly-2024-01-01".to_string(),
                 ),
             ],
-            crate::lsp::HostOs::CURRENT,
+            crate::config::HostOs::CURRENT,
         )
         .unwrap();
 

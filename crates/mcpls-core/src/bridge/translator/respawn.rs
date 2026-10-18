@@ -17,7 +17,7 @@ use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsRole, on_lifecycle};
 use crate::config::ServerId;
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer, ServerInitConfig};
+use crate::lsp::{LspClient, LspServer, ServerInitConfig, SpawnedServer};
 use crate::util::lock_std;
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
@@ -331,21 +331,20 @@ impl Translator {
         let language_id = config.server_config().language_id.clone();
         let pinned_tsserver = config.pinned_tsserver();
 
-        let mut new_server = match LspServer::spawn(config).await {
-            Ok(server) => {
+        let SpawnedServer {
+            server: new_server,
+            lanes,
+        } = match LspServer::spawn(config).await {
+            Ok(spawned) => {
                 self.record_respawn_success(id);
-                server
+                spawned
             }
             Err(err) => {
                 self.record_respawn_failure(id);
                 return Err(err);
             }
         };
-        let receivers = NotificationReceivers {
-            notifications: new_server.take_notification_inbox(),
-            lifecycle: new_server.take_lifecycle_rx(),
-            pinned_tsserver,
-        };
+        let receivers = NotificationReceivers::new(lanes, pinned_tsserver);
 
         let stale_task = lock_std(&self.servers)
             .get_mut(id)
@@ -668,7 +667,8 @@ sleep 0.3
 
             let server = LspServer::spawn(stub_server_config("rust", &crashing))
                 .await
-                .unwrap();
+                .unwrap()
+                .server;
             let translator = Translator::new();
             translator.register_server_complete(server);
             wait_until_dead(&translator, &id).await;
@@ -700,7 +700,7 @@ sleep 0.3
             let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script);
 
-            let server = LspServer::spawn(config).await.unwrap();
+            let server = LspServer::spawn(config).await.unwrap().server;
             let translator = Translator::new();
             translator.register_server_complete(server);
 
@@ -738,7 +738,7 @@ sleep 0.3
             let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script);
 
-            let server = LspServer::spawn(config.clone()).await.unwrap();
+            let server = LspServer::spawn(config.clone()).await.unwrap().server;
             let translator = Translator::new();
             translator.register_server_complete(server);
             wait_until_dead(&translator, &id).await;
@@ -763,7 +763,8 @@ sleep 0.3
             let id = ServerId::from_static("rust");
             let server = LspServer::spawn(stub_server_config("rust", &crash))
                 .await
-                .unwrap();
+                .unwrap()
+                .server;
             let translator = Translator::new();
             translator.register_client(id.clone(), server.client().clone());
             translator.register_server(id.clone(), server);
@@ -813,7 +814,7 @@ sleep 5
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &script);
 
-            let server = LspServer::spawn(seed_config).await.unwrap();
+            let server = LspServer::spawn(seed_config).await.unwrap().server;
             let translator = Translator::new();
             translator.register_client(id.clone(), server.client().clone());
             translator.register_server(id.clone(), server);
@@ -869,7 +870,7 @@ fi
             let id = ServerId::from_static("rust");
             let config = stub_server_config("rust", &script_path);
 
-            let seed = LspServer::spawn(config.clone()).await.unwrap();
+            let seed = LspServer::spawn(config.clone()).await.unwrap().server;
             let translator = Arc::new(Translator::new());
             translator.register_client(id.clone(), seed.client().clone());
             translator.register_server(id.clone(), seed);
@@ -909,7 +910,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
             let clock = Arc::new(FakeClock::new());
             let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
             translator.register_client(id.clone(), seed.client().clone());
@@ -949,7 +950,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
             let clock = Arc::new(FakeClock::new());
             let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
             translator.register_client(id.clone(), seed.client().clone());
@@ -1007,7 +1008,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
             let clock = Arc::new(FakeClock::new());
             let translator = Translator::new().with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
             translator.register_client(id.clone(), seed.client().clone());
@@ -1060,7 +1061,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
@@ -1147,7 +1148,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
@@ -1197,7 +1198,8 @@ fi
             let id = ServerId::from_static("rust");
             let seed = LspServer::spawn(stub_server_config("rust", &seed_script))
                 .await
-                .unwrap();
+                .unwrap()
+                .server;
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
@@ -1249,7 +1251,7 @@ fi
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
 
             let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
             let translator = Translator::new()
@@ -1313,7 +1315,7 @@ sleep 1
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
             let translator = Translator::new().with_router(ToolRouter::catch_all([(
                 id.clone(),
                 LanguageId::from_static("rust"),
@@ -1368,7 +1370,7 @@ sleep 1
             let hover_id = ServerId::from_static("hover-only");
             let hover_seed_config = stub_server_config("hover-only", &seed_script);
 
-            let seed = LspServer::spawn(hover_seed_config).await.unwrap();
+            let seed = LspServer::spawn(hover_seed_config).await.unwrap().server;
 
             // `hover_id` handles only Hover; a separate (never-registered
             // here, purely routing-table) server is the catch-all and thus
@@ -1468,7 +1470,7 @@ sleep 1
             let id = ServerId::from_static("rust");
             let seed_config = stub_server_config("rust", &seed_script);
 
-            let seed = LspServer::spawn(seed_config).await.unwrap();
+            let seed = LspServer::spawn(seed_config).await.unwrap().server;
             let mut translator = Translator::new()
                 .with_router(ToolRouter::catch_all([(
                     id.clone(),

@@ -23,7 +23,7 @@ use mcpls_core::config::{
     FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
     ServerId, TimeoutSecs, ToolRouter,
 };
-use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig};
+use mcpls_core::lsp::{LspNotification, LspServer, ServerInitConfig, SpawnedServer};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
@@ -62,7 +62,7 @@ fn init_tracing() {
 /// 3. Creates and configures a Translator
 /// 4. Returns the translator wrapped in `Arc<Mutex>`
 async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
-    translator_for(spawn_rust_analyzer().await)
+    translator_for(spawn_rust_analyzer().await.server)
 }
 
 /// As [`setup_rust_analyzer`], additionally forwarding the server's lifecycle
@@ -73,8 +73,8 @@ async fn setup_rust_analyzer() -> Arc<Mutex<Translator>> {
 /// before any other await, so no signal sent after initialization is missed.
 async fn setup_rust_analyzer_with_lifecycle_cache()
 -> (Arc<Mutex<Translator>>, Arc<Mutex<NotificationCache>>) {
-    let mut server = spawn_rust_analyzer().await;
-    let mut lifecycle_rx = server.take_lifecycle_rx();
+    let SpawnedServer { server, lanes } = spawn_rust_analyzer().await;
+    let mut lifecycle_rx = lanes.lifecycle;
     let cache = Arc::new(Mutex::new(NotificationCache::new()));
     let forwarder_cache = Arc::clone(&cache);
     let server_id = ServerId::from_static("rust");
@@ -110,7 +110,7 @@ fn translator_for(server: LspServer) -> Arc<Mutex<Translator>> {
     Arc::new(Mutex::new(translator))
 }
 
-async fn spawn_rust_analyzer() -> LspServer {
+async fn spawn_rust_analyzer() -> SpawnedServer {
     init_tracing();
     let workspace_path = rust_workspace_path();
 
@@ -1119,10 +1119,13 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
         std::sync::Arc::default(),
     );
 
-    let mut server = LspServer::spawn(server_init_config)
+    let SpawnedServer {
+        server: _server,
+        lanes,
+    } = LspServer::spawn(server_init_config)
         .await
         .expect("Failed to spawn rust-analyzer");
-    let mut lifecycle_rx = server.take_lifecycle_rx();
+    let mut lifecycle_rx = lanes.lifecycle;
 
     let saw_progress = timeout(Duration::from_secs(30), async {
         while let Some(notif) = lifecycle_rx.recv().await {

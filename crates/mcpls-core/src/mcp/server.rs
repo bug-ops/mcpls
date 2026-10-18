@@ -4676,7 +4676,7 @@ sleep 0.3
             std::sync::Arc::default(),
         );
 
-        let seed = LspServer::spawn(config).await.unwrap();
+        let seed = LspServer::spawn(config).await.unwrap().server;
 
         let notification_cache = Arc::new(Mutex::new(NotificationCache::new()));
         let translator = Arc::new(
