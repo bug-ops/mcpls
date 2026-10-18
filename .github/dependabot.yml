@@ -19,6 +19,10 @@ updates:
     labels:
       - dependencies
       - ci/cd
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
 
   - package-ecosystem: cargo
     directory: /fuzz
