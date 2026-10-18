@@ -2306,6 +2306,23 @@ mod tests {
         assert!(mapped.message.contains("a.rs"), "{}", mapped.message);
     }
 
+    /// #735: a spawn failure's OS cause reaches the client once, though it is
+    /// no longer part of the variant's own message.
+    #[test]
+    fn test_map_bridge_error_carries_the_spawn_cause_once() {
+        let spawn = crate::error::Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::from_static("rust-analyzer"),
+            source: std::io::Error::other("exec format error"),
+        };
+        let mapped = map_bridge_error(spawn);
+        assert_eq!(
+            mapped.message.matches("exec format error").count(),
+            1,
+            "{}",
+            mapped.message
+        );
+    }
+
     /// #720: a secret carried by a chained cause is still hidden by the funnel.
     #[test]
     fn test_render_error_hides_secrets_in_the_rendered_chain() {
@@ -2867,7 +2884,7 @@ mod tests {
                 reason: crate::error::StartupFailure::Spawn(Arc::new(
                     crate::error::Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     },
                 )),
             }));
@@ -4796,7 +4813,7 @@ sleep 0.3
             command: ServerCommand::from_static("rust-analyzer"),
             reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                 command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }]);
         translator.rebind_router(&std::collections::HashSet::new());
@@ -6229,7 +6246,7 @@ sleep 0.3
                     command: ServerCommand::from_static("rust-analyzer"),
                     reason: StartupFailure::Spawn(Arc::new(crate::error::Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
                 translator.rebind_router(&HashSet::new());

@@ -15,8 +15,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::bridge::MAX_SYMBOL_NAME_BYTES;
-use crate::util::{MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
+use crate::util::{MAX_ECHOED_NAME_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
 
 /// Prefix rmcp's router maps to an `isError` tool result instead of a
 /// protocol error.
@@ -29,7 +28,7 @@ const DESERIALIZE_ERROR_PREFIX: &str = "failed to deserialize parameters:";
 /// delegates to `P`, so every tool schema is unchanged. On a malformed call
 /// the error keeps rmcp's `failed to deserialize parameters:` prefix (so the
 /// call is an `isError` result) but object keys longer than
-/// `MAX_SYMBOL_NAME_BYTES` are replaced by their length and the whole message
+/// `MAX_ECHOED_NAME_BYTES` are replaced by their length and the whole message
 /// is capped at `MAX_ERROR_MESSAGE_CALLER_BYTES`.
 #[derive(Debug)]
 pub struct Parameters<P>(pub P);
@@ -76,7 +75,7 @@ fn rejection_message(error: &serde_json::Error) -> String {
     )
 }
 
-/// Replaces every object key longer than `MAX_SYMBOL_NAME_BYTES`, at any
+/// Replaces every object key longer than `MAX_ECHOED_NAME_BYTES`, at any
 /// depth, by `<N-byte name>` (`<N-byte name #k>` for the k-th key of one
 /// object that would otherwise collide). Returns whether any key was renamed;
 /// an object without a long key is not rebuilt.
@@ -86,16 +85,16 @@ fn bound_keys(value: &mut Value) -> bool {
             let mut changed = map
                 .values_mut()
                 .fold(false, |acc, child| bound_keys(child) | acc);
-            if map.keys().any(|key| key.len() > MAX_SYMBOL_NAME_BYTES) {
+            if map.keys().any(|key| key.len() > MAX_ECHOED_NAME_BYTES) {
                 changed = true;
                 let entries = std::mem::take(map);
                 let kept: HashSet<String> = entries
                     .keys()
-                    .filter(|key| key.len() <= MAX_SYMBOL_NAME_BYTES)
+                    .filter(|key| key.len() <= MAX_ECHOED_NAME_BYTES)
                     .cloned()
                     .collect();
                 for (key, child) in entries {
-                    let key = if key.len() > MAX_SYMBOL_NAME_BYTES {
+                    let key = if key.len() > MAX_ECHOED_NAME_BYTES {
                         unused_name(
                             |name| map.contains_key(name) || kept.contains(name),
                             key.len(),
@@ -181,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_key_at_the_bound_is_kept() {
-        let key = "k".repeat(MAX_SYMBOL_NAME_BYTES);
+        let key = "k".repeat(MAX_ECHOED_NAME_BYTES);
         let message = parse_error(json!({
             "file_path": "/a.rs", "line": 1, "character": 2, key.clone(): 1
         }));
@@ -204,7 +203,7 @@ mod tests {
     #[test]
     fn test_nested_long_keys_are_bounded() {
         let mut value = json!({"a": [{"b": 1}]});
-        let long = "n".repeat(MAX_SYMBOL_NAME_BYTES + 1);
+        let long = "n".repeat(MAX_ECHOED_NAME_BYTES + 1);
         value["a"][0][long.as_str()] = json!(1);
         bound_keys(&mut value);
         let text = value.to_string();
@@ -216,10 +215,10 @@ mod tests {
     fn test_equal_length_long_keys_stay_distinct() {
         let mut value = json!({});
         for c in ['a', 'b', 'c'] {
-            value[c.to_string().repeat(MAX_SYMBOL_NAME_BYTES + 1)] = json!(1);
+            value[c.to_string().repeat(MAX_ECHOED_NAME_BYTES + 1)] = json!(1);
         }
         assert!(bound_keys(&mut value));
-        let len = MAX_SYMBOL_NAME_BYTES + 1;
+        let len = MAX_ECHOED_NAME_BYTES + 1;
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys.len(), 3, "{keys:?}");
         assert!(keys.contains(&format!("<{len}-byte name>")));
@@ -228,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_long_key_never_replaces_a_literal_key_of_the_placeholder_name() {
-        let len = MAX_SYMBOL_NAME_BYTES + 1;
+        let len = MAX_ECHOED_NAME_BYTES + 1;
         let placeholder = format!("<{len}-byte name>");
         let mut value = json!({});
         value["!".repeat(len)] = json!("long");

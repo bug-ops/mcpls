@@ -23,7 +23,7 @@ use crate::config::{
     FilePattern, IndexingReadyTimeoutSecs, LanguageId, LanguageMap, ServerId, ServerSettlement,
     ToolKind, ToolRouter,
 };
-use crate::error::{ServerSpawnFailure, StartupFailure};
+use crate::error::{ErrorChain, ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspServer, ServerInitConfig};
 use crate::redaction::Redactions;
 use crate::util::lock_std;
@@ -700,7 +700,7 @@ impl Translator {
                 match server.shutdown().await {
                     Ok(()) => tracing::debug!(%id, "LSP server shut down gracefully"),
                     Err(e) => tracing::warn!(
-                        %id, error = %e,
+                        %id, error = %ErrorChain(&e),
                         "LSP server shutdown failed, killing process instead"
                     ),
                 }
@@ -1145,7 +1145,7 @@ mod tests {
         translator.settle_failed(&ServerSpawnFailure {
             reason: StartupFailure::Spawn(std::sync::Arc::new(Error::ServerNotFound {
                 command: crate::config::ServerCommand::from_static("b"),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
             ..spawn_failure(&configs[1])
         });

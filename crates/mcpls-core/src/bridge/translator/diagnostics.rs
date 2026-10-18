@@ -30,7 +30,7 @@ use crate::bridge::{
     NotificationCache, WorkspacePath, WorkspaceRoots, path_to_uri,
 };
 use crate::config::{ServerId, ToolKind};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorChain, Result};
 use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::lock_std;
 
@@ -501,7 +501,7 @@ impl Translator {
             ProbeOutcome::Refuse => {
                 debug!(
                     %server_id,
-                    %error,
+                    error = %ErrorChain(&error),
                     "server advertises no diagnostic provider and refused a pull; \
                      answering from the push cache"
                 );
@@ -513,18 +513,18 @@ impl Translator {
                 if probe == Some(PullProbe::Refused) {
                     info!(
                         %server_id,
-                        %error,
+                        error = %ErrorChain(&error),
                         "server advertises no diagnostic provider and timed out on two pulls \
                          in a row; answering from the push cache until it is replaced \
                          (restart_server)"
                     );
                 } else {
-                    debug!(%server_id, %error, "probe pull timed out; answering from the push cache");
+                    debug!(%server_id, error = %ErrorChain(&error), "probe pull timed out; answering from the push cache");
                 }
             }
             ProbeOutcome::Transient => debug!(
                 %server_id,
-                %error,
+                error = %ErrorChain(&error),
                 "probe pull could not be answered right now; answering from the push cache"
             ),
         }

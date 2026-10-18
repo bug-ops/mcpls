@@ -13,7 +13,6 @@ use serde::Serialize;
 use crate::bridge::resources::ResourceUriError;
 use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
-    MAX_SYMBOL_NAME_BYTES,
 };
 use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
@@ -22,7 +21,10 @@ use crate::config::{
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 pub use crate::util::SizeExceeded;
-use crate::util::{MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded, escape_control, truncate_str};
+use crate::util::{
+    MAX_ECHOED_NAME_BYTES, MAX_ECHOED_PATH_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded,
+    escape_control, truncate_str,
+};
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
 /// mapping and which `file_patterns` were configured. Empty for any other
@@ -256,7 +258,7 @@ impl fmt::Display for ResolvedItem {
 /// assignment's value.
 ///
 /// The text is cut at the first `=` or whitespace, escaped and bounded to
-/// [`MAX_SYMBOL_NAME_BYTES`] (the escaped text is what is bounded), because
+/// 256 bytes (the escaped text is what is bounded), because
 /// configured arguments can hold secrets and reach MCP clients unredacted.
 ///
 /// # Examples
@@ -280,7 +282,7 @@ impl EchoedArgument {
         let name = arg
             .split_once(|c: char| c == '=' || c.is_whitespace())
             .map_or(arg, |(name, _)| name);
-        Self(escape_bounded(name, MAX_SYMBOL_NAME_BYTES))
+        Self(escape_bounded(name, MAX_ECHOED_NAME_BYTES))
     }
 
     /// The echoed text.
@@ -289,9 +291,6 @@ impl EchoedArgument {
         &self.0
     }
 }
-
-/// Most bytes of a workspace-controlled path shown in a refusal.
-const MAX_ECHOED_PATH_BYTES: usize = 1024;
 
 /// A path the workspace names, shown whole, escaped and bounded.
 ///
@@ -358,122 +357,105 @@ impl fmt::Display for EchoedArgument {
     }
 }
 
-/// A subcommand of a runner that starts a program the workspace chooses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunnerSubcommand {
-    /// `run`.
-    Run,
-    /// `x`.
-    X,
-    /// `task`.
-    Task,
-    /// `eval`.
-    Eval,
-    /// `repl`.
-    Repl,
-    /// `tool`.
-    Tool,
-    /// `exec`.
-    Exec,
+/// Declares a closed enum of command-line spellings: the variants, `ALL`, `as_str`
+/// and `Display`, so a spelling is written once.
+macro_rules! spelled_enum {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident => $spelling:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant),+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+
+            /// The spelling as written on a command line.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $spelling),+
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
 }
 
-impl RunnerSubcommand {
-    /// The subcommand as written on a command line.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Run => "run",
-            Self::X => "x",
-            Self::Task => "task",
-            Self::Eval => "eval",
-            Self::Repl => "repl",
-            Self::Tool => "tool",
-            Self::Exec => "exec",
-        }
+spelled_enum! {
+    /// A subcommand of a runner that starts a program the workspace chooses.
+    RunnerSubcommand {
+        /// `run`.
+        Run => "run",
+        /// `x`.
+        X => "x",
+        /// `task`.
+        Task => "task",
+        /// `eval`.
+        Eval => "eval",
+        /// `repl`.
+        Repl => "repl",
+        /// `tool`.
+        Tool => "tool",
+        /// `exec`.
+        Exec => "exec",
     }
 }
 
-impl fmt::Display for RunnerSubcommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+spelled_enum! {
+    /// The spelling of a long flag that gives a shell a command string.
+    LongCommandName {
+        /// `--command`.
+        Command => "--command",
+        /// `--commands`.
+        Commands => "--commands",
+        /// `--init-command`, which fish runs as a command string.
+        InitCommand => "--init-command",
+        /// `--execute`, which nushell runs as a command string.
+        Execute => "--execute",
     }
 }
 
-/// The spelling of a long flag that gives a shell a command string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LongCommandName {
-    /// `--command`.
-    Command,
-    /// `--commands`.
-    Commands,
-    /// `--init-command`, which fish runs as a command string.
-    InitCommand,
-    /// `--execute`, which nushell runs as a command string.
-    Execute,
-}
-
-impl LongCommandName {
-    /// The flag as written on a command line.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Command => "--command",
-            Self::Commands => "--commands",
-            Self::InitCommand => "--init-command",
-            Self::Execute => "--execute",
-        }
+spelled_enum! {
+    /// A switch of `cmd` that gives it a command string.
+    CmdSwitch {
+        /// `/c`.
+        C => "/c",
+        /// `/k`.
+        K => "/k",
+        /// `/r`.
+        R => "/r",
     }
 }
 
-/// A switch of `cmd` that gives it a command string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmdSwitch {
-    /// `/c`.
-    C,
-    /// `/k`.
-    K,
-    /// `/r`.
-    R,
-}
-
-impl CmdSwitch {
-    /// The switch as written on a command line.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::C => "/c",
-            Self::K => "/k",
-            Self::R => "/r",
-        }
-    }
-}
-
-/// A PowerShell parameter that gives it a command, however abbreviated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PowerShellParameter {
-    /// `-Command`.
-    Command,
-    /// `-CommandWithArgs`.
-    CommandWithArgs,
-    /// `-EncodedCommand`.
-    EncodedCommand,
-}
-
-impl PowerShellParameter {
-    /// The full parameter name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Command => "-Command",
-            Self::CommandWithArgs => "-CommandWithArgs",
-            Self::EncodedCommand => "-EncodedCommand",
-        }
+spelled_enum! {
+    /// A PowerShell parameter that gives it a command, however abbreviated.
+    PowerShellParameter {
+        /// `-Command`.
+        Command => "-Command",
+        /// `-CommandWithArgs`.
+        CommandWithArgs => "-CommandWithArgs",
+        /// `-EncodedCommand`.
+        EncodedCommand => "-EncodedCommand",
     }
 }
 
 /// The flag that gives a shell a command string, as the shell's family
 /// spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShellFlag {
     /// `-c`, alone or inside a cluster such as `-lc`.
     DashC,
@@ -504,6 +486,7 @@ impl fmt::Display for ShellFlag {
 
 /// The flag that gives an interpreter a program to run inline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InlineFlag {
     /// A short flag letter (`-e`, `-c`), alone or inside a cluster.
     Short(char),
@@ -547,6 +530,7 @@ impl fmt::Display for InlineFlag {
 
 /// A positional operand a wrapper takes before the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OperandKind {
     /// `timeout`'s `DURATION`.
     Duration,
@@ -904,7 +888,7 @@ impl fmt::Display for UntrustedRefusal {
 impl fmt::Display for StartupFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Spawn(error) => error.fmt(f),
+            Self::Spawn(error) => ErrorChain(error.as_ref()).fmt(f),
             Self::InitTaskPanicked => {
                 f.write_str("the initialization task panicked (see the mcpls log)")
             }
@@ -1495,7 +1479,7 @@ impl fmt::Display for StdioStream {
 #[non_exhaustive]
 pub enum ConfigError {
     /// A server entry lists a `file_patterns` form that maps to no extension.
-    #[error("lsp_servers entry '{server}': {pattern}")]
+    #[error("lsp_servers entry '{server}'")]
     UnsupportedFilePattern {
         /// The id of the entry that holds the pattern.
         server: ServerId,
@@ -1640,13 +1624,14 @@ impl fmt::Display for InitPhase {
 #[non_exhaustive]
 pub enum Error {
     /// LSP server failed to initialize.
-    #[error("LSP server initialization failed: {phase}: {cause}{}{}", HintSuffix(.hint), StderrSuffix(.stderr))]
+    #[error("LSP server initialization failed: {phase}: {}{}{}", ErrorChain(.cause.as_ref()), HintSuffix(.hint), StderrSuffix(.stderr))]
     LspInitFailed {
         /// The handshake step that failed.
         phase: InitPhase,
         /// Why the step failed, so a timeout and a rejection by the server
-        /// stay distinguishable. Rendered by `Display` instead of being
-        /// exposed through `source()`, so the chain is not printed twice.
+        /// stay distinguishable. Rendered by `Display` through
+        /// [`ErrorChain`] instead of being exposed through `source()`, so the
+        /// chain is not printed twice.
         cause: Box<Self>,
         /// The likely cause and remedy, when one is known.
         hint: Option<InitFailureHint>,
@@ -1669,11 +1654,11 @@ pub enum Error {
     },
 
     /// The MCP server could not complete its handshake with the client.
-    #[error("failed to start MCP server: {0}")]
+    #[error("failed to start MCP server")]
     McpServerStart(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// A background task panicked or was cancelled.
-    #[error("{task} task failed: {source}")]
+    #[error("{task} task failed")]
     TaskFailed {
         /// The task that failed.
         task: BackgroundTask,
@@ -1687,7 +1672,7 @@ pub enum Error {
     StdioCapture(StdioStream),
 
     /// The HTTP transport could not bind its listener.
-    #[error("failed to bind HTTP listener on {addr}: {source}")]
+    #[error("failed to bind HTTP listener on {addr}")]
     HttpBind {
         /// Address the listener was asked to bind.
         addr: std::net::SocketAddr,
@@ -1823,7 +1808,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     /// JSON serialization/deserialization error.
-    #[error("JSON error: {0}")]
+    #[error("JSON error")]
     Json(#[from] serde_json::Error),
 
     /// TOML deserialization error.
@@ -1839,7 +1824,7 @@ pub enum Error {
     Timeout(Duration),
 
     /// LSP server failed to spawn.
-    #[error("failed to spawn LSP server '{command}': {source}")]
+    #[error("failed to spawn LSP server '{command}'")]
     ServerSpawnFailed {
         /// Command that failed to spawn.
         command: ServerCommand,
@@ -1852,13 +1837,13 @@ pub enum Error {
     ///
     /// Distinct from [`Error::ServerSpawnFailed`] so the message can carry
     /// PATH and install guidance.
-    #[error("failed to spawn LSP server '{command}': {source}{}", NotFoundGuidance(.command.as_str(), Platform::CURRENT))]
+    #[error("failed to spawn LSP server '{command}': {io}{}", NotFoundGuidance(.command.as_str(), Platform::CURRENT))]
     ServerNotFound {
         /// Command that could not be found.
         command: ServerCommand,
-        /// Underlying IO error.
-        #[source]
-        source: std::io::Error,
+        /// Underlying IO error. Not a `source()`: the guidance text follows
+        /// it, so it is rendered inline to keep the cause before the advice.
+        io: std::io::Error,
     },
 
     /// LSP protocol error during message parsing.
@@ -2492,12 +2477,13 @@ impl Error {
 /// A specialized Result type for mcpls-core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Renders an error followed by its causes, `outer: cause: root`, skipping a
-/// cause whose text the preceding text already contains.
+/// Renders an error followed by every cause in its
+/// [`source`](std::error::Error::source) chain, `outer: cause: root`.
 ///
 /// An error type's own message names what failed and leaves the cause to
 /// [`std::error::Error::source`]; this is where a reader that wants the whole
-/// story (an MCP client, a log line) joins them once.
+/// story (an MCP client, a log line) joins them once. No cause is skipped, so
+/// a type must not also print its source in its own message.
 ///
 /// # Examples
 ///
@@ -2518,17 +2504,31 @@ pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
 
 impl fmt::Display for ErrorChain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut text = self.0.to_string();
+        write!(f, "{}", self.0)?;
         let mut cause = self.0.source();
         while let Some(error) = cause {
-            let part = error.to_string();
-            if !text.contains(&part) {
-                text.push_str(": ");
-                text.push_str(&part);
-            }
+            write!(f, ": {error}")?;
             cause = error.source();
         }
-        f.write_str(&text)
+        Ok(())
+    }
+}
+
+/// An error that renders its whole [`ErrorChain`] from `Display`, for a
+/// consumer that prints only the outermost error (serde's `try_from` turns the
+/// conversion error into a message with `Display`).
+#[derive(Debug)]
+pub(crate) struct ChainedError<E>(pub(crate) E);
+
+impl<E> From<E> for ChainedError<E> {
+    fn from(error: E) -> Self {
+        Self(error)
+    }
+}
+
+impl<E: std::error::Error + 'static> fmt::Display for ChainedError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        ErrorChain(&self.0).fmt(f)
     }
 }
 
@@ -2967,48 +2967,138 @@ mod tests {
         assert_matches!(err, Error::Json(_));
     }
 
-    /// #706: no entry of a config error's cause chain repeats the text of the
-    /// entry behind it.
-    #[test]
-    fn test_config_error_chain_does_not_repeat_source_text() {
+    fn assert_rendered_once(err: &(dyn std::error::Error + 'static), marker: &str) {
+        let text = ErrorChain(err).to_string();
+        assert_eq!(text.matches(marker).count(), 1, "{text}");
+        let segments: Vec<&str> = text.split(": ").collect();
+        let distinct: std::collections::HashSet<&str> = segments.iter().copied().collect();
+        assert_eq!(distinct.len(), segments.len(), "repeated segment in {text}");
+    }
+
+    fn io_sourced_cases() -> Vec<(Error, String)> {
+        let io = |marker: &str| std::io::Error::other(marker.to_owned());
+        let command = ServerCommand::from_static("rust-analyzer");
+        vec![
+            (
+                Error::HttpBind {
+                    addr: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+                    source: io("bind-marker"),
+                },
+                "bind-marker".to_owned(),
+            ),
+            (
+                Error::ServerSpawnFailed {
+                    command: command.clone(),
+                    source: io("spawn-marker"),
+                },
+                "spawn-marker".to_owned(),
+            ),
+            (
+                Error::ServerNotFound {
+                    command: command.clone(),
+                    io: io("missing-marker"),
+                },
+                "missing-marker".to_owned(),
+            ),
+            (
+                Error::LspInitFailed {
+                    phase: InitPhase::Initialize,
+                    cause: Box::new(Error::ServerSpawnFailed {
+                        command,
+                        source: io("init-marker"),
+                    }),
+                    hint: None,
+                    stderr: None,
+                },
+                "init-marker".to_owned(),
+            ),
+            (
+                Error::from(ConfigError::UnresolvableWorkspaceRoot {
+                    written: PathBuf::from("root"),
+                    base_dir: PathBuf::from("base"),
+                    probe: PathBuf::from("base/root"),
+                    source: io("root-marker"),
+                }),
+                "root-marker".to_owned(),
+            ),
+            (Error::from(io("io-marker")), "io-marker".to_owned()),
+            (
+                Error::FileIo {
+                    path: PathBuf::from("a.rs"),
+                    source: io("file-marker"),
+                },
+                "file-marker".to_owned(),
+            ),
+            (
+                Error::MalformedPath {
+                    path: PathBuf::from("b.rs"),
+                    source: io("path-marker"),
+                },
+                "path-marker".to_owned(),
+            ),
+        ]
+    }
+
+    /// #735: every variant that carries a cause renders it exactly once.
+    #[tokio::test]
+    async fn test_error_chain_renders_each_cause_exactly_once() {
         let toml_err = toml::from_str::<toml::Value>("[invalid toml").unwrap_err();
+        let json_err = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+        let json_text = json_err.to_string();
+        let join_error = tokio::spawn(async { panic!("task-marker") })
+            .await
+            .unwrap_err();
+        let url_err = url::Url::parse("http://[").unwrap_err();
         let non_utf8 = String::from_utf8(vec![0xff]).unwrap_err();
-        let errors = [
-            Error::from(toml_err),
-            Error::from(ConfigError::NotUtf8(non_utf8)),
-            Error::from(ConfigError::UnresolvableWorkspaceRoot {
-                written: PathBuf::from("root"),
-                base_dir: PathBuf::from("base"),
-                probe: PathBuf::from("base/root"),
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory"),
-            }),
-            Error::from(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "access refused",
-            )),
-            Error::FileIo {
-                path: PathBuf::from("a.rs"),
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
-            },
-            Error::MalformedPath {
-                path: PathBuf::from("b.rs"),
-                source: std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a dir"),
-            },
-        ];
-        for err in errors {
-            let mut chain = vec![err.to_string()];
-            let mut source = std::error::Error::source(&err);
-            while let Some(cause) = source {
-                chain.push(cause.to_string());
-                source = cause.source();
-            }
-            for [parent, cause] in chain.array_windows() {
-                assert!(
-                    !parent.contains(cause),
-                    "'{parent}' repeats its source '{cause}'"
-                );
-            }
+
+        let mut cases = io_sourced_cases();
+        cases.extend([
+            (Error::from(toml_err.clone()), toml_err.to_string()),
+            (Error::from(json_err), json_text),
+            (
+                Error::McpServerStart("mcp-marker".into()),
+                "mcp-marker".to_owned(),
+            ),
+            (
+                Error::TaskFailed {
+                    task: BackgroundTask::McpService,
+                    source: join_error,
+                },
+                "task-marker".to_owned(),
+            ),
+            (
+                Error::from(ConfigError::UnsupportedFilePattern {
+                    server: ServerId::from_static("rust"),
+                    pattern: FilePattern::parse("zz/yy").unwrap_err(),
+                }),
+                "'zz/yy'".to_owned(),
+            ),
+            (
+                Error::from(ConfigError::NotUtf8(non_utf8.clone())),
+                non_utf8.to_string(),
+            ),
+            (
+                Error::from(ResourceUriError::UrlParse(url_err)),
+                url_err.to_string(),
+            ),
+            (
+                Error::from(ResourceUriError::ClientPath(InvalidClientPath::Empty)),
+                InvalidClientPath::Empty.to_string(),
+            ),
+        ]);
+        for (err, marker) in &cases {
+            assert_rendered_once(err, marker);
         }
+    }
+
+    #[test]
+    fn test_startup_failure_spawn_renders_the_cause_once() {
+        let failure = StartupFailure::Spawn(Arc::new(Error::ServerSpawnFailed {
+            command: ServerCommand::from_static("rust-analyzer"),
+            source: std::io::Error::other("spawn-marker"),
+        }));
+        let text = failure.to_string();
+        assert_eq!(text.matches("spawn-marker").count(), 1, "{text}");
     }
 
     #[test]
@@ -3059,7 +3149,7 @@ mod tests {
     fn not_found(command: &str) -> Error {
         Error::ServerNotFound {
             command: crate::config::ServerCommand::new(command).unwrap(),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            io: std::io::Error::from(std::io::ErrorKind::NotFound),
         }
     }
 
@@ -3328,7 +3418,7 @@ mod tests {
             assert!(text.len() < MAX_ECHOED_PATH_BYTES + 512, "{}", text.len());
         }
         let name = EchoedArgument::name(&"\u{202e}".repeat(5000));
-        assert!(name.as_str().len() < MAX_SYMBOL_NAME_BYTES + 64);
+        assert!(name.as_str().len() < MAX_ECHOED_NAME_BYTES + 64);
     }
 
     #[test]

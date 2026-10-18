@@ -24,7 +24,7 @@ use super::servers::{Backend, Phase};
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsKey, IndexingState};
 use crate::config::{LanguageId, ServerId};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorChain, Result};
 use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
 use crate::redaction::{Redactions, ServerText};
 use crate::util::lock_std;
@@ -186,7 +186,7 @@ pub enum RestartFailure {
 
 impl RestartFailure {
     fn from_error(error: &Error) -> Self {
-        let message = error.to_string();
+        let message = ErrorChain(error).to_string();
         match error {
             Error::ServerNotFound { .. } | Error::ServerSpawnFailed { .. } => {
                 Self::SpawnFailed { message }
@@ -455,7 +455,7 @@ impl<'a> Deregistered<'a> {
             )
             .await;
         if let Err(error) = stopped {
-            tracing::warn!(id = %self.id, %error, "old LSP server did not stop cleanly; continuing with restart");
+            tracing::warn!(id = %self.id, error = %ErrorChain(&error), "old LSP server did not stop cleanly; continuing with restart");
         }
         Some(config)
     }
@@ -725,7 +725,7 @@ impl Translator {
         // Counted from completion too, so a slow restart cannot be chained at once.
         self.note_restart_attempt(id);
         if let Err(error) = respawned {
-            tracing::warn!(%id, %error, "LSP server restart failed");
+            tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart failed");
             self.invalidate_stopped_server(id, &language_id).await;
             return RestartOutcome::Failed {
                 reason: RestartFailure::from_error(&error),
@@ -785,7 +785,7 @@ impl Translator {
         if let Some(server) = server
             && let Err(error) = server.shutdown().await
         {
-            tracing::warn!(%id, %error, "replacement LSP server shutdown failed");
+            tracing::warn!(%id, error = %ErrorChain(&error), "replacement LSP server shutdown failed");
         }
     }
 }
@@ -907,7 +907,7 @@ mod tests {
     fn spawn_errors_map_to_spawn_failed_and_the_rest_to_initialize_failed() {
         let not_found = Error::ServerNotFound {
             command: crate::config::ServerCommand::from_static("x"),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            io: std::io::Error::from(std::io::ErrorKind::NotFound),
         };
         assert_matches!(
             RestartFailure::from_error(&not_found),
@@ -917,6 +917,18 @@ mod tests {
             RestartFailure::from_error(&Error::Timeout(Duration::from_secs(5))),
             RestartFailure::InitializeFailed { .. }
         );
+    }
+
+    #[test]
+    fn restart_failure_keeps_the_os_cause() {
+        let spawn = Error::ServerSpawnFailed {
+            command: crate::config::ServerCommand::from_static("x"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        let RestartFailure::SpawnFailed { message } = RestartFailure::from_error(&spawn) else {
+            panic!("expected SpawnFailed");
+        };
+        assert_eq!(message, "failed to spawn LSP server 'x': permission denied");
     }
 
     #[cfg(unix)]

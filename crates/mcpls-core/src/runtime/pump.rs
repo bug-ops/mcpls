@@ -2442,7 +2442,7 @@ mod pump_tests {
                     command: crate::config::ServerCommand::from_static("rust-analyzer"),
                     reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                         command: crate::config::ServerCommand::from_static("rust-analyzer"),
-                        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                        io: std::io::Error::from(std::io::ErrorKind::NotFound),
                     })),
                 }]);
             self.translator.rebind_router(&HashSet::new());

@@ -11,7 +11,7 @@ use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, Workspace
 use crate::config::{
     FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
-use crate::error::{Error, Result, ServerSpawnFailure};
+use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
 use crate::util::lock_std;
 
@@ -1322,7 +1322,7 @@ impl Translator {
                         tracing::warn!(
                             %server_id,
                             path = %claim.path.display(),
-                            error = %err,
+                            error = %ErrorChain(&err),
                             "failed to notify evicted document's server of textDocument/didClose; \
                              dropping the close"
                         );
@@ -1535,7 +1535,7 @@ mod tests {
             command: ServerCommand::new(command).unwrap(),
             reason: crate::error::StartupFailure::Spawn(Arc::new(Error::ServerNotFound {
                 command: ServerCommand::new(command).unwrap(),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                io: std::io::Error::from(std::io::ErrorKind::NotFound),
             })),
         }
     }

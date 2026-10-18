@@ -21,7 +21,7 @@ use super::positioned::Positioned;
 use super::routing::{Capability, FileLocalCapability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
-use crate::error::{Error, McpErrorKind, Result};
+use crate::error::{Error, ErrorChain, McpErrorKind, Result};
 use crate::escape_control;
 use crate::lsp::{LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
@@ -311,7 +311,7 @@ async fn resolve_code_action(
             tracing::warn!(
                 %server_id,
                 title = %action.title,
-                error = %err,
+                error = %ErrorChain(&err),
                 "codeAction/resolve failed, returning action without edit"
             );
         }

@@ -22,7 +22,7 @@ use super::server_env::{EnvKey, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::impl_text_newtype;
 use crate::bridge::IndexingPolicy;
-use crate::error::ConfigError;
+use crate::error::{ChainedError, ConfigError};
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -587,7 +587,7 @@ impl From<LspServerConfig> for RawLspServerConfig {
 }
 
 impl TryFrom<RawLspServerConfig> for LspServerConfig {
-    type Error = ConfigError;
+    type Error = ChainedError<ConfigError>;
 
     fn try_from(raw: RawLspServerConfig) -> Result<Self, Self::Error> {
         let RawLspServerConfig {

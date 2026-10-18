@@ -255,6 +255,13 @@ pub const TRUNCATION_MARKER: &str = "... (truncated)";
 /// caller rather than logged.
 pub const MAX_LOG_STRING_BYTES: usize = 200;
 
+/// Most bytes of client- or workspace-chosen name text (an option name, a JSON
+/// key, a method name) echoed back in an error message.
+pub const MAX_ECHOED_NAME_BYTES: usize = 256;
+
+/// Most bytes of a workspace-controlled path echoed back in an error message.
+pub const MAX_ECHOED_PATH_BYTES: usize = 1024;
+
 /// Truncate `s` to at most `max_bytes` bytes, cutting on the last UTF-8 char
 /// boundary at or before the limit and appending a truncation marker. The
 /// returned string can be up to `max_bytes + TRUNCATION_MARKER.len()` bytes

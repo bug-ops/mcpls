@@ -51,7 +51,7 @@ pub enum ResourceUriError {
     InvalidScheme(String),
 
     /// The URI is not parseable as a URL.
-    #[error("malformed resource URI: {0}")]
+    #[error("malformed resource URI")]
     UrlParse(#[source] url::ParseError),
 
     /// The URI does not name a filesystem path.
@@ -59,7 +59,7 @@ pub enum ResourceUriError {
     NotAFilePath(String),
 
     /// The decoded path is not an acceptable client path.
-    #[error("decoded URI path is not acceptable: {0}")]
+    #[error("decoded URI path is not acceptable")]
     ClientPath(#[source] InvalidClientPath),
 }
 

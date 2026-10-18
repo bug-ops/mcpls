@@ -1383,7 +1383,10 @@ async fn early_exit_status(child: &mut ServerProcess) -> Option<std::process::Ex
 /// message can carry PATH and install guidance.
 fn spawn_error(command: ServerCommand, source: std::io::Error) -> Error {
     if source.kind() == std::io::ErrorKind::NotFound {
-        Error::ServerNotFound { command, source }
+        Error::ServerNotFound {
+            command,
+            io: source,
+        }
     } else {
         Error::ServerSpawnFailed { command, source }
     }
