@@ -22,8 +22,8 @@ pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 pub use crate::util::SizeExceeded;
 use crate::util::{
-    MAX_ECHOED_NAME_BYTES, MAX_ECHOED_PATH_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded,
-    escape_control, truncate_str,
+    MAX_ECHOED_NAME_BYTES, MAX_ECHOED_PATH_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES,
+    TRUNCATION_MARKER, escape_bounded, escape_control, truncate_str,
 };
 
 /// Explains a `plaintext` routing failure: which extension or file name had no
@@ -342,6 +342,85 @@ impl EchoedPath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Renders a path as `{path:?}` does, cut after about 1024 bytes of that text.
+///
+/// The cut is made while the debug text is produced, so the work is bounded by
+/// the cut and not by the path, and it never leaves half an escape sequence
+/// (`\u{..}`, `\x..`) in front of the truncation marker. Text within the bound
+/// is byte-identical to the plain debug form.
+struct BoundedDebugPath<'a>(&'a Path);
+
+/// Collects text until `left` bytes are used, then refuses the rest.
+struct CutWriter {
+    text: String,
+    left: usize,
+    cut: bool,
+}
+
+impl fmt::Write for CutWriter {
+    fn write_str(&mut self, piece: &str) -> fmt::Result {
+        if self.cut {
+            return Err(fmt::Error);
+        }
+        if piece.len() <= self.left {
+            self.text.push_str(piece);
+            self.left = self.left.saturating_sub(piece.len());
+            return Ok(());
+        }
+        let keep = piece.floor_char_boundary(self.left);
+        self.text.push_str(piece.get(..keep).unwrap_or_default());
+        self.cut = true;
+        Err(fmt::Error)
+    }
+}
+
+/// The length of `text` without a trailing incomplete debug escape (`\u{1`,
+/// `\x4`, a lone `\`).
+fn complete_escapes_len(text: &str) -> usize {
+    let mut at = 0;
+    while let Some(offset) = text.get(at..).and_then(|tail| tail.find('\\')) {
+        let start = at.saturating_add(offset);
+        let after = start.saturating_add(1);
+        let rest = text.get(after..).unwrap_or_default();
+        let escape_len = match rest.chars().next() {
+            Some('u') => rest.find('}').map(|end| end.saturating_add(1)),
+            Some('x') => (rest.len() >= 3).then_some(3),
+            Some(other) => Some(other.len_utf8()),
+            None => None,
+        };
+        let Some(escape_len) = escape_len else {
+            return start;
+        };
+        at = after.saturating_add(escape_len);
+    }
+    text.len()
+}
+
+impl fmt::Display for BoundedDebugPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write as _;
+
+        let mut writer = CutWriter {
+            text: String::new(),
+            left: MAX_ECHOED_PATH_BYTES,
+            cut: false,
+        };
+        // An error only means the writer refused text after the cut.
+        #[expect(
+            clippy::unnecessary_debug_formatting,
+            reason = "the quoted, escaped debug form is the message format"
+        )]
+        let formatted = write!(writer, "{:?}", self.0);
+        debug_assert!(formatted.is_ok() || writer.cut);
+        if !writer.cut {
+            return f.write_str(&writer.text);
+        }
+        let whole = complete_escapes_len(&writer.text);
+        f.write_str(writer.text.get(..whole).unwrap_or_default())?;
+        f.write_str(TRUNCATION_MARKER)
     }
 }
 
@@ -1944,7 +2023,7 @@ pub enum Error {
     /// (`WorkspaceRoots::validate`); the same IO kinds raised later, while
     /// reading or opening an already validated file, stay [`Error::FileIo`]
     /// because there they are environmental.
-    #[error("malformed file path {path:?}")]
+    #[error("malformed file path {}", BoundedDebugPath(.path))]
     MalformedPath {
         /// The path as supplied by the client.
         path: PathBuf,
@@ -1960,7 +2039,7 @@ pub enum Error {
     /// freshly supplied in this request or was tracked from an earlier one
     /// and has since been deleted/moved on disk -- is caller-fault; any
     /// other IO failure is not.
-    #[error("file I/O error for {path:?}")]
+    #[error("file I/O error for {}", BoundedDebugPath(.path))]
     FileIo {
         /// Path to the file.
         path: PathBuf,
@@ -1970,12 +2049,12 @@ pub enum Error {
     },
 
     /// Path is outside allowed workspace boundaries.
-    #[error("path outside workspace: {0}")]
+    #[error("path outside workspace: {}", EchoedPath::new(.0))]
     PathOutsideWorkspace(PathBuf),
 
     /// No workspace roots are configured, so path-taking operations are
     /// rejected outright rather than allowed unrestricted (fail closed).
-    #[error("no workspace roots configured: refusing access to {0}")]
+    #[error("no workspace roots configured: refusing access to {}", EchoedPath::new(.0))]
     NoWorkspaceRoots(PathBuf),
 
     /// Document limit exceeded.
@@ -2039,7 +2118,7 @@ pub enum Error {
     /// one fails outright (`ENXIO`) before the file-type check that produces
     /// this error ever runs, so it surfaces as [`Self::FileIo`] from a
     /// document read and as [`Self::Io`] from the config loader.
-    #[error("not a regular file: {0}")]
+    #[error("not a regular file: {}", EchoedPath::new(.0))]
     NotARegularFile(PathBuf),
 
     /// All configured LSP servers failed to initialize.
@@ -3099,6 +3178,100 @@ mod tests {
         }));
         let text = failure.to_string();
         assert_eq!(text.matches("spawn-marker").count(), 1, "{text}");
+    }
+
+    fn debug_of(path: &str) -> String {
+        BoundedDebugPath(Path::new(path)).to_string()
+    }
+
+    /// #750 FR-013: the debug-quoted path is cut at the bound, on a character
+    /// boundary, and within the bound it is the plain `{:?}` text.
+    #[test]
+    fn test_bounded_debug_path_cuts_at_the_bound() {
+        let at_bound = "a".repeat(MAX_ECHOED_PATH_BYTES - 2);
+        assert_eq!(debug_of(&at_bound), format!("{:?}", Path::new(&at_bound)));
+        assert!(!debug_of(&at_bound).ends_with(TRUNCATION_MARKER));
+
+        let over = "a".repeat(MAX_ECHOED_PATH_BYTES - 1);
+        let cut = debug_of(&over);
+        assert!(cut.ends_with(TRUNCATION_MARKER), "{cut}");
+        assert_eq!(cut.len(), MAX_ECHOED_PATH_BYTES + TRUNCATION_MARKER.len());
+
+        let straddling = "é".repeat(MAX_ECHOED_PATH_BYTES);
+        let cut = debug_of(&straddling);
+        assert!(cut.ends_with(TRUNCATION_MARKER), "{cut}");
+        assert!(cut.len() <= MAX_ECHOED_PATH_BYTES + TRUNCATION_MARKER.len());
+
+        let honest = debug_of("/ws/quote\"d\\ name.rs");
+        assert_eq!(honest, format!("{:?}", Path::new("/ws/quote\"d\\ name.rs")));
+    }
+
+    /// #750 FR-013: a cut never leaves half an escape sequence before the marker.
+    #[test]
+    fn test_bounded_debug_path_never_splits_an_escape() {
+        for prefix in 0..8 {
+            let text = format!(
+                "{}{}",
+                "a".repeat(prefix),
+                "\u{1b}".repeat(MAX_ECHOED_PATH_BYTES)
+            );
+            let cut = debug_of(&text);
+            let body = cut.strip_suffix(TRUNCATION_MARKER).expect("cut");
+            let tail = body.rsplit('\\').next().unwrap_or_default();
+            assert!(
+                tail.is_empty() || (tail.starts_with("u{1b}") && tail == "u{1b}"),
+                "prefix {prefix}: ends with {tail:?}"
+            );
+            assert!(body.len() <= MAX_ECHOED_PATH_BYTES, "{}", body.len());
+        }
+    }
+
+    /// #750 FR-014: every error that echoes client text renders a bounded
+    /// message for a 1 MiB value, and keeps the whole stored value.
+    #[test]
+    fn test_client_text_echoes_stay_bounded() {
+        let huge = "Z".repeat(1 << 20);
+        let path = PathBuf::from(format!("/{huge}"));
+        let io = || std::io::Error::other("cause");
+        let errors = [
+            Error::PathOutsideWorkspace(path.clone()),
+            Error::NoWorkspaceRoots(path.clone()),
+            Error::NotARegularFile(path.clone()),
+            Error::FileIo {
+                path: path.clone(),
+                source: io(),
+            },
+            Error::MalformedPath {
+                path: path.clone(),
+                source: io(),
+            },
+            Error::from(ResourceUriError::InvalidPath(huge.clone())),
+            Error::from(ResourceUriError::InvalidScheme(huge.clone())),
+            Error::from(ResourceUriError::NotAFilePath(huge)),
+        ];
+        for error in &errors {
+            let text = ErrorChain(error).to_string();
+            let len = text.len();
+            assert!(len <= 2 * MAX_ECHOED_PATH_BYTES, "{len} bytes: {text:.80}");
+            assert!(text.contains(TRUNCATION_MARKER), "{text:.80}");
+        }
+        assert_matches!(&errors[0], Error::PathOutsideWorkspace(stored) if *stored == path);
+    }
+
+    /// #750 FR-013: a path at the bound is echoed whole, one byte over is cut.
+    #[test]
+    fn test_path_echo_variants_cut_one_byte_over_the_bound() {
+        let at_bound = PathBuf::from("a".repeat(MAX_ECHOED_PATH_BYTES));
+        let text = Error::PathOutsideWorkspace(at_bound).to_string();
+        assert!(!text.contains(TRUNCATION_MARKER), "{text:.80}");
+
+        let over = PathBuf::from("a".repeat(MAX_ECHOED_PATH_BYTES + 1));
+        let text = Error::NotARegularFile(over).to_string();
+        assert!(text.ends_with(TRUNCATION_MARKER), "{text:.80}");
+
+        let controls = PathBuf::from("\u{1b}".repeat(MAX_ECHOED_PATH_BYTES));
+        let text = Error::NoWorkspaceRoots(controls).to_string();
+        assert!(text.len() <= 2 * MAX_ECHOED_PATH_BYTES, "{}", text.len());
     }
 
     #[test]

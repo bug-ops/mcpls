@@ -994,6 +994,45 @@ async fn test_run_http_unknown_tool_is_in_band_invalid_params_with_http_200() {
     server_task.abort();
 }
 
+/// #749: over HTTP an undecodable `tools/call` answers `-32602` and an unknown
+/// method `-32601`, both in-band with HTTP 200, as before the override.
+#[tokio::test]
+async fn test_run_http_undecodable_requests_answer_json_rpc_codes_with_http_200() {
+    let (addr, server_task) = spawn_http_server(test_server(), |cfg| cfg).await;
+    let session_id = initialize_legacy_session(addr).await;
+    let initialized = post_in_session(
+        addr,
+        &session_id,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    )
+    .await;
+    assert!(
+        initialized.starts_with("HTTP/1.1 202"),
+        "got: {initialized}"
+    );
+
+    for (body, code) in [
+        (
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":5}}"#,
+            "-32602",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{}}"#,
+            "-32602",
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":4,"method":"foo/bar","params":{}}"#,
+            "-32601",
+        ),
+    ] {
+        let response = post_in_session(addr, &session_id, body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.contains(code), "{code} expected, got: {response}");
+    }
+
+    server_task.abort();
+}
+
 /// S1 non-regression: a non-`initialize` request carrying SEP-2575
 /// per-request `_meta` protocol-version metadata
 /// (`io.modelcontextprotocol/protocolVersion` = `2026-07-28` plus the

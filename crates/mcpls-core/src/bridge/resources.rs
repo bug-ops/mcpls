@@ -15,6 +15,7 @@ use url::Url;
 
 use super::state::{encode_rfc3986_path_chars, file_url, uri_to_path};
 use super::{ClientPath, InvalidClientPath, WorkspaceRoots};
+use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded};
 
 /// URI scheme used for diagnostic resources.
 const SCHEME: &str = "lsp-diagnostics";
@@ -43,11 +44,17 @@ pub(crate) const MAX_LISTEN_STREAMS: usize = 100;
 #[derive(Debug, Error)]
 pub enum ResourceUriError {
     /// The path is relative or contains non-UTF-8 components.
-    #[error("path must be absolute and valid UTF-8: {0}")]
+    #[error(
+        "path must be absolute and valid UTF-8: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     InvalidPath(String),
 
     /// The URI has the wrong scheme or malformed structure.
-    #[error("expected '{SCHEME}:///' prefix in URI: {0}")]
+    #[error(
+        "expected '{SCHEME}:///' prefix in URI: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     InvalidScheme(String),
 
     /// The URI is not parseable as a URL.
@@ -55,7 +62,10 @@ pub enum ResourceUriError {
     UrlParse(#[source] url::ParseError),
 
     /// The URI does not name a filesystem path.
-    #[error("URI does not name a filesystem path: {0}")]
+    #[error(
+        "URI does not name a filesystem path: {}",
+        escape_bounded(.0, MAX_ECHOED_PATH_BYTES)
+    )]
     NotAFilePath(String),
 
     /// The decoded path is not an acceptable client path.

@@ -12,11 +12,11 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, Implementation, ListResourcesResult,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
-    ServerConfig as RmcpServerConfig, SubscribeRequestParams, SubscriptionFilter, ToolAnnotations,
-    UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult, ErrorCode,
+    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
+    ServerCapabilities, ServerConfig as RmcpServerConfig, SubscribeRequestParams,
+    SubscriptionFilter, ToolAnnotations, UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use super::custom_request;
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
 use super::schema_shape::shape_tool_schemas;
@@ -54,6 +55,7 @@ use crate::bridge::{
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
+use crate::util::{MAX_ECHOED_NAME_BYTES, escape_bounded};
 
 /// Built-in `serverInfo.title`, used when `[mcp].title` is not configured.
 const DEFAULT_SERVER_TITLE: &str = "MCPLS - MCP to LSP Bridge";
@@ -382,7 +384,13 @@ fn paginate_resource_paths<'a>(
 
     let start = match cursor {
         Some(c) => c.parse::<usize>().map_err(|_| {
-            McpError::invalid_params(format!("invalid pagination cursor: {c}"), None)
+            McpError::invalid_params(
+                format!(
+                    "invalid pagination cursor: {}",
+                    escape_bounded(c, MAX_ECHOED_NAME_BYTES)
+                ),
+                None,
+            )
         })?,
         None => 0,
     };
@@ -1657,6 +1665,26 @@ const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Erro
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McplsServer {
+    /// The SDK default answers every undecodable request with "method not
+    /// found" and the method name; see `custom_request::answer`.
+    ///
+    /// The session kind follows rmcp's rule through its public API: a session
+    /// is legacy (opened with `initialize`) unless its protocol version has no
+    /// `initialize`. rmcp's own check also looks at whether the session was
+    /// opened by `server/discover`, which is not public; a session opened
+    /// without `initialize` whose request declares a pre-2026-07-28 version in
+    /// `_meta` is therefore read as legacy here.
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        let legacy = context
+            .protocol_version()
+            .is_none_or(|version| version.has_initialize());
+        Err(custom_request::answer(&request, legacy))
+    }
+
     async fn list_resources(
         &self,
         request: Option<rmcp::model::PaginatedRequestParams>,
@@ -5633,6 +5661,16 @@ sleep 0.3
         server: McplsServer,
         params: serde_json::Value,
     ) -> serde_json::Value {
+        request_over_the_wire(server, "tools/call", params).await.0
+    }
+
+    /// As [`tools_call_over_the_wire`] for any `method`; also returns the
+    /// byte length of the response line.
+    async fn request_over_the_wire(
+        server: McplsServer,
+        method: &str,
+        params: serde_json::Value,
+    ) -> (serde_json::Value, usize) {
         use rmcp::ServiceExt as _;
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
@@ -5667,20 +5705,124 @@ sleep 0.3
             .await
             .unwrap();
         let call = send(serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 1, "method": method,
             "params": params,
         }));
         client_write.write_all(call.as_bytes()).await.unwrap();
 
-        let response = loop {
-            let line = lines.next_line().await.unwrap().unwrap();
-            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if message["id"] == 1 {
-                break message;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if message["id"] == 1 {
+                    break (message, line.len());
+                }
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no response to {method}"));
         serving.abort();
         response
+    }
+
+    /// #749: a served method whose params do not decode is `-32602`, a method
+    /// mcpls does not serve stays `-32601`.
+    #[tokio::test]
+    async fn test_undecodable_requests_are_invalid_params_over_the_wire() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        for (method, params, code) in [
+            (
+                "tools/call",
+                serde_json::json!({"name": "get_hover", "arguments": []}),
+                -32602,
+            ),
+            ("tools/call", serde_json::json!({"name": 5}), -32602),
+            ("tools/call", serde_json::json!({}), -32602),
+            ("resources/read", serde_json::json!({}), -32602),
+            ("resources/read", serde_json::json!({"uri": 5}), -32602),
+            ("resources/subscribe", serde_json::json!({}), -32602),
+            ("resources/unsubscribe", serde_json::json!({}), -32602),
+            ("initialize", serde_json::json!({}), -32602),
+            ("foo/bar", serde_json::json!({}), -32601),
+        ] {
+            let (response, _) =
+                request_over_the_wire(server_over(workspace.path()), method, params.clone()).await;
+
+            assert_eq!(
+                response["error"]["code"], code,
+                "{method} {params}: {response}"
+            );
+        }
+    }
+
+    /// #750: a 1 MiB client string echoed in an error leaves the response
+    /// within the message cap plus the envelope, the code unchanged.
+    #[tokio::test]
+    async fn test_oversized_client_strings_stay_bounded_in_error_responses() {
+        const ENVELOPE: usize = 512;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = workspace.path().display().to_string();
+        let big = "Z".repeat(1 << 20);
+        let hover = |file_path: String| {
+            (
+                "tools/call".to_owned(),
+                serde_json::json!({
+                    "name": "get_hover",
+                    "arguments": {"file_path": file_path, "line": 1, "character": 1},
+                }),
+                -32602,
+            )
+        };
+        let call =
+            |method: &str, params: serde_json::Value, code: i64| (method.to_owned(), params, code);
+        let rows = [
+            hover(format!("/{big}")),
+            hover(format!("{root}/{}", "a".repeat(5000))),
+            hover(format!("{root}/{}", "a".repeat(300_000))),
+            call(
+                "resources/read",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call("resources/read", serde_json::json!({"uri": big}), -32602),
+            call(
+                "resources/read",
+                serde_json::json!({"uri": format!("lsp-diagnostics:///{big}")}),
+                -32602,
+            ),
+            call(
+                "resources/subscribe",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call(
+                "resources/unsubscribe",
+                serde_json::json!({"uri": format!("lsp-diagnostics://{big}")}),
+                -32602,
+            ),
+            call("resources/list", serde_json::json!({"cursor": big}), -32602),
+            call(&format!("x/{big}"), serde_json::json!({}), -32601),
+        ];
+        for (index, (method, params, code)) in rows.into_iter().enumerate() {
+            let (response, len) =
+                request_over_the_wire(server_over(workspace.path()), &method, params).await;
+
+            assert_eq!(response["error"]["code"], code, "{response}");
+            assert!(
+                len <= crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES + ENVELOPE,
+                "{len} bytes for {method:.40}"
+            );
+            // Rows 1 and 2 are file names whose error text depends on the OS.
+            if !matches!(index, 1 | 2) {
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(crate::util::TRUNCATION_MARKER)),
+                    "no truncation marker in {:.200}",
+                    response.to_string()
+                );
+            }
+        }
     }
 
     /// #575: a malformed `file_path` is reported as `-32602` by the real tool
