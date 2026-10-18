@@ -1657,6 +1657,7 @@ impl ServerHandler for McplsServer {
     /// opened by `server/discover`, which is not public; a session opened
     /// without `initialize` whose request declares a pre-2026-07-28 version in
     /// `_meta` is therefore read as legacy here.
+    // TODO(#776): reject a well-formed repeated `initialize` with -32600
     async fn on_custom_request(
         &self,
         request: CustomRequest,
@@ -5708,7 +5709,7 @@ sleep 0.3
         response
     }
 
-    /// #749: a served method whose params do not decode is `-32602`, a method
+    /// #750: a served method whose params do not decode is `-32602`, a method
     /// mcpls does not serve stays `-32601`.
     #[tokio::test]
     async fn test_undecodable_requests_are_invalid_params_over_the_wire() {
@@ -5735,10 +5736,17 @@ sleep 0.3
                 response["error"]["code"], code,
                 "{method} {params}: {response}"
             );
+            if code == -32602 {
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.starts_with(&format!("invalid params for `{method}`: ")),
+                    "{message:.120}"
+                );
+            }
         }
     }
 
-    /// #750: a 1 MiB client string echoed in an error leaves the response
+    /// #749: a 1 MiB client string echoed in an error leaves the response
     /// within the message cap plus the envelope, the code unchanged.
     #[tokio::test]
     async fn test_oversized_client_strings_stay_bounded_in_error_responses() {
@@ -5759,7 +5767,11 @@ sleep 0.3
         let call =
             |method: &str, params: serde_json::Value, code: i64| (method.to_owned(), params, code);
         let rows = [
-            hover(format!("/{big}")),
+            hover(if cfg!(windows) {
+                format!(r"C:\{big}")
+            } else {
+                format!("/{big}")
+            }),
             hover(format!("{root}/{}", "a".repeat(5000))),
             hover(format!("{root}/{}", "a".repeat(300_000))),
             call(

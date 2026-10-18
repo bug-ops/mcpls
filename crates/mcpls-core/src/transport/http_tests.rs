@@ -994,7 +994,7 @@ async fn test_run_http_unknown_tool_is_in_band_invalid_params_with_http_200() {
     server_task.abort();
 }
 
-/// #749: over HTTP an undecodable `tools/call` answers `-32602` and an unknown
+/// #750: over HTTP an undecodable `tools/call` answers `-32602` and an unknown
 /// method `-32601`, both in-band with HTTP 200, as before the override.
 #[tokio::test]
 async fn test_run_http_undecodable_requests_answer_json_rpc_codes_with_http_200() {

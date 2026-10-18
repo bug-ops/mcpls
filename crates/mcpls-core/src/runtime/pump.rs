@@ -2730,7 +2730,9 @@ mod burst_tests {
         let root = dunce::canonicalize(workspace.path()).unwrap();
         let (release, gate) = std::sync::mpsc::channel::<()>();
         let gate = std::sync::Mutex::new(gate);
+        let (entered_tx, mut entered) = mpsc::unbounded_channel::<()>();
         let slow: Arc<bridge::CanonicalizeFn> = Arc::new(move |p: &std::path::Path| {
+            entered_tx.send(()).ok();
             gate.lock().map(|rx| rx.recv()).ok();
             Ok(p.to_path_buf())
         });
@@ -2773,7 +2775,10 @@ mod burst_tests {
             ),
             PublishedPathResolver::with_canonicalizer(slow),
         ));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(30), entered.recv())
+            .await
+            .expect("the pump must reach the resolver")
+            .expect("the resolver signals once");
         role_tx.send(DiagnosticsRole::Secondary).unwrap();
         drop(release);
         tokio::time::timeout(Duration::from_secs(60), pump)

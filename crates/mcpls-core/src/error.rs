@@ -3184,7 +3184,7 @@ mod tests {
         BoundedDebugPath(Path::new(path)).to_string()
     }
 
-    /// #750 FR-013: the debug-quoted path is cut at the bound, on a character
+    /// #749 FR-013: the debug-quoted path is cut at the bound, on a character
     /// boundary, and within the bound it is the plain `{:?}` text.
     #[test]
     fn test_bounded_debug_path_cuts_at_the_bound() {
@@ -3206,7 +3206,7 @@ mod tests {
         assert_eq!(honest, format!("{:?}", Path::new("/ws/quote\"d\\ name.rs")));
     }
 
-    /// #750 FR-013: a cut never leaves half an escape sequence before the marker.
+    /// #749 FR-013: a cut never leaves half an escape sequence before the marker.
     #[test]
     fn test_bounded_debug_path_never_splits_an_escape() {
         for prefix in 0..8 {
@@ -3226,7 +3226,7 @@ mod tests {
         }
     }
 
-    /// #750 FR-014: every error that echoes client text renders a bounded
+    /// #749 FR-014: every error that echoes client text renders a bounded
     /// message for a 1 MiB value, and keeps the whole stored value.
     #[test]
     fn test_client_text_echoes_stay_bounded() {
@@ -3258,7 +3258,7 @@ mod tests {
         assert_matches!(&errors[0], Error::PathOutsideWorkspace(stored) if *stored == path);
     }
 
-    /// #750 FR-013: a path at the bound is echoed whole, one byte over is cut.
+    /// #749 FR-013: a path at the bound is echoed whole, one byte over is cut.
     #[test]
     fn test_path_echo_variants_cut_one_byte_over_the_bound() {
         let at_bound = PathBuf::from("a".repeat(MAX_ECHOED_PATH_BYTES));

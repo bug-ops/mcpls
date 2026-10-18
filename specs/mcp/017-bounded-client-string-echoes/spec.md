@@ -10,7 +10,7 @@ tags:
   - error-handling
   - logging
 created: 2026-10-07
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/011-client-path-boundary-parsing/spec|mcp/011-client-path-boundary-parsing]]"
@@ -27,7 +27,7 @@ related:
 > **Priority**: P3
 > **Author**: Andrei G.
 > **Source**: continuous-improvement cycle, live-test finding at HEAD 09b686c
-> **Issue**: #750
+> **Issue**: #749
 
 > [!abstract]
 > Since #713/#716 the unknown-tool-argument rejection echoes a client key as `<N-byte name>` and
@@ -281,8 +281,9 @@ No new persistent data. Entities touched:
 - **Original length next to the marker (FR-008).** Not added. `escape_bounded` keeps appending only `TRUNCATION_MARKER`, so the refusal messages that use it (`EchoedPath`, `EchoedArgument`) do not change and one cut routine serves every echo.
 - **Bound for resource URIs.** One bound, `MAX_ECHOED_PATH_BYTES` (1024), for paths and URIs alike; a URI is measured on the escaped text like a path.
 - **Where the bounds live.** `MAX_ECHOED_PATH_BYTES` and `MAX_ECHOED_NAME_BYTES` are constants in `util.rs` next to `escape_bounded`; `error.rs`, `bridge/` and `mcp/` all use them, so `MAX_SYMBOL_NAME_BYTES` stays the bound of symbol names and kind filters only.
-- **Which requests reach `on_custom_request`.** Every request that does not decode into its typed form reaches the hook, including a served method with malformed params. A request whose `params` is not a JSON object (for example an array) is rejected earlier by the protocol layer as `-32600` with no echo. The override answers `-32601` with the escaped, bounded method name for a method mcpls does not serve, and `-32602` for a served method whose params do not decode (issue #749).
+- **Which requests reach `on_custom_request`.** Every request that does not decode into its typed form reaches the hook, including a served method with malformed params. A request whose `params` is not a JSON object (for example an array) is rejected earlier by the protocol layer as `-32600` with no echo. The override answers `-32601` with the escaped, bounded method name for a method mcpls does not serve, and `-32602` for a served method whose params do not decode (issue #750).
 - **Other `String` variants.** `Error::InvalidToolParams(String)` and the remaining `String`-carrying variants are not audited here; only the variants of section 1 are bounded.
+- **Test coverage of FR-012 and FR-013.** Partial. The FR-012 table runs in process over a duplex pipe with 1 MiB values for the tool path, three resource methods, the cursor and an unknown method, asserting the code, the response length and the marker; the two `.fk` file-name rows use `a` runs of 5000 and 300000 bytes and skip the marker assertion because the OS error text differs. FR-013 (at the bound, one byte over, a straddling character, control characters) is covered for the debug-quoted path and the path variants, and the resource URI, cursor and method name are covered by the 1 MiB rows only. A hierarchy item `uri` echoed by `parse_file_uri` is bounded too and has its own test.
 - **Final guard in `map_bridge_error`.** Not added; bounding each echo where it is rendered is enough, and the FR-012 table asserts the whole response.
 
 ## 10. Documentation Impact

@@ -195,7 +195,7 @@ impl<K: KindFilter> KindFilterInput<K> {
             ))),
             Self::Rejected(Rejection::Unknown(rejected)) => Err(Error::InvalidToolParams(format!(
                 "Invalid {field}: '{}'. Valid values: {}",
-                rejected.as_str(),
+                crate::util::escape_bounded(rejected.as_str(), MAX_SYMBOL_NAME_BYTES),
                 K::valid_values()
             ))),
         }

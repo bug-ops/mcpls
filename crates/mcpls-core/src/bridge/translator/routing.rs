@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure};
 use crate::lsp::LspClient;
-use crate::util::lock_std;
+use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded, lock_std};
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1423,7 +1423,7 @@ impl Translator {
         let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
             Error::InvalidToolParams(format!(
                 "Invalid URI, expected an absolute file:// URI but got: {}",
-                uri.as_ref()
+                escape_bounded(uri.as_ref(), MAX_ECHOED_PATH_BYTES)
             ))
         })?;
 

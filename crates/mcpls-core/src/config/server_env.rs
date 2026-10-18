@@ -94,11 +94,13 @@ impl HostKey {
     }
 }
 
-/// The character Windows compares `c` as: its simple uppercase when that is
-/// one character and both stay in the Basic Multilingual Plane, `c` itself
+/// The character Windows compares `c` as, approximately: its Unicode
+/// uppercase (the full mapping, not the simple one) when that is a single
+/// character and both stay in the Basic Multilingual Plane, `c` itself
 /// otherwise. Windows folds names with a per-UTF-16-unit table, so a
 /// supplementary-plane letter or a mapping that expands (`ß` to `SS`) does not
-/// fold.
+/// fold. A character whose full mapping expands but whose simple mapping is one
+/// character (U+1F80) is left unfolded here although Windows folds it.
 fn windows_fold(c: char) -> char {
     let mut upper = c.to_uppercase();
     match (upper.next(), upper.next()) {

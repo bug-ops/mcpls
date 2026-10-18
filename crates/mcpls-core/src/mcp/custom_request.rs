@@ -5,6 +5,11 @@
 //! with the method name. That is wrong for a method mcpls serves (the client
 //! sent a malformed request, not an unknown method) and echoes a client string
 //! at full length. [`answer`] fixes both.
+//!
+//! Only the methods mcpls advertises and implements count as served. The SDK
+//! also answers `completion/complete` and `prompts/list` with empty results,
+//! but mcpls advertises neither capability, so a malformed request for them
+//! stays "method not found".
 
 use std::borrow::Cow;
 
@@ -86,10 +91,11 @@ impl Served {
 
     const fn lifecycle(self) -> Lifecycle {
         match self {
-            Self::ResourcesSubscribe | Self::ResourcesUnsubscribe => Lifecycle::LegacyOnly,
+            Self::Ping | Self::ResourcesSubscribe | Self::ResourcesUnsubscribe => {
+                Lifecycle::LegacyOnly
+            }
             Self::SubscriptionsListen => Lifecycle::ModernOnly,
             Self::Initialize
-            | Self::Ping
             | Self::Discover
             | Self::ToolsList
             | Self::ToolsCall
@@ -139,17 +145,17 @@ fn method_not_found(method: &str) -> McpError {
 /// The error a request that fell through to the custom-request hook gets.
 ///
 /// `legacy` says whether the session was opened with `initialize`; the
-/// lifecycle-gated methods (`resources/subscribe` and `resources/unsubscribe`
-/// on legacy sessions, `subscriptions/listen` on later ones) answer
-/// "method not found" on the other kind, as the typed path does.
+/// lifecycle-gated methods (`ping`, `resources/subscribe` and
+/// `resources/unsubscribe` on legacy sessions, `subscriptions/listen` on later
+/// ones) answer "method not found" on the other kind, as the typed path does.
 ///
 /// - A method mcpls does not serve is "method not found" with the method name
 ///   escaped and bounded.
 /// - A served method whose params do not decode is "invalid params", naming
 ///   the method and the bounded decoding error.
-/// - A served method whose params decode, yet whose request does not (for
-///   example a malformed `_meta`), is "invalid params" with a fixed text.
-/// - A repeated `initialize` whose params decode keeps "method not found".
+/// - A served method whose params decode when read as a plain value, yet whose
+///   request does not (a duplicate field is the case that gets here), is
+///   "invalid params" with a fixed text.
 pub(super) fn answer(request: &CustomRequest, legacy: bool) -> McpError {
     let Some(served) = Served::of(&request.method) else {
         return method_not_found(&request.method);
@@ -166,13 +172,8 @@ pub(super) fn answer(request: &CustomRequest, legacy: bool) -> McpError {
             ),
             None,
         ),
-        // TODO(#776): reject a well-formed repeated `initialize` with -32600
-        Ok(()) if served == Served::Initialize => method_not_found(&request.method),
         Ok(()) => McpError::invalid_params(
-            format!(
-                "invalid params for `{name}`: the params decode but the request does not \
-                 (check `_meta`)"
-            ),
+            format!("invalid params for `{name}`: the params are malformed (duplicate field)"),
             None,
         ),
     }
@@ -243,22 +244,40 @@ mod tests {
     }
 
     #[test]
-    fn params_that_decode_get_a_fixed_text_and_a_repeated_initialize_stays_not_found() {
-        let tools = answer(&request("tools/list", None), true);
-        assert_eq!(code(&tools), ErrorCode::INVALID_PARAMS);
-        assert!(
-            tools.message.ends_with("(check `_meta`)"),
-            "{}",
-            tools.message
-        );
-
+    fn params_that_decode_get_a_fixed_text() {
         let initialize = json!({
             "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "c", "version": "1"},
         });
-        let repeated = answer(&request("initialize", Some(initialize)), true);
-        assert_eq!(code(&repeated), ErrorCode::METHOD_NOT_FOUND);
+        for (method, params) in [
+            ("tools/list", None),
+            ("initialize", Some(initialize)),
+            ("tools/call", Some(json!({"name": "get_hover"}))),
+        ] {
+            let error = answer(&request(method, params), true);
+            assert_eq!(code(&error), ErrorCode::INVALID_PARAMS, "{method}");
+            assert!(
+                error.message.ends_with("(duplicate field)"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn methods_the_sdk_answers_but_mcpls_does_not_advertise_stay_not_found() {
+        for method in ["completion/complete", "prompts/list"] {
+            let error = answer(&request(method, Some(json!({}))), true);
+            assert_eq!(code(&error), ErrorCode::METHOD_NOT_FOUND, "{method}");
+        }
+    }
+
+    #[test]
+    fn ping_is_served_on_legacy_sessions_only() {
+        let ping = request("ping", Some(json!(5)));
+        assert_eq!(code(&answer(&ping, true)), ErrorCode::INVALID_PARAMS);
+        assert_eq!(code(&answer(&ping, false)), ErrorCode::METHOD_NOT_FOUND);
     }
 
     #[test]

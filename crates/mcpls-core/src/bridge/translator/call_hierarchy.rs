@@ -417,6 +417,46 @@ mod tests {
         );
     }
 
+    /// #749: a hierarchy item whose `uri` is not a `file:` URI is rejected
+    /// with a message that does not grow with the `uri`, and a control
+    /// character in it is escaped.
+    #[tokio::test]
+    async fn test_handle_incoming_calls_bounds_the_echo_of_a_non_file_uri() {
+        let translator = Translator::new();
+        let uri = format!("x\n{}", "Z".repeat(1 << 20));
+        let item = serde_json::json!({
+            "name": "foo",
+            "kind": 12,
+            "uri": uri,
+            "range": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            },
+            "selectionRange": {
+                "start": {"line": 1, "character": 1},
+                "end": {"line": 1, "character": 1}
+            }
+        });
+
+        let result = translator
+            .handle_incoming_calls(checked_hierarchy_item(item))
+            .await;
+
+        let Err(Error::InvalidToolParams(message)) = result else {
+            panic!("expected InvalidToolParams, got {result:?}");
+        };
+        assert!(
+            message.len() <= 2 * crate::util::MAX_ECHOED_PATH_BYTES,
+            "{}",
+            message.len()
+        );
+        assert!(
+            message.ends_with(crate::util::TRUNCATION_MARKER),
+            "{message:.80}"
+        );
+        assert!(!message.contains('\n'));
+    }
+
     /// As above, through `handle_outgoing_calls` -- same
     /// item handling, different caller.
     #[tokio::test]

@@ -581,6 +581,28 @@ mod tests {
         BoundedPublish::new(publish_of(n, message)).1
     }
 
+    /// #738: the method of a dropped frame is escaped and bounded in the log.
+    #[test]
+    fn drop_log_escapes_and_bounds_the_method() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        DropLog::of(Lane::Notification).record(&format!("evil\nFORGED{}", "x".repeat(10_000)));
+        drop(guard);
+
+        let line = captured
+            .messages()
+            .into_iter()
+            .find(|message| message.contains("dropping notification"))
+            .expect("the drop is logged at debug");
+        assert!(!line.contains('\n'), "{line:.80}");
+        assert!(line.contains("evil\\nFORGED"), "{line:.80}");
+        assert!(line.len() < 2 * MAX_LOG_STRING_BYTES, "{}", line.len());
+    }
+
     /// #738: the URI text counts toward the byte budget.
     #[test]
     fn publish_bytes_include_the_uri() {
