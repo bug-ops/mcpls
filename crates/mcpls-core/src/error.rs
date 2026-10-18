@@ -3180,6 +3180,33 @@ mod tests {
         assert_eq!(text.matches("spawn-marker").count(), 1, "{text}");
     }
 
+    /// The docs of the echo types state the bounds as numbers (the constants
+    /// live in a private module and cannot be linked); this keeps them in step.
+    #[test]
+    fn test_echo_bound_docs_state_the_constants() {
+        let source = include_str!("error.rs");
+        for (bytes, doc_marker) in [
+            (MAX_ECHOED_NAME_BYTES, "pub struct EchoedArgument"),
+            (MAX_ECHOED_PATH_BYTES, "pub struct EchoedPath"),
+        ] {
+            let before = source.split(doc_marker).next().unwrap();
+            let doc = before.rsplit("\n\n").next().unwrap();
+            assert!(
+                doc.contains(&format!("{bytes} bytes")),
+                "{doc_marker}: {doc}"
+            );
+        }
+        let debug_doc = source
+            .split("struct BoundedDebugPath")
+            .next()
+            .and_then(|before| before.rsplit("\n\n").next())
+            .unwrap();
+        assert!(
+            debug_doc.contains(&format!("{MAX_ECHOED_PATH_BYTES} bytes")),
+            "{debug_doc}"
+        );
+    }
+
     fn debug_of(path: &str) -> String {
         BoundedDebugPath(Path::new(path)).to_string()
     }

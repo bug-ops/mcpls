@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Error variants no longer repeat their source in `Display`, and `ErrorChain` renders every cause once (#735) (#PR).
 - A diagnostics list is serialized once per publish; its size is recorded when it is bounded (#743) (#PR).
+- Whole-document requests and the name-addressed tools share one request path each (`FromDocument`, `addressed`) (#746) (#PR).
 - **Breaking:** `LspServer::spawn` returns `SpawnedServer { server, lanes }`, `ServerStartOutcome::Started` holds a `SpawnedServer`, and the `take_*` receivers are gone (#744) (#PR).
 - **Breaking:** `NewName`, `CompletionTrigger` and `SymbolName` use `new` instead of `try_new` and report `InvalidTextField`/`TextField`; `InvalidNewName`, `InvalidCompletionTrigger` and `SymbolNameError` are removed, and an empty `trigger` is invalid (#745) (#PR).
 - **Breaking:** `Error::ServerNotFound` renames `source` to `io`, and the `Display` of `McpServerStart`, `TaskFailed`, `HttpBind`, `Json`, `ServerSpawnFailed` and `ConfigError::UnsupportedFilePattern` no longer includes the cause; use `ErrorChain` (#735) (#PR).

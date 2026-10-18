@@ -261,6 +261,26 @@ impl FromDocument for DocumentFormattingParams {
     }
 }
 
+/// The params of the whole-document request `R` for `doc` and the timeout they
+/// carry: the one place both are decided for [`document_request`] and
+/// [`document_request_classified`].
+fn document_call<R>(
+    doc: &PreparedDocument,
+    extra: <R::Params as FromDocument>::Extra,
+) -> (R::Params, Duration)
+where
+    R: lsp_types::Request,
+    R::Params: FromDocument,
+{
+    let params = R::Params::from_document(
+        TextDocumentIdentifier {
+            uri: doc.uri().clone(),
+        },
+        extra,
+    );
+    (params, <R::Params as RequestTimeout>::timeout(doc.client()))
+}
+
 /// Sends the whole-document request `R` for `doc` with the timeout its params
 /// carry.
 ///
@@ -275,16 +295,8 @@ where
     R: lsp_types::Request,
     R::Params: FromDocument,
 {
-    let client = doc.client();
-    let params = R::Params::from_document(
-        TextDocumentIdentifier {
-            uri: doc.uri().clone(),
-        },
-        extra,
-    );
-    client
-        .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
-        .await
+    let (params, timeout) = document_call::<R>(doc, extra);
+    doc.client().request_typed::<R>(params, timeout).await
 }
 
 /// As [`document_request`], but keeps the failure's classification for a
@@ -297,15 +309,9 @@ where
     R: lsp_types::Request,
     R::Params: FromDocument,
 {
-    let client = doc.client();
-    let params = R::Params::from_document(
-        TextDocumentIdentifier {
-            uri: doc.uri().clone(),
-        },
-        extra,
-    );
-    client
-        .request_typed_classified::<R>(params, <R::Params as RequestTimeout>::timeout(client))
+    let (params, timeout) = document_call::<R>(doc, extra);
+    doc.client()
+        .request_typed_classified::<R>(params, timeout)
         .await
 }
 
