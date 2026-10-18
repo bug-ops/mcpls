@@ -382,6 +382,11 @@ pub enum DiagnosticsRole {
 }
 
 impl DiagnosticsRole {
+    /// Whether the server's pushes are cached and announced.
+    pub(crate) const fn caches(self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+
     /// The role of a server that is, or is not, the language's diagnostics route.
     pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
         if is_diagnostics_route {

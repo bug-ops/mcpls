@@ -193,6 +193,8 @@ pub(crate) struct PublishedDiagnosticsUri {
     /// rather than the URI text so percent-encoding and drive-letter case
     /// cannot make a canonical spelling look like an alias.
     is_canonical: bool,
+    /// How the canonical path was obtained.
+    form: CanonicalForm,
 }
 
 /// How trustworthy the canonical path handed to
@@ -228,17 +230,33 @@ impl PublishedDiagnosticsUri {
             canonical,
             is_canonical: form == CanonicalForm::Resolved
                 && same_path(published_path, canonical_path),
+            form,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(source: lsp_types::Uri, canonical: lsp_types::Uri) -> Self {
-        let is_canonical = source == canonical;
+        Self::for_test_with_form(source, canonical, CanonicalForm::Resolved)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_form(
+        source: lsp_types::Uri,
+        canonical: lsp_types::Uri,
+        form: CanonicalForm,
+    ) -> Self {
+        let is_canonical = source == canonical && form == CanonicalForm::Resolved;
         Self {
             source,
             canonical,
             is_canonical,
+            form,
         }
+    }
+
+    /// Whether the canonical path came from the filesystem or stood in for it.
+    pub(crate) const fn form(&self) -> CanonicalForm {
+        self.form
     }
 
     /// Whether the server published under the canonical spelling of the path.

@@ -888,7 +888,7 @@ fn cache_overlay(items: Vec<LspDiagnostic>) -> DiagnosticSources {
         .with_pulled(
             &file(),
             Some(DocumentVersion::new(1)),
-            BoundedDiagnostics(items),
+            BoundedDiagnostics::unbounded(items),
         )
 }
 

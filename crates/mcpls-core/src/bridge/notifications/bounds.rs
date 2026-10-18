@@ -47,18 +47,37 @@ pub(super) const MAX_DIAGNOSTICS_ENTRY_BYTES: usize = 1024 * 1024;
 
 /// Diagnostics bounded the way the cache stores them: messages truncated and
 /// the list capped, so a pull report cannot skip the limits a push obeys.
+///
+/// The byte size is recorded when the list is bounded, so sizing a buffer for
+/// it needs no second serialization.
 #[derive(Debug)]
-pub struct BoundedDiagnostics(pub(super) Vec<LspDiagnostic>);
+pub struct BoundedDiagnostics {
+    list: Vec<LspDiagnostic>,
+    bytes: usize,
+}
 
 impl BoundedDiagnostics {
     /// The bounded list.
     pub(crate) fn into_vec(self) -> Vec<LspDiagnostic> {
-        self.0
+        self.list
     }
 
     /// The bounded list, borrowed.
     pub(crate) fn as_slice(&self) -> &[LspDiagnostic] {
-        &self.0
+        &self.list
+    }
+
+    /// The bytes the list takes in a buffer: an upper bound of its serialized
+    /// size, recorded when it was bounded.
+    pub(crate) const fn buffered_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// A list kept as given, for a test that stores what the cache never would.
+    #[cfg(test)]
+    pub(super) fn unbounded(list: Vec<LspDiagnostic>) -> Self {
+        let bytes = serialized_len(&list).unwrap_or(MAX_DIAGNOSTICS_ENTRY_BYTES);
+        Self { list, bytes }
     }
 
     /// Truncates each message to `MAX_ENTRY_TEXT_BYTES` and bounds the list to
@@ -72,8 +91,11 @@ impl BoundedDiagnostics {
                 MAX_ENTRY_TEXT_BYTES,
             );
         }
-        cap_diagnostics_entry_size(uri, &mut diagnostics);
-        Self(diagnostics)
+        let bytes = cap_diagnostics_entry_size(uri, &mut diagnostics);
+        Self {
+            list: diagnostics,
+            bytes,
+        }
     }
 }
 
@@ -182,14 +204,11 @@ fn cheap_size_estimate(diagnostics: &[LspDiagnostic]) -> Option<usize> {
     })
 }
 
-impl BoundedDiagnostics {
-    /// The bytes the list takes in a buffer: a cheap upper bound of its
-    /// serialized size, or the real one when a field cannot be sized cheaply.
-    pub(crate) fn buffered_bytes(&self) -> usize {
-        cheap_size_estimate(&self.0).unwrap_or_else(|| {
-            serde_json::to_vec(&self.0).map_or(MAX_DIAGNOSTICS_ENTRY_BYTES, |bytes| bytes.len())
-        })
-    }
+/// The serialized length of `diagnostics`, or `None` if serialization fails.
+fn serialized_len(diagnostics: &[LspDiagnostic]) -> Option<usize> {
+    serde_json::to_vec(diagnostics)
+        .ok()
+        .map(|bytes| bytes.len())
 }
 
 /// Bounds `diagnostics`' serialized size to at most
@@ -234,25 +253,33 @@ impl BoundedDiagnostics {
 /// request, so losing it can silently break that diagnostic's quick fix)
 /// -- logs a `tracing::warn!` so the degradation is visible rather than a
 /// silent, hard-to-diagnose gap in what a caller sees.
-pub(super) fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) {
-    let fits = |ds: &[LspDiagnostic]| {
+///
+/// # Returns
+///
+/// The size of the list as it stands on return: the cheap estimate (an upper
+/// bound) when that already fits, otherwise the measured serialized length of
+/// the final list. A measurement taken while searching for a fitting prefix
+/// is never returned, since the list shrinks afterwards.
+pub(super) fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDiagnostic>) -> usize {
+    let measured_fit = |ds: &[LspDiagnostic]| {
         // A serialization error is conservatively treated as "does not
         // fit" (triggers the mitigations below) rather than as success.
         // `LspDiagnostic`'s fields can't actually produce one in practice
         // (no floats, no non-string map keys anywhere in `Diagnostic` or
         // `serde_json::Value`'s own object representation), but failing
         // safe costs nothing here.
-        serde_json::to_vec(ds).is_ok_and(|bytes| bytes.len() <= MAX_DIAGNOSTICS_ENTRY_BYTES)
+        serialized_len(ds).filter(|&len| len <= MAX_DIAGNOSTICS_ENTRY_BYTES)
     };
+    let fits = |ds: &[LspDiagnostic]| measured_fit(ds).is_some();
 
-    if cheap_size_estimate(diagnostics)
-        .is_some_and(|estimated| estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES)
+    if let Some(estimated) = cheap_size_estimate(diagnostics)
+        .filter(|&estimated| estimated <= MAX_DIAGNOSTICS_ENTRY_BYTES)
     {
-        return;
+        return estimated;
     }
 
-    if fits(diagnostics) {
-        return;
+    if let Some(measured) = measured_fit(diagnostics) {
+        return measured;
     }
 
     let original_count = diagnostics.len();
@@ -319,26 +346,28 @@ pub(super) fn cap_diagnostics_entry_size(uri: &Uri, diagnostics: &mut Vec<LspDia
     // Terminal enforcement: guarantee the postcondition directly rather
     // than trusting the mitigations above to have covered every case --
     // see this function's doc.
-    if !fits(diagnostics) {
-        diagnostics.truncate(1);
-        if let Some(diagnostic) = diagnostics.first_mut() {
-            let placeholder = lsp_types::Message::String(String::new());
-            diagnostic.message = truncate_message(
-                std::mem::replace(&mut diagnostic.message, placeholder),
-                DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES,
-            );
-            diagnostic.source = None;
-            diagnostic.code = None;
-            diagnostic.code_description = None;
-            diagnostic.related_information = None;
-            diagnostic.tags = None;
-            diagnostic.data = None;
-        }
-        warn!(
-            "diagnostic for {} still exceeded the cache cap after every other mitigation; \
-             truncated its message to {DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES} bytes and \
-             cleared all other fields",
-            uri.as_ref(),
-        );
+    if let Some(measured) = measured_fit(diagnostics) {
+        return measured;
     }
+    diagnostics.truncate(1);
+    if let Some(diagnostic) = diagnostics.first_mut() {
+        let placeholder = lsp_types::Message::String(String::new());
+        diagnostic.message = truncate_message(
+            std::mem::replace(&mut diagnostic.message, placeholder),
+            DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES,
+        );
+        diagnostic.source = None;
+        diagnostic.code = None;
+        diagnostic.code_description = None;
+        diagnostic.related_information = None;
+        diagnostic.tags = None;
+        diagnostic.data = None;
+    }
+    warn!(
+        "diagnostic for {} still exceeded the cache cap after every other mitigation; \
+         truncated its message to {DIAGNOSTIC_TERMINAL_FALLBACK_MESSAGE_BYTES} bytes and \
+         cleared all other fields",
+        uri.as_ref(),
+    );
+    serialized_len(diagnostics).unwrap_or(MAX_DIAGNOSTICS_ENTRY_BYTES)
 }

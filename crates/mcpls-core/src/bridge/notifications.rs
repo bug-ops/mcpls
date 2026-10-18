@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::bridge::indexing::{IndexingPolicy, IndexingReset, IndexingState, IndexingTracker};
-use crate::bridge::resources::{DiagnosticsResourceUri, PublishedDiagnosticsUri};
+use crate::bridge::resources::{CanonicalForm, DiagnosticsResourceUri, PublishedDiagnosticsUri};
 use crate::bridge::{
     DiagnosticsAvailability, DocumentTracker, DocumentVersion, Opening, uri_to_path,
 };
@@ -616,11 +616,15 @@ struct EvictionMarks {
 }
 
 impl EvictionMarks {
-    fn record(&mut self, file: DiagnosticsKey, owner: ServerId, content: EvictedContent) {
-        let content = match self.by_file.get(&file) {
-            Some(previous) if previous.content == EvictedContent::Lost => EvictedContent::Lost,
+    /// Marks `file`; returns whether that changed what a read of it says (it
+    /// had no mark, or one with other content).
+    fn record(&mut self, file: DiagnosticsKey, owner: ServerId, content: EvictedContent) -> bool {
+        let previous = self.by_file.get(&file).map(|previous| previous.content);
+        let content = match previous {
+            Some(EvictedContent::Lost) => EvictedContent::Lost,
             _ => content,
         };
+        let changed = previous != Some(content);
         self.forget_file(&file);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -641,6 +645,7 @@ impl EvictionMarks {
                 self.overflowed.insert(mark.owner);
             }
         }
+        changed
     }
 
     fn forget_file(&mut self, file: &DiagnosticsKey) {
@@ -754,7 +759,7 @@ impl DiagnosticSources {
             info: DiagnosticInfo {
                 uri: file.clone(),
                 version,
-                diagnostics: diagnostics.0,
+                diagnostics: diagnostics.into_vec(),
             },
             origin: SourceOrigin::Pulled,
             freshness: Freshness::Current,
@@ -1608,7 +1613,7 @@ impl NotificationCache {
 
         let opening = self.document_opening(file);
         let same_state = self.entries.get(&slot_key).is_some_and(|entry| {
-            entry.diagnostics == items.0
+            entry.diagnostics == items.as_slice()
                 && matches!(
                     entry.origin,
                     Origin::Pulled { opening: stored, version, .. }
@@ -1636,15 +1641,15 @@ impl NotificationCache {
             }
         };
 
-        if !items.0.is_empty() {
-            self.learn_pull_sources(server_id, &items.0);
+        if !items.as_slice().is_empty() {
+            self.learn_pull_sources(server_id, items.as_slice());
         }
         let seq = self.next_seq();
         self.insert_entry(
             slot_key,
             CachedEntry {
                 uri: file.clone(),
-                diagnostics: items.0,
+                diagnostics: items.into_vec(),
                 owner: server_id.clone(),
                 seq,
                 origin: Origin::Pulled {
@@ -2343,16 +2348,24 @@ impl NotificationCache {
     /// publish exists that the cache cannot show, and older content must not
     /// pass for it.
     ///
-    /// Returns the files whose view changed, for the caller to announce.
+    /// Returns the files whose view changed, for the caller to announce: those
+    /// with an evicted entry or a newly recorded mark.
+    ///
+    /// A publication whose canonical path is only the published spelling (the
+    /// filesystem could not be asked) names the file of the entry cached under
+    /// that spelling when there is one, so a symlinked file's real entry is
+    /// the one that is evicted.
     pub(crate) fn record_lost_files(
         &mut self,
         owner: &ServerId,
-        files: &[DiagnosticsKey],
+        published: &[PublishedDiagnosticsUri],
     ) -> Vec<DiagnosticsKey> {
-        for file in files {
+        let mut changed = Vec::new();
+        for publication in published {
+            let file = self.lost_file(publication);
             let stale: Vec<SlotKey> = self
                 .files
-                .get(file)
+                .get(&file)
                 .into_iter()
                 .flatten()
                 .filter(|key| {
@@ -2364,15 +2377,31 @@ impl NotificationCache {
                 })
                 .cloned()
                 .collect();
+            let evicted = !stale.is_empty();
             for key in stale {
                 self.evict_entry(&key);
             }
-            if !self.has_diagnostics_for(file) {
-                self.eviction_marks
+            let marked = !self.has_diagnostics_for(&file)
+                && self
+                    .eviction_marks
                     .record(file.clone(), owner.clone(), EvictedContent::Lost);
+            if (evicted || marked) && !changed.contains(&file) {
+                changed.push(file);
             }
         }
-        files.to_vec()
+        changed
+    }
+
+    /// The file a lost publication stands for.
+    fn lost_file(&self, published: &PublishedDiagnosticsUri) -> DiagnosticsKey {
+        let by_source = || {
+            let key = SlotKey::pushed(DiagnosticsKey::of(published.source()));
+            self.entries.get(&key).map(|entry| entry.file(&key).clone())
+        };
+        (published.form() == CanonicalForm::Fallback)
+            .then(by_source)
+            .flatten()
+            .unwrap_or_else(|| DiagnosticsKey::of(published.canonical()))
     }
 
     /// Records that `owner` lost more publishes than the mailbox could name,
@@ -2944,6 +2973,115 @@ mod tests {
         assert!(
             serialized_len <= MAX_DIAGNOSTICS_ENTRY_BYTES,
             "postcondition must hold via the terminal fallback, got {serialized_len} bytes"
+        );
+    }
+
+    fn serialized_len_of(diagnostics: &[LspDiagnostic]) -> usize {
+        serde_json::to_vec(diagnostics).unwrap().len()
+    }
+
+    /// #743 (a): a list the cheap estimate admits is sized by the estimate,
+    /// an upper bound of the real size.
+    #[test]
+    fn test_cap_size_of_an_estimable_list_is_the_estimate() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let mut diagnostics = vec![minimal_diagnostic("short".to_owned()); 3];
+
+        let size = cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 3);
+        assert!(size >= serialized_len_of(&diagnostics), "{size}");
+        assert!(size <= MAX_DIAGNOSTICS_ENTRY_BYTES);
+    }
+
+    /// #743 (b): a list that needs real serialization and fits is sized by
+    /// that one measurement.
+    #[test]
+    fn test_cap_size_of_a_fitting_list_with_data_is_its_serialized_length() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let mut diagnostics: Vec<LspDiagnostic> = (0..50)
+            .map(|n| {
+                let mut diagnostic = minimal_diagnostic(format!("d{n}"));
+                diagnostic.data = Some(serde_json::json!({ "n": n }));
+                diagnostic
+            })
+            .collect();
+
+        let size = cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert_eq!(diagnostics.len(), 50);
+        assert_eq!(size, serialized_len_of(&diagnostics));
+    }
+
+    /// #743 (c): after the list is cut to a fitting prefix the size is that of
+    /// the final list, not of a measurement taken during the search.
+    #[test]
+    fn test_cap_size_after_cutting_the_list_is_the_final_serialized_length() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let blob = "x".repeat(MAX_ENTRY_TEXT_BYTES / 2);
+        let mut diagnostics: Vec<LspDiagnostic> = (0..8)
+            .map(|n| {
+                let mut diagnostic = minimal_diagnostic(format!("d{n}"));
+                diagnostic.data = Some(serde_json::json!({ "blob": blob }));
+                diagnostic
+            })
+            .collect();
+
+        let size = cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert!(diagnostics.len() < 8);
+        assert_eq!(size, serialized_len_of(&diagnostics));
+        assert!(size <= MAX_DIAGNOSTICS_ENTRY_BYTES);
+    }
+
+    /// #743 (c): a single diagnostic whose opaque fields are dropped is sized
+    /// after the drop.
+    #[test]
+    fn test_cap_size_after_dropping_opaque_fields_is_the_final_serialized_length() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let mut diagnostic = minimal_diagnostic("only".to_owned());
+        diagnostic.data =
+            Some(serde_json::json!({ "blob": "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES) }));
+        let mut diagnostics = vec![diagnostic];
+
+        let size = cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert!(diagnostics[0].data.is_none());
+        assert_eq!(size, serialized_len_of(&diagnostics));
+    }
+
+    /// #743 (c): the terminal fallback sizes the list it leaves behind.
+    #[test]
+    fn test_cap_size_after_the_terminal_fallback_is_the_final_serialized_length() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let mut diagnostics = vec![minimal_diagnostic(
+            "x".repeat(MAX_DIAGNOSTICS_ENTRY_BYTES + 1000),
+        )];
+
+        let size = cap_diagnostics_entry_size(&uri, &mut diagnostics);
+
+        assert_eq!(size, serialized_len_of(&diagnostics));
+        assert!(size <= MAX_DIAGNOSTICS_ENTRY_BYTES);
+    }
+
+    /// #743: the size a `BoundedDiagnostics` records is the one the cap
+    /// function measured, for a list that needs real serialization.
+    #[test]
+    fn test_bounded_diagnostics_records_the_size_it_measured() {
+        let uri: Uri = Uri::from("file:///test.rs");
+        let diagnostics: Vec<LspDiagnostic> = (0..1000)
+            .map(|n| {
+                let mut diagnostic = minimal_diagnostic(format!("d{n}"));
+                diagnostic.data = Some(serde_json::json!({ "n": n }));
+                diagnostic
+            })
+            .collect();
+
+        let bounded = BoundedDiagnostics::new(&uri, diagnostics);
+
+        assert_eq!(
+            bounded.buffered_bytes(),
+            serialized_len_of(bounded.as_slice())
         );
     }
 
@@ -4157,7 +4295,8 @@ mod tests {
         let uri = file_uri("a.rs");
         cache.store_diagnostics(&server, &uri, None, vec![diagnostic_at(1, "old")]);
 
-        let changed = cache.record_lost_files(&server, &[DiagnosticsKey::of(&uri)]);
+        let lost = [PublishedDiagnosticsUri::for_test(uri.clone(), uri.clone())];
+        let changed = cache.record_lost_files(&server, &lost);
 
         assert_eq!(changed, [DiagnosticsKey::of(&uri)]);
         assert!(!cache.has_diagnostics(&uri));
@@ -4170,6 +4309,54 @@ mod tests {
             cache.availability(&uri, Some(&server)),
             DiagnosticsAvailability::Published
         );
+        cache.assert_consistent();
+    }
+
+    /// #742: a file that already carries a lost mark, or that still shows
+    /// another owner's diagnostics, is not announced again.
+    #[test]
+    fn test_lost_publish_reports_only_files_whose_view_changed() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let other = ServerId::from_static("other");
+        let uri = file_uri("a.rs");
+        let shared = file_uri("b.rs");
+        let lost = |uri: &Uri| PublishedDiagnosticsUri::for_test(uri.clone(), uri.clone());
+        cache.store_diagnostics(&other, &shared, None, vec![diagnostic_at(1, "theirs")]);
+
+        let first = cache.record_lost_files(&server, &[lost(&uri), lost(&shared)]);
+        let second = cache.record_lost_files(&server, &[lost(&uri), lost(&shared)]);
+
+        assert_eq!(first, [DiagnosticsKey::of(&uri)]);
+        assert!(second.is_empty(), "{second:?}");
+        assert!(cache.has_diagnostics(&shared));
+    }
+
+    /// #738: a lost publish that could only be resolved lexically names the
+    /// real file behind the symlink entry cached under that spelling.
+    #[test]
+    fn test_fallback_lost_publish_evicts_the_symlinked_entry() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let link = file_uri("link.rs");
+        let real = file_uri("main.rs");
+        cache.store_published_diagnostics(
+            &server,
+            &PublishedDiagnosticsUri::for_test(link.clone(), real.clone()),
+            None,
+            vec![diagnostic_at(1, "old")],
+        );
+        assert!(cache.has_diagnostics(&real));
+
+        let fallback = PublishedDiagnosticsUri::for_test_with_form(
+            link.clone(),
+            link,
+            CanonicalForm::Fallback,
+        );
+        let changed = cache.record_lost_files(&server, &[fallback]);
+
+        assert_eq!(changed, [DiagnosticsKey::of(&real)]);
+        assert!(!cache.has_diagnostics(&real));
         cache.assert_consistent();
     }
 
