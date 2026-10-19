@@ -2,21 +2,29 @@
 //!
 //! [`WorkspaceRoots::validate`] and the open that follows it are separate
 //! steps, so a symlink swapped in between would be followed. This module
-//! closes that window: [`WorkspaceRoots::open_contained`] opens first and then
-//! checks the file that was actually opened against the roots, using only the
-//! open handle. The check differs per platform:
+//! closes that window per platform:
 //!
-//! - Linux and Android read the handle's own path from `/proc/self/fd`.
-//! - macOS asks the handle for its path with `fcntl(F_GETPATH)`.
+//! - Linux and Android open the file relative to its root directory with
+//!   `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, so an outside target
+//!   is never opened; without `openat2` they walk the components with
+//!   `O_NOFOLLOW`. The opened handle's own path from `/proc/self/fd` is then
+//!   checked against the roots as well.
+//! - macOS opens first, then asks the handle for its path with
+//!   `fcntl(F_GETPATH)` and checks it against the roots.
 //! - Windows has no safe handle-to-path API in the dependencies, so every
 //!   ancestor directory is pinned (opened without `FILE_SHARE_DELETE`, so it
 //!   cannot be renamed or replaced) and the opened file is compared by
 //!   identity with a second, non-following open of the same path.
-//! - Other Unix systems canonicalize the path again, require it under a root
-//!   and compare the handle's device and inode with it, which is racy.
+//! - Other Unix systems walk the components with `O_NOFOLLOW` from the root
+//!   directory, so no symlink is followed and no outside target is opened.
+
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+mod beneath;
 
 use std::io;
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use self::beneath::Beneath;
 use super::{WorkspacePath, WorkspaceRoots};
 use crate::error::Error;
 use crate::util::{OpenRegularFileError, RegularFile};
@@ -41,8 +49,13 @@ impl WorkspaceRoots {
     }
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 fn open_regular(path: &WorkspacePath) -> Result<RegularFile, Error> {
-    RegularFile::open(path.as_path()).map_err(|error| match error {
+    RegularFile::open(path.as_path()).map_err(|error| open_error(path, error))
+}
+
+fn open_error(path: &WorkspacePath, error: OpenRegularFileError) -> Error {
+    match error {
         // Windows refuses to open a directory without backup semantics
         OpenRegularFileError::Io(source)
             if cfg!(windows)
@@ -53,7 +66,7 @@ fn open_regular(path: &WorkspacePath) -> Result<RegularFile, Error> {
         }
         OpenRegularFileError::Io(source) => file_io(path, source),
         OpenRegularFileError::NotRegular => Error::NotARegularFile(path.as_path().to_path_buf()),
-    })
+    }
 }
 
 fn file_io(path: &WorkspacePath, source: io::Error) -> Error {
@@ -65,6 +78,43 @@ fn file_io(path: &WorkspacePath, source: io::Error) -> Error {
 
 fn outside(path: &WorkspacePath) -> Error {
     Error::PathOutsideWorkspace(path.as_path().to_path_buf())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl WorkspaceRoots {
+    /// Runs `open` on the root containing `path` and the path relative to it.
+    fn open_under_root(
+        &self,
+        path: &WorkspacePath,
+        open: impl FnOnce(&std::path::Path, &std::path::Path) -> io::Result<Beneath>,
+    ) -> Result<Beneath, Error> {
+        let root = self
+            .canonical
+            .iter()
+            .find(|root| path.as_path().starts_with(root))
+            .ok_or_else(|| outside(path))?;
+        let relative = path
+            .as_path()
+            .strip_prefix(root)
+            .map_err(|_| outside(path))?;
+        if relative.as_os_str().is_empty() {
+            return Err(Error::NotARegularFile(path.as_path().to_path_buf()));
+        }
+        open(root, relative).map_err(|source| file_io(path, source))
+    }
+}
+
+/// Turns the outcome of a containment-aware open into a verified regular file.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn regular_from(path: &WorkspacePath, beneath: Beneath) -> Result<RegularFile, Error> {
+    match beneath {
+        Beneath::Opened(file) => {
+            RegularFile::from_file(file).map_err(|error| open_error(path, error))
+        }
+        Beneath::Escaped => Err(outside(path)),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Beneath::Unsupported => Err(file_io(path, io::ErrorKind::Unsupported.into())),
+    }
 }
 
 /// A file unlinked since the open still reports its old path; it is gone, not
@@ -93,7 +143,8 @@ mod platform {
 
     use tracing::warn;
 
-    use super::{WorkspacePath, WorkspaceRoots, file_io, open_regular, outside, require_linked};
+    use super::beneath::{Beneath, open_beneath, open_walking};
+    use super::{WorkspacePath, WorkspaceRoots, file_io, outside, regular_from, require_linked};
     use crate::error::Error;
     use crate::util::RegularFile;
 
@@ -122,7 +173,11 @@ mod platform {
             path: &WorkspacePath,
             after_open: impl FnOnce(),
         ) -> Result<RegularFile, Error> {
-            let file = open_regular(path)?;
+            let mut beneath = self.open_under_root(path, open_beneath)?;
+            if matches!(beneath, Beneath::Unsupported) {
+                beneath = self.open_under_root(path, open_walking)?;
+            }
+            let file = regular_from(path, beneath)?;
             after_open();
             let actual =
                 handle_path_in(Path::new("/proc/self/fd"), file.file()).map_err(|source| {
@@ -174,30 +229,21 @@ mod platform {
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
 mod platform {
-    use super::{WorkspacePath, WorkspaceRoots, file_io, open_regular, outside};
+    use super::beneath::open_walking;
+    use super::{WorkspacePath, WorkspaceRoots, regular_from};
     use crate::error::Error;
-    use crate::util::{FileIdentity, RegularFile};
+    use crate::util::RegularFile;
 
     impl WorkspaceRoots {
-        // TODO(critic): racy; the path is resolved again after the open.
         pub(super) fn open_contained_with(
             &self,
             path: &WorkspacePath,
             after_open: impl FnOnce(),
         ) -> Result<RegularFile, Error> {
-            let file = open_regular(path)?;
+            let beneath = self.open_under_root(path, open_walking)?;
+            let file = regular_from(path, beneath)?;
             after_open();
-            let canonical =
-                dunce::canonicalize(path.as_path()).map_err(|source| file_io(path, source))?;
-            if !self.contains_canonical(&canonical) {
-                return Err(outside(path));
-            }
-            let on_disk = std::fs::metadata(&canonical).map_err(|source| file_io(path, source))?;
-            if FileIdentity::of_metadata(file.metadata()) == FileIdentity::of_metadata(&on_disk) {
-                Ok(file)
-            } else {
-                Err(outside(path))
-            }
+            Ok(file)
         }
     }
 }
@@ -300,6 +346,8 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    #[cfg(unix)]
+    use std::path::Path;
 
     use super::*;
     use crate::bridge::ClientPath;
@@ -366,6 +414,95 @@ mod tests {
             roots.open_contained(&path),
             Err(Error::PathOutsideWorkspace(_))
         );
+    }
+
+    #[cfg(unix)]
+    fn outside_fifo_behind_symlink(
+        base: &std::path::Path,
+        roots: &WorkspaceRoots,
+    ) -> WorkspacePath {
+        let file = base.join("ws/sub/a.rs");
+        std::fs::write(&file, "inside").unwrap();
+        let path = validated(roots, file.clone());
+        let fifo = base.join("out/pipe");
+        crate::test_lsp::make_fifo(&fifo);
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&fifo, &file).unwrap();
+        path
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn test_open_contained_refuses_symlink_to_outside_fifo() {
+        let (_guard, base, roots) = workspace();
+        let path = outside_fifo_behind_symlink(&base, &roots);
+
+        assert_matches!(
+            roots.open_contained(&path),
+            Err(Error::PathOutsideWorkspace(_))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_walking_open_never_opens_a_symlinked_outside_target() {
+        use super::beneath::{Beneath, open_walking};
+
+        let (_guard, base, roots) = workspace();
+        let _path = outside_fifo_behind_symlink(&base, &roots);
+
+        let outcome = open_walking(&base.join("ws"), Path::new("sub/a.rs")).unwrap();
+
+        assert_matches!(outcome, Beneath::Escaped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_walking_open_refuses_symlinked_directory_component() {
+        use super::beneath::{Beneath, open_walking};
+
+        let (_guard, base, _roots) = workspace();
+        std::fs::write(base.join("out/a.rs"), "secret").unwrap();
+        std::fs::remove_dir_all(base.join("ws/sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("out"), base.join("ws/sub")).unwrap();
+
+        let outcome = open_walking(&base.join("ws"), Path::new("sub/a.rs")).unwrap();
+
+        assert_matches!(outcome, Beneath::Escaped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_walking_open_opens_regular_file_inside_root() {
+        use super::beneath::{Beneath, open_walking};
+
+        let (_guard, base, _roots) = workspace();
+        std::fs::write(base.join("ws/sub/a.rs"), "inside").unwrap();
+
+        let outcome = open_walking(&base.join("ws"), Path::new("sub/a.rs")).unwrap();
+
+        let Beneath::Opened(file) = outcome else {
+            panic!("expected an opened file, got {outcome:?}");
+        };
+        assert_eq!(file.metadata().unwrap().len(), 6);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_openat2_refuses_outside_symlink_without_opening_it() {
+        use super::beneath::{Beneath, open_beneath};
+
+        let (_guard, base, roots) = workspace();
+        let _path = outside_fifo_behind_symlink(&base, &roots);
+
+        let outcome = open_beneath(&base.join("ws"), Path::new("sub/a.rs")).unwrap();
+
+        match outcome {
+            Beneath::Escaped => {}
+            // The sandbox running the tests blocks openat2; nothing to assert
+            Beneath::Unsupported => eprintln!("openat2 unavailable, test skipped"),
+            Beneath::Opened(_) => panic!("openat2 opened an outside target"),
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]

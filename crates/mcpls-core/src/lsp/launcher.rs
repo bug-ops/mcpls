@@ -820,10 +820,43 @@ pub fn analyze_launch<'a>(
     command: &str,
     args: &'a [String],
 ) -> Result<WrappedPrograms<'a>, LauncherRefusal> {
+    analyze_with(command, args, None)
+}
+
+/// [`analyze_launch`] that also refuses a script operand which resolves to a
+/// device, FIFO or socket when looked up from `cwd`, the directory the launch
+/// starts in.
+///
+/// The text of an operand cannot rule out a path that names a device through
+/// an alias (`/Volumes/Macintosh HD/dev/stdin`, a workspace symlink to
+/// `/dev/stdin`); only the file system can. A missing path or a directory is
+/// not refused: the child may search for it, add an extension or run a package
+/// directory.
+///
+/// # Errors
+///
+/// The [`LauncherRefusal`] naming what selects workspace code or what cannot
+/// be analyzed.
+pub fn analyze_launch_in<'a>(
+    command: &str,
+    args: &'a [String],
+    cwd: &'a Path,
+) -> Result<WrappedPrograms<'a>, LauncherRefusal> {
+    analyze_with(command, args, Some(cwd))
+}
+
+fn analyze_with<'a>(
+    command: &str,
+    args: &'a [String],
+    probe: Option<&'a Path>,
+) -> Result<WrappedPrograms<'a>, LauncherRefusal> {
     if args.iter().any(|arg| arg.starts_with(NPM_SPECIFIER_PREFIX)) {
         return Err(selects(command, LaunchTrigger::NpmSpecifier));
     }
-    let mut analysis = Analysis::default();
+    let mut analysis = Analysis {
+        probe,
+        ..Analysis::default()
+    };
     analysis.command(command, args, 0, 0, WorkingDir::Inherited)?;
     Ok(WrappedPrograms(analysis.programs))
 }
@@ -865,6 +898,9 @@ struct Frame {
 #[derive(Default)]
 struct Analysis<'a> {
     programs: Vec<WrappedProgram<'a>>,
+    /// The directory a script operand is looked up in, when operands are
+    /// checked against the file system and not only as text.
+    probe: Option<&'a Path>,
 }
 
 impl<'a> Analysis<'a> {
@@ -933,7 +969,7 @@ impl<'a> Analysis<'a> {
                 dir,
             );
         }
-        refuse_workspace_code(command, &stem, args, dir)
+        refuse_workspace_code(command, &stem, args, dir, self.probe)
     }
 
     /// Records `args[index]` as a program the wrapper `wrapper` starts and
@@ -1000,6 +1036,7 @@ fn refuse_workspace_code(
     stem: &CommandStem,
     args: &[String],
     dir: WorkingDir,
+    probe: Option<&Path>,
 ) -> Result<(), LauncherRefusal> {
     if let Some((_, family)) = SHELLS
         .iter()
@@ -1008,7 +1045,7 @@ fn refuse_workspace_code(
         if let Some(trigger) = shell_trigger(*family, args) {
             return Err(selects(command, trigger));
         }
-        stdin_program(*family, args, dir).map_err(|stop| stop.refusal(command))?;
+        stdin_program(*family, args, dir, probe).map_err(|stop| stop.refusal(command))?;
     }
     if let Some(flag) = INLINE_EVAL
         .iter()
@@ -1023,7 +1060,7 @@ fn refuse_workspace_code(
     {
         let mut dir = dir;
         walk_operand(args, &eval.operand_grammar(), &mut dir)
-            .and_then(|program| check_program(program, eval.positional, dir))
+            .and_then(|program| check_program(program, eval.positional, dir, probe))
             .map_err(|stop| stop.refusal(command))?;
     }
     if stem.is_any(NPM_PACKAGE_RUNNERS) {
@@ -1668,6 +1705,7 @@ fn vet_guessed_value(value: &str) -> Result<(), Stop> {
         Program::Operand(value),
         Positional::Subcommand,
         WorkingDir::Inherited,
+        None,
     )
 }
 
@@ -1789,7 +1827,12 @@ fn walk_powershell<'a>(
 
 /// Checks that the shell family's launch does not read its program from
 /// standard input.
-fn stdin_program(family: ShellFamily, args: &[String], dir: WorkingDir) -> Result<(), Stop> {
+fn stdin_program(
+    family: ShellFamily,
+    args: &[String],
+    dir: WorkingDir,
+    probe: Option<&Path>,
+) -> Result<(), Stop> {
     let mut dir = dir;
     let program = match family {
         ShellFamily::Posix => walk_operand(args, &POSIX_OPERANDS, &mut dir)?,
@@ -1800,7 +1843,7 @@ fn stdin_program(family: ShellFamily, args: &[String], dir: WorkingDir) -> Resul
         ShellFamily::PowerShell => walk_powershell(args, PARAMETERS_7, &mut dir)?,
         ShellFamily::WindowsPowerShell => walk_powershell(args, PARAMETERS_51, &mut dir)?,
     };
-    check_program(program, Positional::Script, dir)
+    check_program(program, Positional::Script, dir, probe)
 }
 
 /// Whether `operand` starts at a root, as a string, so the answer is the same
@@ -1816,12 +1859,17 @@ fn is_rooted(operand: &str) -> bool {
 
 /// Checks that the program a launch names is not standard input: not `-`,
 /// not a path under `/dev` or `/proc` (which can name it), and not a path with
-/// `..` (which can reach them). Works on the text of the operand, never on a
-/// `Path`.
+/// `..` (which can reach them). Those checks work on the text of the operand,
+/// never on a `Path`. When `probe` gives the directory the launch starts in, a
+/// script that is not a regular file there is refused as well, which catches
+/// an alias of a device path that the text does not show. A path that does not
+/// exist or is a directory is left to the child, which may search for it
+/// (`ruby -S`), add an extension (`node bin/cli`) or run a package directory.
 fn check_program(
     program: Program<'_>,
     positional: Positional,
     dir: WorkingDir,
+    probe: Option<&Path>,
 ) -> Result<(), Stop> {
     let operand = match program {
         Program::Flag => return Ok(()),
@@ -1848,6 +1896,11 @@ fn check_program(
         return Err(Stop::Unanalyzable(
             UnanalyzableLaunch::RelativeOperandAfterChdir,
         ));
+    }
+    if let (Positional::Script, Some(base)) = (positional, probe)
+        && std::fs::metadata(base.join(operand)).is_ok_and(|meta| !meta.is_file() && !meta.is_dir())
+    {
+        return Err(Stop::Stdin(StdinSource::SpecialFile));
     }
     Ok(())
 }
@@ -3466,6 +3519,61 @@ mod tests {
                 ..
             }) => source,
             other => panic!("expected a program read from stdin, got {other:?}"),
+        }
+    }
+
+    fn refused_in(cwd: &Path, command: &str, args: &[&str]) -> Option<StdinSource> {
+        match analyze_launch_in(command, &strings(args), cwd) {
+            Err(LauncherRefusal::SelectsWorkspaceCode {
+                trigger: LaunchTrigger::ProgramFromStdin(source),
+                ..
+            }) => Some(source),
+            Err(other) => panic!("unexpected refusal {other:?}"),
+            Ok(_) => None,
+        }
+    }
+
+    /// #787: only a script that resolves to a special file is refused; a file,
+    /// a directory and a path that does not exist are left to the child.
+    #[test]
+    fn script_operand_that_does_not_exist_or_is_a_directory_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("srv.py"), "").unwrap();
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+
+        for (command, operand) in [
+            ("python", "srv.py"),
+            ("bash", "srv.py"),
+            ("python", "pkg"),
+            ("node", "bin/cli"),
+            ("ruby", "solargraph"),
+        ] {
+            assert_eq!(
+                refused_in(dir.path(), command, &[operand]),
+                None,
+                "{operand}"
+            );
+        }
+        assert_eq!(refused_in(dir.path(), "deno", &["lsp"]), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_operand_that_aliases_a_special_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("stdin-alias");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let fifo = dir.path().join("pipe");
+        crate::test_lsp::make_fifo(&fifo);
+
+        for command in ["python", "bash"] {
+            for operand in [link.to_str().unwrap(), "stdin-alias", "pipe"] {
+                assert_eq!(
+                    refused_in(dir.path(), command, &[operand]),
+                    Some(StdinSource::SpecialFile),
+                    "{command} {operand}"
+                );
+            }
         }
     }
 

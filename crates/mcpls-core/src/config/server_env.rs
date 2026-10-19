@@ -122,6 +122,50 @@ impl_text_newtype!(
     "environment variable value"
 );
 
+/// The largest `NAME=value` entry with its terminator, in bytes, a server's
+/// `env` table may hold on this host: the documented Windows limit on one
+/// variable (32767 characters).
+#[cfg(windows)]
+pub const MAX_ENV_ENTRY_BYTES: usize = 32_767;
+
+/// The largest `NAME=value` entry with its terminator, in bytes, a server's
+/// `env` table may hold on this host: Linux caps one string at 128 KiB
+/// (`MAX_ARG_STRLEN`).
+#[cfg(not(windows))]
+pub const MAX_ENV_ENTRY_BYTES: usize = 128 * 1024;
+
+/// The largest total size, in bytes, of a server's `env` table, counting each
+/// entry as `NAME=value` and a terminator.
+///
+/// Well under the 1 MiB macOS allows for arguments and environment together,
+/// so the table leaves room for the inherited environment and the arguments;
+/// past the platform limit a spawn fails with `E2BIG`.
+pub const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
+
+/// The `=` between name and value and the terminator the OS adds to an entry.
+const ENTRY_OVERHEAD_BYTES: usize = 2;
+
+/// Why a [`ServerEnv`] is too large to pass to a process.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum EnvTooLarge {
+    /// One entry is over [`MAX_ENV_ENTRY_BYTES`].
+    #[error(
+        "environment variable '{key}' is {bytes} bytes as NAME=value and a terminator, over the {MAX_ENV_ENTRY_BYTES} byte limit"
+    )]
+    Entry {
+        /// The variable.
+        key: EnvKey,
+        /// Its size as `NAME=value`.
+        bytes: usize,
+    },
+    /// The entries together are over [`MAX_ENV_TOTAL_BYTES`].
+    #[error("environment is {bytes} bytes in total, over the {MAX_ENV_TOTAL_BYTES} byte limit")]
+    Total {
+        /// The size of all entries.
+        bytes: usize,
+    },
+}
+
 /// Two keys of one `env` table name the same variable on the host.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[error(
@@ -260,6 +304,32 @@ impl ServerEnv {
             .insert(HostKey::of(key.as_str(), self.host), (key, value));
     }
 
+    /// Checks the table against [`MAX_ENV_ENTRY_BYTES`] and
+    /// [`MAX_ENV_TOTAL_BYTES`], the sizes past which a spawn fails with
+    /// `E2BIG`.
+    ///
+    /// # Errors
+    ///
+    /// [`EnvTooLarge`] naming the first oversized entry, or the total.
+    pub fn check_size(&self) -> Result<(), EnvTooLarge> {
+        let mut total = 0usize;
+        for (key, value) in self.iter() {
+            let bytes = key.as_str().len().saturating_add(value.as_str().len());
+            let bytes = bytes.saturating_add(ENTRY_OVERHEAD_BYTES);
+            if bytes > MAX_ENV_ENTRY_BYTES {
+                return Err(EnvTooLarge::Entry {
+                    key: key.clone(),
+                    bytes,
+                });
+            }
+            total = total.saturating_add(bytes);
+        }
+        if total > MAX_ENV_TOTAL_BYTES {
+            return Err(EnvTooLarge::Total { bytes: total });
+        }
+        Ok(())
+    }
+
     /// The entries, ordered by the host's comparison of the name.
     pub fn iter(&self) -> impl Iterator<Item = (&EnvKey, &EnvValue)> {
         self.vars.values().map(|(key, value)| (key, value))
@@ -304,6 +374,28 @@ mod tests {
             .iter()
             .map(|(name, text)| (key(name), value(text)))
             .collect()
+    }
+
+    #[test]
+    fn check_size_bounds_each_entry_and_the_total() {
+        let mut env = ServerEnv::new(HostOs::Other);
+        env.insert(key("A"), value(&"x".repeat(MAX_ENV_ENTRY_BYTES - 3)));
+        assert_eq!(env.check_size(), Ok(()));
+
+        env.insert(key("A"), value(&"x".repeat(MAX_ENV_ENTRY_BYTES - 2)));
+        assert_eq!(
+            env.check_size(),
+            Err(EnvTooLarge::Entry {
+                key: key("A"),
+                bytes: MAX_ENV_ENTRY_BYTES + 1,
+            })
+        );
+
+        let mut many = ServerEnv::new(HostOs::Other);
+        for index in 0..8 {
+            many.insert(key(&format!("K{index}")), value(&"x".repeat(20_000)));
+        }
+        assert!(matches!(many.check_size(), Err(EnvTooLarge::Total { .. })));
     }
 
     #[test]

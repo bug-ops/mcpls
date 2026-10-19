@@ -15,8 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The untrusted launcher refuses a script operand that resolves to a device, FIFO or socket in the server's working directory, closing device aliases such as `/Volumes/Macintosh HD/dev/stdin` (#787) (#794).
+- A NUL byte in a server's `args` is rejected at config load, naming the server and argument index (#786) (#794).
+- A server `env` table over the host's size limits is rejected at config load (#785) (#794).
+- The diagnostics sweep sends no `didSave` in untrusted workspaces and sends it for reopened files (#789) (#794).
 - The untrusted launcher refuses shells and interpreters that read their program from stdin (`bash -s`, `python -`, `pwsh -File -`, bare `deno`, `/dev/stdin` operands) (#782) (#790).
 - Tool calls and the diagnostics sweep open a file first and verify the opened handle's path against the workspace roots (#783) (#790).
+- Workspace file opens on Linux use `openat2(RESOLVE_BENEATH)` and on other Unix an `O_NOFOLLOW` component walk, so an outside symlink target (FIFO, device) is never opened (#788) (#794).
 - `DocumentNotFound` and `PathToUri` render the client path through `EchoedPath` (#780) (#790).
 - Recording lost files under the diagnostics cache lock is no longer quadratic (#779) (#790).
 - A repeated well-formed `initialize` on an established session answers `-32600` instead of renegotiating (#776) (#790).

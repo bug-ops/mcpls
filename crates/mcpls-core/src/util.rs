@@ -173,7 +173,19 @@ impl RegularFile {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
         }
-        let file = options.open(path)?;
+        Self::from_file(options.open(path)?)
+    }
+
+    /// Verifies that an already open `file` is a regular file.
+    ///
+    /// For callers that open through a containment-aware syscall; the handle
+    /// must have been opened non-blocking on Unix, see the type docs.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenRegularFileError::NotRegular`] for anything but a regular file
+    /// and [`OpenRegularFileError::Io`] when the metadata cannot be read.
+    pub fn from_file(file: std::fs::File) -> Result<Self, OpenRegularFileError> {
         // Must precede metadata(): GetFileInformationByHandle may fail for non-disk handles.
         #[cfg(windows)]
         if !winapi_util::file::typ(&file).is_ok_and(|file_type| file_type.is_disk()) {
@@ -196,16 +208,6 @@ impl RegularFile {
     #[must_use]
     pub(crate) const fn file(&self) -> &std::fs::File {
         &self.file
-    }
-
-    /// The metadata taken from the open handle.
-    #[must_use]
-    #[cfg(all(
-        unix,
-        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
-    ))]
-    pub(crate) const fn metadata(&self) -> &std::fs::Metadata {
-        &self.metadata
     }
 
     /// Reads the file if it is at most `max` bytes.
@@ -232,42 +234,19 @@ impl RegularFile {
 /// Volume and file index of an open file, for comparing two handles.
 ///
 /// Used where the platform has no safe way to ask an open handle for its path
-/// (Windows and Unix systems other than Linux, Android and macOS). A volume
-/// that reports a zero index (some network or FUSE volumes) makes every file on
-/// it compare equal, so the comparison fails open there.
-#[cfg(any(
-    windows,
-    all(
-        unix,
-        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
-    )
-))]
+/// (Windows). A volume that reports a zero index (some network or FUSE
+/// volumes) makes every file on it compare equal, so the comparison fails open
+/// there.
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
     volume: u64,
     index: u64,
 }
 
-#[cfg(any(
-    windows,
-    all(
-        unix,
-        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
-    )
-))]
+#[cfg(windows)]
 impl FileIdentity {
-    /// Identity from the metadata of a followed path or an open handle.
-    #[cfg(unix)]
-    pub(crate) fn of_metadata(metadata: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            volume: metadata.dev(),
-            index: metadata.ino(),
-        }
-    }
-
     /// Identity of an open handle.
-    #[cfg(windows)]
     pub(crate) fn of_file(file: &std::fs::File) -> std::io::Result<Self> {
         let info = winapi_util::file::information(file)?;
         Ok(Self {

@@ -21,7 +21,7 @@ use crate::bridge::state::ResourceLimits;
 use crate::bridge::{DocumentOpenState, DocumentTracker, NotificationCache, WorkspaceRoots};
 use crate::config::{
     FilePattern, IndexingReadyTimeoutSecs, LanguageId, LanguageMap, ServerId, ServerSettlement,
-    ToolKind, ToolRouter,
+    ToolKind, ToolRouter, WorkspaceTrust,
 };
 use crate::error::{ErrorChain, ServerSpawnFailure, StartupFailure};
 use crate::lsp::{LspServer, ServerInitConfig};
@@ -163,6 +163,9 @@ pub struct Translator {
     /// overridable via [`Self::with_indexing_ready_timeout`], wired from
     /// `workspace.indexing_ready_timeout_seconds` in `mcpls.toml` (#424).
     indexing_ready_timeout: std::time::Duration,
+    /// Whether the workspace is trusted; untrusted mode withholds actions
+    /// that make a server run project code, such as the sweep's `didSave`.
+    workspace_trust: WorkspaceTrust,
 }
 
 impl Translator {
@@ -196,6 +199,7 @@ impl Translator {
             wiring: OnceLock::new(),
             clock: Arc::new(SystemClock),
             indexing_ready_timeout: navigation::INDEXING_READY_TIMEOUT,
+            workspace_trust: WorkspaceTrust::default(),
         }
     }
 
@@ -255,6 +259,15 @@ impl Translator {
     #[must_use]
     pub const fn with_indexing_ready_timeout(mut self, timeout: IndexingReadyTimeoutSecs) -> Self {
         self.indexing_ready_timeout = timeout.as_duration();
+        self
+    }
+
+    /// Sets the workspace trust mode.
+    ///
+    /// Only called during single-owner setup, before the translator is shared.
+    #[must_use]
+    pub(crate) fn with_workspace_trust(mut self, trust: WorkspaceTrust) -> Self {
+        self.workspace_trust = trust;
         self
     }
 

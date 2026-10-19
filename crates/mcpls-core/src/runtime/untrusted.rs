@@ -97,6 +97,20 @@ fn launcher_refusal(configured: &LspServerConfig) -> Option<UntrustedRefusal> {
         .map(|cause| project_launcher(configured, cause))
 }
 
+/// Refuses `configured` when a script it passes to an interpreter is not a
+/// regular file in `working_dir`, where the server starts.
+fn script_refusal(
+    configured: &LspServerConfig,
+    working_dir: &ChildWorkingDir,
+) -> Option<UntrustedRefusal> {
+    let ChildWorkingDir::Fixed(dir) = working_dir else {
+        return None;
+    };
+    launcher::analyze_launch_in(configured.command.as_str(), &configured.args, dir)
+        .err()
+        .map(|cause| project_launcher(configured, cause))
+}
+
 /// The refusal of `config`'s launcher for `cause`.
 fn project_launcher(config: &LspServerConfig, cause: LauncherRefusal) -> UntrustedRefusal {
     UntrustedRefusal::ProjectLauncher {
@@ -465,6 +479,9 @@ fn admit(
     if let Some(vetting) = &vetting {
         plan.vet_untrusted(vetting)
             .map_err(|refusal| (command, refusal))?;
+    }
+    if let Some(refusal) = script_refusal(lsp_config, &working_dir) {
+        return Err(configured(refusal));
     }
     let (server_config, pinned) = plan.apply(roots);
     let init = ServerInitConfig::new(
@@ -2070,6 +2087,33 @@ mod plan_tests {
                 crate::config::EnvValue::new(path.to_string_lossy()).unwrap(),
             );
             config
+        }
+
+        #[test]
+        fn plan_untrusted_refuses_a_script_that_is_an_alias_of_a_device() {
+            use std::os::unix::fs::symlink;
+
+            let fx = fixture();
+            outside_tools(&fx, &["python"]);
+            let alias = fx.outside.join("alias.py");
+            symlink("/dev/null", &alias).unwrap();
+            let regular = fx.outside.join("srv.py");
+            std::fs::write(&regular, "").unwrap();
+
+            let refused = plan_allowing_rust(
+                wrapped_launch(&fx, "python", &[alias.to_str().unwrap()]),
+                &fx,
+            );
+            let admitted = plan_allowing_rust(
+                wrapped_launch(&fx, "python", &[regular.to_str().unwrap()]),
+                &fx,
+            );
+
+            std::assert_matches!(
+                refusal_of(&refused),
+                Some(UntrustedRefusal::ProjectLauncher { .. })
+            );
+            assert_eq!(admitted.admitted.len(), 1);
         }
 
         #[test]

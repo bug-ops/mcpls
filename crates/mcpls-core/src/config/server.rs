@@ -628,6 +628,17 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
                 error,
             }
         })?;
+        env.check_size().map_err(|error| ConfigError::EnvTooLarge {
+            server: entry_id(name.as_ref(), &language_id),
+            error,
+        })?;
+        if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
+            return Err(ConfigError::ArgContainsNul {
+                server: entry_id(name.as_ref(), &language_id),
+                index,
+            }
+            .into());
+        }
         let file_patterns = file_patterns
             .iter()
             .map(|pattern| {
@@ -1183,6 +1194,39 @@ mod tests {
             error.to_string().contains(
                 "lsp_servers entry 'rust': environment variable 'A': environment variable value cannot contain NUL"
             ),
+            "{error}"
+        );
+    }
+
+    /// #786: a NUL in an `args` entry is rejected at load, naming the server and
+    /// the argument index.
+    #[test]
+    fn test_nul_in_arg_is_rejected_at_load() {
+        let toml_str =
+            "language_id = \"rust\"\ncommand = \"rust-analyzer\"\nargs = [\"ok\", \"a\\u0000b\"]\n";
+        let error = toml::from_str::<LspServerConfig>(toml_str).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("lsp_servers entry 'rust': args[1] cannot contain NUL"),
+            "{error}"
+        );
+    }
+
+    /// #785: an oversized `env` table is rejected at load, naming the server.
+    #[test]
+    fn test_oversized_env_is_rejected_at_load() {
+        let toml_str = format!(
+            "language_id = \"rust\"\ncommand = \"rust-analyzer\"\n[env]\nA = \"{}\"\n",
+            "x".repeat(1 << 20)
+        );
+        let error = toml::from_str::<LspServerConfig>(&toml_str).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("lsp_servers entry 'rust': environment variable 'A' is"),
             "{error}"
         );
     }

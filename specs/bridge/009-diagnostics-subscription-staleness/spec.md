@@ -99,6 +99,9 @@ report the same state.
 - Dynamic `textDocument/didSave` registration (`client/registerCapability`): not tracked, so a
   server that asks for save notifications only that way receives none.
 - `didSave` outside the sweep: tool calls never send it.
+- `didSave` in an untrusted workspace (`WorkspaceTrust::Untrusted`): the sweep never sends it, since a
+  save makes servers such as rust-analyzer run build scripts and proc macros.
+- Edits to untracked files: they never bump the sweep epoch, so they re-pull no subscribed file.
 - Notification payload changes: `notifications/resources/updated` stays URI-only; the client
   re-reads via `resources/read`.
 
@@ -232,7 +235,7 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | FR-020 | THE SYSTEM SHALL run the sweep of one server's files as one job at a time, so a server that stops answering stalls only its own files, and SHALL stop every job when the server shuts down | must |
 | FR-021 | THE SYSTEM SHALL read the stamp of a state from the cache's pulled slot (not from sweeper-local first-sighting state), so an edit made before the first tick, while nobody was subscribed, or across a re-subscription is still pulled once | must |
 | FR-022 | WHILE at least one session or stream subscribes to a tracked file routed to a server, THE SYSTEM SHALL also resync, without pulling, the tracked unsubscribed files routed to that server (companions): the 256 most recently used, visited at most 32 per tick in path order resuming after the last path visited, after the tick's subscribed files. A companion resync SHALL NOT change the file's LRU position and SHALL NOT open a file the tracker no longer holds. WHEN a visit finds a file's document state changed (by the sweep's own resync or by a tool call's), THE SYSTEM SHALL advance the epoch of the file's server, and a subscribed file SHALL be pulled again when its server's epoch moved since its last pull attempt, under FR-017's retry cap and at most 8 such epoch-driven pulls per server per 2 s window (the rest wait for a later tick), except that a file whose own state moved and whose pulled slot already answers it is not pulled | must |
-| FR-023 | WHEN a sweep visit finds a file's content changed within one opening, THE SYSTEM SHALL send `textDocument/didSave` for it, before any pull, only if the server's `textDocumentSync.save` advertises it: `save: true` or `SaveOptions`, with the text only when `includeText` is true. The bare `TextDocumentSyncKind` form, an absent capability and `save: false` advertise nothing. THE SYSTEM SHALL advertise `textDocument.synchronization.didSave` without dynamic registration, SHALL track no dynamic `didSave` registration and SHALL NOT send `didSave` from a tool call. The subscriber condition holds because the sweep visits only servers with a subscribed file | must |
+| FR-023 | WHEN a sweep visit finds a file's content changed, within one opening or by the file being opened again, THE SYSTEM SHALL, outside `WorkspaceTrust::Untrusted`, send `textDocument/didSave` for it, before any pull, only if the server's `textDocumentSync.save` advertises it: `save: true` or `SaveOptions`, with the text only when `includeText` is true. The bare `TextDocumentSyncKind` form, an absent capability and `save: false` advertise nothing. THE SYSTEM SHALL advertise `textDocument.synchronization.didSave` without dynamic registration, SHALL track no dynamic `didSave` registration and SHALL NOT send `didSave` from a tool call. The subscriber condition holds because the sweep visits only servers with a subscribed file | must |
 | FR-016 | WHEN the routed diagnostics server for a file has failed to start, is initializing, or has been marked `push_degraded` and no pull is possible, THE SYSTEM SHALL keep the existing mcp/002 FR-009..FR-012 behavior and SHALL NOT fabricate notifications | must |
 
 ## 5. Non-Functional Requirements
@@ -278,7 +281,9 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | Subscriber on a file the tracker has not opened | Subscribing does not open the document, and neither does the sweep (FR-018). The first pull by a tool call opens it and notifies |
 | Session disconnects mid-delivery | Handled by existing `Target::send` / `TargetClosed` path; no change |
 | `didSave` sent to a server that closes the document on save semantics | Not applicable: sent only per FR-023's capability gate |
-| An edit to a file the tracker does not hold, a file opened again (evicted and reopened, so its server receives `didOpen`), or a file that re-enters the companion set after a gap | No `didSave`: it is sent only for a content change within one opening that a visit observes (FR-023); the first visit of a file is a baseline |
+| An edit to a file the tracker does not hold | No `didSave`: it is sent only for a content change a visit observes (FR-023); the first visit of a file is a baseline |
+| A file opened again (evicted and reopened, so its server receives `didOpen`) | `didSave` is sent when a visit observes the new opening, as for an edit (FR-023); under `WorkspaceTrust::Untrusted` none is sent |
+| A file resynced by a tool call while outside the companion set (memo trimmed, tracker state already current) | Known limitation: the next visit sees no change, so no `didSave` is sent |
 | A server that registers `textDocument/didSave` dynamically | Receives none: only the static `textDocumentSync.save` is read (FR-023) |
 | A tracked companion evicted between selection and visit | The probe finds it untracked and skips it; it is not opened again (FR-022) |
 | `git checkout` rewrites 300 tracked files | Visited through the windows over several ticks; each changed file is saved once and its server's epoch advances; subscribed files are pulled again when visited |

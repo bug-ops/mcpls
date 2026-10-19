@@ -52,7 +52,8 @@ pub use server::{
     ServerCommand, ServerHeuristics, ServerSelection,
 };
 pub use server_env::{
-    DuplicateEnvKey, EnvKey, EnvValue, InvalidEnvKey, InvalidEnvValue, ServerEnv,
+    DuplicateEnvKey, EnvKey, EnvTooLarge, EnvValue, InvalidEnvKey, InvalidEnvValue,
+    MAX_ENV_ENTRY_BYTES, MAX_ENV_TOTAL_BYTES, ServerEnv,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
