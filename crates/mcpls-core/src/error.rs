@@ -107,6 +107,12 @@ impl fmt::Display for NotFoundGuidance<'_> {
 /// [`Error::LspServerError`] as caller-fault) so the two stay in sync.
 const INVALID_OFFSET_MARKER: &str = "Invalid offset LineCol";
 
+/// Whether `response` is rust-analyzer's "position out of range" internal
+/// error, which [`Error::mcp_error_kind`] classifies as caller-fault.
+pub(crate) fn is_invalid_offset(response: &JsonRpcError) -> bool {
+    response.message.contains(INVALID_OFFSET_MARKER)
+}
+
 /// Rewrites an LSP server's raw error message for display to the MCP caller,
 /// replacing rust-analyzer's "Invalid offset" internal error with a clean,
 /// client-appropriate message.
@@ -210,6 +216,7 @@ pub enum StartupFailure {
 
 /// An environment variable that names the user's home directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HomeVariable {
     /// `HOME`.
     Home,
@@ -237,8 +244,9 @@ impl fmt::Display for HomeVariable {
     }
 }
 
-/// What untrusted-workspace mode resolved to a path that is not valid UTF-8.
+/// What untrusted-workspace mode resolved to a path it could not pass on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResolvedItem {
     /// The server's executable.
     Executable,
@@ -349,6 +357,13 @@ impl EchoedPath {
 
 /// Renders a path as `{path:?}` does, cut after about 1024 bytes of that text.
 ///
+/// The quoted form is for the paths a caller supplied or a file operation
+/// failed on ([`Error::MalformedPath`], [`Error::FileIo`]), where the quotes
+/// keep an empty or spaced path unambiguous and non-UTF-8 bytes visible.
+/// [`EchoedPath`] is the bare form for paths that read inside a sentence
+/// (`NotARegularFile`, `DocumentNotFound`, `PathOutsideWorkspace`,
+/// `NoWorkspaceRoots`), lossy for non-UTF-8 bytes. The two differ on purpose.
+///
 /// The cut is made while the debug text is produced, so the work is bounded by
 /// the cut and not by the path, and it never leaves half an escape sequence
 /// (`\u{..}`, `\x..`) in front of the truncation marker. Text within the bound
@@ -438,8 +453,8 @@ impl fmt::Display for EchoedArgument {
     }
 }
 
-/// Declares a closed enum of command-line spellings: the variants, `ALL`, `as_str`
-/// and `Display`, so a spelling is written once.
+/// Declares a closed enum of spellings: the variants, `ALL`, `as_str` and
+/// `Display`, so a spelling is written once.
 macro_rules! spelled_enum {
     (
         $(#[$meta:meta])*
@@ -458,7 +473,7 @@ macro_rules! spelled_enum {
             /// Every variant, in declaration order.
             pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
 
-            /// The spelling as written on a command line.
+            /// The spelling as written on the wire or a command line.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
@@ -467,13 +482,15 @@ macro_rules! spelled_enum {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(self.as_str())
             }
         }
     };
 }
+
+pub(crate) use spelled_enum;
 
 spelled_enum! {
     /// A subcommand of a runner that starts a program the workspace chooses.
@@ -952,7 +969,7 @@ pub enum UntrustedRefusal {
         /// The wrapped program, as configured.
         program: EchoedPath,
     },
-    /// The vetted path of a program an exec wrapper starts contains `=`, which
+    /// The vetted path of a program that `env` starts contains `=`, which
     /// `env` would read as an assignment, so it cannot be passed on unchanged.
     WrappedProgramPathContainsEquals {
         /// The wrapped program, as configured.
@@ -977,12 +994,28 @@ pub enum UntrustedRefusal {
         /// What the path belongs to.
         what: ResolvedItem,
     },
+    /// A resolved path contains a NUL, which the operating system cannot pass
+    /// in a path or environment variable.
+    NulInResolvedPath {
+        /// What the path belongs to.
+        what: ResolvedItem,
+    },
     /// No directory outside the workspace is available for the server to
     /// start in.
     NoSafeWorkingDirectory,
+    /// The variables untrusted mode sets for the server do not fit in its
+    /// `env` table.
+    EnvTooLarge {
+        /// Which limit the table would be over.
+        error: EnvTooLarge,
+    },
 }
 
 impl fmt::Display for UntrustedRefusal {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one message per refusal, and the refusals are the table"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotAllowed {
@@ -1071,9 +1104,19 @@ impl fmt::Display for UntrustedRefusal {
                 f,
                 "its {what} resolved to a blank path, which cannot be started"
             ),
+            Self::NulInResolvedPath { what } => {
+                write!(
+                    f,
+                    "its {what} resolved to a path containing NUL, which cannot be passed on"
+                )
+            }
             Self::NoSafeWorkingDirectory => f.write_str(
                 "no directory outside the workspace is available to start it in, which \
                  untrusted mode requires",
+            ),
+            Self::EnvTooLarge { error } => write!(
+                f,
+                "the variables untrusted mode sets do not fit in its environment: {error}"
             ),
         }
     }
@@ -1155,7 +1198,9 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
                     | UntrustedRefusal::NonUtf8Path { .. }
                     | UntrustedRefusal::BlankResolvedPath { .. }
-                    | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
+                    | UntrustedRefusal::NulInResolvedPath { .. }
+                    | UntrustedRefusal::NoSafeWorkingDirectory
+                    | UntrustedRefusal::EnvTooLarge { .. } => Ok(()),
                 }
             }
             reason @ (StartupFailure::Spawn(_) | StartupFailure::InitTaskPanicked) => write!(
@@ -1693,31 +1738,34 @@ pub enum ConfigError {
 
     /// A server's `env` table sets one variable twice, which the host treats as
     /// one name.
-    #[error("lsp_servers entry '{server}': {error}")]
+    #[error("lsp_servers entry '{server}'")]
     DuplicateEnvKey {
         /// The id of the entry that holds the table.
         server: ServerId,
         /// The colliding keys.
+        #[source]
         error: DuplicateEnvKey,
     },
 
     /// A server's `env` table holds a value the operating system cannot pass.
-    #[error("lsp_servers entry '{server}': environment variable '{key}': {error}")]
+    #[error("lsp_servers entry '{server}': environment variable '{key}'")]
     InvalidEnvValue {
         /// The id of the entry that holds the table.
         server: ServerId,
         /// The variable whose value is invalid.
         key: EnvKey,
         /// Why the value is invalid.
+        #[source]
         error: InvalidEnvValue,
     },
 
     /// A server's `env` table is too large to pass to a process.
-    #[error("lsp_servers entry '{server}': {error}")]
+    #[error("lsp_servers entry '{server}'")]
     EnvTooLarge {
         /// The id of the entry that holds the table.
         server: ServerId,
         /// Which size limit the table is over.
+        #[source]
         error: EnvTooLarge,
     },
 
@@ -2589,7 +2637,7 @@ impl Error {
             // request's line/character falls outside the target document --
             // caller-fault. Every other `LspServerError` shape is a genuine
             // server-side problem and stays `Internal`.
-            Self::LspServerError(response) if response.message.contains(INVALID_OFFSET_MARKER) => {
+            Self::LspServerError(response) if is_invalid_offset(response) => {
                 McpErrorKind::InvalidPosition(RewrittenServerError::new(
                     response.code,
                     &response.message,
@@ -2760,15 +2808,6 @@ impl fmt::Display for TomlParseError {
         } else {
             Ok(())
         }
-    }
-}
-
-impl From<toml::de::Error> for Error {
-    fn from(error: toml::de::Error) -> Self {
-        Self::TomlDe(TomlParseError {
-            error,
-            line_column: None,
-        })
     }
 }
 
@@ -3340,7 +3379,8 @@ mod tests {
     /// #735: every variant that carries a cause renders it exactly once.
     #[tokio::test]
     async fn test_error_chain_renders_each_cause_exactly_once() {
-        let toml_err = toml::from_str::<toml::Value>("[invalid toml").unwrap_err();
+        let toml_text = "[invalid toml";
+        let toml_err = toml::from_str::<toml::Value>(toml_text).unwrap_err();
         let json_err = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
         let json_text = json_err.to_string();
         let join_error = tokio::spawn(async { panic!("task-marker") })
@@ -3351,7 +3391,10 @@ mod tests {
 
         let mut cases = io_sourced_cases();
         cases.extend([
-            (Error::from(toml_err.clone()), toml_err.message().to_owned()),
+            (
+                Error::TomlDe(TomlParseError::new(toml_err.clone(), toml_text)),
+                toml_err.message().to_owned(),
+            ),
             (Error::from(json_err), json_text),
             (
                 Error::McpServerStart("mcp-marker".into()),
@@ -3555,14 +3598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_error_from_toml_de() {
-        let toml_str = "[invalid toml";
-        let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
-        let err: Error = toml_err.into();
-        assert_matches!(err, Error::TomlDe(_));
-    }
-
-    #[test]
     fn test_toml_parse_error_reports_line_and_column_without_the_line() {
         let text = "a = 1\nsecret = \"sk-SECRET\" bad\n";
         let error = toml::from_str::<toml::Value>(text).unwrap_err();
@@ -3579,7 +3614,8 @@ mod tests {
     fn test_toml_error_never_quotes_an_env_secret() {
         let text = "lsp_servers = [{ language_id = \"rust\", command = \"ra\", \
                     env = { API_TOKEN = \"sk-SECRET\\u0000\" } }]";
-        let err = Error::from(toml::from_str::<crate::config::ServerConfig>(text).unwrap_err());
+        let parse_error = toml::from_str::<crate::config::ServerConfig>(text).unwrap_err();
+        let err = Error::TomlDe(TomlParseError::new(parse_error, text));
 
         let rendered = ErrorChain(&err).to_string();
         assert!(!rendered.contains("sk-SECRET"), "{rendered}");

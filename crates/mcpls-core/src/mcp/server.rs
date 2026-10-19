@@ -26,7 +26,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use super::cancel::{peer_closed, run_cancellable};
-use super::custom_request;
+use super::custom_request::{self, SessionKind};
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
 use super::schema_shape::shape_tool_schemas;
@@ -1675,7 +1675,7 @@ impl ServerHandler for McplsServer {
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         let result = self.negotiate_initialize(&request)?;
-        match self.context.session.state().claim_handshake() {
+        match self.context.session.claim_handshake() {
             HandshakeClaim::Repeat => Err(McpError::invalid_request(
                 "the session is already initialized",
                 None,
@@ -1703,10 +1703,15 @@ impl ServerHandler for McplsServer {
         request: CustomRequest,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
-        let legacy = context
+        let kind = if context
             .protocol_version()
-            .is_none_or(|version| version.has_initialize());
-        Err(custom_request::answer(&request, legacy))
+            .is_none_or(|version| version.has_initialize())
+        {
+            SessionKind::Legacy
+        } else {
+            SessionKind::Modern
+        };
+        Err(custom_request::answer(&request, kind))
     }
 
     async fn list_resources(
@@ -1779,10 +1784,8 @@ impl ServerHandler for McplsServer {
         match run_cancellable(&request_token, peer_closed(&peer), handler).await {
             Ok(result) => result,
             Err(stop) => {
-                // Never delivered: rmcp discards the response of a cancelled
-                // request, and the transport is gone when the connection closed.
                 tracing::debug!(%tool, %stop, "tool call stopped before it finished");
-                Err(McpError::internal_error(stop.to_string(), None))
+                Ok(stop.into_response())
             }
         }
     }
@@ -4700,7 +4703,10 @@ sleep 0.3
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("sh").into(),
-                args: vec![script_path.to_string_lossy().to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    script_path.to_string_lossy().to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
@@ -6549,8 +6555,8 @@ sleep 0.3
             .await
             .unwrap();
 
-        assert!(tool.0.result.diagnostics.is_empty());
-        assert!(resource.diagnostics.is_empty());
+        assert_eq!(tool.0.result.diagnostics.len(), 0);
+        assert_eq!(resource.diagnostics.len(), 0);
     }
 
     fn register_listen(

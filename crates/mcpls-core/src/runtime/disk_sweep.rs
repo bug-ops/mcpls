@@ -1,5 +1,5 @@
 //! Tells `lsp-diagnostics://` subscribers about on-disk edits no tool call
-//! observes (#648, #781, spec bridge/009).
+//! observes (#648, #781, spec bridge/009 and bridge/016).
 //!
 //! While some session subscribes to a tracked file, the sweep resyncs the file
 //! with the disk every [`SWEEP_INTERVAL`] and, when that moved the document to
@@ -16,76 +16,86 @@
 //!
 //! Both sets are visited through bounded windows ([`MAX_SWEPT_FILES_PER_TICK`],
 //! [`MAX_COMPANION_FILES`], [`MAX_COMPANION_FILES_PER_TICK`]), subscribed files
-//! first. Files of one server are swept by one job at a time, so a wedged
-//! server stalls only its own files.
+//! first. Files of one server are swept by one job at a time, and a pull that
+//! does not answer leaves the job (see `SweepContext`), so a wedged server
+//! stalls only its own files and an unanswered pull only its own file.
 //!
 //! Not covered: servers that register `textDocument/didSave` dynamically.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tokio_util::task::TaskTracker;
+use tracing::warn;
 
 use crate::bridge::resources::DiagnosticsResourceUri;
-use crate::bridge::{Interest, NotificationCache, SweepMemo, SweepStep, Translator, path_to_uri};
+use crate::bridge::{
+    Interest, MAX_COMPANION_FILES, MAX_SWEPT_FILES_PER_TICK, NotificationCache, SWEEP_INTERVAL,
+    SweepContext, SweepMemo, Translator, path_to_uri,
+};
 use crate::config::ServerId;
 use crate::mcp::SubscriptionRegistry;
-
-/// Time between two sweeps.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Most subscribed files one sweep visits; the rest follow on later ticks.
-const MAX_SWEPT_FILES_PER_TICK: usize = 64;
-
-/// Most recently used tracked, unsubscribed files of a server with a
-/// subscribed file that count as companions.
-const MAX_COMPANION_FILES: usize = 256;
 
 /// Most companions one sweep visits; the rest follow on later ticks.
 const MAX_COMPANION_FILES_PER_TICK: usize = 32;
 
+/// The server the sweep would use for each tracked file, resolved once per
+/// tick; a file no running server routes is left out.
+type ServerMap = HashMap<PathBuf, ServerId>;
+
+/// A running sweep: the task that ticks and the token that stops it.
+#[derive(Debug)]
+pub struct DiskSweepHandle {
+    stop: CancellationToken,
+    task: JoinHandle<()>,
+}
+
 /// Starts the sweep, which runs until `cancel` fires or the handle is
 /// stopped with [`stop_disk_sweep`].
 ///
-/// The task owns the per-server jobs: ending it aborts them too.
+/// The task owns the per-server jobs and the pulls they left in the
+/// background: it ends only after both are gone.
 pub fn spawn_disk_sweep(
     translator: &Arc<Translator>,
     notification_cache: &Arc<Mutex<NotificationCache>>,
     subscriptions: &SubscriptionRegistry,
     cancel: &CancellationToken,
-) -> JoinHandle<()> {
+) -> DiskSweepHandle {
+    let stop = cancel.child_token();
     let mut sweep = DiskSweep::new(
         Arc::clone(translator),
         Arc::clone(notification_cache),
         subscriptions.clone(),
+        stop.clone(),
     );
-    let cancel = cancel.clone();
-    tokio::spawn(async move {
+    let ticker_stop = stop.clone();
+    let task = tokio::spawn(async move {
         let mut ticks = tokio::time::interval(SWEEP_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => break,
-                _ = ticks.tick() => sweep.tick(&cancel).await,
+                () = ticker_stop.cancelled() => break,
+                _ = ticks.tick() => sweep.tick().await,
             }
         }
-    })
+        sweep.shutdown().await;
+    });
+    DiskSweepHandle { stop, task }
 }
 
 /// Stops the sweep started by [`spawn_disk_sweep`] and waits until its task is
-/// gone, so no job touches a server that shutdown is about to stop.
+/// gone, so no job or pull touches a server that shutdown is about to stop.
 ///
-/// A job aborted inside `ensure_open` leaves nothing behind: a document whose
+/// A job stopped inside `ensure_open` leaves nothing behind: a document whose
 /// resync did not finish is resynced by the next call that needs it.
-pub async fn stop_disk_sweep(handle: JoinHandle<()>) {
-    handle.abort();
-    match handle.await {
+pub async fn stop_disk_sweep(handle: DiskSweepHandle) {
+    handle.stop.cancel();
+    match handle.task.await {
         Err(error) if error.is_panic() => warn!("disk sweep panicked: {error}"),
         Ok(()) | Err(_) => {}
     }
@@ -93,17 +103,15 @@ pub async fn stop_disk_sweep(handle: JoinHandle<()>) {
 
 struct DiskSweep {
     translator: Arc<Translator>,
-    notification_cache: Arc<Mutex<NotificationCache>>,
     subscriptions: SubscriptionRegistry,
-    memo: SweepMemo,
+    context: SweepContext,
     jobs: JoinSet<()>,
     /// Server each unfinished job sweeps.
     running: HashMap<Id, ServerId>,
-    /// Where the next tick starts in the sorted list of swept files, so a
-    /// backlog beyond [`MAX_SWEPT_FILES_PER_TICK`] is visited in turn.
-    next_start: usize,
-    /// The last companion the previous tick examined, so the next tick resumes
-    /// at the first path after it however the companion set changed.
+    /// The last subscribed file the previous tick examined, so the next tick
+    /// resumes at the first path after it however the set changed.
+    subscribed_after: Option<PathBuf>,
+    /// As `subscribed_after`, for companions.
     companions_after: Option<PathBuf>,
 }
 
@@ -112,36 +120,47 @@ impl DiskSweep {
         translator: Arc<Translator>,
         notification_cache: Arc<Mutex<NotificationCache>>,
         subscriptions: SubscriptionRegistry,
+        stop: CancellationToken,
     ) -> Self {
+        let context = SweepContext::new(
+            Arc::clone(&translator),
+            notification_cache,
+            SweepMemo::default(),
+            TaskTracker::new(),
+            stop,
+        );
         Self {
             translator,
-            notification_cache,
             subscriptions,
-            memo: SweepMemo::default(),
+            context,
             jobs: JoinSet::new(),
             running: HashMap::new(),
-            next_start: 0,
+            subscribed_after: None,
             companions_after: None,
         }
     }
 
-    async fn tick(&mut self, cancel: &CancellationToken) {
+    async fn tick(&mut self) {
         self.reap_finished();
+        self.context.memo().begin_tick();
         if !self.subscriptions.any_subscription().await {
-            self.memo.retain(|_| false);
+            self.context.memo().retain(|_| false);
             return;
         }
-        let subscribed = self.subscribed_tracked_files().await;
-        let companions = self.companion_files(&subscribed);
+        let tracked = self.translator.document_tracker().open_paths();
+        let servers = self.server_map(&tracked);
+        let subscribed = self.subscribed_files(&tracked, &servers).await;
+        let companions = self.companion_files(&subscribed, &servers);
         let kept: HashSet<&Path> = subscribed
             .iter()
-            .map(PathBuf::as_path)
-            .chain(companions.iter().map(|(path, _)| path.as_path()))
+            .chain(&companions)
+            .map(|(path, _)| path.as_path())
             .collect();
-        self.memo.retain(|path| kept.contains(path));
+        self.context.memo().retain(|path| kept.contains(path));
 
         let mut by_server: HashMap<ServerId, Vec<(PathBuf, Interest)>> = HashMap::new();
-        for (path, server) in self.next_window(&subscribed) {
+        let window = self.next_subscribed(&subscribed);
+        for (path, server) in window {
             by_server
                 .entry(server)
                 .or_default()
@@ -154,16 +173,21 @@ impl DiskSweep {
                 .push((path, Interest::Companion));
         }
         for (server, visits) in by_server {
-            let job = sweep_files(
-                Arc::clone(&self.translator),
-                Arc::clone(&self.notification_cache),
-                self.memo.clone(),
-                cancel.clone(),
-                visits,
-            );
-            let id = self.jobs.spawn(job).id();
+            let context = self.context.clone();
+            let id = self
+                .jobs
+                .spawn(async move { context.run_job(visits).await })
+                .id();
             self.running.insert(id, server);
         }
+    }
+
+    /// Ends every job and waits for the pulls they left in the background.
+    async fn shutdown(&mut self) {
+        self.jobs.shutdown().await;
+        self.running.clear();
+        self.context.pulls().close();
+        self.context.pulls().wait().await;
     }
 
     fn reap_finished(&mut self) {
@@ -182,9 +206,22 @@ impl DiskSweep {
         }
     }
 
-    /// Tracked files some session or listen stream subscribes to, sorted.
-    async fn subscribed_tracked_files(&self) -> Vec<PathBuf> {
-        let mut tracked = self.translator.document_tracker().open_paths();
+    /// The server of each of `paths` that a running server routes.
+    fn server_map(&self, paths: &[PathBuf]) -> ServerMap {
+        paths
+            .iter()
+            .filter_map(|path| Some((path.clone(), self.translator.sweep_server(path)?)))
+            .collect()
+    }
+
+    /// Tracked files some session or listen stream subscribes to, with their
+    /// servers, sorted by path.
+    async fn subscribed_files(
+        &self,
+        tracked: &[PathBuf],
+        servers: &ServerMap,
+    ) -> Vec<(PathBuf, ServerId)> {
+        let mut tracked = tracked.to_vec();
         tracked.sort();
         let resources = tracked
             .into_iter()
@@ -195,48 +232,54 @@ impl DiskSweep {
                 Some((path, resource))
             })
             .collect();
-        self.subscriptions.retain_subscribed(resources).await
+        self.subscriptions
+            .retain_subscribed(resources)
+            .await
+            .into_iter()
+            .filter_map(|path| {
+                let server = servers.get(&path)?.clone();
+                Some((path, server))
+            })
+            .collect()
     }
 
-    /// The files this tick visits with their servers: at most
-    /// [`MAX_SWEPT_FILES_PER_TICK`], taken in order from where the previous
-    /// tick stopped. Files of a server whose job still runs, or that no
-    /// running server routes, are passed over without using up the window.
-    fn next_window(&mut self, subscribed: &[PathBuf]) -> Vec<(PathBuf, ServerId)> {
-        let len = subscribed.len();
-        let start = self.next_start.checked_rem(len).unwrap_or(0);
-        let mut window = Vec::new();
-        let mut examined = 0_usize;
-        for path in subscribed.iter().cycle().skip(start).take(len) {
-            if window.len() >= MAX_SWEPT_FILES_PER_TICK {
-                break;
-            }
-            examined = examined.saturating_add(1);
-            let Some(server) = self.translator.sweep_server(path) else {
-                continue;
-            };
-            if self.is_busy(&server) {
-                continue;
-            }
-            window.push((path.clone(), server));
-        }
-        self.next_start = start.saturating_add(examined).checked_rem(len).unwrap_or(0);
-        window
+    /// The subscribed files this tick visits: at most
+    /// [`MAX_SWEPT_FILES_PER_TICK`], taken in path order from the first path
+    /// after the one the previous tick stopped at. Files of a server whose job
+    /// still runs are passed over without using up the window.
+    fn next_subscribed(&mut self, subscribed: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
+        let running = &self.running;
+        window_after(
+            subscribed,
+            &mut self.subscribed_after,
+            MAX_SWEPT_FILES_PER_TICK,
+            |server| running.values().any(|running| running == server),
+        )
     }
 
-    fn is_busy(&self, server: &ServerId) -> bool {
-        self.running.values().any(|running| running == server)
+    /// The companions this tick visits: at most
+    /// [`MAX_COMPANION_FILES_PER_TICK`], windowed like the subscribed files.
+    fn next_companions(&mut self, companions: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
+        let running = &self.running;
+        window_after(
+            companions,
+            &mut self.companions_after,
+            MAX_COMPANION_FILES_PER_TICK,
+            |server| running.values().any(|running| running == server),
+        )
     }
 
     /// The most recently used [`MAX_COMPANION_FILES`] tracked files that are
     /// not subscribed but are routed to a server with a subscribed file,
     /// sorted by path.
-    fn companion_files(&self, subscribed: &[PathBuf]) -> Vec<(PathBuf, ServerId)> {
-        let with_subscription: HashSet<ServerId> = subscribed
-            .iter()
-            .filter_map(|path| self.translator.sweep_server(path))
-            .collect();
-        let subscribed: HashSet<&PathBuf> = subscribed.iter().collect();
+    fn companion_files(
+        &self,
+        subscribed: &[(PathBuf, ServerId)],
+        servers: &ServerMap,
+    ) -> Vec<(PathBuf, ServerId)> {
+        let with_subscription: HashSet<&ServerId> =
+            subscribed.iter().map(|(_, server)| server).collect();
+        let subscribed: HashSet<&PathBuf> = subscribed.iter().map(|(path, _)| path).collect();
         let mut companions: Vec<(PathBuf, ServerId)> = self
             .translator
             .document_tracker()
@@ -244,73 +287,57 @@ impl DiskSweep {
             .into_iter()
             .filter(|path| !subscribed.contains(path))
             .filter_map(|path| {
-                let server = self.translator.sweep_server(&path)?;
+                let server = servers.get(&path)?;
                 with_subscription
-                    .contains(&server)
-                    .then_some((path, server))
+                    .contains(server)
+                    .then(|| (path, server.clone()))
             })
             .take(MAX_COMPANION_FILES)
             .collect();
         companions.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         companions
     }
-
-    /// The companions this tick visits: at most
-    /// [`MAX_COMPANION_FILES_PER_TICK`], taken in path order from the first
-    /// path after the one the previous tick stopped at. Companions of a busy
-    /// server are passed over without using up the window.
-    fn next_companions(&mut self, companions: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
-        let len = companions.len();
-        let start = self.companions_after.as_ref().map_or(0, |after| {
-            companions.partition_point(|(path, _)| path <= after)
-        });
-        let mut window = Vec::new();
-        let mut last = None;
-        for (path, server) in companions
-            .iter()
-            .cycle()
-            .skip(start.checked_rem(len).unwrap_or(0))
-            .take(len)
-        {
-            if window.len() >= MAX_COMPANION_FILES_PER_TICK {
-                break;
-            }
-            last = Some(path);
-            if self.is_busy(server) {
-                continue;
-            }
-            window.push((path.clone(), server.clone()));
-        }
-        self.companions_after = last.cloned();
-        window
-    }
 }
 
-/// Sweeps `visits`, all of one server, one after another.
-async fn sweep_files(
-    translator: Arc<Translator>,
-    notification_cache: Arc<Mutex<NotificationCache>>,
-    memo: SweepMemo,
-    cancel: CancellationToken,
-    visits: Vec<(PathBuf, Interest)>,
-) {
-    for (path, interest) in visits {
-        if cancel.is_cancelled() {
-            return;
+/// At most `max` of `items`, sorted by path, taken from the first path after
+/// `cursor` and round again; `cursor` becomes the last path examined. Items of
+/// a server `busy` says is occupied are passed over without using up the
+/// window.
+fn window_after(
+    items: &[(PathBuf, ServerId)],
+    cursor: &mut Option<PathBuf>,
+    max: usize,
+    busy: impl Fn(&ServerId) -> bool,
+) -> Vec<(PathBuf, ServerId)> {
+    let len = items.len();
+    let start = cursor
+        .as_ref()
+        .map_or(0, |after| items.partition_point(|(path, _)| path <= after));
+    let mut window = Vec::new();
+    let mut last = None;
+    for (path, server) in items
+        .iter()
+        .cycle()
+        .skip(start.checked_rem(len).unwrap_or(0))
+        .take(len)
+    {
+        if window.len() >= max {
+            break;
         }
-        let step = translator
-            .sweep_file(&path, interest, &memo, &notification_cache)
-            .await;
-        debug!(path = %path.display(), ?interest, ?step, "disk sweep visited a file");
-        if step == SweepStep::TimedOut {
-            return;
+        last = Some(path);
+        if busy(server) {
+            continue;
         }
+        window.push((path.clone(), server.clone()));
     }
+    *cursor = last.cloned();
+    window
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::{assert_matches, fs};
 
     use serde_json::json;
@@ -319,17 +346,19 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::bridge::{ResourceLimits, ResultContext, WorkspaceRoots};
+    use crate::bridge::{
+        MAX_FAILED_PULLS_PER_STATE, ResourceLimits, ResultContext, WorkspaceRoots,
+    };
     use crate::config::{DocumentLimit, LanguageId, ToolRouter};
     use crate::mcp::{SessionHandle, Target};
     use crate::runtime::pump::{DiagnosticsRoles, PumpShared, PumpWiring};
     use crate::test_lsp::{
-        FakeServer, client_path, fake_lsp_client, read_framed_message, test_extensions,
-        write_response,
+        FakeServer, client_path, fake_lsp_client, next_framed_message, read_framed_message,
+        test_extensions, write_response,
     };
 
     impl DiskSweep {
-        /// Waits for every running job and forgets it.
+        /// Waits for every running job and every pull pass that answers.
         async fn settle(&mut self) {
             while let Some(finished) = self.jobs.join_next_with_id().await {
                 match finished {
@@ -337,10 +366,17 @@ mod tests {
                     Err(error) => self.running.remove(&error.id()),
                 };
             }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.context.pulls().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the pulls did not finish");
         }
 
-        async fn tick_and_settle(&mut self, cancel: &CancellationToken) {
-            self.tick(cancel).await;
+        async fn tick_and_settle(&mut self) {
+            self.tick().await;
             self.settle().await;
         }
     }
@@ -382,7 +418,6 @@ mod tests {
         resource: DiagnosticsResourceUri,
         pulls: Arc<AtomicUsize>,
         sweep: DiskSweep,
-        cancel: CancellationToken,
         _responder: tokio::task::JoinHandle<()>,
     }
 
@@ -432,7 +467,12 @@ mod tests {
             let responder = spawn_responder(server, Arc::clone(&pulls), answers);
             let resource =
                 DiagnosticsResourceUri::for_canonical_file(&path_to_uri(&path).unwrap()).unwrap();
-            let sweep = DiskSweep::new(Arc::clone(&translator), Arc::clone(&cache), subs.clone());
+            let sweep = DiskSweep::new(
+                Arc::clone(&translator),
+                Arc::clone(&cache),
+                subs.clone(),
+                cancel.clone(),
+            );
             let harness = Self {
                 _dir: dir,
                 translator,
@@ -442,7 +482,6 @@ mod tests {
                 resource,
                 pulls,
                 sweep,
-                cancel,
                 _responder: responder,
             };
             harness.pull_by_tool().await;
@@ -472,7 +511,7 @@ mod tests {
         }
 
         async fn tick(&mut self) {
-            self.sweep.tick_and_settle(&self.cancel).await;
+            self.sweep.tick_and_settle().await;
         }
 
         fn pulls(&self) -> usize {
@@ -558,10 +597,10 @@ mod tests {
         let (_session, _rx) = h.subscribe().await;
         h.edit("fn main() { let x: i32 = \"s\"; }");
 
-        h.sweep.tick(&h.cancel).await;
+        h.sweep.tick().await;
         pulls_reach(&h.pulls, 2).await;
-        h.sweep.tick(&h.cancel).await;
-        h.sweep.tick(&h.cancel).await;
+        h.sweep.tick().await;
+        h.sweep.tick().await;
 
         assert_eq!(h.sweep.running.len(), 1);
         assert_eq!(h.pulls(), 2);
@@ -633,13 +672,18 @@ mod tests {
         for file in [&wedged_file, &healthy_file] {
             fs::write(file, "// edited so the length differs").unwrap();
         }
-        let mut sweep = DiskSweep::new(Arc::clone(&translator), Arc::clone(&cache), subs);
+        let mut sweep = DiskSweep::new(
+            Arc::clone(&translator),
+            Arc::clone(&cache),
+            subs,
+            cancel.clone(),
+        );
 
-        sweep.tick(&cancel).await;
+        sweep.tick().await;
         pulls_reach(&wedged_pulls, 2).await;
         pulls_reach(&healthy_pulls, 2).await;
         assert_eq!(next_update(&mut rx).await, healthy_resource.as_str());
-        sweep.tick(&cancel).await;
+        sweep.tick().await;
         assert_quiet(&mut rx).await;
         assert_eq!(wedged_pulls.load(Ordering::SeqCst), 2);
         assert_eq!(healthy_pulls.load(Ordering::SeqCst), 2);
@@ -655,13 +699,14 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        sweep_files(
+        SweepContext::new(
             Arc::clone(&h.translator),
             Arc::clone(&h.cache),
             SweepMemo::default(),
+            TaskTracker::new(),
             cancel,
-            vec![(h.path.clone(), Interest::Subscribed)],
         )
+        .run(vec![(h.path.clone(), Interest::Subscribed)])
         .await;
 
         assert_eq!(h.pulls(), 1);
@@ -681,8 +726,18 @@ mod tests {
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
             SubscriptionRegistry::new(),
+            CancellationToken::new(),
         );
         (sweep, rust, ts)
+    }
+
+    /// `paths` with the servers `sweep` routes them to.
+    fn served(sweep: &DiskSweep, paths: &[PathBuf]) -> Vec<(PathBuf, ServerId)> {
+        let servers = sweep.server_map(paths);
+        paths
+            .iter()
+            .filter_map(|path| Some((path.clone(), servers.get(path)?.clone())))
+            .collect()
     }
 
     fn files(prefix: &str, extension: &str, count: usize) -> Vec<PathBuf> {
@@ -696,8 +751,9 @@ mod tests {
         let (mut sweep, ..) = sweep_over_two_servers();
         let files = files("f", "rs", 100);
 
-        let first = sweep.next_window(&files);
-        let second = sweep.next_window(&files);
+        let files = served(&sweep, &files);
+        let first = sweep.next_subscribed(&files);
+        let second = sweep.next_subscribed(&files);
 
         assert_eq!(first.len(), MAX_SWEPT_FILES_PER_TICK);
         assert_eq!(second.len(), MAX_SWEPT_FILES_PER_TICK);
@@ -715,7 +771,8 @@ mod tests {
         all.extend(files("b", "rs", 70));
         all.sort();
 
-        let window = sweep.next_window(&all);
+        let all = served(&sweep, &all);
+        let window = sweep.next_subscribed(&all);
 
         assert_eq!(window.len(), MAX_SWEPT_FILES_PER_TICK);
         assert!(
@@ -826,7 +883,7 @@ mod tests {
             h.tick().await;
         }
 
-        assert!(h.sweep.memo.tracked_files() <= 1 + MAX_COMPANION_FILES);
+        assert!(h.sweep.context.memo().tracked_files() <= 1 + 2 * MAX_COMPANION_FILES);
     }
 
     fn companions(prefix: &str, count: usize) -> Vec<(PathBuf, ServerId)> {
@@ -921,14 +978,432 @@ mod tests {
             Arc::new(translator),
             Arc::new(Mutex::new(NotificationCache::new())),
             SubscriptionRegistry::new(),
+            CancellationToken::new(),
         );
-        let subscribed = vec![all[0].clone()];
+        let open = sweep.translator.document_tracker().open_paths();
+        let servers = sweep.server_map(&open);
+        let subscribed = served(&sweep, &[all[0].clone()]);
 
-        let found = sweep.companion_files(&subscribed);
+        let found = sweep.companion_files(&subscribed, &servers);
 
         let expected: Vec<&PathBuf> = all[44..].iter().collect();
         let found_paths: Vec<&PathBuf> = found.iter().map(|(path, _)| path).collect();
         assert_eq!(found_paths, expected);
         assert!(found.iter().all(|(_, server)| *server == rust));
+    }
+
+    /// A request or notification the scripted server received.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        at: tokio::time::Instant,
+        method: String,
+        file: String,
+    }
+
+    /// What the scripted server leaves unanswered, and what it received.
+    #[derive(Debug, Clone, Default)]
+    struct Wedge {
+        /// How long the server takes to answer a pull.
+        delay: Arc<std::sync::Mutex<Duration>>,
+        hung: Arc<std::sync::Mutex<HashSet<String>>>,
+        seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    }
+
+    impl Wedge {
+        /// Leaves the pulls of `file` unanswered from now on.
+        fn hang(&self, file: &str) {
+            self.hung.lock().unwrap().insert(file.to_owned());
+        }
+
+        fn seen(&self, method: &str, file: &str) -> Vec<Seen> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|seen| seen.method == method && seen.file == file)
+                .cloned()
+                .collect()
+        }
+
+        fn count(&self, method: &str, file: &str) -> usize {
+            self.seen(method, file).len()
+        }
+    }
+
+    const PULL: &str = "textDocument/diagnostic";
+    const CHANGE: &str = "textDocument/didChange";
+
+    /// Answers every pull that `wedge` does not hang with a report that
+    /// differs every time, and records everything it receives.
+    fn spawn_wedging_responder(server: FakeServer, wedge: Wedge) -> JoinHandle<()> {
+        let FakeServer {
+            read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let writer = Arc::new(Mutex::new(read_half_stdin));
+        tokio::spawn(async move {
+            let mut wire = BufReader::new(&mut write_stdout);
+            let mut answered = 0_u32;
+            loop {
+                let message = next_framed_message(&mut wire).await;
+                let Some(method) = message["method"].as_str() else {
+                    continue;
+                };
+                let file = message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .and_then(|uri| uri.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                wedge.seen.lock().unwrap().push(Seen {
+                    at: tokio::time::Instant::now(),
+                    method: method.to_owned(),
+                    file: file.clone(),
+                });
+                if method != PULL || wedge.hung.lock().unwrap().contains(&file) {
+                    continue;
+                }
+                answered += 1;
+                let delay = *wedge.delay.lock().unwrap();
+                let report = json!({"kind": "full", "items": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "severity": 1,
+                    "message": format!("pull {answered}"),
+                }]});
+                if delay.is_zero() {
+                    write_response(&mut *writer.lock().await, &message["id"], report).await;
+                    continue;
+                }
+                let (writer, id) = (Arc::clone(&writer), message["id"].clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    write_response(&mut *writer.lock().await, &id, report).await;
+                });
+            }
+        })
+    }
+
+    /// Several tracked files of one server, some subscribed and some not.
+    struct Fleet {
+        _tmp: TempDir,
+        dir: PathBuf,
+        sweep: DiskSweep,
+        stop: CancellationToken,
+        wedge: Wedge,
+        request_timeout: Duration,
+        updates: mpsc::Receiver<String>,
+        edits: usize,
+        _session: SessionHandle,
+        _responder: JoinHandle<()>,
+    }
+
+    impl Fleet {
+        /// Tracks and pulls every file once, with all pulls answered, and
+        /// subscribes to `subscribed`.
+        async fn new(subscribed: &[&str], companions: &[&str]) -> Self {
+            let tmp = TempDir::new().unwrap();
+            let root = dunce::canonicalize(tmp.path()).unwrap();
+            let server_id = ServerId::from_static("rust");
+            let cache = Arc::new(Mutex::new(NotificationCache::new()));
+            let subs = SubscriptionRegistry::new();
+            let mut translator = Translator::new()
+                .with_extensions(test_extensions())
+                .with_router(ToolRouter::catch_all([(
+                    server_id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
+                .with_notification_cache(Arc::clone(&cache));
+            let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap();
+            translator.set_workspace_roots(roots.clone());
+            let (client, server) = fake_lsp_client();
+            let request_timeout = client.request_timeout();
+            translator.register_client(server_id, client);
+            let stop = CancellationToken::new();
+            translator.install_wiring(Arc::new(PumpWiring::new(
+                PumpShared {
+                    roles: DiagnosticsRoles::default(),
+                    notification_cache: Arc::clone(&cache),
+                    subs: subs.clone(),
+                    workspace_roots: roots,
+                },
+                stop.clone(),
+            )));
+            let translator = Arc::new(translator);
+            cache
+                .lock()
+                .await
+                .attach_documents(Arc::clone(translator.document_tracker()));
+            let wedge = Wedge::default();
+            let responder = spawn_wedging_responder(server, wedge.clone());
+            let session = SessionHandle::new(subs.clone());
+            let (tx, updates) = mpsc::channel(256);
+            for name in subscribed.iter().chain(companions) {
+                let path = root.join(name);
+                fs::write(&path, "fn f() {}").unwrap();
+                translator
+                    .handle_diagnostics(client_path(&path), ResultContext::None, &cache)
+                    .await
+                    .unwrap();
+            }
+            for name in subscribed {
+                let uri = path_to_uri(&root.join(name)).unwrap();
+                let resource = DiagnosticsResourceUri::for_canonical_file(&uri).unwrap();
+                session
+                    .subscribe_for_test(&resource, Target::Channel(tx.clone()))
+                    .await
+                    .unwrap();
+            }
+            let sweep = DiskSweep::new(translator, cache, subs, stop.clone());
+            Self {
+                _tmp: tmp,
+                dir: root,
+                sweep,
+                stop,
+                wedge,
+                request_timeout,
+                updates,
+                edits: 0,
+                _session: session,
+                _responder: responder,
+            }
+        }
+
+        /// Rewrites `name` with content of another length.
+        fn edit(&mut self, name: &str) {
+            self.edits += 1;
+            fs::write(
+                self.dir.join(name),
+                format!("fn f() {{ {} }}", "x".repeat(self.edits)),
+            )
+            .unwrap();
+        }
+
+        /// Ticks every sweep interval until `done` holds, and returns how
+        /// long that took.
+        async fn tick_until(
+            &mut self,
+            within: Duration,
+            done: impl Fn(&Wedge) -> bool,
+        ) -> Duration {
+            let start = tokio::time::Instant::now();
+            loop {
+                self.sweep.tick().await;
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let elapsed = start.elapsed();
+                if done(&self.wedge) {
+                    return elapsed;
+                }
+                assert!(elapsed <= within, "not done within {within:?}");
+            }
+        }
+    }
+
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// A server slow to answer, with more due files than background slots,
+    /// still gets every file pulled: a pull cancelled for the full slots is not
+    /// a failure of the file.
+    #[tokio::test(start_paused = true)]
+    async fn test_files_beyond_the_background_slots_are_pulled_once_slots_free() {
+        let names = ["a.rs", "b.rs", "c.rs", "d.rs"];
+        let mut fleet = Fleet::new(&names, &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        *fleet.wedge.delay.lock().unwrap() = Duration::from_secs(10);
+        for name in names {
+            fleet.edit(name);
+        }
+        let mut notified = HashSet::new();
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(120) && notified.len() < names.len() {
+            fleet.sweep.tick().await;
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            while let Ok(uri) = fleet.updates.try_recv() {
+                notified.insert(uri);
+            }
+        }
+
+        assert_eq!(notified.len(), names.len(), "{notified:?}");
+    }
+
+    /// An unanswered pull delays only its own file (spec 016 SC-001).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_hung_pull_delays_only_its_own_file() {
+        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        fleet.wedge.hang("a.rs");
+        fleet.edit("a.rs");
+        fleet.sweep.tick().await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let pulls_of_b = fleet.wedge.count(PULL, "b.rs");
+        fleet.edit("b.rs");
+
+        let elapsed = fleet
+            .tick_until(BOUND, |wedge| {
+                wedge.count(CHANGE, "b.rs") >= 1 && wedge.count(PULL, "b.rs") > pulls_of_b
+            })
+            .await;
+
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+        assert_eq!(
+            next_update(&mut fleet.updates).await,
+            DiagnosticsResourceUri::for_canonical_file(
+                &path_to_uri(&fleet.dir.join("b.rs")).unwrap()
+            )
+            .unwrap()
+            .as_str()
+        );
+    }
+
+    /// A pull that never answers is sent the capped number of times for its
+    /// state, one at a time and a request timeout apart (spec 016 SC-006).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_hung_file_gets_the_capped_number_of_pulls_for_its_state() {
+        let mut fleet = Fleet::new(&["a.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        fleet.wedge.hang("a.rs");
+        let before = fleet.wedge.count(PULL, "a.rs");
+        fleet.edit("a.rs");
+        let horizon = fleet.request_timeout * 10;
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < horizon {
+            fleet.sweep.tick().await;
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+        }
+
+        let pulls = fleet.wedge.seen(PULL, "a.rs");
+        let sent = &pulls[before..];
+        assert_eq!(sent.len(), usize::from(MAX_FAILED_PULLS_PER_STATE));
+        for pair in sent.windows(2) {
+            assert!(
+                pair[1].at.duration_since(pair[0].at) >= fleet.request_timeout,
+                "a second pull was sent while the first was outstanding"
+            );
+        }
+    }
+
+    /// With the background slots full, the pulls after the first expiry get a
+    /// grace only, each hung file is still asked once, and the resync of the
+    /// next ticks is not held up.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_full_cap_costs_a_pass_little_and_never_delays_a_resync() {
+        let hung = ["h1.rs", "h2.rs", "h3.rs", "h4.rs", "h5.rs", "h6.rs"];
+        let mut fleet = Fleet::new(&hung, &["d.rs"]).await;
+        fleet.sweep.tick_and_settle().await;
+        for name in hung {
+            fleet.wedge.hang(name);
+            fleet.edit(name);
+        }
+        let pulls_before: usize = hung.iter().map(|name| fleet.wedge.count(PULL, name)).sum();
+        fleet.sweep.tick().await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        fleet.edit("d.rs");
+
+        let elapsed = fleet
+            .tick_until(BOUND, |wedge| wedge.count(CHANGE, "d.rs") >= 1)
+            .await;
+
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+        tokio::time::sleep(SWEEP_INTERVAL * 3).await;
+        let pulls: usize = hung
+            .iter()
+            .map(|name| fleet.wedge.count(PULL, name))
+            .sum::<usize>()
+            - pulls_before;
+        assert_eq!(pulls, hung.len());
+    }
+
+    /// Edits `hung` and `z.rs` together, hangs the pulls of `hung`, and returns
+    /// how long after the edit the answering `z.rs` is pulled (spec 016
+    /// FR-002, "two files hang at once").
+    async fn answering_file_pulled_after(hung: &[&str]) -> Duration {
+        let mut names: Vec<&str> = hung.to_vec();
+        names.push("z.rs");
+        let mut fleet = Fleet::new(&names, &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        for name in hung {
+            fleet.wedge.hang(name);
+            fleet.edit(name);
+        }
+        let before = fleet.wedge.count(PULL, "z.rs");
+        fleet.edit("z.rs");
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        loop {
+            fleet.sweep.tick().await;
+            for _ in 0..20 {
+                tokio::time::sleep(SWEEP_INTERVAL / 20).await;
+                if fleet.wedge.count(PULL, "z.rs") > before {
+                    return start.elapsed();
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "never pulled");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_two_hung_files_do_not_delay_an_answering_one() {
+        let elapsed = Box::pin(answering_file_pulled_after(&["a1.rs", "a2.rs"])).await;
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_three_hung_files_do_not_delay_an_answering_one() {
+        let elapsed = Box::pin(answering_file_pulled_after(&["a1.rs", "a2.rs", "a3.rs"])).await;
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+    }
+
+    /// Files whose own state is new are pulled before one that another file's
+    /// change made stale, whatever their path order.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_pass_pulls_new_states_before_stale_ones() {
+        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        let seen_before = fleet.wedge.seen.lock().unwrap().len();
+        fleet.edit("a.rs");
+        fleet.edit("c.rs");
+
+        fleet.sweep.tick_and_settle().await;
+
+        let pulled: Vec<String> = fleet.wedge.seen.lock().unwrap()[seen_before..]
+            .iter()
+            .filter(|seen| seen.method == PULL)
+            .map(|seen| seen.file.clone())
+            .collect();
+        assert_eq!(pulled, ["a.rs", "c.rs", "b.rs"]);
+    }
+
+    /// Stopping the sweep ends a job that is still running before it returns.
+    #[tokio::test]
+    async fn test_stopping_the_sweep_ends_a_job_in_flight() {
+        let (mut sweep, rust, _ts) = sweep_over_two_servers();
+        let in_flight = sweep.jobs.spawn(std::future::pending()).id();
+        sweep.running.insert(in_flight, rust);
+
+        tokio::time::timeout(Duration::from_secs(5), sweep.shutdown())
+            .await
+            .expect("the shutdown waited for a job that never ends");
+
+        assert!(sweep.jobs.is_empty());
+        assert!(sweep.running.is_empty());
+    }
+
+    /// Stopping the sweep ends the pulls it left in the background before it
+    /// returns.
+    #[tokio::test(start_paused = true)]
+    async fn test_stopping_the_sweep_ends_its_background_pulls() {
+        let mut fleet = Fleet::new(&["a.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        fleet.wedge.hang("a.rs");
+        fleet.edit("a.rs");
+        fleet.sweep.tick().await;
+        tokio::time::sleep(SWEEP_INTERVAL * 2).await;
+        assert!(!fleet.sweep.context.pulls().is_empty());
+
+        fleet.stop.cancel();
+        fleet.sweep.shutdown().await;
+
+        assert!(fleet.sweep.context.pulls().is_empty());
+        assert!(fleet.sweep.running.is_empty());
     }
 }

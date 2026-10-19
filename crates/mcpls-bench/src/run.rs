@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use mcpls_core::ServerConfig;
 use mcpls_core::bridge::IndexingPolicy;
 use mcpls_core::config::{
-    ConfiguredRoot, FilePattern, LspServerConfig, ServerCommand, TimeoutSecs,
+    ConfiguredRoot, FilePattern, LspServerConfig, ServerArgs, ServerCommand, TimeoutSecs,
 };
 use rmcp::model::{ContentBlock, ErrorCode};
 use rmcp::service::{RunningService, ServiceError};
@@ -93,7 +93,7 @@ pub fn mcpls_config(scenario: &Scenario, repo: &Path, server_path: &Path) -> Res
     config.lsp_servers = vec![LspServerConfig {
         language_id: scenario.server.language_id.clone(),
         command: ServerCommand::new(server_path.to_string_lossy().into_owned())?.into(),
-        args: scenario.server.args.clone(),
+        args: ServerArgs::try_from(scenario.server.args.clone())?,
         env: mcpls_core::config::ServerEnv::default(),
         file_patterns,
         initialization_options: None,

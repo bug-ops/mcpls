@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use lsp_types::Notification as _;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::debug;
 
-use super::{ClientCommand, LspClient};
+use super::LspClient;
+use super::notification::OutboundNotification;
 use crate::error::Result;
 use crate::lsp::types::RequestId;
 use crate::util::lock_std;
@@ -239,109 +240,28 @@ impl LspClient {
     }
 
     /// Stops all later cancels from being sent.
-    pub(super) fn suppress_cancels(&self) {
+    pub(crate) fn suppress_cancels(&self) {
         self.closing.store(true, Ordering::Release);
     }
 
     /// Enqueues `$/cancelRequest` for `id` behind the request it cancels,
     /// without waiting: a full or closed queue is logged and ignored.
     fn send_cancel(&self, id: &RequestId, cause: CancelCause) {
-        let params = match serde_json::to_value(CancelParams { id }) {
-            Ok(params) => params,
+        let notification = match OutboundNotification::new(
+            lsp_types::CancelNotification::METHOD.as_str(),
+            CancelParams { id },
+        ) {
+            Ok(notification) => notification,
             Err(error) => {
                 debug!(?id, %error, "could not encode $/cancelRequest");
                 return;
             }
         };
-        let command = ClientCommand::SendNotification {
-            method: lsp_types::CancelNotification::METHOD.as_str().to_owned(),
-            params: Some(params),
-        };
-        match self.command_tx.try_send(command) {
+        match self.try_send_notification(notification) {
             Ok(()) => debug!(?id, ?cause, "sent $/cancelRequest"),
             Err(error) => debug!(?id, ?cause, %error, "dropped $/cancelRequest"),
         }
     }
-
-    /// Encodes `params` for the notification `N`, ready to enqueue on a
-    /// reserved slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `params` cannot be serialized.
-    pub(crate) fn outbound_notification<N>(params: N::Params) -> Result<OutboundNotification>
-    where
-        N: lsp_types::Notification,
-    {
-        let params = Self::omit_null_params(serde_json::to_value(params)?);
-        Ok(OutboundNotification {
-            method: N::METHOD.as_str().to_owned(),
-            params,
-        })
-    }
-
-    /// Waits for room for one notification and reserves it.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ServerTerminated`](crate::error::Error::ServerTerminated) if
-    /// the server has shut down.
-    pub(crate) async fn reserve_notification(&self) -> Result<NotificationPermit<'_>> {
-        let permit = self
-            .command_tx
-            .reserve()
-            .await
-            .map_err(|_| crate::error::Error::ServerTerminated)?;
-        Ok(NotificationPermit(permit))
-    }
-
-    /// Waits for room for two notifications and reserves both, in send order.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ServerTerminated`](crate::error::Error::ServerTerminated) if
-    /// the server has shut down or its queue cannot hold two.
-    pub(crate) async fn reserve_notification_pair(
-        &self,
-    ) -> Result<(NotificationPermit<'_>, NotificationPermit<'_>)> {
-        let mut permits = self
-            .command_tx
-            .reserve_many(2)
-            .await
-            .map_err(|_| crate::error::Error::ServerTerminated)?;
-        match (permits.next(), permits.next()) {
-            (Some(first), Some(second)) => {
-                Ok((NotificationPermit(first), NotificationPermit(second)))
-            }
-            _ => Err(crate::error::Error::ServerTerminated),
-        }
-    }
-}
-
-/// A reserved slot on the command channel for one notification.
-///
-/// Reserving is the only part that can wait, and it is cancel-safe: nothing is
-/// sent until [`Self::send`], which is synchronous. A caller that must enqueue
-/// several notifications and record the outcome in one step reserves first.
-#[derive(Debug)]
-#[must_use = "a reserved slot does nothing until used"]
-pub struct NotificationPermit<'a>(mpsc::Permit<'a, ClientCommand>);
-
-impl NotificationPermit<'_> {
-    /// Enqueues `notification` on the reserved slot.
-    pub(crate) fn send(self, notification: OutboundNotification) {
-        self.0.send(ClientCommand::SendNotification {
-            method: notification.method,
-            params: notification.params,
-        });
-    }
-}
-
-/// A notification encoded and ready to enqueue.
-#[derive(Debug)]
-pub struct OutboundNotification {
-    method: String,
-    params: Option<Value>,
 }
 
 #[cfg(test)]
@@ -351,9 +271,11 @@ mod tests {
 
     use serde_json::json;
     use tokio::io::BufReader;
+    use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tracing_subscriber::prelude::*;
 
+    use super::super::ClientCommand;
     use super::*;
     use crate::config::LspServerConfig;
     use crate::error::Error;
@@ -671,15 +593,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn nothing_is_cancelled_once_the_shutdown_request_was_issued() {
+    async fn nothing_is_cancelled_once_cancels_are_suppressed() {
         let (client, mut server) = fake_lsp_client();
         let mut reader = BufReader::new(&mut server.write_stdout);
 
-        let shutdown = spawn_request(&client, "shutdown");
+        client.suppress_cancels();
+        let stalled = spawn_request(&client, "textDocument/references");
         let request = read_framed_message(&mut reader).await;
-        assert_eq!(request["method"], "shutdown");
+        assert_eq!(request["method"], "textDocument/references");
         tokio::time::advance(TIMEOUT + Duration::from_secs(1)).await;
-        assert_matches!(shutdown.await.unwrap(), Err(Error::Timeout(_)));
+        assert_matches!(stalled.await.unwrap(), Err(Error::Timeout(_)));
 
         let hover = spawn_request(&client, "textDocument/hover");
         let hover_request = read_framed_message(&mut reader).await;
@@ -711,38 +634,5 @@ mod tests {
         drop_task(blocked).await;
         drop_task(filler).await;
         assert!(client.pending_requests.no_waiting());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_reserved_pair_sends_both_in_order() {
-        let (command_tx, mut command_rx) = mpsc::channel(2);
-        let client = LspClient {
-            command_tx,
-            ..LspClient::new(LspServerConfig::rust_analyzer())
-        };
-        let (first, second) = client.reserve_notification_pair().await.unwrap();
-        let one = LspClient::outbound_notification::<lsp_types::ExitNotification>(()).unwrap();
-        let two = LspClient::outbound_notification::<lsp_types::ExitNotification>(()).unwrap();
-        first.send(one);
-        second.send(two);
-        for _ in 0..2 {
-            assert_matches!(
-                command_rx.recv().await,
-                Some(ClientCommand::SendNotification { method, .. }) if method == "exit"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_pair_does_not_fit_a_queue_of_one() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let client = LspClient {
-            command_tx,
-            ..LspClient::new(LspServerConfig::rust_analyzer())
-        };
-        assert_matches!(
-            client.reserve_notification_pair().await,
-            Err(Error::ServerTerminated)
-        );
     }
 }

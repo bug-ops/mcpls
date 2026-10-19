@@ -2113,7 +2113,7 @@ mod tests {
         let mut budget = ItemBudget::with_cap(3);
         assert_eq!(budget.admit_iter(0..), [0, 1, 2]);
         assert!(budget.truncated());
-        assert!(budget.admit_iter(0..2).is_empty());
+        assert_eq!(budget.admit_iter(0..2).len(), 0);
     }
 
     #[test]

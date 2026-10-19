@@ -1064,13 +1064,13 @@ impl Translator {
         // leaving the tracker desynced from that server (#495 S5).
         let result = self
             .document_tracker
-            .ensure_open(OpenRequest {
-                path: validated_path,
-                roots: &self.workspace_roots,
-                server: &server_id,
-                client: &client,
+            .ensure_open(OpenRequest::new(
+                validated_path,
+                &self.workspace_roots,
+                &server_id,
+                &client,
                 access,
-            })
+            ))
             .await;
         self.flush_pending_closes().await;
         let uri = result?;
@@ -1320,7 +1320,8 @@ impl Translator {
                 let Some(mut claim) = self.document_tracker.try_claim_pending_close(&path) else {
                     continue;
                 };
-                for server_id in claim.servers.clone() {
+                let owed: Vec<ServerId> = claim.servers().cloned().collect();
+                for server_id in owed {
                     let Some(client) = lock_std(&self.servers).client(&server_id) else {
                         claim.settle(&server_id);
                         continue;
@@ -1565,7 +1566,7 @@ mod tests {
         LspServerConfig {
             language_id: LanguageId::new(language).unwrap(),
             command: ServerCommand::from_static("sh").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
@@ -2126,7 +2127,7 @@ mod tests {
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
             command: ServerCommand::from_static("typescript-language-server").into(),
-            args: vec!["--stdio".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![FilePattern::from_static("**/*.tsx")],
             initialization_options: None,
@@ -2429,7 +2430,7 @@ mod tests {
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
             command: ServerCommand::from_static("typescript-language-server").into(),
-            args: vec!["--stdio".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![
                 FilePattern::from_static("**/*.js"),
@@ -2809,11 +2810,12 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(100), read_framed_message(&mut wire))
                 .await
                 .is_ok();
-        let owed = tracker
+        let owed: Vec<ServerId> = tracker
             .try_claim_pending_close(&path)
             .unwrap()
-            .servers
-            .clone();
+            .servers()
+            .cloned()
+            .collect();
         assert!(
             owed.contains(&d),
             "the close nobody delivered must stay owed"
@@ -3124,7 +3126,7 @@ mod tests {
         let pyright = LspServerConfig {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

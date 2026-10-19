@@ -36,7 +36,7 @@ use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
-use crate::lsp::vetting::UntrustedBoundary;
+use crate::lsp::vetting::UntrustedVetting;
 use crate::lsp::{
     CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
     process_env, tsserver_pin,
@@ -232,15 +232,35 @@ pub enum ChildWorkingDir {
     Fixed(PathBuf),
 }
 
-/// A tsserver pin mcpls chose, as opposed to one the user configured.
-///
-/// Remembered so a respawn can tell a pin that went stale (the install moved)
-/// from the user's own `tsserver.path`, which is never second-guessed.
+/// Whether a server belongs to an untrusted workspace, and if so what it was
+/// vetted against.
+#[derive(Debug, Clone, Default)]
+enum SpawnTrust {
+    #[default]
+    Trusted,
+    /// The boundary the argument backstop and the tsserver pin are evaluated
+    /// against again before every spawn, and the command as configured.
+    Untrusted(UntrustedVetting),
+}
+
+/// A [`ServerInitConfig`] that [`ServerInitConfig::for_respawn`] vetted, so a
+/// respawn spawns exactly what was checked and does not check it again.
 #[derive(Debug, Clone)]
-struct AutoPin {
-    tsserver: PathBuf,
-    /// What untrusted mode vetted the pin against, if it is on.
-    vetting: Option<tsserver_pin::UntrustedVetting>,
+pub struct VettedInitConfig(ServerInitConfig);
+
+impl VettedInitConfig {
+    /// The vetted config.
+    pub(crate) fn into_inner(self) -> ServerInitConfig {
+        self.0
+    }
+}
+
+impl std::ops::Deref for VettedInitConfig {
+    type Target = ServerInitConfig;
+
+    fn deref(&self) -> &ServerInitConfig {
+        &self.0
+    }
 }
 
 /// Configuration for LSP server initialization.
@@ -255,10 +275,11 @@ pub struct ServerInitConfig {
     position_encodings: PositionEncodings,
     redactions: Arc<Redactions>,
     child_working_dir: ChildWorkingDir,
-    auto_pin: Option<AutoPin>,
-    /// Set in untrusted-workspace mode: the boundary the argument backstop is
-    /// evaluated against again before every spawn.
-    untrusted: Option<UntrustedBoundary>,
+    /// The tsserver pin mcpls chose, as opposed to one the user configured, so
+    /// a respawn can tell a pin that went stale (the install moved) from the
+    /// user's own `tsserver.path`, which is never second-guessed.
+    auto_pin: Option<PathBuf>,
+    trust: SpawnTrust,
 }
 
 impl ServerInitConfig {
@@ -309,15 +330,16 @@ impl ServerInitConfig {
             redactions,
             child_working_dir: ChildWorkingDir::Inherit,
             auto_pin: None,
-            untrusted: None,
+            trust: SpawnTrust::Trusted,
         }
     }
 
     /// This config marked as an untrusted-workspace server whose arguments
-    /// must keep clear of `boundary` (see [`Self::vet_arguments`]).
+    /// must keep clear of the boundary `vetting` holds (see
+    /// [`Self::vet_arguments`]).
     #[must_use]
-    pub(crate) fn with_untrusted_boundary(mut self, boundary: WorkspaceRoots) -> Self {
-        self.untrusted = Some(UntrustedBoundary::new(boundary));
+    pub(crate) fn with_untrusted(mut self, vetting: UntrustedVetting) -> Self {
+        self.trust = SpawnTrust::Untrusted(vetting);
         self
     }
 
@@ -334,10 +356,11 @@ impl ServerInitConfig {
     /// [`Error::ServerFailedToStart`] with the untrusted-mode refusal when an
     /// argument now names an executable inside the workspace.
     pub(crate) fn vet_arguments(&self) -> Result<()> {
-        let Some(boundary) = &self.untrusted else {
+        let SpawnTrust::Untrusted(vetting) = &self.trust else {
             return Ok(());
         };
-        boundary
+        vetting
+            .boundary()
             .refuse_arguments(
                 &self.server_config.args,
                 &self.child_working_dir,
@@ -349,7 +372,7 @@ impl ServerInitConfig {
     /// [`Self::vet_arguments`] on the blocking pool, skipped for a trusted
     /// config.
     pub(crate) async fn vet_arguments_off_runtime(&self) -> Result<()> {
-        if self.untrusted.is_none() {
+        if matches!(self.trust, SpawnTrust::Trusted) {
             return Ok(());
         }
         self.on_planning_pool(Self::vet_arguments).await
@@ -369,15 +392,10 @@ impl ServerInitConfig {
             })?
     }
 
-    /// This config with `tsserver` recorded as the pin mcpls chose, vetted
-    /// as `vetting` says in untrusted-workspace mode.
+    /// This config with `tsserver` recorded as the pin mcpls chose.
     #[must_use]
-    pub(crate) fn with_auto_pin(
-        mut self,
-        tsserver: PathBuf,
-        vetting: Option<tsserver_pin::UntrustedVetting>,
-    ) -> Self {
-        self.auto_pin = Some(AutoPin { tsserver, vetting });
+    pub(crate) fn with_auto_pin(mut self, tsserver: PathBuf) -> Self {
+        self.auto_pin = Some(tsserver);
         self
     }
 
@@ -453,9 +471,10 @@ impl ServerInitConfig {
 
     /// The config a respawn of this server spawns from.
     ///
-    /// Called by every respawn right before it spawns, and by a restart before
-    /// it stops the running server; the filesystem work runs on the blocking
-    /// pool and only for an auto-pinned or untrusted server.
+    /// Called by a restart before it stops the running server and by every
+    /// other respawn right before it spawns; the filesystem work runs on the
+    /// blocking pool and only for an auto-pinned or untrusted server. The
+    /// result is what the respawn spawns, so it is vetted once.
     ///
     /// In untrusted mode the argument backstop runs again
     /// ([`Self::vet_arguments`]). A tsserver pin mcpls chose whose canonical
@@ -471,41 +490,37 @@ impl ServerInitConfig {
     /// launched in a way no tsserver can be pinned for (the same two checks
     /// startup makes), or an argument now names an executable inside the
     /// workspace.
-    pub(crate) async fn for_respawn(&self) -> Result<Self> {
-        if self.auto_pin.is_none() && self.untrusted.is_none() {
-            return Ok(self.clone());
+    pub(crate) async fn for_respawn(&self) -> Result<VettedInitConfig> {
+        if self.auto_pin.is_none() && matches!(self.trust, SpawnTrust::Trusted) {
+            return Ok(VettedInitConfig(self.clone()));
         }
         self.on_planning_pool(Self::plan_respawn).await
     }
 
     /// The blocking half of [`Self::for_respawn`]: canonicalizes the pin and
     /// re-plans the tsserver, so it runs on the blocking pool.
-    pub(crate) fn plan_respawn(&self) -> Result<Self> {
+    pub(crate) fn plan_respawn(&self) -> Result<VettedInitConfig> {
         self.vet_arguments()?;
-        let Some(pin) = self
+        let pin_is_current = self
             .auto_pin
             .as_ref()
-            .filter(|pin| dunce::canonicalize(&pin.tsserver).ok().as_ref() != Some(&pin.tsserver))
-        else {
-            return Ok(self.clone());
-        };
+            .is_none_or(|pin| dunce::canonicalize(pin).ok().as_ref() == Some(pin));
+        if pin_is_current {
+            return Ok(VettedInitConfig(self.clone()));
+        }
         let mut unpinned = self.server_config.clone();
         unpinned.initialization_options = None;
         let plan = tsserver_pin::plan_typescript(unpinned, process_env);
-        if let Some(vetting) = &pin.vetting {
+        if let SpawnTrust::Untrusted(vetting) = &self.trust {
             plan.vet_untrusted(vetting)
                 .map_err(|refusal| self.refusal(refusal))?;
         }
-        let (server_config, tsserver) = plan.apply(&self.workspace_roots);
-        let auto_pin = tsserver.map(|tsserver| AutoPin {
-            tsserver,
-            vetting: pin.vetting.clone(),
-        });
-        Ok(Self {
+        let (server_config, auto_pin) = plan.apply(&self.workspace_roots);
+        Ok(VettedInitConfig(Self {
             server_config,
             auto_pin,
             ..self.clone()
-        })
+        }))
     }
 
     fn refusal(&self, refusal: UntrustedRefusal) -> Error {
@@ -642,6 +657,7 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<SpawnedServer> {
+        // Repeated on purpose: a workspace file can become executable between plan and spawn (#736).
         config.vet_arguments_off_runtime().await?;
         let own = Redactions::for_server(config.server_config(), current_environment());
         let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));
@@ -1257,6 +1273,7 @@ impl LspServer {
         let shutdown_request_timeout = Duration::from_secs(5).min(budget);
 
         let handshake: Result<MarkOutcome> = timeout_at(deadline, async {
+            client.suppress_cancels();
             let _: serde_json::Value = client
                 .request(
                     ShutdownRequest::METHOD.as_str(),
@@ -1851,13 +1868,14 @@ mod tests {
         env.insert(
             crate::config::EnvKey::from_static("PYTHONPATH"),
             crate::config::EnvValue::from_static("/usr/lib"),
-        );
+        )
+        .unwrap();
 
         let config = ServerInitConfig::new(
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pyright-langserver").into(),
-                args: vec!["--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
                 env,
                 file_patterns: vec![FilePattern::from_static("**/*.py")],
                 initialization_options: Some(init_opts),
@@ -2267,14 +2285,22 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"seen=$OTHER_VALUE own=$API_TOKEN\" >&2\nexit 1\n",
         );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("OTHER_VALUE"),
-            crate::config::EnvValue::from_static("bravo-secret-222"),
-        );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("API_TOKEN"),
-            crate::config::EnvValue::from_static("s3cr3t-value"),
-        );
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("OTHER_VALUE"),
+                crate::config::EnvValue::from_static("bravo-secret-222"),
+            )
+            .unwrap();
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("API_TOKEN"),
+                crate::config::EnvValue::from_static("s3cr3t-value"),
+            )
+            .unwrap();
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
             "bravo-secret-222".to_owned(),
@@ -2296,14 +2322,22 @@ echo 'fatal: bad toolchain' >&2
             dir.path(),
             "echo \"token=$API_TOKEN toolchain=$RUSTUP_TOOLCHAIN\" >&2\nexit 1\n",
         );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
-            crate::config::EnvValue::from_static("nightly-2024-01-01"),
-        );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("API_TOKEN"),
-            crate::config::EnvValue::from_static("s3cr3t-value"),
-        );
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
+                crate::config::EnvValue::from_static("nightly-2024-01-01"),
+            )
+            .unwrap();
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("API_TOKEN"),
+                crate::config::EnvValue::from_static("s3cr3t-value"),
+            )
+            .unwrap();
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2320,7 +2354,7 @@ echo 'fatal: bad toolchain' >&2
         use crate::test_lsp::CapturedLogs;
 
         let mut config = LspServerConfig::rust_analyzer();
-        config.args = vec!["--api-key=SuperSecretArg456".to_string()];
+        config.args = crate::config::ServerArgs::new(["--api-key=SuperSecretArg456"]).unwrap();
         let redactions = Redactions::for_server(&config, std::iter::empty());
         let logs = CapturedLogs::default();
         let info_only = tracing_subscriber::registry()
@@ -2381,14 +2415,23 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
+        config.server_config.args = crate::config::ServerArgs::new(
+            config
+                .server_config
+                .args
+                .iter()
+                .cloned()
+                .chain(["--api-key=SuperSecretArg456".to_string()]),
+        )
+        .unwrap();
         config
             .server_config
-            .args
-            .push("--api-key=SuperSecretArg456".to_string());
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("API_TOKEN"),
-            crate::config::EnvValue::from_static("SuperSecretValue123"),
-        );
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("API_TOKEN"),
+                crate::config::EnvValue::from_static("SuperSecretValue123"),
+            )
+            .unwrap();
 
         let SpawnedServer {
             server: _server,
@@ -2425,10 +2468,14 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("API_TOKEN"),
-            crate::config::EnvValue::from_static("SuperSecretValue123"),
-        );
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("API_TOKEN"),
+                crate::config::EnvValue::from_static("SuperSecretValue123"),
+            )
+            .unwrap();
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2449,10 +2496,14 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config.server_config.env.insert(
-            crate::config::EnvKey::from_static("API_TOKEN"),
-            crate::config::EnvValue::from_static("SuperSecretValue123"),
-        );
+        config
+            .server_config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("API_TOKEN"),
+                crate::config::EnvValue::from_static("SuperSecretValue123"),
+            )
+            .unwrap();
 
         let err = LspServer::spawn(config).await.unwrap_err();
 
@@ -2854,7 +2905,7 @@ sleep 5
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::from_entries(env, HostOs::CURRENT).unwrap(),
             file_patterns: vec![],
             initialization_options: None,
@@ -3002,7 +3053,7 @@ sleep 5
             PositionEncodings::DEFAULT,
             std::sync::Arc::default(),
         )
-        .with_auto_pin(PathBuf::from("/mcpls-test/stale/tsserver.js"), None);
+        .with_auto_pin(PathBuf::from("/mcpls-test/stale/tsserver.js"));
 
         let respawn = config.for_respawn().await.unwrap();
 
@@ -3020,14 +3071,16 @@ sleep 5
         let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let mut server_config = LspServerConfig::rust_analyzer();
         server_config.command = ServerCommand::from_static("mcpls-test-no-such-server").into();
-        server_config.args = vec![tool.to_string_lossy().into_owned()];
+        server_config.args =
+            crate::config::ServerArgs::new([tool.to_string_lossy().into_owned()]).unwrap();
+        let command = server_config.command.server_command().clone();
         let init = ServerInitConfig::new(
             server_config,
             roots.clone(),
             PositionEncodings::DEFAULT,
             std::sync::Arc::default(),
         )
-        .with_untrusted_boundary(roots);
+        .with_untrusted(UntrustedVetting::new(roots, command));
         (dir, tool, init)
     }
 
@@ -3099,6 +3152,43 @@ sleep 5
         trusted.for_respawn().await.unwrap();
     }
 
+    /// The `shutdown` result is `null` by the specification; a server that
+    /// answers with another value still gets the `exit` that follows.
+    #[tokio::test(start_paused = true)]
+    async fn test_terminate_sends_exit_after_a_shutdown_answer_that_is_not_null() {
+        use tokio::io::BufReader;
+
+        use crate::test_lsp::{fake_lsp_client, read_framed_message, write_response};
+
+        let (client, mut fake) = fake_lsp_client();
+        let mut server = LspServer {
+            client,
+            capabilities: lsp_types::ServerCapabilities::default(),
+            position_encoding: PositionEncodingKind::UTF8,
+            child: None,
+            init_config: crate::test_lsp::init_config_for(LspServerConfig::rust_analyzer()),
+        };
+        let terminating = tokio::spawn(async move {
+            server
+                .terminate(SHUTDOWN_TIMEOUT, ExitGrace::WithinBudget)
+                .await
+        });
+        let mut wire = BufReader::new(&mut fake.write_stdout);
+
+        let request = read_framed_message(&mut wire).await;
+        assert_eq!(request["method"], "shutdown");
+        write_response(
+            &mut fake.read_half_stdin,
+            &request["id"],
+            serde_json::json!({}),
+        )
+        .await;
+        let exit = read_framed_message(&mut wire).await;
+
+        assert_eq!(exit["method"], "exit");
+        assert_matches!(terminating.await.unwrap(), Ok(()));
+    }
+
     /// Regression test for #247: `LspServerConfig::env` entries must reach
     /// the spawned child (previously dead configuration).
     #[test]
@@ -3158,7 +3248,7 @@ sleep 5
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pyright-langserver").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
@@ -3173,7 +3263,7 @@ sleep 5
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pylsp").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,

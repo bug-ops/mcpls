@@ -13,7 +13,7 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
-use super::positioned::document_request;
+use super::positioned::{budgeted, document_request};
 use super::routing::{
     Capability, FileLocalCapability, IndexingGate, PreparedDocument, WorkspaceRouteLookup,
     lookup_workspace_route,
@@ -302,9 +302,7 @@ impl Translator {
             partial_result_params: PartialResultParams::default(),
         };
 
-        let response = client
-            .request_typed::<lsp_types::WorkspaceSymbolRequest>(params, client.request_timeout())
-            .await?;
+        let response = budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params).await?;
 
         let ctx = self.encoding_ctx(&server_id);
 
@@ -591,7 +589,7 @@ mod tests {
         let configs = vec![crate::config::LspServerConfig {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

@@ -68,7 +68,12 @@ pub use addressing::{
     ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
-pub use diagnostics::{Interest, SweepMemo, SweepStep};
+#[cfg(test)]
+pub use diagnostics::MAX_FAILED_PULLS_PER_STATE;
+pub use diagnostics::{
+    Interest, MAX_COMPANION_FILES, MAX_SWEPT_FILES_PER_TICK, SWEEP_INTERVAL, SweepContext,
+    SweepMemo,
+};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
@@ -1446,8 +1451,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(translator.document_tracker.len(), 1);
-        assert!(!translator.document_tracker.is_open(&path_a));
-        assert!(translator.document_tracker.is_open(&path_b));
+        assert_eq!(
+            translator.document_tracker.open_state(&path_a),
+            DocumentOpenState::NotOpen
+        );
+        assert_eq!(
+            translator.document_tracker.open_state(&path_b),
+            DocumentOpenState::Open
+        );
     }
 
     /// `with_resource_limits` called *after* `with_extensions` (the reverse
@@ -1495,7 +1506,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(translator.document_tracker.len(), 1);
-        assert!(!translator.document_tracker.is_open(&path_a));
+        assert_eq!(
+            translator.document_tracker.open_state(&path_a),
+            DocumentOpenState::NotOpen
+        );
 
         let state = translator.document_tracker.close(&path_b).unwrap();
         assert_eq!(

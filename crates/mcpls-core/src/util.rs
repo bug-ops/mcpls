@@ -119,6 +119,30 @@ pub enum OpenRegularFileError {
     NotRegular,
 }
 
+impl OpenRegularFileError {
+    /// The caller-facing error for a failed open of `path`.
+    ///
+    /// Windows refuses to open a directory without backup semantics, so a
+    /// `PermissionDenied` on a directory is [`crate::Error::NotARegularFile`],
+    /// as it is on other platforms.
+    pub(crate) fn into_error(self, path: &Path) -> crate::Error {
+        match self {
+            Self::Io(source)
+                if cfg!(windows)
+                    && source.kind() == std::io::ErrorKind::PermissionDenied
+                    && path.is_dir() =>
+            {
+                crate::Error::NotARegularFile(path.to_path_buf())
+            }
+            Self::Io(source) => crate::Error::FileIo {
+                path: path.to_path_buf(),
+                source,
+            },
+            Self::NotRegular => crate::Error::NotARegularFile(path.to_path_buf()),
+        }
+    }
+}
+
 /// Why [`RegularFile::read_bounded`] did not return the file's bytes.
 #[derive(thiserror::Error, Debug)]
 pub enum ReadBoundedError {
@@ -628,10 +652,9 @@ mod tests {
         assert_eq!(read_regular_file_bounded(&path, limit(2)).unwrap(), b"{}");
         let empty = dir.path().join("empty.json");
         std::fs::write(&empty, b"").unwrap();
-        assert!(
-            read_regular_file_bounded(&empty, limit(2))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_regular_file_bounded(&empty, limit(2)).unwrap().len(),
+            0
         );
     }
 

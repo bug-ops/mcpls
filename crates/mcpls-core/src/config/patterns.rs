@@ -63,15 +63,10 @@ impl InvalidProjectMarker {
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectMarker(Cow<'static, str>);
 
-const fn keep_project_marker_fault(_: &str, fault: InvalidProjectMarker) -> InvalidProjectMarker {
-    fault
-}
-
 impl_text_newtype!(
     ProjectMarker,
     InvalidProjectMarker,
     fault = InvalidProjectMarker::check,
-    explain = keep_project_marker_fault,
     "project marker"
 );
 

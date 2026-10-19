@@ -15,13 +15,13 @@ use super::dto::{
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
-use super::positioned::{Positioned, document_request};
+use super::positioned::{Positioned, budgeted, document_request};
 use super::routing::{Capability, FileLocalCapability, IndexingGate};
 use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
-use crate::error::{Error, ErrorChain, McpErrorKind, Result};
+use crate::error::{ErrorChain, Result, is_invalid_offset};
 use crate::escape_control;
-use crate::lsp::{JsonRpcError, LspClient, UnclassifiedError};
+use crate::lsp::{LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
 
 /// Convert a raw LSP `WorkspaceEdit` into MCP `DocumentChanges`.
@@ -287,12 +287,7 @@ async fn resolve_code_action(
     server_id: &ServerId,
     mut action: lsp_types::CodeAction,
 ) -> lsp_types::CodeAction {
-    let outcome = client
-        .request_typed::<lsp_types::CodeActionResolveRequest>(
-            action.clone(),
-            client.code_action_resolve_timeout(),
-        )
-        .await;
+    let outcome = budgeted::<lsp_types::CodeActionResolveRequest>(client, action.clone()).await;
     match outcome {
         Ok(resolved) => {
             if resolved.edit.is_some() {
@@ -477,17 +472,13 @@ fn prepare_rename_rejection(
     err: UnclassifiedError,
     redactions: &Redactions,
 ) -> Result<PrepareRenameOutcome> {
-    let (message, code) = match err.error() {
-        Error::LspServerError(JsonRpcError { code, message, .. })
-            if let Some(code) = not_renameable_code(*code)
-                && !matches!(
-                    err.error().mcp_error_kind(),
-                    McpErrorKind::InvalidPosition(_)
-                ) =>
-        {
-            (escape_control(message).into_owned(), code)
-        }
-        _ => return Err(err.surface()),
+    let rejection = err.server_error().and_then(|response| {
+        let code = not_renameable_code(response.code)?;
+        (!is_invalid_offset(response))
+            .then(|| (escape_control(&response.message).into_owned(), code))
+    });
+    let Some((message, code)) = rejection else {
+        return Err(err.surface());
     };
     drop(err.handled());
     if code == lsp_types::ErrorCodes::UnknownErrorCode {
@@ -564,7 +555,7 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an error if the position is invalid or its line lies beyond
-    /// the end of the document ([`Error::PositionBeyondDocument`]), the LSP
+    /// the end of the document ([`crate::Error::PositionBeyondDocument`]), the LSP
     /// request fails for a reason other than rejecting the position, the
     /// file cannot be opened, the routed server does not advertise rename
     /// preparation support (`renameProvider.prepareProvider`), or the server
@@ -662,7 +653,7 @@ impl Translator {
     ///
     /// Returns an error if the range is invalid (zero or oversized
     /// positions, start after end), a line lies beyond the end of the
-    /// document ([`Error::PositionBeyondDocument`]), the LSP request fails,
+    /// document ([`crate::Error::PositionBeyondDocument`]), the LSP request fails,
     /// the file cannot be opened, or the routed server does not advertise
     /// `documentRangeFormattingProvider` support.
     pub async fn handle_format_range(
@@ -797,6 +788,7 @@ mod tests {
     use crate::bridge::WorkspaceRoots;
     use crate::bridge::notifications::ReportedSeverity;
     use crate::bridge::translator::testing::*;
+    use crate::error::Error;
     use crate::test_lsp::client_path;
 
     /// S2/S4 regression: a `documentChanges` entry mixing a plain `TextEdit`

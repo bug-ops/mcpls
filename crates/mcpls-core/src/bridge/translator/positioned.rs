@@ -38,6 +38,44 @@ pub(super) trait RequestTimeout {
     }
 }
 
+impl RequestTimeout for lsp_types::WorkspaceSymbolParams {}
+
+impl RequestTimeout for lsp_types::CodeAction {
+    fn timeout(client: &LspClient) -> Duration {
+        client.code_action_resolve_timeout()
+    }
+}
+
+/// Sends the request `R` with the timeout its params carry.
+///
+/// # Errors
+///
+/// Returns an error if the LSP request fails.
+pub(super) async fn budgeted<R>(client: &LspClient, params: R::Params) -> Result<R::Result>
+where
+    R: lsp_types::Request,
+    R::Params: RequestTimeout,
+{
+    client
+        .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
+        .await
+}
+
+/// As [`budgeted`], but keeps the failure's classification for a caller that
+/// tells a server's rejection from an operational error.
+pub(super) async fn budgeted_classified<R>(
+    client: &LspClient,
+    params: R::Params,
+) -> std::result::Result<R::Result, UnclassifiedError>
+where
+    R: lsp_types::Request,
+    R::Params: RequestTimeout,
+{
+    client
+        .request_typed_classified::<R>(params, <R::Params as RequestTimeout>::timeout(client))
+        .await
+}
+
 /// LSP request params built from a resolved document position.
 ///
 /// Implemented once per position-taking request so [`Translator::position_request`]
@@ -261,24 +299,21 @@ impl FromDocument for DocumentFormattingParams {
     }
 }
 
-/// The params of the whole-document request `R` for `doc` and the timeout they
-/// carry: the one place both are decided for [`document_request`] and
-/// [`document_request_classified`].
-fn document_call<R>(
+/// The params of the whole-document request `R` for `doc`.
+fn document_params<R>(
     doc: &PreparedDocument,
     extra: <R::Params as FromDocument>::Extra,
-) -> (R::Params, Duration)
+) -> R::Params
 where
     R: lsp_types::Request,
     R::Params: FromDocument,
 {
-    let params = R::Params::from_document(
+    R::Params::from_document(
         TextDocumentIdentifier {
             uri: doc.uri().clone(),
         },
         extra,
-    );
-    (params, <R::Params as RequestTimeout>::timeout(doc.client()))
+    )
 }
 
 /// Sends the whole-document request `R` for `doc` with the timeout its params
@@ -295,8 +330,7 @@ where
     R: lsp_types::Request,
     R::Params: FromDocument,
 {
-    let (params, timeout) = document_call::<R>(doc, extra);
-    doc.client().request_typed::<R>(params, timeout).await
+    budgeted::<R>(doc.client(), document_params::<R>(doc, extra)).await
 }
 
 /// As [`document_request`], but keeps the failure's classification for a
@@ -309,10 +343,7 @@ where
     R: lsp_types::Request,
     R::Params: FromDocument,
 {
-    let (params, timeout) = document_call::<R>(doc, extra);
-    doc.client()
-        .request_typed_classified::<R>(params, timeout)
-        .await
+    budgeted_classified::<R>(doc.client(), document_params::<R>(doc, extra)).await
 }
 
 /// LSP request params built from a resolved document range.
@@ -507,10 +538,7 @@ where
     ///
     /// Returns an error if the LSP request fails.
     pub(super) async fn send(self) -> Result<Positioned<R::Result>> {
-        let client = self.doc.client();
-        let result = client
-            .request_typed::<R>(self.params, <R::Params as RequestTimeout>::timeout(client))
-            .await?;
+        let result = budgeted::<R>(self.doc.client(), self.params).await?;
         Ok(Positioned {
             result,
             ctx: self.ctx,
@@ -523,13 +551,7 @@ where
     pub(super) async fn send_classified(
         self,
     ) -> Positioned<std::result::Result<R::Result, UnclassifiedError>> {
-        let client = self.doc.client();
-        let result = client
-            .request_typed_classified::<R>(
-                self.params,
-                <R::Params as RequestTimeout>::timeout(client),
-            )
-            .await;
+        let result = budgeted_classified::<R>(self.doc.client(), self.params).await;
         Positioned {
             result,
             ctx: self.ctx,
@@ -577,9 +599,7 @@ impl<'a> DisclosedDocument<'a> {
     {
         let client = self.doc.client();
         let before = self.translator.sample_indexing(self.server_id()).await;
-        let result = client
-            .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
-            .await?;
+        let result = budgeted::<R>(client, params).await?;
         let after = self.translator.sample_indexing(self.server_id()).await;
         Ok(Indexed::new(result, before.union(after)))
     }
@@ -735,10 +755,7 @@ impl Translator {
         let (ctx, params) = self
             .ranged_params::<R::Params>(doc.server_id(), doc.uri(), range, extra)
             .await;
-        let client = doc.client();
-        let result = client
-            .request_typed::<R>(params, <R::Params as RequestTimeout>::timeout(client))
-            .await?;
+        let result = budgeted::<R>(doc.client(), params).await?;
         Ok(Positioned { result, ctx, doc })
     }
 
@@ -793,13 +810,7 @@ impl Translator {
             .await?;
         let ctx = self.encoding_ctx(doc.server_id());
         let lsp_item = hierarchy_item_to_lsp(item, doc.uri().clone(), &ctx).await;
-        let client = doc.client();
-        let result = client
-            .request_typed::<R>(
-                R::Params::from_item(lsp_item),
-                <R::Params as RequestTimeout>::timeout(client),
-            )
-            .await?;
+        let result = budgeted::<R>(doc.client(), R::Params::from_item(lsp_item)).await?;
         Ok(Positioned { result, ctx, doc })
     }
 }
@@ -973,6 +984,14 @@ mod tests {
         assert_eq!(
             <SignatureHelpParams as RequestTimeout>::timeout(&client),
             client.request_timeout()
+        );
+        assert_eq!(
+            <lsp_types::WorkspaceSymbolParams as RequestTimeout>::timeout(&client),
+            client.request_timeout()
+        );
+        assert_eq!(
+            <lsp_types::CodeAction as RequestTimeout>::timeout(&client),
+            client.code_action_resolve_timeout()
         );
     }
 }

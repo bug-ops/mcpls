@@ -17,7 +17,7 @@ use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsKey, DiagnosticsRole, NotificationCache, on_lifecycle};
 use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, Result};
-use crate::lsp::{LspClient, LspServer, ServerInitConfig, SpawnedServer};
+use crate::lsp::{LspClient, LspServer, ServerInitConfig, SpawnedServer, VettedInitConfig};
 use crate::util::lock_std;
 
 /// Tracks respawn attempts for one server, so [`Translator::respawn_if_dead`]
@@ -265,7 +265,7 @@ impl Translator {
         tracing::warn!("LSP server '{id}' has crashed, respawning");
         self.respawn_locked(
             id,
-            config,
+            RespawnConfig::Unvetted(config),
             BackoffPolicy::Honor,
             NotificationRouting::Discard,
         )
@@ -311,7 +311,7 @@ impl Translator {
     pub(super) async fn respawn_locked(
         &self,
         id: &ServerId,
-        config: ServerInitConfig,
+        config: RespawnConfig,
         backoff: BackoffPolicy,
         routing: NotificationRouting<'_>,
     ) -> Result<()> {
@@ -329,14 +329,17 @@ impl Translator {
         }
 
         let attempt = AttemptGuard::begin(self, id);
-        let config = config.for_respawn().await?;
+        let config = match config {
+            RespawnConfig::Unvetted(config) => config.for_respawn().await?,
+            RespawnConfig::Vetted(vetted) => vetted,
+        };
         let language_id = config.server_config().language_id.clone();
         let pinned_tsserver = config.pinned_tsserver();
 
         let SpawnedServer {
             server: new_server,
             lanes,
-        } = LspServer::spawn(config).await?;
+        } = LspServer::spawn(config.into_inner()).await?;
         let receivers = NotificationReceivers::new(lanes, pinned_tsserver);
 
         // The last await before the commit: a drop up to here kills the new
@@ -538,6 +541,16 @@ impl Drop for AttemptGuard<'_> {
             self.translator.record_respawn_failure(self.id);
         }
     }
+}
+
+/// The config [`Translator::respawn_locked`] spawns from, and whether it was
+/// vetted already.
+pub(super) enum RespawnConfig {
+    /// The config of a server that died; vetted right before the spawn.
+    Unvetted(ServerInitConfig),
+    /// A config a restart vetted before it stopped the old server, so the
+    /// respawn does not vet it again.
+    Vetted(VettedInitConfig),
 }
 
 /// Whether [`Translator::respawn_locked`] honours the crash-loop backoff.
@@ -1439,7 +1452,7 @@ sleep 1
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,
@@ -1454,7 +1467,7 @@ sleep 1
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,
@@ -1641,7 +1654,7 @@ sleep 1
             translator
                 .respawn_locked(
                     &id,
-                    config,
+                    RespawnConfig::Unvetted(config),
                     BackoffPolicy::Bypass,
                     NotificationRouting::Discard,
                 )

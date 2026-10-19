@@ -117,7 +117,7 @@ async fn spawn_rust_analyzer() -> SpawnedServer {
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::from_static("rust-analyzer").into(),
-        args: vec![],
+        args: mcpls_core::config::ServerArgs::default(),
         env: mcpls_core::config::ServerEnv::default(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,
@@ -1096,7 +1096,7 @@ async fn test_progress_notifications_arrive_on_lifecycle_lane() {
     let lsp_config = LspServerConfig {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::from_static("rust-analyzer").into(),
-        args: vec![],
+        args: mcpls_core::config::ServerArgs::default(),
         env: mcpls_core::config::ServerEnv::default(),
         file_patterns: vec![FilePattern::from_static("**/*.rs")],
         initialization_options: None,

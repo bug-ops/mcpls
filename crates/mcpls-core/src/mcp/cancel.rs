@@ -9,6 +9,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use rmcp::RoleServer;
+use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock};
 use rmcp::service::Peer;
 use tokio_util::sync::CancellationToken;
 
@@ -22,16 +23,28 @@ use tokio_util::sync::CancellationToken;
 pub(super) const PEER_CLOSE_POLL: Duration = Duration::from_millis(250);
 
 /// Why a handler was stopped before it finished. The text is what the log and
-/// the (never delivered) error carry.
+/// the placeholder response carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(super) enum CallStop {
     /// The client sent `notifications/cancelled`, or the serve loop was
     /// cancelled.
-    #[error("request cancelled")]
+    #[error("request cancelled (client cancellation or server shutdown)")]
     ClientCancelled,
     /// The connection ended.
     #[error("connection closed")]
     ConnectionClosed,
+}
+
+impl CallStop {
+    /// The tool-level error result that stands in for the call's response.
+    ///
+    /// rmcp discards it for a call the client cancelled and the transport is
+    /// gone when the connection closed; only a call still pending when the
+    /// serve loop is cancelled has it delivered, in place of a protocol error
+    /// that would be logged as a failure.
+    pub(super) fn into_response(self) -> CallToolResponse {
+        CallToolResult::error(vec![ContentBlock::text(self.to_string())]).into()
+    }
 }
 
 /// Resolves once `peer`'s transport has closed.

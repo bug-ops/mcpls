@@ -163,11 +163,14 @@ impl DocumentStamp {
         Self { opening, version }
     }
 
-    /// Whether `other` is a state of the same opening of the file, so that
-    /// a different version means the content changed rather than the file was
-    /// opened again.
-    pub(crate) fn same_opening(self, other: Self) -> bool {
-        self.opening.is_some() && self.opening == other.opening
+    /// The opening of the file this state belongs to, when known.
+    pub(crate) const fn opening(self) -> Option<Opening> {
+        self.opening
+    }
+
+    /// The document version of this state.
+    pub(crate) const fn version(self) -> DocumentVersion {
+        self.version
     }
 }
 
@@ -314,8 +317,8 @@ impl ChangeOutcome {
 /// What the document tracker says about the document a push is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentSync {
-    /// The server was last told this version of the document.
-    Synced(DocumentVersion),
+    /// The server was last told this opening and version of the document.
+    Synced(DocumentStamp),
     /// The document is not open for the server.
     NotOpen,
     /// No tracker is attached, so there is nothing to compare with.
@@ -336,12 +339,12 @@ pub enum DocumentSync {
 ///
 /// Without a tracker ([`DocumentSync::Unattached`]) only a newer version counts.
 fn pull_is_superseded(
-    pulled: DocumentVersion,
+    pulled: DocumentStamp,
     pushed: Option<DocumentVersion>,
     sync: DocumentSync,
 ) -> bool {
     match (pushed, sync) {
-        (Some(pushed), _) if pushed > pulled => true,
+        (Some(pushed), _) if pushed > pulled.version() => true,
         (_, DocumentSync::Unattached) => false,
         (_, DocumentSync::NotOpen) => true,
         (_, DocumentSync::Synced(current)) => current != pulled,
@@ -424,11 +427,10 @@ enum Origin {
     Pulled {
         /// Orders the pulls of the file's pulled slot.
         ticket: PullTicket,
-        /// The tracked opening of the document when the report was stored, or
-        /// `None` without a tracker or an open document.
-        opening: Option<Opening>,
-        /// Document version the pull was requested at.
-        version: DocumentVersion,
+        /// The document state the pull answers: the tracked opening when the
+        /// report was stored (`None` without a tracker or an open document)
+        /// and the version the pull was requested at.
+        state: DocumentStamp,
     },
 }
 
@@ -437,7 +439,7 @@ impl Origin {
     const fn version(&self) -> Option<DocumentVersion> {
         match self {
             Self::Pushed { version, .. } => *version,
-            Self::Pulled { version, .. } => Some(*version),
+            Self::Pulled { state, .. } => Some(state.version()),
         }
     }
 
@@ -1504,19 +1506,12 @@ impl NotificationCache {
         let Some(entry) = self.entries.get(&slot) else {
             return;
         };
-        let Origin::Pulled {
-            opening: pulled_opening,
-            version: pulled,
-            ..
-        } = entry.origin
-        else {
+        let Origin::Pulled { state: pulled, .. } = entry.origin else {
             return;
         };
         let owner = entry.owner.clone();
         let sync = self.document_sync(&owner, canonical);
-        let reopened =
-            self.documents.is_some() && pulled_opening != self.document_opening(canonical);
-        if reopened || pull_is_superseded(pulled, pushed_version, sync) {
+        if pull_is_superseded(pulled, pushed_version, sync) {
             debug!(
                 "dropping the pulled diagnostics of {}: superseded by a push \
                  (pulled {pulled:?}, pushed {pushed_version:?}, {sync:?})",
@@ -1536,9 +1531,7 @@ impl NotificationCache {
             .entries
             .get(&SlotKey::pulled(DiagnosticsKey::of(file)))?;
         match entry.origin {
-            Origin::Pulled {
-                opening, version, ..
-            } if entry.owner == *server => Some(DocumentStamp::new(opening, version)),
+            Origin::Pulled { state, .. } if entry.owner == *server => Some(state),
             Origin::Pulled { .. } | Origin::Pushed { .. } => None,
         }
     }
@@ -1557,7 +1550,7 @@ impl NotificationCache {
             return DocumentSync::Unattached;
         };
         uri_to_path(canonical)
-            .and_then(|path| documents.synced_version(&path, owner))
+            .and_then(|path| documents.stamp(&path, owner))
             .map_or(DocumentSync::NotOpen, DocumentSync::Synced)
     }
 
@@ -1650,14 +1643,10 @@ impl NotificationCache {
             return discard(Discard::OlderTicket, items);
         }
 
-        let opening = self.document_opening(file);
+        let state = DocumentStamp::new(self.document_opening(file), stamp.version);
         let same_state = self.entries.get(&slot_key).is_some_and(|entry| {
             entry.diagnostics == items.as_slice()
-                && matches!(
-                    entry.origin,
-                    Origin::Pulled { opening: stored, version, .. }
-                        if stored == opening && version == stamp.version
-                )
+                && matches!(entry.origin, Origin::Pulled { state: stored, .. } if stored == state)
         });
         let gained = self.coverage_gained(&slot_key);
         let slot = if same_state && gained.is_empty() {
@@ -1693,8 +1682,7 @@ impl NotificationCache {
                 seq,
                 origin: Origin::Pulled {
                     ticket: stamp.ticket,
-                    opening,
-                    version: stamp.version,
+                    state,
                 },
             },
         );
@@ -1810,10 +1798,7 @@ impl NotificationCache {
         let Some(pulled) = self.entries.get(slot) else {
             return Vec::new();
         };
-        let Origin::Pulled {
-            opening, version, ..
-        } = &pulled.origin
-        else {
+        let Origin::Pulled { state, .. } = &pulled.origin else {
             return Vec::new();
         };
         let Some(members) = self.files.get(&slot.uri) else {
@@ -1834,8 +1819,8 @@ impl NotificationCache {
                     return None;
                 };
                 let same_state = entry.owner == pulled.owner
-                    && entry.origin.version() == Some(*version)
-                    && pushed_opening.is_none_or(|pushed| Some(pushed) == *opening);
+                    && entry.origin.version() == Some(state.version())
+                    && pushed_opening.is_none_or(|pushed| Some(pushed) == state.opening());
                 if !same_state {
                     return None;
                 }
@@ -1896,9 +1881,8 @@ impl NotificationCache {
         let DocumentSync::Synced(synced) = self.document_sync(&entry.owner, requested) else {
             return Freshness::Current;
         };
-        let current_opening = self.document_opening(requested);
-        let same_opening = opening.is_none_or(|opening| Some(opening) == current_opening);
-        if same_opening && version == synced {
+        let same_opening = opening.is_none_or(|opening| Some(opening) == synced.opening());
+        if same_opening && version == synced.version() {
             return Freshness::Current;
         }
         let answered_at_synced_state =
@@ -1906,11 +1890,7 @@ impl NotificationCache {
                 .get(&SlotKey::pulled(key.clone()))
                 .is_some_and(|pulled| {
                     pulled.owner == entry.owner
-                        && matches!(
-                            pulled.origin,
-                            Origin::Pulled { opening: pulled_opening, version: pulled_version, .. }
-                                if pulled_version == synced && pulled_opening == current_opening
-                        )
+                        && matches!(pulled.origin, Origin::Pulled { state, .. } if state == synced)
                 });
         if !answered_at_synced_state {
             return Freshness::Current;
@@ -4172,7 +4152,7 @@ mod tests {
         assert_eq!(messages(&merged(&cache).unwrap()), ["e1", "e2"]);
 
         cache.store_published_diagnostics(&server, &published("alias.rs"), None, vec![]);
-        assert!(merged(&cache).unwrap().diagnostics.is_empty());
+        assert_eq!(merged(&cache).unwrap().diagnostics.len(), 0);
     }
 
     #[test]
@@ -4777,13 +4757,12 @@ mod tests {
     #[test]
     fn test_a_push_that_needs_no_room_reports_no_eviction() {
         let mut cache = full_cache(false);
-        assert!(
-            write_error(&mut cache, "file:///first.rs")
-                .evicted()
-                .is_empty()
+        assert_eq!(
+            write_error(&mut cache, "file:///first.rs").evicted().len(),
+            0
         );
         let mut roomy = NotificationCache::new();
-        assert!(write_error(&mut roomy, "file:///a.rs").evicted().is_empty());
+        assert_eq!(write_error(&mut roomy, "file:///a.rs").evicted().len(), 0);
     }
 
     fn route() -> ServerId {

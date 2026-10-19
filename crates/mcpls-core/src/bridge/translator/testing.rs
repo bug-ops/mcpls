@@ -255,7 +255,10 @@ mod sh_servers {
             LspServerConfig {
                 language_id: LanguageId::new(id).unwrap(),
                 command: ServerCommand::from_static("sh").into(),
-                args: vec![script.to_string_lossy().to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    script.to_string_lossy().to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,

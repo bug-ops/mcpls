@@ -17,6 +17,9 @@
 /// `fn(&str, F) -> $err` that turns it into the error. One rule table serves
 /// both `from_static` and `new`, so they cannot disagree.
 ///
+/// The `fault` form without `explain` is for a type whose error is the fault
+/// itself: `$fault` is a `const fn(&str) -> Option<$err>`.
+///
 /// The `@impl` form is the shared tail for a generic type, taking its generic
 /// parameters in brackets.
 macro_rules! impl_text_newtype {
@@ -98,6 +101,15 @@ macro_rules! impl_text_newtype {
 
         impl_text_newtype!(@impl [] $ty, $err);
     };
+    ($ty:ident, $err:ident, fault = $fault:path, $what:literal) => {
+        impl_text_newtype!(
+            $ty,
+            $err,
+            fault = $fault,
+            explain = $crate::config::text_newtype::keep_fault,
+            $what
+        );
+    };
     ($ty:ident, $err:ty) => {
         impl_text_newtype!(@impl [] $ty, $err);
     };
@@ -165,3 +177,21 @@ macro_rules! impl_text_newtype {
 }
 
 pub(crate) use impl_text_newtype;
+
+/// The `explain` of a type whose error is the fault itself.
+pub const fn keep_fault<F>(_: &str, fault: F) -> F {
+    fault
+}
+
+/// Whether `text` holds a NUL, which the operating system cannot pass in a
+/// path, argument or environment variable.
+pub const fn contains_nul(text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    while let [byte, tail @ ..] = rest {
+        if *byte == 0 {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}

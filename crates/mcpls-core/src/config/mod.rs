@@ -15,6 +15,7 @@ mod patterns;
 mod position_encodings;
 mod routing;
 mod server;
+mod server_args;
 mod server_env;
 mod settings;
 pub(crate) mod text_newtype;
@@ -51,9 +52,10 @@ pub use server::{
     BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
     ServerCommand, ServerHeuristics, ServerSelection,
 };
+pub use server_args::{InvalidServerArgs, ServerArgs};
 pub use server_env::{
     DuplicateEnvKey, EnvKey, EnvTooLarge, EnvValue, InvalidEnvKey, InvalidEnvValue,
-    MAX_ENV_ENTRY_BYTES, MAX_ENV_TOTAL_BYTES, ServerEnv,
+    InvalidServerEnv, MAX_ENV_TOTAL_BYTES, ServerEnv,
 };
 pub use settings::{InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
@@ -1081,12 +1083,11 @@ impl ServerConfig {
     /// [`load_from`](Self::load_from)) uses
     /// [`RelativeRootBase::ConfigDir`], preserving #345's original behavior.
     fn load_from_with_root_base(path: &Path, relative_root_base: RelativeRootBase) -> Result<Self> {
-        let file = RegularFile::open(path).map_err(|e| match e {
+        let file = RegularFile::open(path).map_err(|error| match error {
             OpenRegularFileError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Error::ConfigNotFound(path.to_path_buf())
             }
-            OpenRegularFileError::Io(e) => Error::Io(e),
-            OpenRegularFileError::NotRegular => Error::NotARegularFile(path.to_path_buf()),
+            other => other.into_error(path),
         })?;
         let buf = file
             .read_bounded(MAX_CONFIG_FILE_BYTES)
@@ -2415,7 +2416,7 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("cpp"),
                 command: ServerCommand::from_static("clangd").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.c"),
@@ -2447,7 +2448,11 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("typescript"),
                 command: ServerCommand::from_static("tsgo").into(),
-                args: vec!["--lsp".to_string(), "--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    "--lsp".to_string(),
+                    "--stdio".to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.ts"),
@@ -2479,7 +2484,7 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("javascript"),
                 command: ServerCommand::from_static("typescript-language-server").into(),
-                args: vec!["--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.js"),

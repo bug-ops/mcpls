@@ -166,6 +166,16 @@ pub async fn read_framed_message(reader: &mut BufReader<&mut DuplexStream>) -> V
         .expect("timed out waiting for a complete framed JSON-RPC message")
 }
 
+/// As [`read_framed_message`], but waits as long as the next frame takes, for a
+/// scripted server that sits idle between requests.
+///
+/// # Panics
+///
+/// Panics if the stream reaches EOF before a complete frame is read.
+pub async fn next_framed_message(reader: &mut BufReader<&mut DuplexStream>) -> Value {
+    read_framed_message_inner(reader).await
+}
+
 async fn read_framed_message_inner(reader: &mut BufReader<&mut DuplexStream>) -> Value {
     let mut content_length = None;
     let mut line = String::new();
@@ -355,7 +365,8 @@ pub fn sh_script_init_config(dir: &std::path::Path, script_body: &str) -> Server
     std::fs::write(&script, script_body).unwrap();
     let mut server_config = LspServerConfig::rust_analyzer();
     server_config.command = ServerCommand::from_static("sh").into();
-    server_config.args = vec![script.to_string_lossy().to_string()];
+    server_config.args =
+        crate::config::ServerArgs::new([script.to_string_lossy().to_string()]).unwrap();
     init_config_for(server_config)
 }
 
@@ -693,7 +704,9 @@ impl crate::bridge::NotificationWiring for GatedWiring {
         Box::pin(async move {
             self.arrived
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            drop(self.gate.acquire().await);
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
             self.published
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
@@ -704,5 +717,30 @@ impl crate::bridge::NotificationWiring for GatedWiring {
         _file: &'a lsp_types::Uri,
     ) -> futures::future::BoxFuture<'a, ()> {
         Box::pin(async {})
+    }
+}
+
+#[cfg(all(test, unix))]
+mod gated_wiring_tests {
+    use std::sync::Arc;
+
+    use super::GatedWiring;
+    use crate::bridge::NotificationWiring as _;
+
+    #[tokio::test]
+    async fn one_release_lets_exactly_one_invalidation_through() {
+        let wiring = Arc::new(GatedWiring::closed());
+        wiring.release();
+        for _ in 0..2 {
+            let wiring = Arc::clone(&wiring);
+            tokio::spawn(async move { wiring.publish_invalidated(&[]).await });
+        }
+        while wiring.arrived() < 2 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(wiring.published(), 1);
     }
 }

@@ -33,11 +33,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::{
-    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
+    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerArgs, ServerCommand,
+    ServerId,
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::resolve_named;
 use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX};
+use crate::lsp::vetting::UntrustedVetting;
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
@@ -51,7 +53,7 @@ const NATIVE_TSC_WINDOWS_SHIM: &str = "tsc.cmd";
 const NODE_NAME: &str = "node";
 const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
-const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
+const NATIVE_TSC_ARGS: &[&str] = &["--lsp", "--stdio"];
 const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
 const PNPM_GLOBAL_DIR: &str = "global";
 /// Most `global/<store version>` entries a pnpm install is searched through;
@@ -592,16 +594,13 @@ impl NativeTsc {
     }
 
     /// The `command` and `args` that start the native server.
-    fn launch_parts(&self) -> (ServerCommand, Vec<String>) {
-        let lsp_args = NATIVE_TSC_ARGS.iter().map(ToString::to_string);
+    fn launch_parts(&self) -> (ServerCommand, ServerArgs) {
+        let lsp_args = ServerArgs::from_static(NATIVE_TSC_ARGS);
         match &self.launch {
-            NativeLaunch::Direct => (self.tsc.clone(), lsp_args.collect()),
-            NativeLaunch::ThroughNode(node) => (
-                node.clone(),
-                std::iter::once(self.tsc.to_string())
-                    .chain(lsp_args)
-                    .collect(),
-            ),
+            NativeLaunch::Direct => (self.tsc.clone(), lsp_args),
+            NativeLaunch::ThroughNode(node) => {
+                (node.clone(), lsp_args.with_leading(self.tsc.clone()))
+            }
         }
     }
 }
@@ -944,24 +943,6 @@ pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> T
     }
 }
 
-/// What untrusted mode vets a TypeScript server against, remembered so a
-/// respawn repeats the startup checks and names the same command.
-#[derive(Debug, Clone)]
-pub struct UntrustedVetting {
-    boundary: WorkspaceRoots,
-    configured: ServerCommand,
-}
-
-impl UntrustedVetting {
-    /// Vetting against `boundary` for the server configured as `configured`.
-    pub const fn new(boundary: WorkspaceRoots, configured: ServerCommand) -> Self {
-        Self {
-            boundary,
-            configured,
-        }
-    }
-}
-
 impl TypescriptPlan {
     /// The refusal untrusted mode owes this plan, if any: a pin inside the
     /// boundary, or a launcher no tsserver can be pinned for. Startup and
@@ -973,12 +954,12 @@ impl TypescriptPlan {
     /// [`UntrustedRefusal::UnpinnedTypescriptLauncher`], the latter naming
     /// the command as configured.
     pub fn vet_untrusted(&self, vetting: &UntrustedVetting) -> Result<(), UntrustedRefusal> {
-        if let Some(tsserver) = self.pin_inside(&vetting.boundary) {
+        if let Some(tsserver) = self.pin_inside(vetting.boundary().roots()) {
             return Err(UntrustedRefusal::WorkspaceTsserver { tsserver });
         }
         if self.has_unpinnable_launcher() {
             return Err(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                command: vetting.configured.clone(),
+                command: vetting.configured().clone(),
             });
         }
         Ok(())
@@ -1203,7 +1184,7 @@ mod launch_tests {
 
     fn config(command: &str, args: &[&str]) -> LspServerConfig {
         let mut config = super::typescript_entry(command);
-        config.args = args.iter().map(ToString::to_string).collect();
+        config.args = ServerArgs::new(args.iter().copied()).unwrap();
         config
     }
 
@@ -1734,10 +1715,13 @@ mod tests {
     fn test_resolve_config_env_path_overrides_parent() {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
-        config.env.insert(
-            crate::config::EnvKey::from_static("PATH"),
-            crate::config::EnvValue::new(layout.bin.to_str().unwrap()).unwrap(),
-        );
+        config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("PATH"),
+                crate::config::EnvValue::new(layout.bin.to_str().unwrap()).unwrap(),
+            )
+            .unwrap();
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }
@@ -1852,7 +1836,7 @@ mod tests {
             ),
         ] {
             let mut config = config(command);
-            config.args = args.into_iter().map(String::from).collect();
+            config.args = ServerArgs::new(args).unwrap();
             assert_eq!(
                 resolve(&config, |_| None),
                 Some(TsserverResolution::Unresolved(reason)),
@@ -1864,7 +1848,7 @@ mod tests {
     #[test]
     fn test_unsupported_launcher_options_stay_unpinned() {
         let mut config = config("npx");
-        config.args = vec!["typescript-language-server".into(), "--stdio".into()];
+        config.args = ServerArgs::new(["typescript-language-server", "--stdio"]).unwrap();
         assert_eq!(
             pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
             None
@@ -2174,7 +2158,7 @@ mod tests {
     #[test]
     fn test_native_command_gets_no_pin() {
         let mut config = config("tsc");
-        config.args = vec!["--lsp".into(), "--stdio".into()];
+        config.args = ServerArgs::new(["--lsp", "--stdio"]).unwrap();
         assert_eq!(resolve(&config, |_| None), None);
         assert_eq!(
             pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
@@ -2653,7 +2637,7 @@ mod tests {
     #[test]
     fn test_plan_flags_a_package_runner_as_an_unpinnable_launcher() {
         let mut runner = config("npx");
-        runner.args = vec![SERVER_STEM.to_owned()];
+        runner.args = ServerArgs::new([SERVER_STEM]).unwrap();
 
         let plan = plan_typescript(runner, |_| None);
 

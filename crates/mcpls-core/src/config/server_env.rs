@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::host_os::HostOs;
-use super::text_newtype::impl_text_newtype;
+use super::text_newtype::{contains_nul, impl_text_newtype};
 
 /// Why a string is not a valid [`EnvKey`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +33,9 @@ const fn env_key_fault(key: &str) -> Option<InvalidEnvKey> {
     None
 }
 
-const fn keep_env_key_fault(_: &str, fault: InvalidEnvKey) -> InvalidEnvKey {
-    fault
-}
-
 /// Why a string is not a valid [`EnvValue`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidEnvValue {
     /// The value contained a NUL, which the operating system cannot pass in
     /// an environment.
@@ -47,18 +44,11 @@ pub enum InvalidEnvValue {
 }
 
 const fn env_value_fault(value: &str) -> Option<InvalidEnvValue> {
-    let mut rest = value.as_bytes();
-    while let [byte, tail @ ..] = rest {
-        if *byte == 0 {
-            return Some(InvalidEnvValue::ContainsNul);
-        }
-        rest = tail;
+    if contains_nul(value) {
+        Some(InvalidEnvValue::ContainsNul)
+    } else {
+        None
     }
-    None
-}
-
-const fn keep_env_value_fault(_: &str, fault: InvalidEnvValue) -> InvalidEnvValue {
-    fault
 }
 
 /// The name of an environment variable: non-empty, with no `=` and no NUL, so
@@ -89,7 +79,6 @@ impl_text_newtype!(
     EnvKey,
     InvalidEnvKey,
     fault = env_key_fault,
-    explain = keep_env_key_fault,
     "environment variable name"
 );
 
@@ -118,21 +107,8 @@ impl_text_newtype!(
     EnvValue,
     InvalidEnvValue,
     fault = env_value_fault,
-    explain = keep_env_value_fault,
     "environment variable value"
 );
-
-/// The largest `NAME=value` entry with its terminator, in bytes, a server's
-/// `env` table may hold on this host: the documented Windows limit on one
-/// variable (32767 characters).
-#[cfg(windows)]
-pub const MAX_ENV_ENTRY_BYTES: usize = 32_767;
-
-/// The largest `NAME=value` entry with its terminator, in bytes, a server's
-/// `env` table may hold on this host: Linux caps one string at 128 KiB
-/// (`MAX_ARG_STRLEN`).
-#[cfg(not(windows))]
-pub const MAX_ENV_ENTRY_BYTES: usize = 128 * 1024;
 
 /// The largest total size, in bytes, of a server's `env` table, counting each
 /// entry as `NAME=value` and a terminator.
@@ -145,18 +121,28 @@ pub const MAX_ENV_TOTAL_BYTES: usize = 128 * 1024;
 /// The `=` between name and value and the terminator the OS adds to an entry.
 const ENTRY_OVERHEAD_BYTES: usize = 2;
 
+fn entry_bytes(key: &EnvKey, value: &EnvValue) -> usize {
+    key.as_str()
+        .len()
+        .saturating_add(value.as_str().len())
+        .saturating_add(ENTRY_OVERHEAD_BYTES)
+}
+
 /// Why a [`ServerEnv`] is too large to pass to a process.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnvTooLarge {
-    /// One entry is over [`MAX_ENV_ENTRY_BYTES`].
+    /// One entry is over [`HostOs::max_env_entry_bytes`] of the table's host.
     #[error(
-        "environment variable '{key}' is {bytes} bytes as NAME=value and a terminator, over the {MAX_ENV_ENTRY_BYTES} byte limit"
+        "environment variable '{key}' is {bytes} bytes as NAME=value and a terminator, over the {limit} byte limit"
     )]
     Entry {
         /// The variable.
         key: EnvKey,
         /// Its size as `NAME=value`.
         bytes: usize,
+        /// The most one entry may take on the table's host.
+        limit: usize,
     },
     /// The entries together are over [`MAX_ENV_TOTAL_BYTES`].
     #[error("environment is {bytes} bytes in total, over the {MAX_ENV_TOTAL_BYTES} byte limit")]
@@ -164,6 +150,18 @@ pub enum EnvTooLarge {
         /// The size of all entries.
         bytes: usize,
     },
+}
+
+/// Why entries do not make a valid [`ServerEnv`].
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidServerEnv {
+    /// Two keys name one variable on the host.
+    #[error(transparent)]
+    Duplicate(DuplicateEnvKey),
+    /// The table is too large to pass to a process.
+    #[error(transparent)]
+    TooLarge(EnvTooLarge),
 }
 
 /// Two keys of one `env` table name the same variable on the host.
@@ -215,7 +213,9 @@ fn windows_fold(c: char) -> char {
 /// process sees. The host is fixed at construction, so a table built for one
 /// host cannot be read or extended as another. Keys come in through
 /// [`Self::from_entries`], which rejects collisions, or [`Self::insert`],
-/// which replaces them.
+/// which replaces them. Neither lets the table outgrow what the host can pass
+/// to a process: [`HostOs::max_env_entry_bytes`] for one entry and
+/// [`MAX_ENV_TOTAL_BYTES`] for all.
 ///
 /// # Examples
 ///
@@ -223,20 +223,23 @@ fn windows_fold(c: char) -> char {
 /// use mcpls_core::config::{EnvKey, EnvValue, HostOs, ServerEnv};
 ///
 /// let mut env = ServerEnv::new(HostOs::Windows);
-/// env.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap());
+/// env.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap())?;
 /// assert_eq!(env.get("PATH"), Some("/a"));
 ///
-/// env.insert(EnvKey::new("PATH").unwrap(), EnvValue::new("/b").unwrap());
+/// env.insert(EnvKey::new("PATH").unwrap(), EnvValue::new("/b").unwrap())?;
 /// assert_eq!(env.len(), 1);
 ///
 /// let mut other = ServerEnv::new(HostOs::Other);
-/// other.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap());
+/// other.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap())?;
 /// assert_eq!(other.get("PATH"), None);
+/// # Ok::<(), mcpls_core::config::EnvTooLarge>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEnv {
     host: HostOs,
     vars: BTreeMap<HostKey, (EnvKey, EnvValue)>,
+    /// The size of all entries as `NAME=value` and a terminator.
+    total_bytes: usize,
 }
 
 impl Default for ServerEnv {
@@ -252,6 +255,7 @@ impl ServerEnv {
         Self {
             host,
             vars: BTreeMap::new(),
+            total_bytes: 0,
         }
     }
 
@@ -259,20 +263,22 @@ impl ServerEnv {
     ///
     /// # Errors
     ///
-    /// [`DuplicateEnvKey`] when two keys name one variable on `host`.
+    /// [`InvalidServerEnv::Duplicate`] when two keys name one variable on
+    /// `host`, [`InvalidServerEnv::TooLarge`] when an entry or the table is
+    /// too large to pass to a process there.
     pub fn from_entries(
         entries: impl IntoIterator<Item = (EnvKey, EnvValue)>,
         host: HostOs,
-    ) -> Result<Self, DuplicateEnvKey> {
+    ) -> Result<Self, InvalidServerEnv> {
         let mut env = Self::new(host);
         for (key, value) in entries {
             if let Some((first, _)) = env.vars.get(&HostKey::of(key.as_str(), host)) {
-                return Err(DuplicateEnvKey {
+                return Err(InvalidServerEnv::Duplicate(DuplicateEnvKey {
                     first: first.clone(),
                     second: key,
-                });
+                }));
             }
-            env.insert(key, value);
+            env.insert(key, value).map_err(InvalidServerEnv::TooLarge)?;
         }
         Ok(env)
     }
@@ -299,34 +305,36 @@ impl ServerEnv {
 
     /// Sets `key`, replacing the spelling of it that the table's host treats
     /// as the same variable.
-    pub fn insert(&mut self, key: EnvKey, value: EnvValue) {
-        self.vars
-            .insert(HostKey::of(key.as_str(), self.host), (key, value));
-    }
-
-    /// Checks the table against [`MAX_ENV_ENTRY_BYTES`] and
-    /// [`MAX_ENV_TOTAL_BYTES`], the sizes past which a spawn fails with
-    /// `E2BIG`.
     ///
     /// # Errors
     ///
-    /// [`EnvTooLarge`] naming the first oversized entry, or the total.
-    pub fn check_size(&self) -> Result<(), EnvTooLarge> {
-        let mut total = 0usize;
-        for (key, value) in self.iter() {
-            let bytes = key.as_str().len().saturating_add(value.as_str().len());
-            let bytes = bytes.saturating_add(ENTRY_OVERHEAD_BYTES);
-            if bytes > MAX_ENV_ENTRY_BYTES {
-                return Err(EnvTooLarge::Entry {
-                    key: key.clone(),
-                    bytes,
-                });
-            }
-            total = total.saturating_add(bytes);
+    /// [`EnvTooLarge`] when the entry is over [`HostOs::max_env_entry_bytes`]
+    /// or the table would be over [`MAX_ENV_TOTAL_BYTES`], the sizes past which
+    /// a spawn fails with `E2BIG`; the table is left as it was.
+    pub fn insert(&mut self, key: EnvKey, value: EnvValue) -> Result<(), EnvTooLarge> {
+        let bytes = key
+            .as_str()
+            .len()
+            .saturating_add(value.as_str().len())
+            .saturating_add(ENTRY_OVERHEAD_BYTES);
+        let limit = self.host.max_env_entry_bytes();
+        if bytes > limit {
+            return Err(EnvTooLarge::Entry { key, bytes, limit });
         }
+        let host_key = HostKey::of(key.as_str(), self.host);
+        let replaced = self
+            .vars
+            .get(&host_key)
+            .map_or(0, |(old_key, old_value)| entry_bytes(old_key, old_value));
+        let total = self
+            .total_bytes
+            .saturating_sub(replaced)
+            .saturating_add(bytes);
         if total > MAX_ENV_TOTAL_BYTES {
             return Err(EnvTooLarge::Total { bytes: total });
         }
+        self.total_bytes = total;
+        self.vars.insert(host_key, (key, value));
         Ok(())
     }
 
@@ -359,6 +367,8 @@ impl From<ServerEnv> for BTreeMap<EnvKey, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     fn key(name: &str) -> EnvKey {
@@ -377,25 +387,53 @@ mod tests {
     }
 
     #[test]
-    fn check_size_bounds_each_entry_and_the_total() {
-        let mut env = ServerEnv::new(HostOs::Other);
-        env.insert(key("A"), value(&"x".repeat(MAX_ENV_ENTRY_BYTES - 3)));
-        assert_eq!(env.check_size(), Ok(()));
+    fn insert_bounds_each_entry_by_the_tables_host() {
+        for host in [HostOs::Other, HostOs::Windows] {
+            let max = host.max_env_entry_bytes();
+            let mut env = ServerEnv::new(host);
+            assert_eq!(env.insert(key("A"), value(&"x".repeat(max - 3))), Ok(()));
 
-        env.insert(key("A"), value(&"x".repeat(MAX_ENV_ENTRY_BYTES - 2)));
-        assert_eq!(
-            env.check_size(),
-            Err(EnvTooLarge::Entry {
-                key: key("A"),
-                bytes: MAX_ENV_ENTRY_BYTES + 1,
-            })
-        );
-
-        let mut many = ServerEnv::new(HostOs::Other);
-        for index in 0..8 {
-            many.insert(key(&format!("K{index}")), value(&"x".repeat(20_000)));
+            assert_eq!(
+                env.insert(key("A"), value(&"x".repeat(max - 2))),
+                Err(EnvTooLarge::Entry {
+                    key: key("A"),
+                    bytes: max + 1,
+                    limit: max,
+                })
+            );
+            assert_eq!(env.get("A").map(str::len), Some(max - 3));
         }
-        assert!(matches!(many.check_size(), Err(EnvTooLarge::Total { .. })));
+    }
+
+    #[test]
+    fn insert_bounds_the_total_and_counts_a_replacement_once() {
+        let mut env = ServerEnv::new(HostOs::Other);
+        for index in 0..6 {
+            env.insert(key(&format!("K{index}")), value(&"x".repeat(20_000)))
+                .unwrap();
+        }
+        assert_matches!(
+            env.insert(key("K6"), value(&"x".repeat(20_000))),
+            Err(EnvTooLarge::Total { .. })
+        );
+        assert_eq!(env.len(), 6);
+
+        env.insert(key("K0"), value(&"y".repeat(20_000))).unwrap();
+        assert_eq!(env.len(), 6);
+    }
+
+    #[test]
+    fn from_entries_refuses_a_table_that_is_too_large_or_has_a_duplicate() {
+        let big = |name: &str| (key(name), value(&"x".repeat(20_000)));
+        let too_large =
+            ServerEnv::from_entries((0..8).map(|n| big(&format!("K{n}"))), HostOs::Other);
+        assert_matches!(
+            too_large,
+            Err(InvalidServerEnv::TooLarge(EnvTooLarge::Total { .. }))
+        );
+        let duplicate =
+            ServerEnv::from_entries(entries(&[("Path", "a"), ("PATH", "b")]), HostOs::Windows);
+        assert_matches!(duplicate, Err(InvalidServerEnv::Duplicate(_)));
     }
 
     #[test]
@@ -452,14 +490,14 @@ mod tests {
     fn insert_replaces_every_alias_on_windows_and_only_the_exact_key_elsewhere() {
         let mut windows =
             ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Windows).unwrap();
-        windows.insert(key("PATH"), value("b"));
+        windows.insert(key("PATH"), value("b")).unwrap();
         assert_eq!(
             windows.iter().collect::<Vec<_>>(),
             [(&key("PATH"), &value("b"))]
         );
 
         let mut other = ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Other).unwrap();
-        other.insert(key("PATH"), value("b"));
+        other.insert(key("PATH"), value("b")).unwrap();
         assert_eq!(other.len(), 2);
         assert_eq!(other.get("Path"), Some("a"));
     }
@@ -469,6 +507,9 @@ mod tests {
         let err =
             ServerEnv::from_entries(entries(&[("Path", "a"), ("PATH", "b")]), HostOs::Windows)
                 .unwrap_err();
+        let InvalidServerEnv::Duplicate(err) = err else {
+            panic!("expected a duplicate, got {err:?}");
+        };
         assert_eq!(err.first, "Path");
         assert_eq!(err.second, "PATH");
         let other =

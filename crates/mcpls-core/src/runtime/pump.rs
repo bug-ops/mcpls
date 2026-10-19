@@ -22,6 +22,13 @@ use crate::lsp::{
 use crate::mcp::SubscriptionRegistry;
 use crate::util::{catch_panic, lock_std};
 
+impl DiagnosticsRole {
+    /// Whether the server's pushes are cached and announced.
+    const fn caches(self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+}
+
 /// `Arc`-backed state shared by every `diagnostics_pump` task spawned for one
 /// `serve_with` run, factored out of `diagnostics_pump`'s parameter list to
 /// keep it under clippy's argument-count lint. `Clone` is cheap (`Arc`
@@ -1355,7 +1362,7 @@ mod pump_tests {
             cache.store_published_diagnostics(&id, &published, None, vec![error]);
             cache.clear_server_diagnostics(&id)
         };
-        assert!(!cleared.is_empty());
+        assert_ne!(cleared.len(), 0);
 
         let subs = make_subs();
         let session = SessionHandle::new(subs.clone());

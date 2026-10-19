@@ -800,11 +800,17 @@ impl WorkspaceRoots {
             .map_or(true, |canonical| self.contains_canonical(&canonical))
     }
 
-    /// Whether the canonical `path` lies under a canonical root.
-    pub(crate) fn contains_canonical(&self, path: &Path) -> bool {
+    /// The canonical root the canonical `path` lies under, if any.
+    pub(crate) fn canonical_root_of(&self, path: &Path) -> Option<&Path> {
         self.canonical
             .iter()
-            .any(|root| is_within(path, root, CaseRule::Exact))
+            .map(PathBuf::as_path)
+            .find(|root| is_within(path, root, CaseRule::Exact))
+    }
+
+    /// Whether the canonical `path` lies under a canonical root.
+    pub(crate) fn contains_canonical(&self, path: &Path) -> bool {
+        self.canonical_root_of(path).is_some()
     }
 }
 

@@ -697,7 +697,7 @@ mod tests {
         #[test]
         fn test_http_allowed_origin_defaults_to_none() {
             let args = Args::parse_from(["mcpls"]);
-            assert!(args.allowed_origins().is_empty());
+            assert_eq!(args.allowed_origins().len(), 0);
         }
 
         #[test]
@@ -775,7 +775,7 @@ mod tests {
         #[test]
         fn test_http_allowed_host_defaults_to_none() {
             let args = Args::parse_from(["mcpls"]);
-            assert!(args.allowed_hosts().is_empty());
+            assert_eq!(args.allowed_hosts().len(), 0);
         }
 
         #[test]

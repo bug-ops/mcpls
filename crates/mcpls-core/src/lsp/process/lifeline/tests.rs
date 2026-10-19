@@ -600,14 +600,14 @@ fn test_awk_roots_at_the_leader_unconditionally_until_it_is_forgotten() {
         sweep_awk(rows, 900, 100, Some(500)),
         ["group 500", "group 501"]
     );
-    assert!(sweep_awk(rows, 900, 100, None).is_empty());
+    assert_eq!(sweep_awk(rows, 900, 100, None).len(), 0);
 }
 
 #[test]
 fn test_awk_ignores_blank_and_non_numeric_rows_when_no_leader_is_registered() {
     let rows = "\n   \nabc def ghi\n1x 2 3\n0 0 0\n-5 1 1\n7 8\n1 0 1\n100 1 100\n101 100 100\n900 1 900\n";
 
-    assert!(sweep_awk(rows, 900, 100, None).is_empty());
+    assert_eq!(sweep_awk(rows, 900, 100, None).len(), 0);
 }
 
 #[test]
@@ -792,7 +792,7 @@ async fn test_missing_ps_is_reported_as_a_failed_scan_while_mark_still_confirms(
     let channel = &mut fixture.watchdog_mut().channel;
     channel.drain();
     assert_eq!(channel.scan, ScanOutcome::Failed);
-    assert!(channel.targets.is_empty());
+    assert_eq!(channel.targets.len(), 0);
     let pids = fixture.all();
     fixture.process.terminate_tree(LIFELINE_SWEEP_BUDGET).await;
     for pid in [pids[0], pids[2]] {

@@ -14,6 +14,7 @@ use tokio::io::{
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::PEER_CLOSE_POLL;
 use crate::bridge::{NotificationCache, Translator, WorkspaceRoots};
@@ -34,6 +35,7 @@ struct Wire {
     reader: tokio::io::Lines<BufReader<ReadHalf<DuplexStream>>>,
     writer: WriteHalf<DuplexStream>,
     serving: JoinHandle<()>,
+    stop: CancellationToken,
     next_id: i64,
 }
 
@@ -82,8 +84,10 @@ impl Wire {
         lsp: Option<FakeServer>,
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let stop = CancellationToken::new();
+        let serve_stop = stop.clone();
         let serving = tokio::spawn(async move {
-            if let Ok(running) = server.serve(split(server_io)).await {
+            if let Ok(running) = server.serve_with_ct(split(server_io), serve_stop).await {
                 running.waiting().await.ok();
             }
         });
@@ -95,6 +99,7 @@ impl Wire {
             reader: BufReader::new(read).lines(),
             writer,
             serving,
+            stop,
             next_id: 0,
         };
         wire.handshake().await;
@@ -209,6 +214,55 @@ async fn a_client_cancel_cancels_the_lsp_request_and_sends_no_response() {
     let probe = wire.call("get_tool_support", json!({})).await;
     let seen = wire.responses_until(probe).await;
     assert_eq!(seen, vec![probe], "the cancelled call got a response");
+}
+
+/// #807: a cancelled call is stopped without a WARN from the serve loop, whose
+/// "response error" line a protocol error would have triggered.
+#[tokio::test(start_paused = true)]
+async fn a_client_cancel_logs_no_warning() {
+    use tracing_subscriber::prelude::*;
+
+    let logs = crate::test_lsp::CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with(logs.clone()),
+    );
+    let mut wire = Wire::connect().await;
+    let hover = wire.call_hover().await;
+    wire.hover_request().await;
+
+    wire.cancel(hover).await;
+    let cancel = wire.lsp_frame().await;
+    assert_eq!(cancel["method"], "$/cancelRequest");
+    let probe = wire.call("get_tool_support", json!({})).await;
+    wire.responses_until(probe).await;
+
+    let warnings: Vec<_> = logs
+        .entries()
+        .into_iter()
+        .filter(|(level, _)| *level <= tracing::Level::WARN)
+        .collect();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// #807: a call still pending when the serve loop is cancelled is answered
+/// with a tool error that says why, not a protocol error.
+#[tokio::test(start_paused = true)]
+async fn a_call_pending_at_shutdown_gets_a_tool_error_result() {
+    let mut wire = Wire::connect().await;
+    let hover = wire.call_hover().await;
+    wire.hover_request().await;
+
+    wire.stop.cancel();
+    let (_, response) = wire.responses_until_with(hover).await;
+
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "request cancelled (client cancellation or server shutdown)"
+    );
 }
 
 /// FR-002: a call already cancelled when its handler starts touches nothing.

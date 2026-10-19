@@ -7115,6 +7115,24 @@
           "description": "Why a restart failed.",
           "oneOf": [
             {
+              "description": "The restart was refused before the old process was stopped, so it was\nnot restarted and keeps",
+              "properties": {
+                "kind": {
+                  "const": "refused",
+                  "type": "string"
+                },
+                "message": {
+                  "description": "Why the restart was refused.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
               "description": "The replacement process could not be started.",
               "properties": {
                 "kind": {

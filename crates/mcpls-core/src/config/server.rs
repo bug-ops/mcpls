@@ -18,9 +18,10 @@ use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
-use super::server_env::{EnvKey, EnvValue, ServerEnv};
+use super::server_args::{InvalidServerArgs, ServerArgs};
+use super::server_env::{EnvKey, EnvValue, InvalidServerEnv, ServerEnv};
 use super::settings::LspSettings;
-use super::text_newtype::impl_text_newtype;
+use super::text_newtype::{contains_nul, impl_text_newtype};
 use crate::bridge::IndexingPolicy;
 use crate::error::{ChainedError, ConfigError};
 
@@ -230,10 +231,18 @@ impl ServerSelection {
     }
 }
 
-/// A server command was empty or whitespace-only.
+/// Why a string is not a valid [`ServerCommand`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
-#[error("command cannot be blank")]
-pub struct InvalidServerCommand;
+#[non_exhaustive]
+pub enum InvalidServerCommand {
+    /// The command was empty or whitespace-only.
+    #[error("command cannot be blank")]
+    Blank,
+    /// The command contained a NUL, which the operating system cannot pass in
+    /// a path.
+    #[error("command cannot contain NUL")]
+    ContainsNul,
+}
 
 /// The non-blank executable name or path of an LSP server.
 ///
@@ -252,7 +261,54 @@ pub struct InvalidServerCommand;
 #[serde(try_from = "String", into = "String")]
 pub struct ServerCommand(Cow<'static, str>);
 
-impl_text_newtype!(ServerCommand, InvalidServerCommand, non_blank, "command");
+impl ServerCommand {
+    /// Builds the value from a literal, checked at compile time when evaluated
+    /// in a `const` context.
+    ///
+    /// Accepts only ASCII literals that are not blank and hold no NUL, a
+    /// subset of what [`Self::new`] accepts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the literal is blank, not ASCII or holds a NUL.
+    #[must_use]
+    pub const fn from_static(text: &'static str) -> Self {
+        assert!(
+            text.is_ascii() && !text.trim_ascii().is_empty() && !contains_nul(text),
+            "command must be ASCII and not blank, and hold no NUL"
+        );
+        Self(Cow::Borrowed(text))
+    }
+
+    /// Builds the value from any string.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidServerCommand::Blank`] if `text` is blank, else
+    /// [`InvalidServerCommand::ContainsNul`] if it holds a NUL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::{InvalidServerCommand, ServerCommand};
+    ///
+    /// assert!(ServerCommand::new("rust-analyzer").is_ok());
+    /// assert_eq!(ServerCommand::new("  "), Err(InvalidServerCommand::Blank));
+    /// assert_eq!(ServerCommand::new("a\0b"), Err(InvalidServerCommand::ContainsNul));
+    /// ```
+    pub fn new(text: impl Into<String>) -> Result<Self, InvalidServerCommand> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(InvalidServerCommand::Blank);
+        }
+        if contains_nul(&text) {
+            return Err(InvalidServerCommand::ContainsNul);
+        }
+        Ok(Self(Cow::Owned(text)))
+    }
+}
+
+impl_text_newtype!(ServerCommand, InvalidServerCommand);
 
 impl AsRef<OsStr> for ServerCommand {
     fn as_ref(&self) -> &OsStr {
@@ -437,7 +493,7 @@ pub struct LspServerConfig {
     pub command: LaunchCommand,
 
     /// Arguments to pass to the LSP server command.
-    pub args: Vec<String>,
+    pub args: ServerArgs,
 
     /// Environment variables for the LSP server process.
     pub env: ServerEnv,
@@ -570,7 +626,7 @@ impl From<LspServerConfig> for RawLspServerConfig {
         Self {
             language_id,
             command,
-            args,
+            args: args.into(),
             env: env.into(),
             file_patterns: file_patterns.into_iter().map(String::from).collect(),
             initialization_options,
@@ -606,6 +662,7 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
             indexing,
             selection,
         } = raw;
+        let entry = entry_id(name.as_ref(), &language_id);
         let command = LaunchCommand::new(command, selection).map_err(|InvalidAutoSelection| {
             ConfigError::SelectionAutoOnNonTypescript {
                 language: language_id.clone(),
@@ -616,34 +673,33 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
             .map(|(key, value)| match EnvValue::new(value) {
                 Ok(value) => Ok((key, value)),
                 Err(error) => Err(ConfigError::InvalidEnvValue {
-                    server: entry_id(name.as_ref(), &language_id),
+                    server: entry.clone(),
                     key,
                     error,
                 }),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let env = ServerEnv::from_entries(env, HostOs::CURRENT).map_err(|error| {
-            ConfigError::DuplicateEnvKey {
-                server: entry_id(name.as_ref(), &language_id),
+        let env = ServerEnv::from_entries(env, HostOs::CURRENT).map_err(|error| match error {
+            InvalidServerEnv::Duplicate(error) => ConfigError::DuplicateEnvKey {
+                server: entry.clone(),
                 error,
-            }
+            },
+            InvalidServerEnv::TooLarge(error) => ConfigError::EnvTooLarge {
+                server: entry.clone(),
+                error,
+            },
         })?;
-        env.check_size().map_err(|error| ConfigError::EnvTooLarge {
-            server: entry_id(name.as_ref(), &language_id),
-            error,
-        })?;
-        if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
-            return Err(ConfigError::ArgContainsNul {
-                server: entry_id(name.as_ref(), &language_id),
+        let args = ServerArgs::try_from(args).map_err(|InvalidServerArgs { index }| {
+            ConfigError::ArgContainsNul {
+                server: entry.clone(),
                 index,
             }
-            .into());
-        }
+        })?;
         let file_patterns = file_patterns
             .iter()
             .map(|pattern| {
                 FilePattern::parse(pattern).map_err(|pattern| ConfigError::UnsupportedFilePattern {
-                    server: entry_id(name.as_ref(), &language_id),
+                    server: entry.clone(),
                     pattern,
                 })
             })
@@ -826,14 +882,14 @@ impl LspServerConfig {
     fn builtin(
         language_id: LanguageId,
         server: BuiltinServer,
-        args: &[&str],
+        args: &'static [&'static str],
         file_patterns: &[&'static str],
         markers: impl IntoIterator<Item = &'static str>,
     ) -> Self {
         Self {
             language_id,
             command: ServerCommand::from_static(server.command()).into(),
-            args: args.iter().map(ToString::to_string).collect(),
+            args: ServerArgs::from_static(args),
             env: crate::config::ServerEnv::default(),
             file_patterns: file_patterns
                 .iter()
@@ -963,8 +1019,12 @@ mod tests {
 
     #[test]
     fn test_server_command_rejects_blank_and_round_trips() {
-        assert_eq!(ServerCommand::new(""), Err(InvalidServerCommand));
-        assert_eq!(ServerCommand::new(" \t"), Err(InvalidServerCommand));
+        assert_eq!(ServerCommand::new(""), Err(InvalidServerCommand::Blank));
+        assert_eq!(ServerCommand::new(" \t"), Err(InvalidServerCommand::Blank));
+        assert_eq!(
+            ServerCommand::new("a\0b"),
+            Err(InvalidServerCommand::ContainsNul)
+        );
         let command: ServerCommand = serde_json::from_str("\"gopls\"").unwrap();
         assert_eq!(command, "gopls");
         assert_eq!(serde_json::to_string(&command).unwrap(), "\"gopls\"");
@@ -1109,12 +1169,13 @@ mod tests {
         env.insert(
             EnvKey::from_static("RUST_LOG"),
             EnvValue::from_static("debug"),
-        );
+        )
+        .unwrap();
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
             command: ServerCommand::from_static("custom-lsp").into(),
-            args: vec!["--flag".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--flag".to_string()]).unwrap(),
             env: env.clone(),
             file_patterns: vec![FilePattern::from_static("**/*.custom")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
@@ -1345,7 +1406,7 @@ mod tests {
         let config = LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("test-lsp").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

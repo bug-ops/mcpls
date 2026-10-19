@@ -546,7 +546,7 @@ mod tests {
     fn server_config() -> LspServerConfig {
         let mut config = LspServerConfig::rust_analyzer();
         config.env = crate::config::ServerEnv::default();
-        config.args = Vec::new();
+        config.args = crate::config::ServerArgs::default();
         config.initialization_options = None;
         config
     }
@@ -554,12 +554,15 @@ mod tests {
     #[test]
     fn test_for_servers_covers_every_configured_server_over_one_environment() {
         let mut first = server_config();
-        first.env.insert(
-            crate::config::EnvKey::from_static("FIRST_TOKEN"),
-            crate::config::EnvValue::from_static("first-secret-value"),
-        );
+        first
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("FIRST_TOKEN"),
+                crate::config::EnvValue::from_static("first-secret-value"),
+            )
+            .unwrap();
         let mut second = server_config();
-        second.args = vec!["--api-key=second-secret-value".into()];
+        second.args = crate::config::ServerArgs::new(["--api-key=second-secret-value"]).unwrap();
 
         let set = Redactions::for_servers(
             [&first, &second],
@@ -982,16 +985,19 @@ mod tests {
     #[test]
     fn test_for_server_takes_secret_flag_values_in_both_forms() {
         let mut config = server_config();
-        config.args = [
-            "--stdio",
-            "--api-key=key-value-1",
-            "--auth-token",
-            "tok-value-2",
-            "--verbose",
-            "--log-level=trace-level",
-        ]
-        .map(String::from)
-        .to_vec();
+        config.args = crate::config::ServerArgs::try_from(
+            [
+                "--stdio",
+                "--api-key=key-value-1",
+                "--auth-token",
+                "tok-value-2",
+                "--verbose",
+                "--log-level=trace-level",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+        .unwrap();
 
         let set = Redactions::for_server(&config, []);
 

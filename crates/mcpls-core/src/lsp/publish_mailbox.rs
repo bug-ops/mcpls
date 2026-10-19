@@ -208,17 +208,24 @@ struct Shared {
     limits: MailboxLimits,
 }
 
+/// Whether `seq` is the sequence number of the pending publish of `key`.
+fn is_current(pending: &HashMap<DiagnosticsKey, Pending>, key: &DiagnosticsKey, seq: u64) -> bool {
+    pending.get(key).is_some_and(|pending| pending.seq == seq)
+}
+
 impl State {
+    /// Appends `key` to the arrival order under a fresh sequence number.
+    fn enqueue(&mut self, key: DiagnosticsKey) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = seq.saturating_add(1);
+        self.order.push_back((key, seq));
+        seq
+    }
+
     fn withdraw(&mut self, key: &DiagnosticsKey) {
         if let Some(pending) = self.pending.remove(key) {
             self.bytes = self.bytes.saturating_sub(pending.bytes);
         }
-    }
-
-    fn is_current(&self, key: &DiagnosticsKey, seq: u64) -> bool {
-        self.pending
-            .get(key)
-            .is_some_and(|pending| pending.seq == seq)
     }
 
     /// Drops the entries of `order` that no longer match a pending publish
@@ -228,7 +235,7 @@ impl State {
         if self.order.len() > max_pending.saturating_mul(2).max(16) {
             let pending = &self.pending;
             self.order
-                .retain(|(key, seq)| pending.get(key).is_some_and(|pending| pending.seq == *seq));
+                .retain(|(key, seq)| is_current(pending, key, *seq));
         }
     }
 
@@ -239,7 +246,7 @@ impl State {
             return Some(PublishDelivery::Lost(lost));
         }
         while let Some((key, seq)) = self.order.pop_front() {
-            if !self.is_current(&key, seq) {
+            if !is_current(&self.pending, &key, seq) {
                 continue;
             }
             if let Some(pending) = self.pending.remove(&key) {
@@ -339,15 +346,10 @@ impl PublishWriter {
         state.withdraw(&key);
         let warn_due = if fits {
             state.bytes = state.bytes.saturating_add(bytes);
-            let seq = replaced.map_or_else(
-                || {
-                    let seq = state.next_seq;
-                    state.next_seq = seq.saturating_add(1);
-                    state.order.push_back((key.clone(), seq));
-                    seq
-                },
-                |(_, seq)| seq,
-            );
+            let seq = match replaced {
+                Some((_, seq)) => seq,
+                None => state.enqueue(key.clone()),
+            };
             state.pending.insert(
                 key,
                 Pending {

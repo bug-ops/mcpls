@@ -11,7 +11,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::bridge::{WorkspaceRoots, lexically_normalize};
-use crate::config::HostOs;
+use crate::config::{HostOs, ServerCommand};
 use crate::error::UntrustedRefusal;
 use crate::lsp::ChildWorkingDir;
 
@@ -27,6 +27,11 @@ impl UntrustedBoundary {
         Self(roots)
     }
 
+    /// The roots that draw the boundary.
+    pub const fn roots(&self) -> &WorkspaceRoots {
+        &self.0
+    }
+
     /// Refuses an argument of `args` that names an executable file inside the
     /// boundary, as [`refuse_workspace_executable_arguments`] does.
     ///
@@ -38,6 +43,34 @@ impl UntrustedBoundary {
         host: HostOs,
     ) -> Result<(), UntrustedRefusal> {
         refuse_workspace_executable_arguments(args, &self.0, working_dir, host)
+    }
+}
+
+/// What untrusted mode vets a server against, remembered so a respawn repeats
+/// the startup checks and names the same command.
+#[derive(Debug, Clone)]
+pub struct UntrustedVetting {
+    boundary: UntrustedBoundary,
+    configured: ServerCommand,
+}
+
+impl UntrustedVetting {
+    /// Vetting against `boundary` for the server configured as `configured`.
+    pub const fn new(boundary: WorkspaceRoots, configured: ServerCommand) -> Self {
+        Self {
+            boundary: UntrustedBoundary::new(boundary),
+            configured,
+        }
+    }
+
+    /// The boundary the server's executables and arguments must keep clear of.
+    pub const fn boundary(&self) -> &UntrustedBoundary {
+        &self.boundary
+    }
+
+    /// The command as the user configured it.
+    pub const fn configured(&self) -> &ServerCommand {
+        &self.configured
     }
 }
 
