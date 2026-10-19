@@ -43,6 +43,14 @@ impl WorkspaceRoots {
 
 fn open_regular(path: &WorkspacePath) -> Result<RegularFile, Error> {
     RegularFile::open(path.as_path()).map_err(|error| match error {
+        // Windows refuses to open a directory without backup semantics
+        OpenRegularFileError::Io(source)
+            if cfg!(windows)
+                && source.kind() == io::ErrorKind::PermissionDenied
+                && path.as_path().is_dir() =>
+        {
+            Error::NotARegularFile(path.as_path().to_path_buf())
+        }
         OpenRegularFileError::Io(source) => file_io(path, source),
         OpenRegularFileError::NotRegular => Error::NotARegularFile(path.as_path().to_path_buf()),
     })
@@ -468,7 +476,7 @@ mod tests {
         std::fs::remove_dir_all(base.join("ws/sub")).unwrap();
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(base.join("ws/sub"))
+            .arg(base.join("ws").join("sub"))
             .arg(base.join("out"))
             .status()
             .unwrap();
