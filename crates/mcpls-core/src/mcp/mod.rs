@@ -3,6 +3,7 @@
 //! This module defines the MCP tools that expose LSP capabilities
 //! to AI agents.
 
+mod cancel;
 mod custom_request;
 mod handlers;
 mod parameters;

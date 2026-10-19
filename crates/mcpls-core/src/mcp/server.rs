@@ -24,6 +24,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use super::cancel::{peer_closed, run_cancellable};
 use super::custom_request;
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
@@ -1326,7 +1327,7 @@ impl McplsServer {
 
     /// Restart LSP servers.
     #[tool(
-        description = "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+        description = "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; if its old process was already stopped, the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
         title = "Restart Server",
         annotations(
             title = "Restart Server",
@@ -1339,7 +1340,17 @@ impl McplsServer {
         &self,
         Parameters(RestartServerParams { target }): Parameters<RestartServerParams>,
     ) -> Result<Json<RestartServerResult>, McpError> {
-        self.structured_result(self.context.translator.restart_servers(target).await)
+        // Once begun, a restart must reach a defined end state per server, so it
+        // is detached from this handler: a cancel after entry does not abandon
+        // a server half-restarted.
+        let translator = Arc::clone(&self.context.translator);
+        let restarted =
+            crate::util::run_detached(async move { translator.restart_servers(target).await })
+                .await;
+        restarted.map_or_else(
+            |_| Err(McpError::internal_error("mcpls is shutting down", None)),
+            |result| self.structured_result(result),
+        )
     }
 
     /// Report which tools are usable for which languages.
@@ -1732,8 +1743,19 @@ impl ServerHandler for McplsServer {
         request: CallToolRequestParams,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let tool = request.name.clone();
+        let (request_token, peer) = (context.ct.clone(), context.peer.clone());
         let tcc = ToolCallContext::new(self, request, context);
-        contain_panic(self.tool_router.call(tcc), "tool call").await
+        let handler = contain_panic(self.tool_router.call(tcc), "tool call");
+        match run_cancellable(&request_token, peer_closed(&peer), handler).await {
+            Ok(result) => result,
+            Err(stop) => {
+                // Never delivered: rmcp discards the response of a cancelled
+                // request, and the transport is gone when the connection closed.
+                tracing::debug!(%tool, %stop, "tool call stopped before it finished");
+                Err(McpError::internal_error(stop.to_string(), None))
+            }
+        }
     }
 
     /// When cached diagnostics exist, the replay notification is sent to the client

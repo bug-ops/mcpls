@@ -1,7 +1,6 @@
 //! LSP client implementation with async request/response handling.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use lsp_types::{ErrorCodes, LspErrorCodes, PublishDiagnosticsParams};
@@ -23,6 +22,10 @@ use crate::lsp::types::{
 use crate::lsp::{DropCounter, DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
 use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;
+
+mod cancel;
+
+use cancel::{InFlightRequest, PendingRequests, Resolution};
 
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
@@ -132,9 +135,6 @@ const COMPLETION_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 /// be a best-effort follow-up. Mirrors [`COMPLETION_TIMEOUT_CAP`]'s
 /// reasoning. See [`LspClient::code_action_resolve_timeout`].
 const CODE_ACTION_RESOLVE_TIMEOUT_CAP: Duration = Duration::from_secs(10);
-
-/// Type alias for pending request tracking map.
-type PendingRequests = HashMap<RequestId, oneshot::Sender<Result<Value>>>;
 
 /// Spawns the dedicated background task that owns `reader` exclusively and
 /// decodes inbound LSP frames in a loop, handing each one to
@@ -276,7 +276,11 @@ pub struct LspClient {
     /// connection known to be dead can fail its stragglers immediately via
     /// [`Self::fail_pending_requests`] rather than leaving each to discover
     /// that only when its own timeout elapses.
-    pending_requests: Arc<Mutex<PendingRequests>>,
+    pending_requests: PendingRequests,
+
+    /// Set once the `shutdown` request is issued or the client shuts down:
+    /// from then on no `$/cancelRequest` is sent. Shared by every clone.
+    closing: Arc<AtomicBool>,
 
     /// The error stragglers in `pending_requests` fail with, shared by every
     /// clone and by the message loop's exit-path drain.
@@ -318,7 +322,8 @@ impl Clone for LspClient {
             state: Arc::clone(&self.state),
             request_counter: Arc::clone(&self.request_counter),
             command_tx: self.command_tx.clone(),
-            pending_requests: Arc::clone(&self.pending_requests),
+            pending_requests: self.pending_requests.clone(),
+            closing: Arc::clone(&self.closing),
             pending_failure: Arc::clone(&self.pending_failure),
             receiver_task: None,
             redactions: Arc::clone(&self.redactions),
@@ -349,7 +354,25 @@ enum Delivery {
     Dropped(Lane),
 }
 
+/// The receiving end of a test client's command channel.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct CommandProbe(mpsc::Receiver<ClientCommand>);
+
+#[cfg(test)]
+impl CommandProbe {
+    /// The method of the next queued command, `None` when the queue is empty.
+    pub(crate) fn next_method(&mut self) -> Option<String> {
+        match self.0.try_recv().ok()? {
+            ClientCommand::SendRequest { request } => Some(request.method),
+            ClientCommand::SendNotification { method, .. } => Some(method),
+            ClientCommand::Shutdown => Some("<shutdown>".to_owned()),
+        }
+    }
+}
+
 /// Commands for client control.
+#[derive(Debug)]
 enum ClientCommand {
     /// Send a request and wait for response.
     SendRequest { request: JsonRpcRequest },
@@ -379,12 +402,30 @@ impl LspClient {
             state: Arc::new(Mutex::new(super::ServerState::Uninitialized)),
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_requests: PendingRequests::default(),
+            closing: Arc::default(),
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
             connection_id: ConnectionId::next(),
         }
+    }
+
+    /// A client over a command channel of `capacity` that the test drains
+    /// itself, standing in for the message loop.
+    #[cfg(test)]
+    pub(crate) fn with_command_channel(
+        config: LspServerConfig,
+        capacity: usize,
+    ) -> (Self, CommandProbe) {
+        let (command_tx, command_rx) = mpsc::channel(capacity);
+        (
+            Self {
+                command_tx,
+                ..Self::new(config)
+            },
+            CommandProbe(command_rx),
+        )
     }
 
     /// Create client from transport (for testing or custom spawning).
@@ -397,7 +438,7 @@ impl LspClient {
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
-        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
         let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
 
         let (command_tx, command_rx) = mpsc::channel(100);
@@ -405,7 +446,7 @@ impl LspClient {
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
-            Arc::clone(&pending_requests),
+            pending_requests.clone(),
             Arc::clone(&pending_failure),
             None,
             None,
@@ -419,6 +460,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            closing: Arc::default(),
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions: Arc::default(),
@@ -443,7 +485,7 @@ impl LspClient {
     ) -> Self {
         let state = Arc::new(Mutex::new(super::ServerState::Initializing));
         let request_counter = Arc::new(AtomicI64::new(1));
-        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
         let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
 
         let (command_tx, command_rx) = mpsc::channel(100);
@@ -451,7 +493,7 @@ impl LspClient {
         let receiver_task = tokio::spawn(Self::message_loop(
             transport,
             command_rx,
-            Arc::clone(&pending_requests),
+            pending_requests.clone(),
             Arc::clone(&pending_failure),
             Some(notification_tx),
             Some(lifecycle_tx),
@@ -465,6 +507,7 @@ impl LspClient {
             request_counter,
             command_tx,
             pending_requests,
+            closing: Arc::default(),
             pending_failure,
             receiver_task: Some(receiver_task),
             redactions,
@@ -594,31 +637,22 @@ impl LspClient {
         self.request_timeout().min(CODE_ACTION_RESOLVE_TIMEOUT_CAP)
     }
 
-    /// Registers before enqueuing the send command (not before the message
-    /// loop's own transport read), cleaning up the entry if the send fails.
+    /// Registers the request before enqueuing it (not before the message
+    /// loop's own transport read), so a reply can never beat its entry. The
+    /// returned guard cancels the request on the server if it is dropped while
+    /// the request is outstanding.
     async fn register_and_send_request(
         &self,
         request: JsonRpcRequest,
-        response_tx: oneshot::Sender<Result<Value>>,
-    ) -> Result<()> {
-        let id = request.id.clone();
-
-        self.pending_requests
-            .lock()
-            .await
-            .insert(id.clone(), response_tx);
-
-        if self
-            .command_tx
+        responder: oneshot::Sender<Result<Value>>,
+    ) -> Result<InFlightRequest<'_>> {
+        let mut in_flight = InFlightRequest::register(self, request.id.clone(), responder);
+        self.command_tx
             .send(ClientCommand::SendRequest { request })
             .await
-            .is_err()
-        {
-            self.pending_requests.lock().await.remove(&id);
-            return Err(Error::ServerTerminated);
-        }
-
-        Ok(())
+            .map_err(|_| Error::ServerTerminated)?;
+        in_flight.mark_sent();
+        Ok(in_flight)
     }
 
     /// Send request and wait for response with timeout.
@@ -629,6 +663,16 @@ impl LspClient {
     /// `data.retriggerRequest` when present -- using exponential backoff
     /// starting at 500 ms. Both codes share the same attempt budget: a
     /// request that hits -32801 then -32802 does not get 8 attempts, only 4.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future while the request is outstanding sends
+    /// `$/cancelRequest` for it to the server, once, and ends any retry
+    /// backoff without allocating another request id. A request that exceeds
+    /// `timeout_duration` is cancelled the same way before
+    /// [`Error::Timeout`] is returned. The server's late reply is dropped
+    /// quietly. Nothing is sent for a request that already has its reply, was
+    /// failed in bulk, or is the `shutdown` request.
     ///
     /// This method owns the severity of LSP error-response logging (#392):
     /// a transient error about to be retried logs at `warn!`, while `error!`
@@ -677,6 +721,9 @@ impl LspClient {
         let params_value = Self::omit_null_params(
             serde_json::to_value(params).map_err(|e| UnclassifiedError::logged(e.into()))?,
         );
+        if method == <lsp_types::ShutdownRequest as lsp_types::Request>::METHOD.as_str() {
+            self.suppress_cancels();
+        }
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
@@ -700,20 +747,21 @@ impl LspClient {
 
             debug!("Sending request: {} (id={:?})", method, id);
 
-            self.register_and_send_request(request, response_tx)
+            let mut in_flight = self
+                .register_and_send_request(request, response_tx)
                 .await
                 .map_err(UnclassifiedError::logged)?;
 
             let outcome = match timeout(timeout_duration, response_rx).await {
                 Ok(received) => {
+                    in_flight.mark_settled();
                     received.map_err(|_| UnclassifiedError::logged(Error::ServerTerminated))?
                 }
                 Err(_elapsed) => {
-                    // The response may still arrive after this point (the
-                    // server is just slow, not dead), but nothing will ever
-                    // read it again -- drop the now-orphaned entry instead of
-                    // leaking it in `pending_requests` forever.
-                    self.pending_requests.lock().await.remove(&id);
+                    // The server is slow, not necessarily dead: tell it to stop
+                    // and keep a tombstone so its late reply is dropped quietly
+                    // rather than warned about as an unknown id.
+                    in_flight.expire();
                     return Err(UnclassifiedError::logged(Error::Timeout(timeout_duration)));
                 }
             };
@@ -860,8 +908,8 @@ impl LspClient {
     /// Intended for a client that is about to be discarded -- e.g.
     /// superseded by a respawned replacement for the same server -- so
     /// callers still waiting on it unblock immediately.
-    pub(crate) async fn fail_pending_requests(&self) {
-        Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure).await;
+    pub(crate) fn fail_pending_requests(&self) {
+        Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure);
     }
 
     /// Make every request still pending, or failed later by the loop's exit
@@ -877,11 +925,8 @@ impl LspClient {
     /// Drains `pending`, resolving each remaining sender to
     /// `Err(Error::ServerTerminated)`. Shared by [`Self::fail_pending_requests`]
     /// and [`Self::message_loop`]'s exit-path cleanup (#458).
-    async fn drain_and_fail_pending(
-        pending: &Arc<Mutex<PendingRequests>>,
-        failure: &StdMutex<PendingFailure>,
-    ) {
-        for (_, sender) in pending.lock().await.drain() {
+    fn drain_and_fail_pending(pending: &PendingRequests, failure: &StdMutex<PendingFailure>) {
+        for sender in pending.drain_waiting() {
             let error = failure
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -952,6 +997,7 @@ impl LspClient {
     pub(crate) async fn shutdown_until(&mut self, deadline: Instant) -> Result<()> {
         debug!("Shutting down LSP client");
 
+        self.suppress_cancels();
         let mut task = self.receiver_task.take();
         let command_tx = &self.command_tx;
         let outcome = timeout_at(deadline, async {
@@ -977,7 +1023,7 @@ impl LspClient {
                 // request cannot enqueue after the drain below (#458).
                 let _ = timeout(SHUTDOWN_ABORT_SETTLE, task).await;
             }
-            Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure).await;
+            Self::drain_and_fail_pending(&self.pending_requests, &self.pending_failure);
         }
 
         *self.state.lock().await = super::ServerState::Shutdown;
@@ -998,7 +1044,7 @@ impl LspClient {
     async fn message_loop(
         transport: (LspTransport, LspTransportReader),
         mut command_rx: mpsc::Receiver<ClientCommand>,
-        pending_requests: Arc<Mutex<PendingRequests>>,
+        pending_requests: PendingRequests,
         pending_failure: Arc<StdMutex<PendingFailure>>,
         notification_tx: Option<NotificationSink>,
         lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
@@ -1034,7 +1080,7 @@ impl LspClient {
         // Runs after `message_loop_inner` returns, so a response the Shutdown
         // drain (#451) already resolved is gone from the map by now -- only
         // requests with no answer get failed here (#458).
-        Self::drain_and_fail_pending(&pending_requests, &pending_failure).await;
+        Self::drain_and_fail_pending(&pending_requests, &pending_failure);
         if let Err(ref e) = result {
             error!("Message loop exiting with error: {}", e);
         } else {
@@ -1149,7 +1195,7 @@ impl LspClient {
         transport: &mut LspTransport,
         msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
-        pending_requests: &Arc<Mutex<PendingRequests>>,
+        pending_requests: &PendingRequests,
         notification_tx: Option<&NotificationSink>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
@@ -1233,17 +1279,15 @@ impl LspClient {
     }
 
     /// Hands `response` to the request waiting for it, if any.
-    async fn complete_pending(
-        pending_requests: &Arc<Mutex<PendingRequests>>,
+    fn complete_pending(
+        pending_requests: &PendingRequests,
         response: JsonRpcResponse,
         redactions: &Redactions,
     ) {
         trace!("Received response: id={:?}", response.id);
 
-        let sender = pending_requests.lock().await.remove(&response.id);
-
-        if let Some(sender) = sender {
-            match response.outcome {
+        match pending_requests.resolve(&response.id) {
+            Resolution::Waiting(sender) => match response.outcome {
                 JsonRpcOutcome::Error(error) => {
                     // Deliberately not logged at `error!` here: this fires
                     // for every attempt, before `LspClient::request`'s retry
@@ -1277,12 +1321,19 @@ impl LspClient {
                 JsonRpcOutcome::Result(result) => {
                     let _ = sender.send(Ok(result));
                 }
+            },
+            Resolution::Cancelled(cause) => {
+                trace!(
+                    "Dropped the reply to a request mcpls cancelled ({cause:?}): id={:?}",
+                    response.id
+                );
             }
-        } else {
-            warn!(
-                "Received response for unknown request ID: {:?}",
-                response.id
-            );
+            Resolution::Unknown => {
+                warn!(
+                    "Received response for unknown request ID: {:?}",
+                    response.id
+                );
+            }
         }
     }
 
@@ -1294,7 +1345,7 @@ impl LspClient {
     async fn handle_inbound_message(
         transport: &mut LspTransport,
         message: InboundMessage,
-        pending_requests: &Arc<Mutex<PendingRequests>>,
+        pending_requests: &PendingRequests,
         notification_tx: Option<&NotificationSink>,
         lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
         redactions: &Redactions,
@@ -1302,12 +1353,11 @@ impl LspClient {
     ) -> Result<()> {
         match message {
             InboundMessage::Response(response) => {
-                Self::complete_pending(pending_requests, response, redactions).await;
+                Self::complete_pending(pending_requests, response, redactions);
             }
             InboundMessage::UndecodableResponse { id } => {
                 warn!("Failed the request answered by an undecodable response: id={id:?}");
-                let sender = pending_requests.lock().await.remove(&id);
-                if let Some(sender) = sender {
+                if let Resolution::Waiting(sender) = pending_requests.resolve(&id) {
                     let _ = sender.send(Err(Error::LspProtocolError(RedactedText::fixed(
                         "undecodable response",
                     ))));
@@ -1686,7 +1736,7 @@ mod tests {
         );
         let (mut transport, _reader) = LspTransport::new(tokio::io::sink(), tokio::io::empty());
         let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = PendingRequests::default();
         let notification = InboundMessage::Notification(JsonRpcNotification {
             jsonrpc: JsonRpcVersion,
             method: "custom/echo".to_string(),
@@ -2205,14 +2255,11 @@ mod tests {
     async fn test_null_response_handling() {
         use crate::lsp::types::{JsonRpcResponse, RequestId};
 
-        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
 
         let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
 
-        pending_requests
-            .lock()
-            .await
-            .insert(RequestId::Number(1), response_tx);
+        pending_requests.register(RequestId::Number(1), response_tx);
 
         let null_response = JsonRpcResponse {
             jsonrpc: JsonRpcVersion,
@@ -2220,10 +2267,10 @@ mod tests {
             outcome: JsonRpcOutcome::Result(Value::Null),
         };
 
-        let sender = pending_requests.lock().await.remove(&null_response.id);
-        if let Some(sender) = sender {
-            let _ = sender.send(Ok(Value::Null));
-        }
+        let Resolution::Waiting(sender) = pending_requests.resolve(&null_response.id) else {
+            panic!("the request must be waiting");
+        };
+        let _ = sender.send(Ok(Value::Null));
 
         let timeout_result =
             tokio::time::timeout(tokio::time::Duration::from_millis(100), response_rx).await;
@@ -2252,13 +2299,10 @@ mod tests {
     async fn test_error_response_handling() {
         use crate::lsp::types::{JsonRpcError, JsonRpcResponse, RequestId};
 
-        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
         let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
 
-        pending_requests
-            .lock()
-            .await
-            .insert(RequestId::Number(1), response_tx);
+        pending_requests.register(RequestId::Number(1), response_tx);
 
         let error_response = JsonRpcResponse {
             jsonrpc: JsonRpcVersion,
@@ -2270,8 +2314,7 @@ mod tests {
             }),
         };
 
-        let sender = pending_requests.lock().await.remove(&error_response.id);
-        if let Some(sender) = sender
+        if let Resolution::Waiting(sender) = pending_requests.resolve(&error_response.id)
             && let JsonRpcOutcome::Error(error) = error_response.outcome
         {
             let _ = sender.send(Err(Error::LspServerError {
@@ -2296,7 +2339,7 @@ mod tests {
     async fn test_unknown_request_id() {
         use crate::lsp::types::{JsonRpcResponse, RequestId};
 
-        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
 
         let response = JsonRpcResponse {
             jsonrpc: JsonRpcVersion,
@@ -2304,8 +2347,11 @@ mod tests {
             outcome: JsonRpcOutcome::Result(Value::Null),
         };
 
-        let sender = pending_requests.lock().await.remove(&response.id);
-        assert!(sender.is_none(), "Should not find sender for unknown ID");
+        assert_matches!(
+            pending_requests.resolve(&response.id),
+            Resolution::Unknown,
+            "Should not find sender for unknown ID"
+        );
     }
 
     #[test]
@@ -2411,7 +2457,7 @@ mod tests {
 
         assert_matches!(result, Err(Error::Timeout(_)), "got {result:?}");
         assert!(
-            client.pending_requests.lock().await.is_empty(),
+            client.pending_requests.no_waiting(),
             "timed-out request must not remain in pending_requests"
         );
     }
@@ -2421,7 +2467,7 @@ mod tests {
     /// immediately rather than leaving callers to wait out their timeout.
     #[tokio::test]
     async fn test_fail_pending_requests_resolves_all_as_server_terminated() {
-        let pending_requests: Arc<Mutex<PendingRequests>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests = PendingRequests::default();
         let (command_tx, _command_rx) = mpsc::channel(1);
 
         let client = LspClient {
@@ -2429,7 +2475,8 @@ mod tests {
             state: Arc::new(Mutex::new(super::super::ServerState::Ready)),
             request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
-            pending_requests: Arc::clone(&pending_requests),
+            pending_requests: pending_requests.clone(),
+            closing: Arc::default(),
             pending_failure: Arc::default(),
             receiver_task: None,
             redactions: Arc::default(),
@@ -2438,18 +2485,12 @@ mod tests {
 
         let (tx1, rx1) = oneshot::channel::<Result<Value>>();
         let (tx2, rx2) = oneshot::channel::<Result<Value>>();
-        pending_requests
-            .lock()
-            .await
-            .insert(RequestId::Number(1), tx1);
-        pending_requests
-            .lock()
-            .await
-            .insert(RequestId::Number(2), tx2);
+        pending_requests.register(RequestId::Number(1), tx1);
+        pending_requests.register(RequestId::Number(2), tx2);
 
-        client.fail_pending_requests().await;
+        client.fail_pending_requests();
 
-        assert!(pending_requests.lock().await.is_empty());
+        assert!(pending_requests.no_waiting());
         assert_matches!(rx1.await.unwrap(), Err(Error::ServerTerminated));
         assert_matches!(rx2.await.unwrap(), Err(Error::ServerTerminated));
     }
@@ -2491,9 +2532,12 @@ mod tests {
                 "request awaiting its reply must time out"
             );
             assert!(
-                client.pending_requests.lock().await.is_empty(),
+                client.pending_requests.no_waiting(),
                 "timed-out request must not remain in pending_requests"
             );
+            let cancel = read_framed_message(&mut reader).await;
+            assert_eq!(cancel["method"], "$/cancelRequest");
+            assert_eq!(cancel["params"]["id"], first_request["id"]);
 
             write_response(
                 &mut server.read_half_stdin,
@@ -2513,7 +2557,7 @@ mod tests {
             .await;
 
             assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("fresh"));
-            assert!(client.pending_requests.lock().await.is_empty());
+            assert!(client.pending_requests.no_waiting());
         }
 
         #[tokio::test]
@@ -2549,7 +2593,7 @@ mod tests {
             )
             .await;
             assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("alive"));
-            assert!(client.pending_requests.lock().await.is_empty());
+            assert!(client.pending_requests.no_waiting());
         }
 
         fn deeply_nested() -> String {
@@ -2741,6 +2785,9 @@ mod tests {
             let first_request = read_framed_message(&mut reader).await;
             first.abort();
             assert!(first.await.unwrap_err().is_cancelled());
+            let cancel = read_framed_message(&mut reader).await;
+            assert_eq!(cancel["method"], "$/cancelRequest");
+            assert_eq!(cancel["params"]["id"], first_request["id"]);
 
             write_response(
                 &mut server.read_half_stdin,
@@ -2760,7 +2807,7 @@ mod tests {
 
             assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("fresh"));
             assert!(
-                client.pending_requests.lock().await.is_empty(),
+                client.pending_requests.no_waiting(),
                 "the orphaned reply must clear the abandoned entry"
             );
         }
@@ -3552,8 +3599,7 @@ mod tests {
             let (mut transport, _reader) = inert_transport();
             let (_command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
             let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
-            let pending_requests: Arc<Mutex<PendingRequests>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            let pending_requests = PendingRequests::default();
 
             drop(msg_tx);
 
@@ -3588,14 +3634,10 @@ mod tests {
             let (mut transport, _reader) = inert_transport();
             let (_command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
             let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
-            let pending_requests: Arc<Mutex<PendingRequests>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            let pending_requests = PendingRequests::default();
 
             let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
-            pending_requests
-                .lock()
-                .await
-                .insert(RequestId::Number(1), response_tx);
+            pending_requests.register(RequestId::Number(1), response_tx);
 
             drop(msg_tx);
 
@@ -3612,11 +3654,11 @@ mod tests {
             .await;
             assert_matches!(result, Err(Error::ServerTerminated), "got {result:?}");
 
-            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default()).await;
+            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default());
 
             let received = response_rx.await.unwrap();
             assert_matches!(received, Err(Error::ServerTerminated), "got {received:?}");
-            assert!(pending_requests.lock().await.is_empty());
+            assert!(pending_requests.no_waiting());
         }
 
         /// The reader task can run ahead of `select!` and have already queued
@@ -3631,15 +3673,11 @@ mod tests {
             let (mut transport, _reader) = inert_transport();
             let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
             let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
-            let pending_requests: Arc<Mutex<PendingRequests>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            let pending_requests = PendingRequests::default();
 
             let id = RequestId::Number(1);
             let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
-            pending_requests
-                .lock()
-                .await
-                .insert(id.clone(), response_tx);
+            pending_requests.register(id.clone(), response_tx);
 
             msg_tx
                 .send(Ok(InboundMessage::Response(JsonRpcResponse {
@@ -3670,7 +3708,7 @@ mod tests {
             let received = response_rx.await.unwrap();
             assert_eq!(received.unwrap(), serde_json::json!({ "ok": true }));
             assert!(
-                pending_requests.lock().await.is_empty(),
+                pending_requests.no_waiting(),
                 "the drained response must resolve its pending request entry"
             );
         }
@@ -3686,19 +3724,15 @@ mod tests {
         async fn test_message_loop_fails_pending_requests_on_transport_error_exit() {
             let (transport, reader) = inert_transport();
             let (_command_tx, command_rx) = mpsc::channel::<ClientCommand>(1);
-            let pending_requests: Arc<Mutex<PendingRequests>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            let pending_requests = PendingRequests::default();
 
             let (response_tx, response_rx) = oneshot::channel::<Result<Value>>();
-            pending_requests
-                .lock()
-                .await
-                .insert(RequestId::Number(1), response_tx);
+            pending_requests.register(RequestId::Number(1), response_tx);
 
             let result = LspClient::message_loop(
                 (transport, reader),
                 command_rx,
-                Arc::clone(&pending_requests),
+                pending_requests.clone(),
                 Arc::default(),
                 None,
                 None,
@@ -3710,7 +3744,7 @@ mod tests {
             assert!(result.is_err(), "got {result:?}");
             let received = response_rx.await.unwrap();
             assert_matches!(received, Err(Error::ServerTerminated), "got {received:?}");
-            assert!(pending_requests.lock().await.is_empty());
+            assert!(pending_requests.no_waiting());
         }
 
         /// #458: unit-level check that composing `message_loop_inner`'s
@@ -3727,21 +3761,14 @@ mod tests {
             let (mut transport, _reader) = inert_transport();
             let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(1);
             let (msg_tx, mut msg_rx) = mpsc::channel::<Result<InboundMessage>>(1);
-            let pending_requests: Arc<Mutex<PendingRequests>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            let pending_requests = PendingRequests::default();
 
             let answered_id = RequestId::Number(1);
             let (answered_tx, answered_rx) = oneshot::channel::<Result<Value>>();
             let unanswered_id = RequestId::Number(2);
             let (unanswered_tx, unanswered_rx) = oneshot::channel::<Result<Value>>();
-            pending_requests
-                .lock()
-                .await
-                .insert(answered_id.clone(), answered_tx);
-            pending_requests
-                .lock()
-                .await
-                .insert(unanswered_id.clone(), unanswered_tx);
+            pending_requests.register(answered_id.clone(), answered_tx);
+            pending_requests.register(unanswered_id.clone(), unanswered_tx);
 
             msg_tx
                 .send(Ok(InboundMessage::Response(JsonRpcResponse {
@@ -3769,7 +3796,7 @@ mod tests {
 
             // Mirrors the drain `message_loop` runs after `message_loop_inner`
             // returns.
-            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default()).await;
+            LspClient::drain_and_fail_pending(&pending_requests, &StdMutex::default());
 
             let answered = answered_rx.await.unwrap();
             assert_eq!(answered.unwrap(), serde_json::json!({ "ok": true }));
@@ -3780,7 +3807,7 @@ mod tests {
                 Err(Error::ServerTerminated),
                 "got {unanswered:?}"
             );
-            assert!(pending_requests.lock().await.is_empty());
+            assert!(pending_requests.no_waiting());
         }
 
         /// #458 S2: end-to-end proof that `message_loop`'s post-loop drain

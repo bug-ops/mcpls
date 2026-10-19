@@ -197,7 +197,6 @@ async fn init_lsp_servers(
         tally: StartupTally::default(),
     };
 
-    // TODO(#648): subscribed-file disk re-pull needs a task owned by serve_with
     let mut cancelled = cancel.is_cancelled();
     let mut pending = (!cancelled).then(|| start_servers(configs, max_concurrent_starts));
     loop {

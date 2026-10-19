@@ -1043,7 +1043,7 @@ impl Translator {
     /// The guard is taken before `ensure_open` so there is no window between
     /// the path lock releasing and the guard taking effect (#503); it is
     /// dropped with the error on failure.
-    async fn open_prepared(
+    pub(super) async fn open_prepared(
         &self,
         server_id: ServerId,
         client: LspClient,
@@ -1296,20 +1296,23 @@ impl Translator {
     /// unrelated calls. Paths not reached before the deadline stay pending.
     ///
     /// Best-effort: a failed close is logged and its debt dropped, never
-    /// failing the request that triggered the eviction. A wedged or dead
-    /// server is respawned, and `forget_server` clears its history anyway. A
-    /// server that is no longer registered is dropped the same way.
+    /// failing the request that triggered the eviction. A close whose send was
+    /// cut short (the call was cancelled, or the deadline passed) stays owed.
+    /// A wedged or dead server is respawned, and `forget_server` clears its
+    /// history anyway. A server that is no longer registered is dropped the
+    /// same way.
     async fn flush_pending_closes(&self) {
         let flush = async {
             for path in self.document_tracker.pending_close_paths() {
-                let Some(claim) = self.document_tracker.try_claim_pending_close(&path) else {
+                let Some(mut claim) = self.document_tracker.try_claim_pending_close(&path) else {
                     continue;
                 };
-                for server_id in &claim.servers {
-                    let Some(client) = lock_std(&self.servers).client(server_id) else {
+                for server_id in claim.servers.clone() {
+                    let Some(client) = lock_std(&self.servers).client(&server_id) else {
+                        claim.settle(&server_id);
                         continue;
                     };
-                    if let Err(err) = client
+                    let sent = client
                         .notify_typed::<lsp_types::DidCloseTextDocumentNotification>(
                             lsp_types::DidCloseTextDocumentParams {
                                 text_document: lsp_types::TextDocumentIdentifier {
@@ -1317,8 +1320,9 @@ impl Translator {
                                 },
                             },
                         )
-                        .await
-                    {
+                        .await;
+                    claim.settle(&server_id);
+                    if let Err(err) = sent {
                         tracing::warn!(
                             %server_id,
                             path = %claim.path.display(),
@@ -1337,7 +1341,7 @@ impl Translator {
             tracing::warn!(
                 deadline = ?FLUSH_PENDING_CLOSES_DEADLINE,
                 "flushing evicted documents' didClose notifications hit the deadline; paths not yet \
-                 reached stay pending, the in-flight path's remaining closes are dropped"
+                 reached and the in-flight path's unsent closes stay pending"
             );
         }
     }
@@ -2738,6 +2742,64 @@ mod tests {
         assert!(
             tracker.pending_close_paths().is_empty(),
             "a failed close is dropped, not re-owed"
+        );
+    }
+
+    /// #687 FR-027: a flush abandoned while it waits on one server leaves
+    /// every close it did not deliver owed, and none it delivered.
+    #[tokio::test(start_paused = true)]
+    async fn test_flush_pending_closes_dropped_midway_keeps_undelivered_closes_owed() {
+        let dir = TempDir::new().unwrap();
+        let (translator, mut server_a) = single_document_translator(&dir);
+        let (client_d, _probe_d) =
+            LspClient::with_command_channel(crate::config::LspServerConfig::rust_analyzer(), 2);
+        let (a, d) = (
+            ServerId::from_static("lang_a"),
+            ServerId::from_static("lang_d"),
+        );
+
+        let tracker = &translator.document_tracker;
+        let path = dir.path().join("p.aa");
+        std::fs::write(&path, "p").unwrap();
+        let other = dir.path().join("q.aa");
+        std::fs::write(&other, "q").unwrap();
+        let client_a = lock_std(&translator.servers).client(&a).unwrap();
+        tracker.ensure_open(&path, &a, &client_a).await.unwrap();
+        tracker.ensure_open(&path, &d, &client_d).await.unwrap();
+        tracker.ensure_open(&other, &a, &client_a).await.unwrap();
+        translator.register_client(d.clone(), client_d.clone());
+        client_d
+            .notify("test/fill", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        {
+            let flush = translator.flush_pending_closes();
+            let mut flush = std::pin::pin!(flush);
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+        }
+
+        let mut wire = tokio::io::BufReader::with_capacity(1, &mut server_a.write_stdout);
+        for method in ["textDocument/didOpen", "textDocument/didOpen"] {
+            assert_eq!(read_framed_message(&mut wire).await["method"], method);
+        }
+        let a_close_delivered =
+            tokio::time::timeout(Duration::from_millis(100), read_framed_message(&mut wire))
+                .await
+                .is_ok();
+        let owed = tracker
+            .try_claim_pending_close(&path)
+            .unwrap()
+            .servers
+            .clone();
+        assert!(
+            owed.contains(&d),
+            "the close nobody delivered must stay owed"
+        );
+        assert_eq!(
+            owed.contains(&a),
+            !a_close_delivered,
+            "a close is owed exactly when it was not delivered: {owed:?}"
         );
     }
 

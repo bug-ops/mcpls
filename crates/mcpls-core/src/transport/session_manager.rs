@@ -1011,6 +1011,43 @@ mod tests {
         serving.abort();
     }
 
+    /// #687 / FR-023: closing a session stops its in-flight tool call, so the
+    /// language server is told to cancel, within rmcp's drain plus one poll.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
+    )]
+    #[tokio::test(start_paused = true)]
+    async fn test_closing_a_session_cancels_its_in_flight_tool_call() {
+        use tokio::io::BufReader;
+
+        use crate::test_lsp::read_framed_message;
+
+        let manager = manager_with_short_deadline();
+        let (_dir, mut lsp, server, call) = hung_tool_call();
+        let (id, serving) = initialized_session_serving(&manager, server).await;
+        let _stream = manager.create_stream(&id, call).await.unwrap();
+
+        // One byte of buffer: a larger one swallows the frames behind the one read.
+        let mut reader = BufReader::with_capacity(1, &mut lsp.write_stdout);
+        let opened = read_framed_message(&mut reader).await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        let hover = read_framed_message(&mut reader).await;
+        assert_eq!(hover["method"], "textDocument/hover");
+
+        let closed_at = tokio::time::Instant::now();
+        manager.close_session(&id).await.unwrap();
+        let cancel = read_framed_message(&mut reader).await;
+        assert_eq!(cancel["method"], "$/cancelRequest");
+        assert_eq!(cancel["params"]["id"], hover["id"]);
+        assert!(
+            closed_at.elapsed() <= std::time::Duration::from_secs(5 + 1),
+            "the handler outlived the session by {:?}",
+            closed_at.elapsed()
+        );
+        serving.abort();
+    }
+
     /// #587 wiring: a request-wise `resume` (not the common channel) is
     /// bounded too.
     #[allow(

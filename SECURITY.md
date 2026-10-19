@@ -166,33 +166,55 @@ enforces the following, and nothing more:
   refused: package runners (`npm`, `npx`, `bunx`, `pnpm`, `pnpx`, `yarn`, `uvx`,
   `corepack`, `deno npm:`), task runners (`make`, `just`, `task`, `rake`, `mvn`,
   `sbt`), programs that run their arguments (`xargs`, `find`, `awk`, `gawk`,
-  `mawk`, `nawk`, `script`, `su`, `flock`, `watch`), wrappers whose options are not
+  `mawk`, `nawk`, `script`, `su`, `flock`, `watch`, and `cmd`, which without `/c`
+  reads the LSP frames on its stdin as commands; a bare POSIX shell or a
+  program reading its program from stdin is not refused, see below), wrappers
+  whose options are not
   analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`, `setpriv`,
   `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`,
   `unshare`, `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`:
   they change the user, root, directory or environment, or take optional
   arguments) and the run subcommands of `bun`, `deno` (including `eval` and `repl`),
-  `cargo`, `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`, `bundle`, `dotnet`, `pipenv`,
-  `pixi`, `swift`, `stack` and `cabal`. `npx` runs
+  `cargo` (`run`, `r`, `test`, `t`, `bench`), `go`, `uv`, `pipx`, `poetry`, `pdm`, `hatch`,
+  `bundle`, `dotnet`, `pipenv`, `pixi`, `swift`, `stack` (`run`, `exec`, `runghc`,
+  `runhaskell`, `script`, `eval`, `ghci`, `repl`) and `cabal` (`run`, `exec`, `repl`
+  and their `v1-`, `v2-` and `new-` spellings). `npx` runs
   `./node_modules/.bin/<name>` from the working directory before anything else
   and reads a workspace `.npmrc`, so the planted package would run. `env` is
   unwrapped; `env -S`, `env -P`, a `PATH=` assignment and a relative program that `env -C`
   itself starts cannot be analyzed and are refused (a program a nested wrapper
   starts is resolved from mcpls' working directory and spawned by its absolute
   path). A command string
-  cannot be analyzed either, so it is refused for these shells (`-c`, `--command`,
-  `--commands`, `/c`, `/k`, `/r`, PowerShell's `-Command`, `-CommandWithArgs`
+  cannot be analyzed either, so it is refused for these shells (`-c`, `+c`,
+  `--command`, `--commands`, PowerShell's `-Command`, `-CommandWithArgs`
   (`-cwa`) and `-EncodedCommand`, fish's `-C` and `--init-command`, nushell's
   `-e` and `--execute`): `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`,
-  `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`,
-  `powershell`, `pwsh` (also as a `busybox` applet, and with a version suffix such
-  as `ksh93`), and for these interpreters given an inline program (`-e`, `-E`,
-  `-c`, `-p`, `-r`, `--eval`, `--print`, also with the value glued on or after
-  `=`): `node`, `nodejs`,
-  `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`;
-  also a perl `-M` or `-m` value that is more than a module name and an import
-  list (`-MPOSIX;code`), and a `data:` URL given to `--import`, `--loader` or
-  `--experimental-loader` of `node`, `nodejs` and `bun`.
+  `lksh`, `oksh`, `yash`, `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`,
+  `powershell`, `pwsh` (also as a `busybox` applet). The name may carry a version
+  (`ksh93`, `zsh-5.9`) and the suffixes distributions add (`-preview`, `-static`,
+  `-intel64`, `-dbg`, `_d`, `w`, `t`: `pwsh-preview`, `bash-static`, `pythonw3.12`,
+  `python3.13t`, `python_d`). A shell or interpreter flag is read with the
+  whitespace around it removed
+  (runner subcommands and `npm:` are compared as written).
+  PowerShell reads `-`, the en dash, the em dash and the horizontal bar alike,
+  and `/` for a parameter, with any prefix of a parameter name; Windows
+  PowerShell 5.1 (`powershell`) also reads a bare argument as `-Command`, and
+  starts the command string at the first parameter it does not recognize, so
+  for it only the known parameters of 5.1 (with the shortest prefix 5.1 accepts,
+  written bare: an attached `:value` or `=value` makes the token unknown) and
+  their values are admitted and everything else is refused (what follows
+  `-File` is the script's own). fish accepts any
+  prefix of a long flag (`--comm`), elvish one or two dashes (`-c`, `--c`,
+  `-c=true`). The same is refused for these interpreters given an inline
+  program (`-e`, `-E`, `-c`, `-p`, `-r`, `-R`, `-B`, `-F`, `--eval`, `--print`,
+  php's `--run` and `--process-*`, also
+  with the value glued on or after `=`): `node`, `nodejs`, `bun`, `python`, `py`,
+  `perl`, `ruby`, `php`, `lua`, `rscript`, `julia`, `osascript`; also a perl
+  `-M` or `-m` value that is more than a module name and an import list
+  (`-MPOSIX;code`), and a `data:` URL (tabs and newlines inside it are ignored,
+  as URL parsing does) given to `--import`, `--loader` or `--experimental-loader`
+  of `node`, `nodejs` and `bun`. Implementations with the same command line
+  (`pypy`, `luajit`, `jruby`, `truffleruby`) are not listed.
   The wrappers with a small option grammar (`time`, `nice`, `nohup`, `timeout`,
   `setsid`, `stdbuf`, `caffeinate`, `arch`, and `env`, also under their Homebrew GNU
   names `gtime`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`, `genv` and as `busybox`,
@@ -218,7 +240,8 @@ enforces the following, and nothing more:
   workspace and cannot be read (permission denied) is refused as well. An
   executable data file passed in `args` is therefore refused. On a file system where every file has the execute bit (WSL
   drvfs, exFAT, SMB shares) every workspace file in `args` is refused. A resolved wrapped-program path
-  that contains `=` is refused, because `env` would read it as an assignment. The list matches the command's
+  that contains `=` is refused when `env` starts it, because `env` would read
+  it as an assignment. The list matches the command's
   file stem and arguments and is best-effort: the trusted configuration is the
   boundary, so install the server globally and give its absolute path as
   `command`.
@@ -269,9 +292,20 @@ What the mode does not cover:
   (refused only for the TypeScript server) pick versions from workspace files;
   Go switches toolchains from `go.mod`. The executable check sees only the
   launcher, and the launcher list is best-effort.
-- The argument check (see Launcher) runs once, when the server is planned. A
-  restart or respawn reuses the admitted configuration, so a file in `args`
-  that becomes executable afterwards is not caught.
+- The argument check (see Launcher) runs when the server is planned and again
+  right before every spawn, including startup, restarts and respawns. A restart
+  refused by the pre-restart check leaves the running server untouched; the
+  same check also re-plans a trusted TypeScript server's tsserver pin, so a pin
+  that no longer resolves refuses the restart instead of stopping the server. A file
+  that becomes executable after the last check but before the launched
+  program executes it is not caught. A restart whose spawn is refused after the
+  old process was stopped (the file changed in between) leaves the server
+  stopped, not running unchecked.
+- Known gap: a shell or interpreter that is given no command string but reads
+  its program from stdin, which carries the LSP frames (`bash`, `bash -s`,
+  `pwsh -File -`, `python -`), is not refused. Only the workspace folder path
+  in the `initialize` frame is outside the trusted config, and no file content
+  is sent before `initialize` succeeds.
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not

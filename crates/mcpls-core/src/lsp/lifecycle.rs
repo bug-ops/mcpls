@@ -36,6 +36,7 @@ use crate::lsp::process::{MarkOutcome, ServerProcess};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
+use crate::lsp::vetting::UntrustedBoundary;
 use crate::lsp::{
     CONTENT_MODIFIED_RETRY_METHODS, ManagedEnvVar, NotificationInbox, NotificationSink, ParentEnv,
     process_env, tsserver_pin,
@@ -255,6 +256,9 @@ pub struct ServerInitConfig {
     redactions: Arc<Redactions>,
     child_working_dir: ChildWorkingDir,
     auto_pin: Option<AutoPin>,
+    /// Set in untrusted-workspace mode: the boundary the argument backstop is
+    /// evaluated against again before every spawn.
+    untrusted: Option<UntrustedBoundary>,
 }
 
 impl ServerInitConfig {
@@ -305,7 +309,64 @@ impl ServerInitConfig {
             redactions,
             child_working_dir: ChildWorkingDir::Inherit,
             auto_pin: None,
+            untrusted: None,
         }
+    }
+
+    /// This config marked as an untrusted-workspace server whose arguments
+    /// must keep clear of `boundary` (see [`Self::vet_arguments`]).
+    #[must_use]
+    pub(crate) fn with_untrusted_boundary(mut self, boundary: WorkspaceRoots) -> Self {
+        self.untrusted = Some(UntrustedBoundary::new(boundary));
+        self
+    }
+
+    /// Re-runs the untrusted argument backstop on the arguments the server
+    /// would be spawned with; trusted configs are never vetted.
+    ///
+    /// A workspace file can become executable after the plan admitted the
+    /// server, so every spawn (startup, respawn, restart) checks again.
+    /// Walks the file system, so async callers use
+    /// [`Self::vet_arguments_off_runtime`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ServerFailedToStart`] with the untrusted-mode refusal when an
+    /// argument now names an executable inside the workspace.
+    pub(crate) fn vet_arguments(&self) -> Result<()> {
+        let Some(boundary) = &self.untrusted else {
+            return Ok(());
+        };
+        boundary
+            .refuse_arguments(
+                &self.server_config.args,
+                &self.child_working_dir,
+                self.server_config.env.host(),
+            )
+            .map_err(|refusal| self.refusal(refusal))
+    }
+
+    /// [`Self::vet_arguments`] on the blocking pool, skipped for a trusted
+    /// config.
+    pub(crate) async fn vet_arguments_off_runtime(&self) -> Result<()> {
+        if self.untrusted.is_none() {
+            return Ok(());
+        }
+        self.on_planning_pool(Self::vet_arguments).await
+    }
+
+    /// Runs the blocking `plan` on a clone of this config on the blocking pool.
+    async fn on_planning_pool<T: Send + 'static>(
+        &self,
+        plan: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let config = self.clone();
+        crate::on_blocking_pool(move || plan(&config))
+            .await
+            .map_err(|source| Error::TaskFailed {
+                task: crate::error::BackgroundTask::ServerPlanning,
+                source,
+            })?
     }
 
     /// This config with `tsserver` recorded as the pin mcpls chose, vetted
@@ -392,35 +453,35 @@ impl ServerInitConfig {
 
     /// The config a respawn of this server spawns from.
     ///
-    /// Called by every respawn right before it spawns; the filesystem work
-    /// runs on the blocking pool and only for an auto-pinned server. A tsserver pin mcpls
-    /// chose whose canonical path changed (the install was upgraded, moved or
-    /// retargeted through a symlink) is resolved again and, in untrusted mode,
-    /// checked against the boundary it was first vetted against. A pin the
-    /// user configured is kept as is.
+    /// Called by every respawn right before it spawns, and by a restart before
+    /// it stops the running server; the filesystem work runs on the blocking
+    /// pool and only for an auto-pinned or untrusted server.
+    ///
+    /// In untrusted mode the argument backstop runs again
+    /// ([`Self::vet_arguments`]). A tsserver pin mcpls chose whose canonical
+    /// path changed (the install was upgraded, moved or retargeted through a
+    /// symlink) is resolved again and, in untrusted mode, checked against the
+    /// boundary it was first vetted against. A pin the user configured is kept
+    /// as is.
     ///
     /// # Errors
     ///
     /// [`Error::ServerFailedToStart`] with an untrusted-mode refusal when the
-    /// tsserver now resolves inside the workspace, or the server is now
+    /// tsserver now resolves inside the workspace, the server is now
     /// launched in a way no tsserver can be pinned for (the same two checks
-    /// startup makes).
+    /// startup makes), or an argument now names an executable inside the
+    /// workspace.
     pub(crate) async fn for_respawn(&self) -> Result<Self> {
-        if self.auto_pin.is_none() {
+        if self.auto_pin.is_none() && self.untrusted.is_none() {
             return Ok(self.clone());
         }
-        let config = self.clone();
-        crate::on_blocking_pool(move || config.plan_respawn())
-            .await
-            .map_err(|source| Error::TaskFailed {
-                task: crate::error::BackgroundTask::ServerPlanning,
-                source,
-            })?
+        self.on_planning_pool(Self::plan_respawn).await
     }
 
     /// The blocking half of [`Self::for_respawn`]: canonicalizes the pin and
     /// re-plans the tsserver, so it runs on the blocking pool.
     pub(crate) fn plan_respawn(&self) -> Result<Self> {
+        self.vet_arguments()?;
         let Some(pin) = self
             .auto_pin
             .as_ref()
@@ -581,6 +642,7 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<SpawnedServer> {
+        config.vet_arguments_off_runtime().await?;
         let own = Redactions::for_server(config.server_config(), current_environment());
         let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));
         Self::log_spawn(config.server_config(), &redactions);
@@ -2908,6 +2970,95 @@ sleep 5
 
         assert_eq!(respawn.server_config().id(), config.server_config().id());
         assert_ne!(respawn.pinned_tsserver(), config.pinned_tsserver());
+    }
+
+    /// An untrusted server with `tool`, a file inside its boundary that is not
+    /// executable yet, as its only argument.
+    fn untrusted_init_naming_a_tool_argument() -> (tempfile::TempDir, PathBuf, ServerInitConfig) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dunce::canonicalize(dir.path()).unwrap();
+        let tool = workspace.join("tool");
+        std::fs::write(&tool, "").unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
+        let mut server_config = LspServerConfig::rust_analyzer();
+        server_config.command = ServerCommand::from_static("mcpls-test-no-such-server").into();
+        server_config.args = vec![tool.to_string_lossy().into_owned()];
+        let init = ServerInitConfig::new(
+            server_config,
+            roots.clone(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        )
+        .with_untrusted_boundary(roots);
+        (dir, tool, init)
+    }
+
+    /// Makes the file `tool` something the host would start.
+    fn become_executable(tool: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(tool.with_added_extension("exe"), "").unwrap();
+    }
+
+    fn refused_argument(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::ServerFailedToStart(failure) if matches!(
+                failure.reason,
+                StartupFailure::RefusedUntrustedWorkspace(
+                    UntrustedRefusal::WorkspaceExecutableArgument { index: 0, .. }
+                )
+            )
+        )
+    }
+
+    /// Regression test for #736: the backstop runs again at spawn time.
+    #[tokio::test]
+    async fn test_spawn_refuses_an_argument_that_became_executable_after_planning() {
+        let (_dir, tool, init) = untrusted_init_naming_a_tool_argument();
+        init.vet_arguments().unwrap();
+
+        become_executable(&tool);
+
+        let Err(error) = LspServer::spawn(init).await else {
+            panic!("the spawn must be refused");
+        };
+        assert!(refused_argument(&error), "{error:?}");
+    }
+
+    /// Regression test for #736: a respawn plan is a complete dry run.
+    #[tokio::test]
+    async fn test_for_respawn_refuses_an_argument_that_became_executable_after_planning() {
+        let (_dir, tool, init) = untrusted_init_naming_a_tool_argument();
+        let unchanged = init.for_respawn().await.unwrap();
+        assert_eq!(unchanged.server_config().args, init.server_config().args);
+
+        become_executable(&tool);
+
+        let Err(error) = init.for_respawn().await else {
+            panic!("the respawn plan must be refused");
+        };
+        assert!(refused_argument(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_trusted_config_is_never_vetted_at_spawn_time() {
+        let (_dir, tool, init) = untrusted_init_naming_a_tool_argument();
+        let trusted = ServerInitConfig::new(
+            init.server_config().clone(),
+            init.workspace_roots().clone(),
+            PositionEncodings::DEFAULT,
+            std::sync::Arc::default(),
+        );
+        become_executable(&tool);
+
+        trusted.vet_arguments().unwrap();
+        trusted.vet_arguments_off_runtime().await.unwrap();
+        trusted.for_respawn().await.unwrap();
     }
 
     /// Regression test for #247: `LspServerConfig::env` entries must reach

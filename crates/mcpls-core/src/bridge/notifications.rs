@@ -149,6 +149,21 @@ impl PullStamp {
     }
 }
 
+/// The state of a tracked document a pulled report answers: which opening of
+/// the file it was and which version `didOpen`/`didChange` last told the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentStamp {
+    opening: Option<Opening>,
+    version: DocumentVersion,
+}
+
+impl DocumentStamp {
+    /// The document state of `opening` at `version`.
+    pub const fn new(opening: Option<Opening>, version: DocumentVersion) -> Self {
+        Self { opening, version }
+    }
+}
+
 /// Whether the tracker still holds the document version a pull was requested at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionCheck {
@@ -1501,6 +1516,23 @@ impl NotificationCache {
                 canonical.as_ref()
             );
             drop(self.take_entry(&slot));
+        }
+    }
+
+    /// The document state the pulled slot of `file` answers, when `server`
+    /// owns that slot.
+    ///
+    /// Read-only: lets a caller tell whether a pull of the tracked document
+    /// as it is now would add anything the slot does not already hold.
+    pub(crate) fn pulled_stamp(&self, server: &ServerId, file: &Uri) -> Option<DocumentStamp> {
+        let entry = self
+            .entries
+            .get(&SlotKey::pulled(DiagnosticsKey::of(file)))?;
+        match entry.origin {
+            Origin::Pulled {
+                opening, version, ..
+            } if entry.owner == *server => Some(DocumentStamp::new(opening, version)),
+            Origin::Pulled { .. } | Origin::Pushed { .. } => None,
         }
     }
 

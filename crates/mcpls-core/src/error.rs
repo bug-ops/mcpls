@@ -490,6 +490,40 @@ spelled_enum! {
         Tool => "tool",
         /// `exec`.
         Exec => "exec",
+        /// cabal's `v1-run`.
+        V1Run => "v1-run",
+        /// cabal's `v2-run`.
+        V2Run => "v2-run",
+        /// cabal's `new-run`.
+        NewRun => "new-run",
+        /// cabal's `v1-exec`.
+        V1Exec => "v1-exec",
+        /// cabal's `v2-exec`.
+        V2Exec => "v2-exec",
+        /// cabal's `new-exec`.
+        NewExec => "new-exec",
+        /// stack's `runghc`.
+        Runghc => "runghc",
+        /// stack's `runhaskell`.
+        Runhaskell => "runhaskell",
+        /// stack's `script`.
+        Script => "script",
+        /// cargo's `r` shorthand for `run`.
+        R => "r",
+        /// cargo's `t` shorthand for `test`.
+        T => "t",
+        /// `test`, which runs the project's tests.
+        Test => "test",
+        /// cargo's `bench`.
+        Bench => "bench",
+        /// stack's `ghci`.
+        Ghci => "ghci",
+        /// cabal's `v1-repl`.
+        V1Repl => "v1-repl",
+        /// cabal's `v2-repl`.
+        V2Repl => "v2-repl",
+        /// cabal's `new-repl`.
+        NewRepl => "new-repl",
     }
 }
 
@@ -504,18 +538,6 @@ spelled_enum! {
         InitCommand => "--init-command",
         /// `--execute`, which nushell runs as a command string.
         Execute => "--execute",
-    }
-}
-
-spelled_enum! {
-    /// A switch of `cmd` that gives it a command string.
-    CmdSwitch {
-        /// `/c`.
-        C => "/c",
-        /// `/k`.
-        K => "/k",
-        /// `/r`.
-        R => "/r",
     }
 }
 
@@ -538,28 +560,84 @@ spelled_enum! {
 pub enum ShellFlag {
     /// `-c`, alone or inside a cluster such as `-lc`.
     DashC,
+    /// `+c`, which POSIX shells read like `-c`.
+    PlusC,
     /// fish's `-C`, which runs an init command string.
     DashCapitalC,
     /// nushell's `-e`, which executes a command string.
     DashE,
     /// A long flag such as `--command`.
     LongCommand(LongCommandName),
-    /// `cmd`'s `/c`, `/k` or `/r`.
-    SlashC(CmdSwitch),
     /// A PowerShell parameter or an abbreviation or alias of it.
     PowerShell(PowerShellParameter),
 }
 
+/// How a [`ShellFlag`] is written on a command line.
+enum FlagSpelling {
+    /// A prefix character and a letter (`-c`, `+c`).
+    Short(char, char),
+    /// A whole word (`--command`, `-Command`).
+    Word(&'static str),
+}
+
+impl ShellFlag {
+    const fn spelling(self) -> FlagSpelling {
+        match self {
+            Self::DashC => FlagSpelling::Short('-', 'c'),
+            Self::PlusC => FlagSpelling::Short('+', 'c'),
+            Self::DashCapitalC => FlagSpelling::Short('-', 'C'),
+            Self::DashE => FlagSpelling::Short('-', 'e'),
+            Self::LongCommand(name) => FlagSpelling::Word(name.as_str()),
+            Self::PowerShell(parameter) => FlagSpelling::Word(parameter.as_str()),
+        }
+    }
+
+    /// The prefix character and letter of a short flag, or `None` for a flag
+    /// written as a whole word.
+    ///
+    /// This is the one place a short flag's spelling is written, so a flag
+    /// cannot be reported with a prefix the user did not use.
+    #[must_use]
+    pub(crate) const fn short_spelling(self) -> Option<(char, char)> {
+        match self.spelling() {
+            FlagSpelling::Short(prefix, letter) => Some((prefix, letter)),
+            FlagSpelling::Word(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for ShellFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::DashC => "-c",
-            Self::DashCapitalC => "-C",
-            Self::DashE => "-e",
-            Self::LongCommand(name) => name.as_str(),
-            Self::SlashC(switch) => switch.as_str(),
-            Self::PowerShell(parameter) => parameter.as_str(),
-        })
+        match self.spelling() {
+            FlagSpelling::Short(prefix, letter) => write!(f, "{prefix}{letter}"),
+            FlagSpelling::Word(word) => f.write_str(word),
+        }
+    }
+}
+
+spelled_enum! {
+    /// The spelling of a long flag that gives an interpreter a program to run.
+    LongInlineFlag {
+        /// `--eval`.
+        Eval => "--eval",
+        /// `--print`.
+        Print => "--print",
+        /// `--import`, given a `data:` URL.
+        Import => "--import",
+        /// `--loader`, given a `data:` URL.
+        Loader => "--loader",
+        /// `--experimental-loader`, given a `data:` URL.
+        ExperimentalLoader => "--experimental-loader",
+        /// php's `--run`, the long form of `-r`.
+        Run => "--run",
+        /// php's `--process-begin`, the long form of `-B`.
+        ProcessBegin => "--process-begin",
+        /// php's `--process-code`, the long form of `-R`.
+        ProcessCode => "--process-code",
+        /// php's `--process-end`, the long form of `-E`.
+        ProcessEnd => "--process-end",
+        /// php's `--process-file`, the long form of `-F`.
+        ProcessFile => "--process-file",
     }
 }
 
@@ -569,40 +647,15 @@ impl fmt::Display for ShellFlag {
 pub enum InlineFlag {
     /// A short flag letter (`-e`, `-c`), alone or inside a cluster.
     Short(char),
-    /// `--eval`.
-    Eval,
-    /// `--print`.
-    Print,
-    /// `--import`, given a `data:` URL.
-    Import,
-    /// `--loader`, given a `data:` URL.
-    Loader,
-    /// `--experimental-loader`, given a `data:` URL.
-    ExperimentalLoader,
-}
-
-impl InlineFlag {
-    /// The long spelling, for the long flags.
-    #[must_use]
-    pub const fn long_name(self) -> Option<&'static str> {
-        match self {
-            Self::Short(_) => None,
-            Self::Eval => Some("--eval"),
-            Self::Print => Some("--print"),
-            Self::Import => Some("--import"),
-            Self::Loader => Some("--loader"),
-            Self::ExperimentalLoader => Some("--experimental-loader"),
-        }
-    }
+    /// A long flag such as `--eval`.
+    Long(LongInlineFlag),
 }
 
 impl fmt::Display for InlineFlag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Short(letter) => write!(f, "-{letter}"),
-            Self::Eval | Self::Print | Self::Import | Self::Loader | Self::ExperimentalLoader => {
-                f.write_str(self.long_name().unwrap_or_default())
-            }
+            Self::Long(flag) => f.write_str(flag.as_str()),
         }
     }
 }
@@ -636,6 +689,8 @@ pub enum LaunchTrigger {
     Subcommand(RunnerSubcommand),
     /// This flag gives it a command string.
     CommandString(ShellFlag),
+    /// A bare argument is read as its command string (Windows PowerShell).
+    ImplicitCommandString,
     /// This flag gives an interpreter a program to run inline.
     InlineProgram(InlineFlag),
     /// An argument names an npm package to run (`npm:`).
@@ -653,6 +708,9 @@ impl fmt::Display for LaunchTrigger {
                     "`{flag}` gives it a command string, which cannot be analyzed"
                 )
             }
+            Self::ImplicitCommandString => f.write_str(
+                "it reads a bare argument as a command string, which cannot be analyzed",
+            ),
             Self::InlineProgram(flag) => write!(f, "`{flag}` gives it a program to run"),
             Self::NpmSpecifier => f.write_str("an `npm:` argument names a package to run"),
         }
@@ -866,6 +924,11 @@ pub enum UntrustedRefusal {
         /// The path, as resolved.
         path: PathBuf,
     },
+    /// A resolved path is blank, so there is nothing to start.
+    BlankResolvedPath {
+        /// What the path belongs to.
+        what: ResolvedItem,
+    },
     /// No directory outside the workspace is available for the server to
     /// start in.
     NoSafeWorkingDirectory,
@@ -956,6 +1019,10 @@ impl fmt::Display for UntrustedRefusal {
                 "its {what}, {}, is not valid UTF-8, so untrusted mode cannot pass it on",
                 EchoedPath::new(path)
             ),
+            Self::BlankResolvedPath { what } => write!(
+                f,
+                "its {what} resolved to a blank path, which cannot be started"
+            ),
             Self::NoSafeWorkingDirectory => f.write_str(
                 "no directory outside the workspace is available to start it in, which \
                  untrusted mode requires",
@@ -1039,6 +1106,7 @@ impl fmt::Display for FailedToStart<'_> {
                     | UntrustedRefusal::WrappedProgramPathContainsEquals { .. }
                     | UntrustedRefusal::UnpinnedTypescriptLauncher { .. }
                     | UntrustedRefusal::NonUtf8Path { .. }
+                    | UntrustedRefusal::BlankResolvedPath { .. }
                     | UntrustedRefusal::NoSafeWorkingDirectory => Ok(()),
                 }
             }
@@ -4181,6 +4249,17 @@ mod tests {
             "/tmp/out/a=b/srv"
         );
         assert_eq!(EchoedPath::program("no such dir").as_str(), "no such dir");
+    }
+
+    #[test]
+    fn shell_flags_display_the_prefix_they_are_spelled_with() {
+        assert_eq!(ShellFlag::PlusC.short_spelling(), Some(('+', 'c')));
+        assert_eq!(ShellFlag::PlusC.to_string(), "+c");
+        assert_eq!(ShellFlag::DashC.to_string(), "-c");
+        assert_eq!(ShellFlag::DashCapitalC.short_spelling(), Some(('-', 'C')));
+        let long = ShellFlag::LongCommand(LongCommandName::Command);
+        assert_eq!(long.short_spelling(), None);
+        assert_eq!(long.to_string(), "--command");
     }
 
     #[test]

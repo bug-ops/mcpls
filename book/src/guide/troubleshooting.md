@@ -126,7 +126,7 @@ mcpls respawns a crashed server on the next call that needs it. Push-only diagno
 
 ### Results look stale after a file changed
 
-mcpls detects changes made on disk (a checkout, a formatter, another editor) and resynchronizes the server on the next call. Two cases are not detected: a file restored with the same size and the same modification time (`tar x`, `rsync -a`, `cp -p`), and files mcpls has never opened, which `workspace_symbol_search` reads from the server's own index. Run `touch` on the file, or restart the server.
+mcpls detects changes made on disk (a checkout, a formatter, another editor) and resynchronizes the server on the next call (or within about two seconds, for a file a client subscribes to through `resources/subscribe`). Two cases are not detected: a file restored with the same size and the same modification time (`tar x`, `rsync -a`, `cp -p`), and files mcpls has never opened, which `workspace_symbol_search` reads from the server's own index. Run `touch` on the file, or restart the server.
 
 ## Configuration
 

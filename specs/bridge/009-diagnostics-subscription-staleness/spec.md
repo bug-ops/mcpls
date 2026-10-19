@@ -25,7 +25,7 @@ related:
 > **Author**: k05h31
 > **Type**: enhancement
 > **Priority**: P3
-> **Related issues**: #574; feature under repair: #115 (resource subscriptions, [[mcp/002-mcp-resources-diagnostics/spec|mcp/002]]); follow-ups #648 (no-tool-call trigger), #649 (notify on push-triggered eviction)
+> **Related issues**: #574; feature under repair: #115 (resource subscriptions, [[mcp/002-mcp-resources-diagnostics/spec|mcp/002]]); follow-ups #648 (no-tool-call trigger, Option E shipped), #649 (notify on push-triggered eviction)
 > **Reproduced on**: release build, HEAD ad90190, stdio and HTTP (three sessions), rust-analyzer, tiny cargo project
 
 ## 1. Overview
@@ -76,9 +76,10 @@ report the same state.
 
 > [!success] Decision
 > Option A only (section 3): pull results are written to the cache and published. The trigger is
-> a tool call that pulled (`get_diagnostics`); mcpls sends no `didSave`, watches no files, polls
-> nothing and does not act on `workspace/diagnostic/refresh`. An on-disk edit that no tool call
-> observes still notifies nobody; that remainder is #648. Push behavior is unchanged (FR-007).
+> a tool call that pulled (`get_diagnostics`); mcpls sends no `didSave`, watches no files and does
+> not act on `workspace/diagnostic/refresh`. Option E (#648, FR-017..FR-021) adds a
+> subscription-driven sweep that resyncs and re-pulls tracked, subscribed files every 2 s, so an
+> on-disk edit that no tool call observes also notifies. Push behavior is unchanged (FR-007).
 
 ### Out of Scope
 
@@ -90,7 +91,10 @@ report the same state.
 - Workspace-wide diagnostics (`workspace/diagnostic`) and subscriptions to files that are not
   tracked (`DocumentTracker`) by any session's activity.
 - Retrying or extending the `ContentModified` handling ([[lsp/005-lsp-content-modified-retry/spec|lsp/005]]).
-- A trigger that needs no tool call (`didSave`, a file watcher, re-pulling subscribed files): #648.
+- A trigger that sends `didSave` or watches files (Options B and C), and refreshing flycheck-only
+  diagnostics (pushed by the server after a save) or the diagnostics of a file whose own content did
+  not change but whose diagnostics depend on another file's edit (cross-file staleness): left open
+  in the follow-up to #648.
 - Notification payload changes: `notifications/resources/updated` stays URI-only; the client
   re-reads via `resources/read`.
 
@@ -150,6 +154,21 @@ WHEN the same file is pulled N times with no content change
 THEN the subscriber receives no resources/updated from those pulls
 ```
 
+### US-005: Learn of an edit nobody pulled after (#648)
+
+AS A coding agent subscribed to `lsp-diagnostics://<file>` that edits files with its own tools
+I WANT a `resources/updated` within a few seconds of an on-disk edit, without calling a tool
+SO THAT I need not poll `get_diagnostics` after each edit.
+
+**Acceptance criteria:**
+```
+GIVEN a session subscribed to a tracked file
+WHEN the file is edited on disk and no tool call touches it
+THEN within the sweep interval the file is resynced and pulled, and the session receives exactly one
+     resources/updated when the file's merged diagnostics changed
+AND idle ticks send nothing and notify nothing
+```
+
 ## 3. Design Options
 
 The triggers in the issue are not mutually exclusive. Each option is scored on what it fixes.
@@ -160,10 +179,10 @@ The triggers in the issue are not mutually exclusive. Each option is scored on w
 | **B. Send `didSave` after resync** | After `didChange` for a content-changed file, send `textDocument/didSave` so the server runs flycheck and pushes | server-driven push (flycheck included) with no cache semantics change | still needs a tool call to trigger the resync; servers not advertising save support | Heavy side effect on the user's workspace (`cargo check` per save), must respect `TextDocumentSyncOptions.save` and `includeText` | #648 |
 | **C. Watch tracked files** | A file watcher over tracked (open) documents resyncs on change and then triggers B and/or A | the only option that works with no tool call at all | none of the above is free | New dependency, event storms, debounce, cross-platform parity; the previous watcher was removed | #648 |
 | **D. React to `workspace/diagnostic/refresh`** | Treat the request as "re-pull the tracked files that have subscribers" | servers that refresh by request | servers that never send it | Needs an accurate `refreshSupport` capability; re-pull fan-out can storm | not shipped |
-| **E. Subscription-driven re-pull** | While a file has subscribers, mcpls pulls it periodically or on a resync trigger and publishes on change | works with no watcher; bounded by subscriber count | latency equals the poll period | Timer per subscribed file, cap interplay with FR-012 | #648 |
+| **E. Subscription-driven re-pull** | While a file has subscribers, mcpls resyncs it with the disk every 2 s and pulls it when the resync produced a state the cache holds no pulled report for; publishes on change | works with no watcher; bounded by subscribed tracked files; an on-disk edit of the file itself | latency equals the sweep interval; flycheck-only diagnostics and cross-file staleness | One sweep task, one job per server, a per-state attempt memo | shipped (#648) |
 
 > [!success] Decisions
-> - **Option set**: A only. The trigger is a tool call that pulled (US-001, US-003); an edit that no tool call observes is #648.
+> - **Option set**: A and E. Triggers: a tool call that pulled (US-001, US-003) and the sweep (US-005). Options B, C and cross-file refresh are not shipped.
 > - **FR-002 and pushes**: change detection applies to pull writes only. Every accepted push still notifies as before (FR-007).
 > - **Freshness bound**: the notification is enqueued before the pull's tool call returns (FR-008).
 
@@ -181,13 +200,18 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | FR-006 | WHEN a pull request fails (timeout, `-32601`, `ContentModified`) or answers with an `unchanged` or partial report, THE SYSTEM SHALL leave the cache and subscribers unchanged | must |
 | FR-007 | WHILE a server pushes after every change, THE SYSTEM SHALL behave as before for that server: one `resources/updated` per accepted publish, including re-publishes with identical content. FR-002 applies to pull writes only; a push is never suppressed and never changes which URIs are notified for the pushed file itself; an eviction the push causes adds one notification for the evicted file (FR-013) | must |
 | FR-008 | WHEN a pull changes the merged view of a subscribed file, THE SYSTEM SHALL enqueue the notification before the pull's tool call returns | must |
-| FR-009 | Option B (`didSave` after resync) | not shipped, #648 |
-| FR-010 | Option C (file watcher) | not shipped, #648 |
+| FR-009 | Option B (`didSave` after resync) | not shipped, left open in the follow-up to #648 |
+| FR-010 | Option C (file watcher) | not shipped, left open in the follow-up to #648 |
 | FR-011 | Option D (`workspace/diagnostic/refresh`) | not shipped |
 | FR-012 | THE SYSTEM SHALL store pull-sourced entries under the same global budgets as pushed ones (`MAX_DIAGNOSTIC_ENTRIES`, `MAX_DIAGNOSTICS_ENTRY_BYTES`, per-owner fair-share eviction, #266, #276, #284). The pulled slot (one per file, canonical URI) is not counted toward `MAX_SOURCES_PER_FILE`, so a file holds at most 8 pushed slots plus one pulled slot; a pull write never evicts a slot of the file it writes | must |
 | FR-013 | WHEN a pull or push write evicts the entry of another file, THE SYSTEM SHALL publish `resources/updated` for the evicted file so its subscribers re-read (#649). The write returns the evicted files and the caller publishes after the cache lock is released | should |
 | FR-014 | THE SYSTEM SHALL deliver every publication through the existing per-session `Delivery` (coalescing pending-URI set plus capacity-1 doorbell), never awaiting a peer from the publishing task | must |
 | FR-015 | THE SYSTEM SHALL publish only to sessions that subscribed to the exact file URI (or a `subscriptions/listen` stream that listed it); a pull, resync or `didSave` caused by session A SHALL NOT notify, expose or delay any other session beyond the notification FR-001 prescribes for that session's own subscriptions | must |
+| FR-017 | WHILE at least one session or `subscriptions/listen` stream is subscribed to the `lsp-diagnostics://` resource of a tracked file, THE SYSTEM SHALL resync that file with the disk and, when the resync leaves the document at a state (opening, synced version) that the file's pulled slot does not answer and that the sweep has not pulled already, pull it through the path `get_diagnostics` uses (FR-002..FR-008 apply unchanged), at most every 2 seconds; a pull that failed is retried on later ticks, at most 3 times per document state | must |
+| FR-018 | THE SYSTEM SHALL sweep only tracked documents, SHALL NOT open an untracked file on a subscriber's behalf, and SHALL visit at most 64 files per tick, continuing from where the previous tick stopped | must |
+| FR-019 | THE SYSTEM SHALL NOT respawn, restart, wait for or send anything to a server that is dead, initializing, restarting or failed on behalf of the sweep; a server that does not pull, or whose pull support is still unknown (advertises no provider and has not answered a pull), receives the resync only: the sweep never probes, so only a tool call's pull can settle a server to push-only | must |
+| FR-020 | THE SYSTEM SHALL run the sweep of one server's files as one job at a time, so a server that stops answering stalls only its own files, and SHALL stop every job when the server shuts down | must |
+| FR-021 | THE SYSTEM SHALL read the stamp of a state from the cache's pulled slot (not from sweeper-local first-sighting state), so an edit made before the first tick, while nobody was subscribed, or across a re-subscription is still pulled once | must |
 | FR-016 | WHEN the routed diagnostics server for a file has failed to start, is initializing, or has been marked `push_degraded` and no pull is possible, THE SYSTEM SHALL keep the existing mcp/002 FR-009..FR-012 behavior and SHALL NOT fabricate notifications | must |
 
 ## 5. Non-Functional Requirements
@@ -199,8 +223,8 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | NFR-003 | Per-session isolation | Notification delivery state is per session (mcp/002 FR-006). A stalled or slow session cannot delay or lose another's update; a session that did not subscribe never sees a URI. Sessions share one translator, notification cache and set of workspace roots, so a pulled report is readable by every session through the cache reads (FR-003); only the notification is URI-only and limited to the files a session subscribed to. |
 | NFR-004 | Cache budget | Pull-sourced entries never raise the cache above its existing global bounds (1,000 entries, 1 MiB per entry, 8 sources per file). A pull-only server (one that never pushes) must not be able to evict another server's entries beyond its fair share. |
 | NFR-005 | Lock discipline | Cache writes follow the pump's rule: the cache lock is never held across an LSP round trip, and a pull-sourced write takes it only for the store (as `handle_diagnostics` already does for its read). |
-| NFR-006 | LSP load | The feature adds no LSP traffic: a pull is the caller's own request. (Options B and D, not shipped, would add at most one `didSave` / one re-pull per tracked file per content change.) |
-| NFR-007 | Cost containment | Triggers that can start heavy server work (flycheck via `didSave`) are skipped when the file has no subscriber, unless the open question in FR-009 is resolved otherwise. |
+| NFR-006 | LSP load | The feature adds at most one answered pull per subscribed tracked file per (opening, document version), up to 3 more for failed ones, plus the `didChange` of a resync; it adds none for a file that has not changed, however many ticks pass. Without a subscriber it adds no traffic. (Options B and D, not shipped, would add at most one `didSave` / one re-pull per tracked file per content change.) |
+| NFR-007 | Cost containment | Triggers that can start heavy server work (flycheck via `didSave`) are not shipped. The sweep does nothing while nothing is subscribed, and its attempt memo is bounded by the tracked, subscribed files. |
 | NFR-008 | Type safety | Pull-versus-push provenance is a closed typed enum on the cache entry, not a string or boolean flag; the changed/unchanged decision returns a typed outcome the pump and the tool path consume exhaustively. |
 | NFR-009 | Compatibility | `notifications/resources/updated` payload, `resources/read` schema, `get_cached_diagnostics` and `get_diagnostics` tool schemas are unchanged (no `tool_surface.json` change). |
 | NFR-010 | Merge cost | Merging a file's sources costs a lookup per pushed diagnostic (comparison grouped by normalized `(severity, code)`), not a scan of the pulled ones; a file at the entry cap merges in well under a second, since every read path runs the merge on a runtime worker |
@@ -230,7 +254,7 @@ The EARS requirements below hold for any chosen option. Option-specific requirem
 | Server `push_degraded` (respawned, pump dark) | The cache cannot be fresh by push; a pull-sourced write is the only freshness path and is the case most helped by this feature. Pull writes proceed as usual and notifications carry no flag; the read-side `push_notifications_degraded` flag is unchanged |
 | File outside the workspace or symlink alias | Same `PublishedDiagnosticsUri` canonicalization as push (mcp/002, #552); a pull for an alias writes under its canonical file key |
 | Many subscribed files, one bulk resync | One resync/pull per tracked file; one notification per subscribed URI per session; trigger concurrency bounded (NFR-002) |
-| Subscriber on a file the tracker has not opened | Subscribing does not open the document: a `didOpen` is a side effect that belongs to the no-tool-call trigger (#648). The first pull opens it and notifies |
+| Subscriber on a file the tracker has not opened | Subscribing does not open the document, and neither does the sweep (FR-018). The first pull by a tool call opens it and notifies |
 | Session disconnects mid-delivery | Handled by existing `Target::send` / `TargetClosed` path; no change |
 | `didSave` sent to a server that closes the document on save semantics | Not applicable: send only per FR-009's capability gate |
 | Cache cap reached while many subscribed files are pulled | Eviction per FR-012; the evicted files' subscribers are notified (FR-013) |
@@ -259,7 +283,10 @@ Compared with merging the cache into the pull at read time, results differ in fo
 | SC-007 | Writing pull-sourced entries for 1,100 distinct files stays within `MAX_DIAGNOSTIC_ENTRIES` and does not evict another server's entries below its fair share | Unit test on `NotificationCache` |
 | SC-008 | A flycheck-sourced pushed warning survives a clean pull and a later pull-sourced error survives a push | Unit test |
 | SC-009 | A stalled session does not delay another session's notification (mcp/002 FR-006 test shape extended to pull-triggered publishes) | Integration test |
-| SC-010 | Not applicable: Options B and C are not shipped (#648) | none |
+| SC-010 | Not applicable: Options B and C are not shipped | none |
+| SC-011 | An edit made before the first tick, while nobody was subscribed, or across a re-subscription notifies once; 100 idle ticks pull nothing; a state whose report is not stored is pulled once | `runtime::disk_sweep` and `diagnostics::sweep_tests` unit tests |
+| SC-012 | A server that never answers stalls only its own files; a dead server is neither respawned nor sent anything | `runtime::disk_sweep` and `diagnostics::sweep_tests` unit tests |
+| SC-013 | A pull dropped right after its report was stored still delivers the notification | `diagnostics::sweep_tests` unit test |
 
 ## 9. Agent Boundaries
 

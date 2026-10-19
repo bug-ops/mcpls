@@ -948,6 +948,9 @@ mod tests {
         let timeout_secs = crate::config::LspServerConfig::rust_analyzer().request_timeout_seconds;
         tokio::time::advance(Duration::from_secs(timeout_secs.get() + 1)).await;
         assert_matches!(first.await.unwrap().unwrap_err(), Error::Timeout(_));
+        let cancel = read_framed_message(&mut wire).await;
+        assert_eq!(cancel["method"], "$/cancelRequest");
+        assert_eq!(cancel["params"]["id"], first_request["id"]);
 
         let second = spawn_hover();
         let second_request = read_framed_message(&mut wire).await;

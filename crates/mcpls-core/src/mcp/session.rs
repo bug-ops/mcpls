@@ -379,6 +379,11 @@ impl SessionState {
         self.subs.is_empty().await
     }
 
+    /// Whether this session is subscribed to `uri`.
+    async fn is_subscribed(&self, uri: &DiagnosticsResourceUri) -> bool {
+        self.subs.contains(uri).await
+    }
+
     /// Queues `uri` for delivery to this session only if it is subscribed to it.
     pub(crate) async fn publish_if_subscribed(&self, uri: &DiagnosticsResourceUri) {
         if !self.subs.contains(uri).await {
@@ -626,6 +631,25 @@ impl SubscriptionRegistry {
             }
         }
         false
+    }
+
+    /// The items whose resource some live session, or `subscriptions/listen`
+    /// stream, is subscribed to, in their order.
+    pub(crate) async fn retain_subscribed<T>(
+        &self,
+        items: Vec<(T, DiagnosticsResourceUri)>,
+    ) -> Vec<T> {
+        let sessions = self.live_sessions();
+        let mut kept = Vec::new();
+        for (item, uri) in items {
+            for session in &sessions {
+                if session.is_subscribed(&uri).await {
+                    kept.push(item);
+                    break;
+                }
+            }
+        }
+        kept
     }
 
     /// Queues, on every live session, each subscribed URI for which `pred`
