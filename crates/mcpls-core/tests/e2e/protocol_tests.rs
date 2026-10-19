@@ -656,16 +656,11 @@ fn hover_args(path: &std::path::Path) -> serde_json::Value {
     })
 }
 
-/// Calls `get_hover` on `path`, retrying while the error is
-/// `Error::ServerInitializing`/`WorkspaceServersInitializing` (message
-/// contains "initializing") -- the transient state before rust-analyzer's
-/// background `initialize` handshake (`spawn_lsp_servers_background` in
-/// `lib.rs`) has completed and it registers with the translator. This is the
-/// only rust-analyzer-readiness state that can affect the calls below:
-/// opening a document happens in `prepare_gated_document` *before* the
-/// capability-gated LSP round trip (`bridge/translator/routing.rs`), so
-/// whether rust-analyzer has finished *indexing* the workspace never affects
-/// whether a document is counted against `max_documents`/`max_file_size`.
+/// Calls `get_hover` on `path`, retrying while the error is a transient
+/// readiness state: `Error::ServerInitializing`/`WorkspaceServersInitializing`
+/// (message contains "initializing") before rust-analyzer's background
+/// `initialize` handshake has completed, or the retryable "still indexing"
+/// error returned once the server-side indexing wait elapses on a slow runner.
 fn call_hover_past_server_init(
     client: &mut McpClient,
     path: &std::path::Path,
@@ -673,10 +668,13 @@ fn call_hover_past_server_init(
 ) -> Result<serde_json::Value> {
     loop {
         match client.call_tool("get_hover", &hover_args(path)) {
-            Err(e) if e.to_string().contains("initializing") => {
+            Err(e)
+                if e.to_string().contains("initializing")
+                    || e.to_string().contains("still indexing") =>
+            {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "rust-analyzer never finished initializing: {e}"
+                    "rust-analyzer never became ready: {e}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -728,7 +726,7 @@ fn test_e2e_max_documents_config_enforced() -> Result<()> {
          exercise eviction repeatedly, not just once"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     for (i, path) in files.iter().enumerate() {
         let result = call_hover_past_server_init(&mut client, path, deadline);
         assert!(
@@ -776,7 +774,7 @@ fn test_e2e_max_file_size_config_enforced() -> Result<()> {
     let (_config_dir, mut client) = spawn_mcpls_with_workspace_config("max_file_size = 1")?;
 
     let lib_rs = workspace_path.join("src/lib.rs");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let result = call_hover_past_server_init(&mut client, &lib_rs, deadline);
     match result {
         Err(e) => assert!(
