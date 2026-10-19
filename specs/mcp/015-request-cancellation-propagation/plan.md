@@ -9,7 +9,7 @@ tags:
   - cancellation
   - resource-hygiene
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[mcp/015-request-cancellation-propagation/spec|spec]]"
   - "[[constitution]]"
@@ -20,7 +20,7 @@ related:
 > [!info] References
 > **Spec**: [[mcp/015-request-cancellation-propagation/spec|request-cancellation-propagation]]
 > **Baseline**: commit `12ee3a1`, `rmcp` 3.5.1, `tokio` 1.53.1, `gen-lsp-types` 0.11.0
-> **Status**: draft; decisions below adopt the defaults stated in the spec's open questions
+> **Status**: implemented; section 12 lists where the implementation departs from the draft below
 
 ## 1. Architecture
 
@@ -297,6 +297,19 @@ explicit barriers, never by sleeps near CI jitter (NFR-008).
 | Servers that treat `$/cancelRequest` for a finished request as an error | low | low | The base protocol requires servers to ignore unknown ids; exactly-once and the `Waiting` check already avoid sending for finished ids |
 | A future tool needs run-to-completion semantics and forgets the policy | medium | low | Default `Cooperative` is the safe default for read-only tools; a registration test lists every non-default policy so adding one is a reviewed change |
 | Scripted fake-server fixture is flaky on Windows | medium | medium | Prefer in-process duplex endpoints for most scenarios; spawn a real executable only for EOF and child-lifetime paths |
+
+## 12. Departures from the draft
+
+| Draft | Implemented | Why |
+|-------|-------------|-----|
+| `lsp/cancel.rs`, declared from `lsp/mod.rs` | `lsp/client/cancel.rs`, declared from `client.rs` | Keeps the pending table and the guard next to the private `LspClient` fields they use; no `lsp/mod.rs` change |
+| `CancelCause { Client, ConnectionClosed, Timeout }` | `CancelCause { Timeout, Abandoned }` in `lsp`; the MCP layer logs `CallStop { ClientCancelled, ConnectionClosed }` at `debug` | `lsp/` cannot know MCP causes (NFR-006) |
+| `ConnectionScope` token cancelled by the transport runners | `call_tool` polls `Peer::is_transport_closed` every 250 ms; no transport wiring | One mechanism for stdio and HTTP; rmcp ends the peer when its serve loop ends |
+| `CancelPolicy { Cooperative, RunToCompletion }` per tool; `restart_servers(target, &CancellationToken)` | `restart_server` runs its body through `util::run_detached`; `Translator::restart_servers` is unchanged | A name-to-policy table breaks under `tool_prefix`; detaching gives the same end-state guarantee without a signature change |
+| `reserve_notifications(n)` / `NotificationPermits` | `reserve_notification()` and `reserve_notification_pair()` returning `NotificationPermit`s; `LspClient::outbound_notification` encodes first | Typed single and pair forms need no count and no exhaustion case; encoding before the debt is taken means a serialize error loses no owed close |
+| `respawn_locked` cooperative | Cancellable phase up to the cache lock, one synchronous commit, a detached tail (FR-033) | A drop between `swap_in` and the announcements left waiters hanging and subscribers uninformed |
+| `shutdown()` marks the client closing | A `closing` flag set by `shutdown_until` and by issuing the `shutdown` request; that request is never cancelled | The `shutdown` request itself can time out (FR-012) |
+| Diagnostics store then publish | Tail runs through `run_detached` (FR-034), owned by the diagnostics pull code | A drop between store and publish lost the notification for good |
 
 ## See Also
 

@@ -7,13 +7,13 @@
 //! a spawn for it.
 
 use std::borrow::Cow;
-use std::io::ErrorKind;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::info;
 
-use crate::bridge::{WorkspaceRoots, lexically_normalize};
+use crate::bridge::WorkspaceRoots;
 use crate::config::{
     BuiltinServer, EnvKey, HostOs, LspServerConfig, MarkerScan, ServerCommand, ServerConfig,
     WorkspaceTrust, login_home_dir,
@@ -23,7 +23,9 @@ use crate::error::{
     UntrustedRefusal,
 };
 use crate::lsp::command_path::ResolvedCommand;
+use crate::lsp::launcher::WrapperKind;
 use crate::lsp::tsserver_pin::UntrustedVetting;
+use crate::lsp::vetting::refuse_workspace_executable_arguments;
 use crate::lsp::{
     self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
     tsserver_pin,
@@ -112,7 +114,7 @@ fn project_launcher(config: &LspServerConfig, cause: LauncherRefusal) -> Untrust
 fn vetted_spawn_path(
     resolved: ResolvedCommand,
     boundary: &WorkspaceRoots,
-) -> Result<String, UntrustedRefusal> {
+) -> Result<ServerCommand, UntrustedRefusal> {
     if boundary.contains_canonical(&resolved.canonical) {
         return Err(UntrustedRefusal::WorkspaceExecutable {
             executable: resolved.canonical,
@@ -127,12 +129,15 @@ fn vetted_spawn_path(
     } else {
         resolved.spawn
     };
-    executable
+    let executable = executable
         .into_string()
         .map_err(|path| UntrustedRefusal::NonUtf8Path {
             what: ResolvedItem::Executable,
             path,
-        })
+        })?;
+    ServerCommand::new(executable).map_err(|_| UntrustedRefusal::BlankResolvedPath {
+        what: ResolvedItem::Executable,
+    })
 }
 
 /// The argument indices of the programs `effective`'s wrappers start, each
@@ -141,14 +146,14 @@ fn vetted_wrapped_programs(
     effective: &LspServerConfig,
     boundary: &WorkspaceRoots,
     parent_env: &dyn ParentEnv,
-) -> Result<Vec<(usize, String)>, UntrustedRefusal> {
+) -> Result<BTreeMap<usize, ServerCommand>, UntrustedRefusal> {
     let programs = launcher::analyze_launch(effective.command.as_str(), &effective.args)
         .map_err(|cause| project_launcher(effective, cause))?;
     programs
-        .indices()
+        .programs()
         .iter()
-        .map(|&index| {
-            let program = effective.args.get(index).map_or("", String::as_str);
+        .map(|wrapped| {
+            let program = wrapped.program;
             let unresolved = || UntrustedRefusal::UnresolvedWrappedProgram {
                 program: EchoedPath::program(program),
             };
@@ -156,13 +161,26 @@ fn vetted_wrapped_programs(
                 lsp::command_path::resolve_named(Path::new(program), effective, parent_env)
                     .ok_or_else(unresolved)?;
             let path = vetted_spawn_path(resolved, boundary)?;
-            if path.contains('=') {
+            if wrapped.starter == WrapperKind::Env && path.as_str().contains('=') {
                 return Err(UntrustedRefusal::WrappedProgramPathContainsEquals {
                     program: EchoedPath::program(program),
                 });
             }
-            Ok((index, path))
+            Ok((wrapped.index, path))
         })
+        .collect()
+}
+
+/// `args` with each program at a key of `programs` replaced by its vetted
+/// path. Programs are found by index, so no ordering of the analysis can make
+/// a replacement be skipped.
+fn with_vetted_programs(
+    args: Vec<String>,
+    mut programs: BTreeMap<usize, ServerCommand>,
+) -> Vec<String> {
+    args.into_iter()
+        .enumerate()
+        .map(|(index, arg)| programs.remove(&index).map_or(arg, String::from))
         .collect()
 }
 
@@ -212,20 +230,15 @@ fn harden_for_untrusted(
         path: PathBuf::from(path),
     })?;
     let home_env = home_overrides(&effective, boundary, login_home, parent_env)?;
-    let hardened_command = ServerCommand::new(command).map_err(|_| unresolved())?;
     effective.command = effective
         .command
         .clone()
-        .retarget(hardened_command.clone())
+        .retarget(command.clone())
         .map_err(|cause| UntrustedRefusal::AutoSelectionTarget {
-            executable: hardened_command,
+            executable: command,
             cause,
         })?;
-    for (index, program) in wrapped {
-        if let Some(arg) = effective.args.get_mut(index) {
-            *arg = program;
-        }
-    }
+    effective.args = with_vetted_programs(std::mem::take(&mut effective.args), wrapped);
     effective.env.insert(ManagedEnvVar::Path.key(), path);
     for (name, value) in home_env {
         effective.env.insert(name, value);
@@ -237,102 +250,6 @@ fn harden_for_untrusted(
         );
     }
     Ok(effective)
-}
-
-/// Extensions Windows starts as programs.
-const WINDOWS_EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "com", "bat", "cmd"];
-
-/// Whether `path` is a file `host` would start: an execute bit on Unix, and on
-/// Windows an extension it starts as a program.
-fn is_started_as_program(host: HostOs, path: &Path) -> bool {
-    host.is_executable_file(path)
-        && (host == HostOs::Other
-            || path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| {
-                    WINDOWS_EXECUTABLE_EXTENSIONS
-                        .iter()
-                        .any(|known| extension.eq_ignore_ascii_case(known))
-                }))
-}
-
-/// The refusal for the text `candidate` of argument `index`, when it names an
-/// executable inside `boundary` as the child would resolve it.
-///
-/// A lookup that fails with permission denied fails closed when the path lies
-/// inside the boundary; any other failure means the text is not a file.
-fn argument_refusal(
-    index: usize,
-    candidate: &str,
-    boundary: &WorkspaceRoots,
-    working_dir: &ChildWorkingDir,
-    host: HostOs,
-) -> Option<UntrustedRefusal> {
-    let resolved = match working_dir {
-        ChildWorkingDir::Fixed(dir) => dir.join(candidate),
-        ChildWorkingDir::Inherit => PathBuf::from(candidate),
-    };
-    let siblings = (host == HostOs::Windows && resolved.extension().is_none())
-        .then(|| {
-            WINDOWS_EXECUTABLE_EXTENSIONS
-                .iter()
-                .map(|extension| resolved.with_added_extension(extension))
-        })
-        .into_iter()
-        .flatten();
-    std::iter::once(resolved.clone())
-        .chain(siblings)
-        .find_map(|path| path_refusal(index, &path, boundary, host))
-}
-
-/// The refusal for `resolved`, one spelling of argument `index`.
-fn path_refusal(
-    index: usize,
-    resolved: &Path,
-    boundary: &WorkspaceRoots,
-    host: HostOs,
-) -> Option<UntrustedRefusal> {
-    match dunce::canonicalize(resolved) {
-        Ok(canonical) => (is_started_as_program(host, &canonical)
-            && boundary.contains_canonical(&canonical))
-        .then_some(UntrustedRefusal::WorkspaceExecutableArgument {
-            index,
-            executable: canonical,
-        }),
-        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
-            let path = lexically_normalize(resolved);
-            boundary
-                .admits_lexically(&path)
-                .then_some(UntrustedRefusal::UnreadableWorkspaceArgument { index, path })
-        }
-        Err(_) => None,
-    }
-}
-
-/// Refuses a configured argument that names an executable file inside
-/// `boundary`, whichever launcher precedes it, so a wrapper missing from the
-/// launcher table cannot start a workspace program.
-///
-/// Each argument is judged as a path, and so is the text after its first `=`
-/// (`--exec=<path>`). A file that is not executable, a directory and text that
-/// is no file are admitted.
-fn refuse_workspace_executable_arguments(
-    args: &[String],
-    boundary: &WorkspaceRoots,
-    working_dir: &ChildWorkingDir,
-    host: HostOs,
-) -> Result<(), UntrustedRefusal> {
-    for (index, arg) in args.iter().enumerate() {
-        let after_equals = arg.split_once('=').map(|(_, value)| value);
-        let candidates = std::iter::once(arg.as_str()).chain(after_equals);
-        for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
-            if let Some(refusal) = argument_refusal(index, candidate, boundary, working_dir, host) {
-                return Err(refusal);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The home-directory variables untrusted mode sets for a server that does
@@ -546,6 +463,10 @@ fn admit(
         Arc::clone(redactions),
     )
     .with_child_working_dir(working_dir);
+    let init = match mode {
+        PlanMode::Trusted => init,
+        PlanMode::Untrusted { boundary, .. } => init.with_untrusted_boundary(boundary.clone()),
+    };
     Ok(match pinned {
         Some(tsserver) => init.with_auto_pin(tsserver, vetting),
         None => init,
@@ -848,6 +769,7 @@ mod plan_tests {
 
         use super::*;
         use crate::config::ServerCommand;
+        use crate::lsp::vetting::is_started_as_program;
 
         struct Fixture {
             _dir: tempfile::TempDir,
@@ -2081,24 +2003,62 @@ mod plan_tests {
         }
 
         #[test]
-        fn plan_untrusted_echoes_the_whole_path_of_a_wrapped_program_containing_equals() {
+        fn plan_untrusted_names_the_wrapped_program_whose_vetted_path_env_would_read_as_an_assignment()
+         {
             let fx = fixture();
-            outside_tools(&fx, &["nice", "a=b"]);
-            let odd = fx.outside.join("a=b");
+            let config = wrapped_launch_through_equals_dir(&fx, "env");
 
-            let plan =
-                plan_allowing_rust(wrapped_launch(&fx, "nice", &[odd.to_str().unwrap()]), &fx);
+            let plan = plan_allowing_rust(config, &fx);
 
             let Some(refusal @ UntrustedRefusal::WrappedProgramPathContainsEquals { program }) =
                 refusal_of(&plan)
             else {
                 panic!("expected a path containing '='");
             };
-            assert_eq!(program.as_str(), odd.to_str().unwrap());
+            assert_eq!(program.as_str(), "srv");
             assert!(
                 refusal.to_string().contains("its launcher starts"),
                 "{refusal}"
             );
+        }
+
+        #[test]
+        fn plan_untrusted_admits_a_wrapped_program_with_equals_in_its_path_unless_env_starts_it() {
+            let fx = fixture();
+
+            for wrapper in ["nice", "timeout"] {
+                let args: &[&str] = if wrapper == "timeout" {
+                    &["5", "srv"]
+                } else {
+                    &["srv"]
+                };
+                let mut config = wrapped_launch_through_equals_dir(&fx, wrapper);
+                config.args = args.iter().map(ToString::to_string).collect();
+
+                let plan = plan_allowing_rust(config, &fx);
+
+                assert_eq!(refusal_of(&plan), None, "{wrapper}");
+                assert!(
+                    launched_args(&plan)
+                        .iter()
+                        .any(|arg| arg.ends_with("a=b/srv") || arg.ends_with("a=b\\srv")),
+                    "{wrapper}"
+                );
+            }
+        }
+
+        fn wrapped_launch_through_equals_dir(fx: &Fixture, wrapper: &str) -> LspServerConfig {
+            outside_tools(fx, &[wrapper]);
+            let odd = fx.outside.join("a=b");
+            std::fs::create_dir_all(&odd).unwrap();
+            executable(&odd.join("srv"));
+            let mut config = wrapped_launch(fx, wrapper, &["srv"]);
+            let path = std::env::join_paths([&odd, &fx.outside]).unwrap();
+            config.env.insert(
+                crate::config::EnvKey::from_static("PATH"),
+                path.to_string_lossy().into_owned(),
+            );
+            config
         }
 
         #[test]

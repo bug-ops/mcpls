@@ -20,14 +20,23 @@ use crate::config::{LanguageId, ServerId, ToolRouter};
 use crate::test_lsp::{client_path, fake_lsp_client_with_redactions};
 
 #[derive(Debug, Default)]
-struct RecordingWiring {
-    subscribed: std::sync::atomic::AtomicBool,
+pub(super) struct RecordingWiring {
+    pub(super) subscribed: std::sync::atomic::AtomicBool,
+    /// Makes every publication cross an await point, so a caller dropped
+    /// between the store and the publication loses it unless it is detached.
+    pub(super) yields: std::sync::atomic::AtomicBool,
     changed: StdMutex<Vec<Uri>>,
     invalidated: StdMutex<Vec<DiagnosticsKey>>,
 }
 
 impl RecordingWiring {
-    fn changed(&self) -> Vec<Uri> {
+    async fn maybe_yield(&self) {
+        if self.yields.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(super) fn changed(&self) -> Vec<Uri> {
         self.changed.lock().unwrap().clone()
     }
 }
@@ -52,11 +61,15 @@ impl NotificationWiring for RecordingWiring {
     }
 
     fn has_subscriptions(&self) -> futures::future::BoxFuture<'_, bool> {
-        Box::pin(async move { self.subscribed.load(std::sync::atomic::Ordering::Relaxed) })
+        Box::pin(async move {
+            self.maybe_yield().await;
+            self.subscribed.load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     fn publish_changed<'a>(&'a self, file: &'a Uri) -> futures::future::BoxFuture<'a, ()> {
         Box::pin(async move {
+            self.maybe_yield().await;
             self.changed.lock().unwrap().push(file.clone());
         })
     }
@@ -64,17 +77,17 @@ impl NotificationWiring for RecordingWiring {
 
 type Pull = JoinHandle<Result<DocumentDiagnosticsResult>>;
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: TempDir,
-    translator: Arc<Translator>,
-    cache: Arc<Mutex<NotificationCache>>,
-    wiring: Arc<RecordingWiring>,
-    path: PathBuf,
-    uri: Uri,
+    pub(super) translator: Arc<Translator>,
+    pub(super) cache: Arc<Mutex<NotificationCache>>,
+    pub(super) wiring: Arc<RecordingWiring>,
+    pub(super) path: PathBuf,
+    pub(super) uri: Uri,
 }
 
 impl Fixture {
-    fn new(redactions: crate::redaction::Redactions) -> (Self, FakeServer) {
+    pub(super) fn new(redactions: crate::redaction::Redactions) -> (Self, FakeServer) {
         let dir = TempDir::new().unwrap();
         let mut translator = Translator::new()
             .with_extensions(crate::test_lsp::test_extensions())
@@ -107,7 +120,7 @@ impl Fixture {
         (fixture, server)
     }
 
-    fn spawn_pull(&self) -> Pull {
+    pub(super) fn spawn_pull(&self) -> Pull {
         let (translator, cache) = (Arc::clone(&self.translator), Arc::clone(&self.cache));
         let path = self.path.clone();
         tokio::spawn(async move {
@@ -117,14 +130,14 @@ impl Fixture {
         })
     }
 
-    async fn finish(pull: Pull) -> Result<DocumentDiagnosticsResult> {
+    pub(super) async fn finish(pull: Pull) -> Result<DocumentDiagnosticsResult> {
         timeout(Duration::from_secs(5), pull)
             .await
             .expect("pull did not finish")
             .unwrap()
     }
 
-    async fn sources(&self) -> Option<DiagnosticInfo> {
+    pub(super) async fn sources(&self) -> Option<DiagnosticInfo> {
         self.cache
             .lock()
             .await
@@ -132,13 +145,13 @@ impl Fixture {
             .merge()
     }
 
-    fn rust() -> ServerId {
+    pub(super) fn rust() -> ServerId {
         ServerId::from_static("rust")
     }
 }
 
 /// Reads client messages until the pull request arrives and returns it.
-async fn next_pull_request(wire: &mut BufReader<&mut DuplexStream>) -> Value {
+pub(super) async fn next_pull_request(wire: &mut BufReader<&mut DuplexStream>) -> Value {
     loop {
         let message = read_framed_message(wire).await;
         if message["method"] == "textDocument/diagnostic" {
@@ -147,13 +160,13 @@ async fn next_pull_request(wire: &mut BufReader<&mut DuplexStream>) -> Value {
     }
 }
 
-fn full_report(items: Value) -> Value {
+pub(super) fn full_report(items: Value) -> Value {
     let mut report = json!({"kind": "full"});
     report["items"] = items;
     report
 }
 
-fn error_item(line: u32, message: &str) -> Value {
+pub(super) fn error_item(line: u32, message: &str) -> Value {
     json!({
         "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 4}},
         "severity": 1,
@@ -162,12 +175,16 @@ fn error_item(line: u32, message: &str) -> Value {
     })
 }
 
-async fn answer(wire: &mut BufReader<&mut DuplexStream>, stdin: &mut DuplexStream, report: Value) {
+pub(super) async fn answer(
+    wire: &mut BufReader<&mut DuplexStream>,
+    stdin: &mut DuplexStream,
+    report: Value,
+) {
     let request = next_pull_request(wire).await;
     write_response(stdin, &request["id"], report).await;
 }
 
-fn shown(result: &DocumentDiagnosticsResult) -> Vec<&str> {
+pub(super) fn shown(result: &DocumentDiagnosticsResult) -> Vec<&str> {
     result
         .diagnostics
         .iter()

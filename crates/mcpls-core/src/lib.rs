@@ -66,6 +66,7 @@ pub use config::{
 use config::{ServerId, ToolRouter};
 pub use error::Error;
 use mcp::SubscriptionRegistry;
+use runtime::disk_sweep::{spawn_disk_sweep, stop_disk_sweep};
 use runtime::{StartPlan, plan_server_starts, shutdown, spawn_lsp_servers_background};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -305,14 +306,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let _cancel_on_drop = cancel.clone().drop_guard();
 
     let lsp_init_handle = if applicable_configs.is_empty() {
-        if refusals.is_empty() {
-            warn!("No applicable LSP servers configured — starting in protocol-only mode");
-        } else {
-            warn!(
-                "The workspace is untrusted and no applicable LSP server was allowed — starting \
-                 in protocol-only mode; allow servers with `--allow-server <id>`"
-            );
-        }
+        warn_protocol_only(refusals.is_empty());
         None
     } else {
         info!(
@@ -329,6 +323,12 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
             max_concurrent_server_starts,
         ))
     };
+    let disk_sweep = spawn_disk_sweep(
+        &translator,
+        &notification_cache,
+        &subscription_registry,
+        &cancel,
+    );
 
     info!("Starting MCP server with rmcp...");
     let mcp_server = mcp::McplsServer::new(
@@ -350,10 +350,23 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         Transport::Http(cfg) => run_http(mcp_server, cfg, shutdown_signal).await,
     };
 
+    stop_disk_sweep(disk_sweep).await;
     shutdown(&cancel, &translator, lsp_init_handle).await;
 
     info!("MCPLS server shutting down");
     result
+}
+
+/// Logs why no LSP server is started.
+fn warn_protocol_only(no_refusals: bool) {
+    if no_refusals {
+        warn!("No applicable LSP servers configured — starting in protocol-only mode");
+    } else {
+        warn!(
+            "The workspace is untrusted and no applicable LSP server was allowed — starting \
+             in protocol-only mode; allow servers with `--allow-server <id>`"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -621,3 +621,88 @@ pub fn absolute_uri(relative: &str) -> String {
 pub fn diagnostics_uri(uri: &str) -> crate::bridge::resources::DiagnosticsResourceUri {
     crate::bridge::resources::DiagnosticsResourceUri::for_test(uri)
 }
+
+/// A [`NotificationWiring`](crate::bridge::NotificationWiring) that holds every
+/// invalidation back until the test releases it, and counts the ones let
+/// through, so a test can pin a call at its announcement step.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct GatedWiring {
+    gate: tokio::sync::Semaphore,
+    arrived: std::sync::atomic::AtomicUsize,
+    published: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl GatedWiring {
+    /// A wiring that publishes nothing until [`Self::release`].
+    pub fn closed() -> Self {
+        Self {
+            gate: tokio::sync::Semaphore::new(0),
+            arrived: std::sync::atomic::AtomicUsize::new(0),
+            published: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Lets one more invalidation through.
+    pub fn release(&self) {
+        self.gate.add_permits(1);
+    }
+
+    /// How many calls reached the gate, whether or not they were let through.
+    pub fn arrived(&self) -> usize {
+        self.arrived.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many invalidations went through.
+    pub fn published(&self) -> usize {
+        self.published.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits until a call has reached the gate, whether or not it is let
+    /// through.
+    pub async fn wait_arrived(&self) {
+        while self.arrived.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Waits until at least one invalidation went through.
+    pub async fn wait_published(&self) {
+        while self.published() == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl crate::bridge::NotificationWiring for GatedWiring {
+    fn spawn_pump(
+        &self,
+        _id: crate::config::ServerId,
+        _receivers: crate::bridge::NotificationReceivers,
+        _role: crate::bridge::DiagnosticsRole,
+    ) -> tokio::task::AbortHandle {
+        tokio::spawn(async {}).abort_handle()
+    }
+
+    fn publish_invalidated<'a>(
+        &'a self,
+        _cleared: &'a [crate::bridge::DiagnosticsKey],
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.arrived
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(self.gate.acquire().await);
+            self.published
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
+    fn publish_changed<'a>(
+        &'a self,
+        _file: &'a lsp_types::Uri,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}

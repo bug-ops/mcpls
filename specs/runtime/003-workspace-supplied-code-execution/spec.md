@@ -99,12 +99,16 @@ related:
   program is refused: `UntrustedRefusal::ProjectLauncher` for package runners (`npm`, `npx`, `bunx`,
   `pnpm`, `pnpx`, `yarn`, `uvx`, `corepack`, any `npm:` argument), task runners (`make`, `just`, `task`,
   `rake`, `mvn`, `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`, `poetry`,
-  `pdm`, `hatch`, `bundle`, `dotnet` (`lsp/launcher.rs`, a `LaunchRule` per command stem); `env` is
-  unwrapped, `env -S` is refused as unanalyzable, and so is a command string: `-c`, `--command`,
-  `--commands` or `/c` for `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`, `oksh`, `yash`,
-  `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `cmd`, `powershell`, `pwsh` (also as a `busybox`
-  applet) and an inline program for `node`, `bun`, `python`, `perl`, `ruby`, `php`, `lua`, `rscript`,
-  `julia`, `osascript` and `deno eval`. `xargs`, `find` and the `awk` family are refused outright, and so
+  `pdm`, `hatch`, `bundle`, `dotnet`, `stack` and `cabal` including their `runghc`, `script` and `v1-`/`v2-`/`new-` aliases (`lsp/launcher.rs`, a `LaunchRule` per command stem); `env` is
+  unwrapped, `env -S` is refused as unanalyzable, and so is a command string: `-c`, `+c`, `--command`,
+  `--commands` for `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`, `lksh`, `oksh`, `yash`,
+  `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `powershell`, `pwsh` (also as a `busybox`
+  applet; a version and the distribution suffixes `-preview`, `-static`, `-intel64`, `-dbg`, `w` and `t` do not hide the name) and an inline program for `node`, `bun`, `python`, `py`, `perl`, `ruby`, `php` (`-r`, `-R`, `-B`, `-E`, `-F`), `lua`, `rscript`,
+  `julia`, `osascript` and `deno eval`. Arguments are read with the whitespace around them removed; PowerShell
+  also reads the en dash, em dash and horizontal bar as `-`, Windows PowerShell 5.1 (`powershell`) reads a
+  bare argument as `-Command` (`LaunchTrigger::ImplicitCommandString`; `-File` ends the check), fish matches long flags by prefix and elvish
+  reads `-c`, `--c` and `-c=true` alike. `cmd` is a runner refused on every use (`LaunchRule::Always`):
+  without `/c` it reads the LSP frames on its stdin as commands. `xargs`, `find` and the `awk` family are refused outright, and so
   are the wrappers whose options are not analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`,
   `setpriv`, `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`, `unshare`,
   `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`, `script`): they change the user, root, directory or environment, or take optional arguments (#709).
@@ -125,11 +129,11 @@ related:
   admitted. `UntrustedRefusal::AutoSelectionTarget` refuses an auto-selected TypeScript command whose
   `PATH` entry resolves to another program (#697). The list is best-effort; the trusted configuration is the
   boundary (`SECURITY.md`).
-- **Wrapped programs (#710).** Each program a parsed wrapper or `env` starts (`WrappedPrograms`, indices into
-  `args`, outermost first) goes through the same vetting as the server's own executable
-  (`vetted_spawn_path`): resolved on the child `PATH` as it was before hardening, refused as
+- **Wrapped programs (#710).** Each program a parsed wrapper or `env` starts (`WrappedProgram { index, program, starter }`
+  from `WrappedPrograms`, indices into `args`, outermost first) goes through the same vetting as the server's own executable
+  (`vetted_spawn_path`, which returns a `ServerCommand`): resolved on the child `PATH` as it was before hardening, refused as
   `WorkspaceExecutable` when it canonicalizes inside the boundary, as `UnresolvedWrappedProgram` when it is
-  not found, refused as `ProjectLauncher` when its path contains `=` (`env` would read it as an assignment),
+  not found, refused as `WrappedProgramPathContainsEquals` when its path contains `=` and `env` starts it (`env` would read it as an assignment; other wrappers do not),
   and replaced in `args` by its vetted absolute spawn path, so a restart or respawn cannot find a
   binary the workspace adds later. Trusted mode neither analyzes nor rewrites.
 - **Working directory and Windows lookups (#653).** An untrusted server starts in the login home, else the

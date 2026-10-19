@@ -1,6 +1,8 @@
 //! Process-level runtime of the server: everything `serve_with` drives after
 //! its configuration is resolved.
 //!
+//! - [`disk_sweep`] tells subscribers about on-disk edits no tool call
+//!   observes.
 //! - [`pump`] drains each LSP server's notifications into the shared cache and
 //!   the subscribed MCP sessions.
 //! - [`startup`] starts the configured servers in the background, registers
@@ -13,6 +15,7 @@
 //! through the narrow wiring traits they define themselves, such as
 //! [`NotificationWiring`](crate::bridge::NotificationWiring).
 
+pub mod disk_sweep;
 pub mod pump;
 pub mod shutdown;
 pub mod startup;

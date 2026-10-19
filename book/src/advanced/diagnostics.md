@@ -32,7 +32,7 @@ flowchart LR
 - The cache holds at most 1000 file entries. When a write evicts another file, that file becomes `evicted`, which is reported honestly instead of as clean.
 - Server log messages (100 entries) and `showMessage` messages (50 entries) are kept in separate bounded buffers for `get_server_logs` and `get_server_messages`.
 
-`get_diagnostics` merges the pull answer with the cached pushes, deduplicating by severity, code and proximity. `get_cached_diagnostics` returns the cache alone and never triggers analysis. A file that is edited on disk keeps its last known diagnostics until the server publishes new ones or the next pull replaces them; there is no window where they appear empty.
+`get_diagnostics` merges the pull answer with the cached pushes, deduplicating by severity, code and proximity. `get_cached_diagnostics` returns the cache alone and never triggers analysis. A file that is edited on disk keeps its last known diagnostics until the server publishes new ones or a pull replaces them (the next call, or, for a subscribed file, the next sweep); there is no window where they appear empty.
 
 ## Availability
 
@@ -72,7 +72,10 @@ mcpls supports `resources/subscribe`. A subscribed session receives `resources/u
 
 - once per accepted publish from the language server;
 - when a `get_diagnostics` pull changes the merged view of the file, before that call returns (an identical pull sends nothing);
-- when a write evicts the file from the cache, so a re-read returns its new `availability`.
+- when a write evicts the file from the cache, so a re-read returns its new `availability`;
+- within about two seconds of an on-disk edit to a file the session subscribes to, even when no tool call touches it (see below).
+
+While a tracked file has a subscriber, mcpls checks it against the disk every two seconds. When the file changed it resynchronizes the server and pulls the file's diagnostics once per document version, which notifies the subscriber if they changed. Nothing is sent while nothing changes, a server whose pull support is not yet known (it advertises no diagnostic provider and has not answered a pull) is only resynchronized until one `get_diagnostics` call settles it, after which the sweep notifies from then on, a failed pull is retried on later ticks up to three times per version, and a server that is dead, starting or restarting is left alone. Only files mcpls already tracks (opened by an earlier tool call) are checked, at most 64 per tick. Diagnostics that only change after a save (flycheck-only), or because another file was edited, are not refreshed by the sweep.
 
 If the file's server is still starting, subscribing succeeds, and the subscriber receives one `resources/updated` if startup then fails. A session may hold at most 1000 subscriptions.
 

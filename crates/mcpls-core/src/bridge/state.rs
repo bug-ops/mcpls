@@ -478,6 +478,14 @@ impl DocumentState {
     }
 }
 
+/// What a `textDocument/didOpen` carries.
+struct OpenedDocument {
+    uri: Uri,
+    language_id: LanguageId,
+    text: String,
+    version: DocumentVersion,
+}
+
 /// Resource limits for document tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceLimits {
@@ -551,6 +559,10 @@ struct PendingClose {
 /// Holds the path's lock for as long as it lives, so any later `didOpen` for
 /// the path through [`DocumentTracker::ensure_open`] is ordered after the
 /// closes. Drop it as soon as the notifications are sent.
+///
+/// A server whose close was not marked [`Self::settle`]d when the claim is
+/// dropped (the sending future was cancelled or timed out) goes back to owing
+/// it, so the tracker never forgets a close the server did not receive.
 #[derive(Debug)]
 #[must_use = "dropping the claim releases the path lock; send the closes first"]
 pub struct PendingCloseClaim<'a> {
@@ -560,7 +572,26 @@ pub struct PendingCloseClaim<'a> {
     pub(crate) uri: Uri,
     /// Servers that still need a `textDocument/didClose` for `uri`.
     pub(crate) servers: Vec<ServerId>,
+    tracker: &'a DocumentTracker,
+    /// Servers not yet settled, with the generation observed at claim time.
+    unsettled: Vec<(ServerId, u64)>,
     _path_guard: PathLockGuard<'a>,
+}
+
+impl PendingCloseClaim<'_> {
+    /// Marks `server`'s close as dealt with: sent, or given up on.
+    pub(crate) fn settle(&mut self, server: &ServerId) {
+        self.unsettled.retain(|(unsettled, _)| unsettled != server);
+    }
+}
+
+impl Drop for PendingCloseClaim<'_> {
+    fn drop(&mut self) {
+        for (server, generation) in self.unsettled.drain(..) {
+            self.tracker
+                .restore_pending_close(&self.path, &self.uri, &server, generation);
+        }
+    }
 }
 
 /// Whether a tracked document has a given line.
@@ -1092,12 +1123,26 @@ impl DocumentTracker {
         if servers.is_empty() {
             return None;
         }
+        let unsettled = servers
+            .iter()
+            .map(|server| (server.clone(), self.generation(server)))
+            .collect();
         Some(PendingCloseClaim {
             path: path.to_path_buf(),
             uri: pending.uri,
             servers,
+            tracker: self,
+            unsettled,
             _path_guard: path_guard,
         })
+    }
+
+    /// Whether `server` still owes a `didClose` for `path`. Must be called
+    /// under `path`'s lock.
+    fn owes_pending_close(&self, path: &Path, server: &ServerId) -> bool {
+        lock_std(&self.pending_closes)
+            .get(path)
+            .is_some_and(|pending| pending.servers.contains(server))
     }
 
     /// Removes `server`'s owed close for `path`, returning whether there was
@@ -1491,6 +1536,81 @@ impl DocumentTracker {
         read_nth_line(&mut reader, line, cap).await.map_err(io_err)
     }
 
+    /// Enqueues `didOpen` for `server`, preceded by the `didClose` it still
+    /// owes for this path, if any.
+    ///
+    /// Cancel-safe: the only await reserves queue room, and nothing is taken
+    /// or sent until the room is held. From there the debt is cleared and both
+    /// notifications are enqueued with no await in between, so a drop either
+    /// leaves the debt owed and sends nothing, or leaves it settled with both
+    /// sent.
+    async fn send_open(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        lsp_client: &LspClient,
+        document: OpenedDocument,
+    ) -> Result<()> {
+        let OpenedDocument {
+            uri,
+            language_id,
+            text,
+            version,
+        } = document;
+        let open = LspClient::outbound_notification::<DidOpenTextDocumentNotification>(
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: String::from(language_id).into(),
+                    version: version.get(),
+                    text,
+                },
+            },
+        )?;
+        if !self.owes_pending_close(path, server) {
+            lsp_client.reserve_notification().await?.send(open);
+            return Ok(());
+        }
+        let close = LspClient::outbound_notification::<DidCloseTextDocumentNotification>(
+            DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )?;
+        let (close_permit, open_permit) = lsp_client.reserve_notification_pair().await?;
+        if self.take_pending_close(path, server) {
+            close_permit.send(close);
+        }
+        open_permit.send(open);
+        Ok(())
+    }
+
+    /// Enqueues a full-replacement `didChange`. Cancel-safe: see
+    /// [`Self::send_open`].
+    async fn send_change(
+        lsp_client: &LspClient,
+        uri: &Uri,
+        text: String,
+        version: DocumentVersion,
+    ) -> Result<()> {
+        let change = LspClient::outbound_notification::<DidChangeTextDocumentNotification>(
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    version: version.get(),
+                    text_document_identifier: lsp_types::TextDocumentIdentifier {
+                        uri: uri.clone(),
+                    },
+                },
+                content_changes: vec![
+                    TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
+                        lsp_types::TextDocumentContentChangeWholeDocument { text },
+                    ),
+                ],
+            },
+        )?;
+        lsp_client.reserve_notification().await?.send(change);
+        Ok(())
+    }
+
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
     /// or nothing to `server` depending on its last-synced version, and
     /// commits the outcome only after the notification succeeds.
@@ -1547,49 +1667,15 @@ impl DocumentTracker {
         };
 
         let notify_result = if is_first_open {
-            let closed = if self.take_pending_close(path, server) {
-                lsp_client
-                    .notify_typed::<DidCloseTextDocumentNotification>(DidCloseTextDocumentParams {
-                        text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-                    })
-                    .await
-                    .inspect_err(|_| self.restore_pending_close(path, &uri, server, generation))
-            } else {
-                Ok(())
+            let document = OpenedDocument {
+                uri: uri.clone(),
+                language_id,
+                text,
+                version: target_version,
             };
-            match closed {
-                Ok(()) => {
-                    lsp_client
-                        .notify_typed::<DidOpenTextDocumentNotification>(
-                            DidOpenTextDocumentParams {
-                                text_document: TextDocumentItem {
-                                    uri: uri.clone(),
-                                    language_id: String::from(language_id).into(),
-                                    version: target_version.get(),
-                                    text,
-                                },
-                            },
-                        )
-                        .await
-                }
-                Err(err) => Err(err),
-            }
+            self.send_open(path, server, lsp_client, document).await
         } else {
-            lsp_client
-                .notify_typed::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
-                    text_document: VersionedTextDocumentIdentifier {
-                        version: target_version.get(),
-                        text_document_identifier: lsp_types::TextDocumentIdentifier {
-                            uri: uri.clone(),
-                        },
-                    },
-                    content_changes: vec![
-                        TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
-                            lsp_types::TextDocumentContentChangeWholeDocument { text },
-                        ),
-                    ],
-                })
-                .await
+            Self::send_change(lsp_client, &uri, text, target_version).await
         };
 
         if let Err(err) = notify_result {
@@ -4678,7 +4764,7 @@ mod tests {
         evict_by_opening(&tracker, &dir, "q.rs").await;
 
         assert_eq!(tracker.pending_close_paths(), vec![path.clone()]);
-        let claim = tracker.try_claim_pending_close(&path).unwrap();
+        let mut claim = tracker.try_claim_pending_close(&path).unwrap();
         assert_eq!(claim.path, path);
         let mut claimed = claim.servers.clone();
         claimed.sort_by_key(ToString::to_string);
@@ -4686,6 +4772,9 @@ mod tests {
             claimed,
             vec![ServerId::from_static("a"), ServerId::from_static("d")]
         );
+        for server in claimed {
+            claim.settle(&server);
+        }
         drop(claim);
 
         assert!(tracker.pending_close_paths().is_empty());
@@ -4739,6 +4828,115 @@ mod tests {
         assert!(!reopen.is_finished(), "ensure_open must wait for the claim");
         drop(claim);
         reopen.await.unwrap().unwrap();
+    }
+
+    /// #687 FR-027: a claim dropped before its closes were sent (the flushing
+    /// call was cancelled) puts them back, so the server is not left with a
+    /// document the tracker has forgotten.
+    #[tokio::test]
+    async fn test_claim_dropped_unsettled_restores_the_owed_closes() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a", "d"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let mut claim = tracker.try_claim_pending_close(&path).unwrap();
+        claim.settle(&ServerId::from_static("a"));
+        drop(claim);
+
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([ServerId::from_static("d")]),
+            "only the close that was never settled stays owed"
+        );
+    }
+
+    /// A server respawned while its close was claimed owes nothing any more.
+    #[tokio::test]
+    async fn test_claim_dropped_after_the_server_was_forgotten_restores_nothing() {
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+
+        let claim = tracker.try_claim_pending_close(&path).unwrap();
+        tracker.forget_server(&ServerId::from_static("a"));
+        drop(claim);
+
+        assert!(pending_servers(&tracker, &path).is_empty());
+    }
+
+    /// #687 FR-026: a sync dropped while it waits for room on the command
+    /// queue neither sends nor settles anything, and a later call delivers the
+    /// close and the open together.
+    #[tokio::test]
+    async fn test_sync_phase_dropped_while_waiting_for_queue_room_keeps_the_debt() {
+        use crate::lsp::LspClient;
+
+        let dir = TempDir::new().unwrap();
+        let tracker = one_document_tracker();
+        let (path, _servers) = open_for_servers(&tracker, &dir, "p.rs", &["a"]).await;
+        evict_by_opening(&tracker, &dir, "q.rs").await;
+        let server = ServerId::from_static("a");
+        let (client, mut commands) =
+            LspClient::with_command_channel(crate::config::LspServerConfig::rust_analyzer(), 2);
+        client
+            .notify("test/fill", serde_json::json!({}))
+            .await
+            .unwrap();
+        client
+            .notify("test/fill", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let generation = tracker.generation(&server);
+        let decision = tracker.disk_phase(&path).await.unwrap();
+        {
+            let sync = tracker.sync_phase(&path, &server, &client, decision, generation);
+            let mut sync = std::pin::pin!(sync);
+            assert!(futures::poll!(sync.as_mut()).is_pending());
+        }
+        assert_eq!(
+            pending_servers(&tracker, &path),
+            HashSet::from([server.clone()]),
+            "the abandoned sync must leave the close owed"
+        );
+        assert!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&server)
+                .is_none()
+        );
+
+        assert_eq!(commands.next_method().as_deref(), Some("test/fill"));
+        assert_eq!(commands.next_method().as_deref(), Some("test/fill"));
+        assert_eq!(
+            commands.next_method(),
+            None,
+            "the abandoned sync sent something"
+        );
+
+        let generation = tracker.generation(&server);
+        let decision = tracker.disk_phase(&path).await.unwrap();
+        tracker
+            .sync_phase(&path, &server, &client, decision, generation)
+            .await
+            .unwrap();
+        let methods: Vec<_> = std::iter::from_fn(|| commands.next_method()).collect();
+        assert_eq!(
+            methods,
+            ["textDocument/didClose", "textDocument/didOpen"],
+            "the debt is settled before the open, in one step"
+        );
+        assert!(pending_servers(&tracker, &path).is_empty());
+        assert!(
+            tracker
+                .get(&path)
+                .unwrap()
+                .synced_version(&server)
+                .is_some()
+        );
     }
 
     /// #515: evict, re-open and evict again merges into one entry per server.

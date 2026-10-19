@@ -64,8 +64,8 @@ pub use translator::{
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,
     InlayHintsResult, NotificationReceivers, NotificationWiring, OutgoingCallsResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, ToolSupportSnapshot,
-    WorkspaceSymbolResult,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SweepMemo, SweepStep,
+    ToolSupportSnapshot, WorkspaceSymbolResult,
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};

@@ -51,7 +51,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
 | 013 | [[mcp/013-http-allowed-host-default-port-rejection/spec\|http-allowed-host-default-port-rejection]] | enhancement | P3 | implemented | #629 |
 | 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (135,500 B tools/list budget, #654 kind filter schemas, #705 closed input schemas) | #630; #654 |
-| 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | draft | #687 |
+| 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | implemented | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
 | 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730 |
@@ -68,7 +68,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 006 | [[bridge/006-lsp-indexing-readiness-gate/spec\|lsp-indexing-readiness-gate]] | bug | P1 | implemented (#421) | #420 |
 | 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | implemented | #565 |
 | 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
-| 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648, #649 (follow-ups) |
+| 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648 (FR-017..FR-021, option E); #649 (follow-up) |
 | 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580) | #558 |
 | 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | implemented (#666, #670) | #666; #670 |
 | 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | implemented (#667) | #667 |

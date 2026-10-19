@@ -406,6 +406,37 @@ impl<T> Drop for AbortOnDrop<'_, T> {
     }
 }
 
+/// Spawns `work` on the runtime now and returns a future for its result.
+///
+/// The spawn happens when this function is called, not on the first poll, so an
+/// `.await` placed between the call and the returned future cannot delay it.
+/// Dropping the returned future detaches the task: `work` still runs to
+/// completion, which makes this the tool for tails that must finish once begun.
+///
+/// A panic in `work` is re-raised on the caller while it still awaits; once the
+/// caller is gone the panic is lost. An `Err` means the runtime shut down and
+/// cancelled the task, so `work` did not finish.
+///
+/// # Errors
+///
+/// Returns the [`tokio::task::JoinError`] of a task cancelled by runtime
+/// shutdown.
+#[must_use = "dropping the future detaches the task; the work still runs"]
+pub fn run_detached<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> impl Future<Output = Result<T, tokio::task::JoinError>> + Send {
+    let handle = tokio::spawn(work);
+    async move {
+        match handle.await {
+            Ok(value) => Ok(value),
+            Err(error) => match error.try_into_panic() {
+                Ok(payload) => std::panic::resume_unwind(payload),
+                Err(cancelled) => Err(cancelled),
+            },
+        }
+    }
+}
+
 /// A future that panicked while being driven by [`catch_panic`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("task panicked: {message}")]
@@ -502,6 +533,22 @@ mod tests {
         assert!(!limiter.due(start + every, every));
         assert!(limiter.due(start + every + Duration::from_millis(1), every));
         assert!(!limiter.due(start + every + Duration::from_secs(2), every));
+    }
+
+    #[tokio::test]
+    async fn run_detached_spawns_eagerly_and_survives_a_dropped_caller() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let pending = run_detached(async move {
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        });
+        drop(pending);
+        assert_eq!(done_rx.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn run_detached_returns_the_value() {
+        assert_eq!(run_detached(async { 3 }).await.ok(), Some(3));
     }
 
     #[tokio::test]

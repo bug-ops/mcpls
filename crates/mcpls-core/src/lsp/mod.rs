@@ -14,6 +14,7 @@ mod stderr;
 mod transport;
 pub(crate) mod tsserver_pin;
 pub(crate) mod types;
+pub(crate) mod vetting;
 
 pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, UnclassifiedError};
 pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};

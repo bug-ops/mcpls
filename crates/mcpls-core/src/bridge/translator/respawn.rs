@@ -14,8 +14,8 @@ use super::Translator;
 use super::restart::{NotificationReceivers, NotificationRouting};
 use super::servers::Backend;
 use crate::bridge::indexing::IndexingReset;
-use crate::bridge::{DiagnosticsRole, on_lifecycle};
-use crate::config::ServerId;
+use crate::bridge::{DiagnosticsKey, DiagnosticsRole, NotificationCache, on_lifecycle};
+use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, Result};
 use crate::lsp::{LspClient, LspServer, ServerInitConfig, SpawnedServer};
 use crate::util::lock_std;
@@ -63,7 +63,7 @@ impl Translator {
     /// respawn path should react to -- and for any `try_wait` error, on the
     /// conservative assumption that a health check that itself failed should
     /// not trigger a respawn.
-    fn dead_server_config(&self, id: &ServerId) -> Option<ServerInitConfig> {
+    pub(super) fn dead_server_config(&self, id: &ServerId) -> Option<ServerInitConfig> {
         let mut servers = lock_std(&self.servers);
         let server = servers.server_mut(id)?;
         let config = server.is_dead().ok()?.then(|| server.init_config().clone());
@@ -257,7 +257,7 @@ impl Translator {
         // A panicked message loop never drains its own pending requests.
         let dead_client = lock_std(&self.servers).client(id);
         if let Some(client) = dead_client {
-            client.fail_pending_requests().await;
+            client.fail_pending_requests();
         }
 
         self.reconcile_respawn_stability(id);
@@ -278,29 +278,36 @@ impl Translator {
     /// Shared by the crash path ([`Self::respawn_if_dead`]) and the manual
     /// restart. Ordering matters:
     ///
-    /// 1. Backoff (when honoured), then spawn, recorded in the backoff
-    ///    bookkeeping.
-    /// 2. The previous notification task for `id` is aborted. Abort is
-    ///    asynchronous: it may still finish one cache write already in
-    ///    progress.
-    /// 3. `id`'s indexing state is reset (a server that reported a readiness
-    ///    signal before reads `Loading` until its replacement reports one or
-    ///    the indexing-ready timeout elapses), and for the diagnostics-route
+    /// 1. Backoff (when honoured), then spawn. A failure is recorded in the
+    ///    backoff bookkeeping.
+    /// 2. Waiting for the notification cache. Dropping the call up to here
+    ///    kills the replacement and leaves no trace.
+    /// 3. The commit, in one step without an await: the success is recorded,
+    ///    the previous notification task for `id` is aborted (asynchronously:
+    ///    it may still finish one cache write already in progress), `id`'s
+    ///    indexing state is reset (a server that reported a readiness signal
+    ///    before reads `Loading` until its replacement reports one or the
+    ///    indexing-ready timeout elapses), and for the diagnostics-route
     ///    server its cached diagnostics are cleared and its push-degraded
-    ///    flag updated per `routing`. This precedes step 4 so a readiness
-    ///    signal or diagnostics push the replacement emitted during its own
-    ///    handshake, already buffered in its channels, is the last write.
-    /// 4. The consumer for the replacement's notification lanes is started.
-    /// 5. The replacement replaces the registered client and server,
+    ///    flag updated per `routing`. The consumer for the replacement's
+    ///    notification lanes starts after that, so a readiness signal or
+    ///    diagnostics push the replacement emitted during its own handshake,
+    ///    already buffered in its channels, is the last write. Then the
+    ///    replacement replaces the registered client and server, and
     ///    `document_tracker` forgets `id` (after the swap: a caller still on
-    ///    the old client must not record sync against the new generation),
-    ///    the old client's pending requests fail, and subscribers of the
-    ///    cleared diagnostics are told to re-read.
+    ///    the old client must not record sync against the new generation).
+    /// 4. The old client's pending requests fail and subscribers of the
+    ///    cleared diagnostics are told to re-read. This tail runs detached,
+    ///    so it finishes even if the caller is dropped after the commit.
     ///
     /// # Errors
     ///
     /// [`Error::ServerUnavailable`] when backoff is honoured and active, or
     /// the spawn error of the replacement.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the cache guard must be held up to the commit, which takes it by value; the lint cannot see the move"
+    )]
     pub(super) async fn respawn_locked(
         &self,
         id: &ServerId,
@@ -321,30 +328,63 @@ impl Translator {
             });
         }
 
-        let config = match config.for_respawn().await {
-            Ok(config) => config,
-            Err(err) => {
-                self.record_respawn_failure(id);
-                return Err(err);
-            }
-        };
+        let attempt = AttemptGuard::begin(self, id);
+        let config = config.for_respawn().await?;
         let language_id = config.server_config().language_id.clone();
         let pinned_tsserver = config.pinned_tsserver();
 
         let SpawnedServer {
             server: new_server,
             lanes,
-        } = match LspServer::spawn(config).await {
-            Ok(spawned) => {
-                self.record_respawn_success(id);
-                spawned
-            }
-            Err(err) => {
-                self.record_respawn_failure(id);
-                return Err(err);
-            }
-        };
+        } = LspServer::spawn(config).await?;
         let receivers = NotificationReceivers::new(lanes, pinned_tsserver);
+
+        // The last await before the commit: a drop up to here kills the new
+        // child and changes nothing but the backoff, so a half-done respawn
+        // cannot exist.
+        let cache = match &self.notification_cache {
+            Some(cache) => Some(cache.lock().await),
+            None => None,
+        };
+        let (old_client, cleared) =
+            self.commit_respawn(attempt, new_server, receivers, routing, &language_id, cache);
+
+        // Must finish once begun, even if the caller goes away: the old
+        // waiters need their error and subscribers their invalidation.
+        let wiring = self.wiring.get().cloned();
+        let finish = crate::util::run_detached(async move {
+            if let Some(old_client) = old_client {
+                old_client.fail_pending_requests();
+            }
+            if let Some(wiring) = wiring {
+                wiring.publish_invalidated(&cleared).await;
+            }
+        });
+        if finish.await.is_err() {
+            tracing::debug!("runtime shut down before the respawn of '{id}' was announced");
+        }
+
+        tracing::info!("LSP server '{id}' respawned successfully");
+        Ok(())
+    }
+
+    /// The synchronous half of a respawn: records the success, resets what the
+    /// old process left behind, starts the replacement's consumer and swaps it
+    /// in. Has no await point, so it cannot be abandoned half-done.
+    ///
+    /// Returns the replaced client and the diagnostics keys cleared for it.
+    fn commit_respawn(
+        &self,
+        attempt: AttemptGuard<'_>,
+        new_server: LspServer,
+        receivers: NotificationReceivers,
+        routing: NotificationRouting<'_>,
+        language_id: &LanguageId,
+        cache: Option<tokio::sync::MutexGuard<'_, NotificationCache>>,
+    ) -> (Option<LspClient>, Vec<DiagnosticsKey>) {
+        let id = attempt.disarm();
+        self.record_respawn_success(id);
+        let diagnostics_route = self.is_diagnostics_route(language_id, id);
 
         let stale_task = lock_std(&self.servers)
             .get_mut(id)
@@ -357,10 +397,8 @@ impl Translator {
         // the cache, and `clear_server_diagnostics` is scoped to one server's
         // own entries (#266), so a crashed rust-analyzer never wipes a
         // healthy pyright's cached diagnostics.
-        let diagnostics_route = self.is_diagnostics_route(&language_id, id);
         let mut cleared = Vec::new();
-        if let Some(cache) = &self.notification_cache {
-            let mut cache = cache.lock().await;
+        if let Some(mut cache) = cache {
             cache.reset_indexing_state(
                 id,
                 IndexingReset::AwaitReplacement {
@@ -392,19 +430,8 @@ impl Translator {
             NotificationRouting::Discard => self.spawn_discard_consumer(id, receivers),
         };
         let old_client = self.swap_in(id, new_server, &consumer);
-
         self.document_tracker.forget_server(id);
-
-        if let Some(old_client) = old_client {
-            old_client.fail_pending_requests().await;
-        }
-
-        if let Some(wiring) = self.wiring.get() {
-            wiring.publish_invalidated(&cleared).await;
-        }
-
-        tracing::info!("LSP server '{id}' respawned successfully");
-        Ok(())
+        (old_client, cleared)
     }
 
     /// Installs `new_server` and its consumer in `id`'s slot in one step and
@@ -477,6 +504,39 @@ impl Translator {
             }
         });
         forwarder.abort_handle()
+    }
+}
+
+/// One respawn attempt in the backoff bookkeeping: unless disarmed before the
+/// commit, dropping it counts the attempt as a failure, so a call cancelled
+/// mid-respawn and retried backs off instead of paying a full spawn each time.
+struct AttemptGuard<'a> {
+    translator: &'a Translator,
+    id: &'a ServerId,
+    armed: bool,
+}
+
+impl<'a> AttemptGuard<'a> {
+    const fn begin(translator: &'a Translator, id: &'a ServerId) -> Self {
+        Self {
+            translator,
+            id,
+            armed: true,
+        }
+    }
+
+    /// Ends the attempt without counting a failure; hands back the server id.
+    fn disarm(mut self) -> &'a ServerId {
+        self.armed = false;
+        self.id
+    }
+}
+
+impl Drop for AttemptGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.translator.record_respawn_failure(self.id);
+        }
     }
 }
 
@@ -611,11 +671,11 @@ mod tests {
         use tokio::time::Duration;
 
         use super::*;
-        use crate::bridge::WorkspaceRoots;
         use crate::bridge::translator::testing::{
             pid_is_running, stub_server_config, write_crash_after_init_script,
             write_responder_script,
         };
+        use crate::bridge::{NotificationWiring, WorkspaceRoots};
         use crate::config::{
             FileExtension, LanguageId, ServerCommand, TimeoutSecs, ToolKind, ToolRouter, ToolSet,
         };
@@ -1506,6 +1566,114 @@ sleep 1
                 translator.dead_server_config(&id).is_none(),
                 "the respawned replacement should be alive"
             );
+        }
+
+        /// A diagnostics-route translator whose seed server has crashed, with a
+        /// cache holding one diagnostics entry for it.
+        async fn crashed_diagnostics_translator(
+            dir: &TempDir,
+        ) -> (
+            Translator,
+            Arc<Mutex<crate::bridge::NotificationCache>>,
+            ServerId,
+        ) {
+            let id = ServerId::from_static("rust");
+            let seed_script = write_crash_after_init_script(dir.path());
+            let seed = LspServer::spawn(stub_server_config("rust", &seed_script))
+                .await
+                .unwrap()
+                .server;
+            let cache = Arc::new(Mutex::new(crate::bridge::NotificationCache::new()));
+            let translator = Translator::new()
+                .with_router(ToolRouter::catch_all([(
+                    id.clone(),
+                    LanguageId::from_static("rust"),
+                )]))
+                .with_notification_cache(Arc::clone(&cache));
+            translator.register_client(id.clone(), seed.client().clone());
+            translator.register_server(id.clone(), seed);
+            cache.lock().await.store_diagnostics(
+                &id,
+                &lsp_types::Uri::from("file:///workspace/opened.rs"),
+                None,
+                vec![],
+            );
+            wait_until_dead(&translator, &id).await;
+            let respawn_script = write_responder_script(dir.path(), 5);
+            set_respawn_config(
+                &translator,
+                &id,
+                stub_server_config("rust", &respawn_script),
+            );
+            (translator, cache, id)
+        }
+
+        /// #687 S1: a respawn dropped before its commit leaves no trace: no
+        /// success recorded, the dead server still registered, the cache
+        /// untouched. A later respawn then works.
+        #[tokio::test]
+        async fn test_respawn_dropped_before_the_commit_changes_nothing() {
+            let dir = TempDir::new().unwrap();
+            let (translator, cache, id) = crashed_diagnostics_translator(&dir).await;
+            let uri = lsp_types::Uri::from("file:///workspace/opened.rs");
+
+            let cache_guard = cache.lock().await;
+            let abandoned =
+                tokio::time::timeout(Duration::from_millis(500), translator.respawn_if_dead(&id))
+                    .await;
+            assert!(abandoned.is_err(), "the respawn must wait for the cache");
+            assert!(
+                translator
+                    .backoff_of(&id)
+                    .is_some_and(|b| !b.last_attempt_succeeded),
+                "an abandoned respawn counts as a failed attempt"
+            );
+            assert!(translator.dead_server_config(&id).is_some());
+            assert!(cache_guard.diagnostics(&uri).is_some());
+            drop(cache_guard);
+
+            assert_matches!(
+                translator.respawn_if_dead(&id).await,
+                Err(Error::ServerUnavailable { .. }),
+                "the retried call must back off"
+            );
+            let config = translator.dead_server_config(&id).unwrap();
+            translator
+                .respawn_locked(
+                    &id,
+                    config,
+                    BackoffPolicy::Bypass,
+                    NotificationRouting::Discard,
+                )
+                .await
+                .unwrap();
+            assert!(translator.dead_server_config(&id).is_none());
+            assert!(cache.lock().await.diagnostics(&uri).is_none());
+        }
+
+        /// #687 S1: once the replacement is swapped in, the subscribers are
+        /// still told even if the caller goes away while that happens.
+        #[tokio::test]
+        async fn test_respawn_dropped_after_the_commit_still_announces_it() {
+            let dir = TempDir::new().unwrap();
+            let (translator, _cache, id) = crashed_diagnostics_translator(&dir).await;
+            let wiring = Arc::new(crate::test_lsp::GatedWiring::closed());
+            translator.install_wiring(Arc::clone(&wiring) as Arc<dyn NotificationWiring>);
+
+            let abandoned =
+                tokio::time::timeout(Duration::from_secs(2), translator.respawn_if_dead(&id)).await;
+            assert!(abandoned.is_err(), "the announcement is held at the gate");
+            assert!(
+                translator.dead_server_config(&id).is_none(),
+                "the replacement was committed before the caller was dropped"
+            );
+            assert_eq!(wiring.published(), 0);
+
+            wiring.release();
+            tokio::time::timeout(Duration::from_secs(2), wiring.wait_published())
+                .await
+                .expect("the detached tail must still publish");
+            assert_eq!(wiring.published(), 1);
         }
     }
 }

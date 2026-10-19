@@ -67,6 +67,7 @@ pub use addressing::{
     ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
+pub use diagnostics::{SweepMemo, SweepStep};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,

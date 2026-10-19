@@ -43,8 +43,9 @@ For each server mcpls:
 
 ## 4. Steady state
 
-- **Documents.** `textDocument/didOpen` is sent on first use of a file. Beyond `workspace.max_documents`, the least recently used unlocked document is closed with `didClose`. Edits on disk are detected on the next call and the server is resynchronized.
+- **Documents.** `textDocument/didOpen` is sent on first use of a file. Beyond `workspace.max_documents`, the least recently used unlocked document is closed with `didClose`. Edits on disk are detected on the next call and the server is resynchronized; for a file a client subscribes to, also by a sweep every two seconds ([Diagnostics and Resources](diagnostics.md#subscriptions)).
 - **Requests.** Each is bounded by `request_timeout_seconds`. A "content modified" answer (`-32802`) is retried with exponential backoff, up to 4 attempts. Completions are capped at 10 seconds.
+- **Cancellation.** When an MCP client cancels a tool call, or its connection closes, the call stops and every request it has outstanding is cancelled on the server with `$/cancelRequest`, and no retry follows. A connection that closed is noticed within 5.25 seconds (rmcp's 5 second drain plus a 250 ms check). A request that hits `request_timeout_seconds` is cancelled the same way, and the server's late reply is ignored. A cancelled `restart_server` still finishes the restarts it began.
 - **Indexing readiness.** mcpls watches the server's readiness signals (rust-analyzer's `experimental/serverStatus`, or generic `$/progress`). Whole-workspace queries wait for a server that is still indexing, up to `indexing_ready_timeout_seconds`, and then fail with a "still indexing" error instead of answering from a partial index. A server that never reports a signal is never delayed, and `indexing = "disabled"` opts a server out.
 - **Notifications.** Diagnostics, log messages and `showMessage` notifications are cached for the tools that read them ([Diagnostics and Resources](diagnostics.md)).
 

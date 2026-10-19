@@ -7,7 +7,6 @@ use lsp_types::{DocumentDiagnosticParams, Uri};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use super::Translator;
 use super::availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
 use super::dto::{
     Diagnostic, DiagnosticsResult, DocumentDiagnosticsResult, ServerLogsResult,
@@ -18,6 +17,7 @@ use super::encoding_ctx::EncodingCtx;
 use super::positioned::document_request_classified;
 use super::pull_support::{PullProbe, PullSupport};
 use super::routing::PreparedDocument;
+use super::{NotificationWiring, Translator};
 use crate::bridge::encoding::PositionEncoding;
 use crate::bridge::notifications::{
     BoundedDiagnostics, ChangeOutcome, LogLevel, PullStamp, PullWrite, ReportedSeverity,
@@ -30,7 +30,12 @@ use crate::bridge::{
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, ErrorChain, Result};
 use crate::lsp::{ConnectionId, UnclassifiedError};
-use crate::util::lock_std;
+use crate::util::{lock_std, run_detached};
+
+mod sweep;
+pub use sweep::{SweepMemo, SweepStep};
+#[cfg(test)]
+mod sweep_tests;
 
 /// Hand-rolled union of `textDocument/diagnostic`'s two possible result
 /// shapes.
@@ -137,6 +142,41 @@ struct PullSettlement {
     /// Whether the cache has an answer for the file, read in the same
     /// critical section as `sources`.
     availability: DiagnosticsAvailability,
+}
+
+/// What a pull round made of a file.
+pub(super) struct PullRound {
+    origin: DiagnosticsOrigin,
+    /// Why the pull request failed, when it did.
+    failure: Option<Error>,
+    /// The file's merged view with the report in it.
+    merged: Option<DiagnosticInfo>,
+    availability: DiagnosticsAvailability,
+}
+
+/// The notifications a pull write owes its subscribers.
+struct Notices {
+    /// The file whose merged view changed.
+    changed: Option<Uri>,
+    /// Files whose entries were evicted to make room.
+    evicted: Vec<DiagnosticsKey>,
+}
+
+impl Notices {
+    const fn is_empty(&self) -> bool {
+        self.changed.is_none() && self.evicted.is_empty()
+    }
+
+    async fn deliver(self, wiring: Arc<dyn NotificationWiring>) {
+        if let Some(file) = &self.changed
+            && wiring.has_subscriptions().await
+        {
+            wiring.publish_changed(file).await;
+        }
+        if !self.evicted.is_empty() {
+            wiring.publish_invalidated(&self.evicted).await;
+        }
+    }
 }
 
 /// Whether a server answered a request with JSON-RPC "method not found".
@@ -335,61 +375,12 @@ impl Translator {
             .await?;
         let (server_id, uri) = (doc.server_id(), doc.uri());
         let ctx = self.encoding_ctx(server_id);
-        let support = self.pull_support(server_id);
-
-        let stamp = match self.document_tracker.synced_version(doc.path(), server_id) {
-            Some(version) if support.sends_pull() => Some(
-                notification_cache
-                    .lock()
-                    .await
-                    .begin_pull(server_id, version),
-            ),
-            _ => None,
-        };
-
-        let attempt = self.request_pull(&doc, support).await;
-        let origin = attempt.origin();
-        let (pulled, failure) = match attempt {
-            PullAttempt::Answered(pulled) => (pulled, None),
-            PullAttempt::PushOnly => (None, None),
-            PullAttempt::Failed(e) => (None, Some(e)),
-        };
-
-        let snapshot_before = match self.wiring.get() {
-            Some(wiring) if wiring.has_subscriptions().await => SnapshotBefore::Take,
-            _ => SnapshotBefore::Skip,
-        };
-        let PullSettlement {
-            sources,
-            storage,
-            evicted,
+        let PullRound {
+            origin,
+            failure,
+            merged: diag_info,
             availability,
-        } = {
-            let mut cache = notification_cache.lock().await;
-            self.settle_pull(&mut cache, &doc, stamp, pulled, snapshot_before)
-        };
-        let diag_info = sources.merge();
-
-        if let Some(wiring) = self.wiring.get() {
-            if let PullStorage::Stored(slot) = storage
-                && wiring.has_subscriptions().await
-            {
-                let outcome = match slot {
-                    SlotChange::Identical => ChangeOutcome::Unchanged,
-                    SlotChange::Replaced { before } => before
-                        .map_or(ChangeOutcome::Changed, |before| {
-                            ChangeOutcome::of(before.merge().as_ref(), diag_info.as_ref())
-                        }),
-                };
-                match outcome {
-                    ChangeOutcome::Changed => wiring.publish_changed(uri).await,
-                    ChangeOutcome::Unchanged => {}
-                }
-            }
-            if !evicted.is_empty() {
-                wiring.publish_invalidated(&evicted).await;
-            }
-        }
+        } = self.pull_round(&doc, notification_cache).await;
 
         let merged = Self::diagnostics_from_cache_entry(
             diag_info.as_ref(),
@@ -424,6 +415,86 @@ impl Translator {
             availability,
             origin,
         })
+    }
+
+    /// Pulls the document `doc` names, stores a full report as its pulled slot
+    /// and tells the subscribers what that changed.
+    ///
+    /// The cache lock is held for the store only. The notifications run
+    /// detached from the caller (`run_detached`) and are spawned with no
+    /// `.await` after the store, so a caller dropped once the report is stored
+    /// still delivers them, while one dropped earlier stored nothing (FR-005).
+    /// The caller waiting on the result keeps FR-008: they are enqueued before
+    /// it continues.
+    pub(super) async fn pull_round(
+        &self,
+        doc: &PreparedDocument,
+        notification_cache: &Mutex<NotificationCache>,
+    ) -> PullRound {
+        let (server_id, uri) = (doc.server_id(), doc.uri());
+        let support = self.pull_support(server_id);
+
+        let stamp = match self.document_tracker.synced_version(doc.path(), server_id) {
+            Some(version) if support.sends_pull() => Some(
+                notification_cache
+                    .lock()
+                    .await
+                    .begin_pull(server_id, version),
+            ),
+            _ => None,
+        };
+
+        let attempt = self.request_pull(doc, support).await;
+        let origin = attempt.origin();
+        let (pulled, failure) = match attempt {
+            PullAttempt::Answered(pulled) => (pulled, None),
+            PullAttempt::PushOnly => (None, None),
+            PullAttempt::Failed(e) => (None, Some(e)),
+        };
+
+        let wiring = self.wiring.get().map(Arc::clone);
+        let snapshot_before = match &wiring {
+            Some(wiring) if wiring.has_subscriptions().await => SnapshotBefore::Take,
+            _ => SnapshotBefore::Skip,
+        };
+        let PullSettlement {
+            sources,
+            storage,
+            evicted,
+            availability,
+        } = {
+            let mut cache = notification_cache.lock().await;
+            self.settle_pull(&mut cache, doc, stamp, pulled, snapshot_before)
+        };
+        let merged = sources.merge();
+
+        if let Some(wiring) = wiring {
+            let outcome = match storage {
+                PullStorage::Stored(SlotChange::Replaced { before }) => before
+                    .map_or(ChangeOutcome::Changed, |before| {
+                        ChangeOutcome::of(before.merge().as_ref(), merged.as_ref())
+                    }),
+                PullStorage::Stored(SlotChange::Identical) | PullStorage::NotStored => {
+                    ChangeOutcome::Unchanged
+                }
+            };
+            let notices = Notices {
+                changed: (outcome == ChangeOutcome::Changed).then(|| uri.clone()),
+                evicted,
+            };
+            if !notices.is_empty()
+                && let Err(error) = run_detached(notices.deliver(wiring)).await
+            {
+                debug!("diagnostics notifications were cancelled: {error}");
+            }
+        }
+
+        PullRound {
+            origin,
+            failure,
+            merged,
+            availability,
+        }
     }
 
     /// Sends the pull request `support` calls for, and learns from how it

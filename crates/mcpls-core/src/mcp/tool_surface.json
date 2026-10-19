@@ -7063,7 +7063,7 @@
   {
     "name": "restart_server",
     "title": "Restart Server",
-    "description": "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+    "description": "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; if its old process was already stopped, the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -7112,7 +7112,7 @@
           ]
         },
         "RestartFailure": {
-          "description": "Why a restart failed after the old process was already stopped.",
+          "description": "Why a restart failed.",
           "oneOf": [
             {
               "description": "The replacement process could not be started.",

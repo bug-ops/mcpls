@@ -163,10 +163,12 @@ pub enum RestartTarget {
     Servers(ServerIds),
 }
 
-/// Why a restart failed after the old process was already stopped.
+/// Why a restart failed.
 ///
-/// The server stays registered as dead; the next tool call retries the spawn
-/// under the normal crash-loop backoff.
+/// A refusal found before the old process is stopped leaves it running.
+/// Otherwise the old process is already stopped: the server stays registered
+/// as dead, and the next tool call retries the spawn under the normal
+/// crash-loop backoff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestartFailure {
@@ -188,9 +190,9 @@ impl RestartFailure {
     fn from_error(error: &Error) -> Self {
         let message = ErrorChain(error).to_string();
         match error {
-            Error::ServerNotFound { .. } | Error::ServerSpawnFailed { .. } => {
-                Self::SpawnFailed { message }
-            }
+            Error::ServerNotFound { .. }
+            | Error::ServerSpawnFailed { .. }
+            | Error::ServerFailedToStart(_) => Self::SpawnFailed { message },
             Error::LspInitFailed { .. }
             | Error::ServerExitedDuringInit { .. }
             | Error::ServerTerminated
@@ -212,7 +214,6 @@ impl RestartFailure {
             | Error::DocumentNotFound(_)
             | Error::NoServerForLanguage { .. }
             | Error::NoServerForTool { .. }
-            | Error::ServerFailedToStart(_)
             | Error::ServerInitializing { .. }
             | Error::ServerRestarted { .. }
             | Error::SymbolResolution(_)
@@ -717,6 +718,18 @@ impl Translator {
         self.note_restart_attempt(id);
         tracing::info!(%id, "restarting LSP server on request");
 
+        let running = lock_std(&self.servers)
+            .server(id)
+            .map(|server| server.init_config().clone());
+        if let Some(running) = running
+            && let Err(error) = running.for_respawn().await
+        {
+            tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart refused");
+            return RestartOutcome::Failed {
+                reason: RestartFailure::from_error(&error),
+            };
+        }
+
         let Some(mut old) = Deregistered::take(self, id) else {
             return RestartOutcome::NotRunning {
                 message: format!("LSP server '{id}' is not running"),
@@ -980,7 +993,7 @@ mod tests {
             cache: Arc<Mutex<NotificationCache>>,
             clock: Arc<FakeClock>,
             id: ServerId,
-            _dir: TempDir,
+            dir: TempDir,
         }
 
         fn server_ids(names: &[&str]) -> RestartTarget {
@@ -1031,7 +1044,7 @@ mod tests {
                 cache,
                 clock,
                 id,
-                _dir: dir,
+                dir,
             }
         }
 
@@ -1052,6 +1065,27 @@ mod tests {
         }
 
         impl Fixture {
+            fn root(&self) -> &Path {
+                self.dir.path()
+            }
+
+            #[cfg(unix)]
+            fn vet_arguments_against(&self, boundary: WorkspaceRoots, tool: &Path) {
+                let init = lock_std(&self.translator.servers)
+                    .server_mut(&self.id)
+                    .unwrap()
+                    .init_config()
+                    .clone();
+                let mut init = init.with_untrusted_boundary(boundary);
+                init.server_config_mut()
+                    .args
+                    .push(tool.to_string_lossy().into_owned());
+                lock_std(&self.translator.servers)
+                    .server_mut(&self.id)
+                    .unwrap()
+                    .set_init_config(init);
+            }
+
             fn registered(&self) -> bool {
                 let servers = lock_std(&self.translator.servers);
                 servers.server(&self.id).is_some() && servers.client(&self.id).is_some()
@@ -1102,6 +1136,47 @@ mod tests {
             assert_eq!(log.matches("started").count(), 2, "{log}");
             assert!(log.contains(r#""method":"shutdown""#), "{log}");
             assert!(log.contains(r#""method":"exit""#), "{log}");
+            assert!(fx.registered() && !fx.expected() && !fx.is_dead());
+        }
+
+        /// Regression test for #736: a restart refused by the argument recheck
+        /// is decided before the running server is stopped.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_restart_refused_by_the_argument_recheck_keeps_the_old_server_running() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let (fx, log) = protocol_fixture(None).await;
+            let workspace = fx.root().join("ws");
+            fs::create_dir_all(&workspace).unwrap();
+            let tool = workspace.join("tool");
+            fs::write(&tool, "").unwrap();
+            fx.vet_arguments_against(WorkspaceRoots::from_paths(&[workspace]).unwrap(), &tool);
+            fx.translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+            fx.clock.advance(RESTART_COOLDOWN + Duration::from_secs(1));
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            let RestartOutcome::Failed {
+                reason: RestartFailure::SpawnFailed { message },
+            } = only_outcome(&result)
+            else {
+                panic!("expected a refused restart, got {result:?}");
+            };
+            assert!(
+                message.contains("executable inside the workspace"),
+                "{message}"
+            );
+            let log = read_log(&log);
+            assert_eq!(log.matches("started").count(), 2, "{log}");
             assert!(fx.registered() && !fx.expected() && !fx.is_dead());
         }
 

@@ -10,7 +10,7 @@ tags:
   - cancellation
   - resource-hygiene
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp-tool-surface-and-routing]]"
@@ -28,6 +28,7 @@ related:
 > **Type**: enhancement (protocol compliance, resource hygiene)
 > **Priority**: P3
 > **Related issues**: #687
+> **Implemented in**: the PR closing #687; the plan records where the design deviates from the draft
 > **Baseline commit**: 12ee3a1 (31 tools, `rmcp` 3.5.1)
 
 ## 1. Overview
@@ -202,8 +203,8 @@ failed in bulk.
 |----|------------|----------|
 | FR-001 | WHEN the request token of a `tools/call` is cancelled THE SYSTEM SHALL stop the handler future at its next await point and return without producing a tool result | must |
 | FR-002 | WHEN the request token is already cancelled at handler entry THE SYSTEM SHALL issue no LSP request, send no LSP notification, and open no document on behalf of that call | must |
-| FR-003 | THE SYSTEM SHALL NOT send a result or an error response for a cancelled request itself; discarding any late response is left to the transport | must |
-| FR-004 | THE SYSTEM SHALL log a cancelled tool call at `debug` level with tool name and the phase it was in, and SHALL NOT log it as a handler failure, panic or error | should |
+| FR-003 | THE SYSTEM SHALL NOT produce a tool result for a cancelled call: the handler returns `Err`, never `Ok`. The transport discards that error for a client-cancelled id and may deliver it as an error response when the serve loop itself is cancelled (rmcp still answers ids left in its request pool then); mcpls sends no response of its own | must |
+| FR-004 | THE SYSTEM SHALL log a cancelled tool call at `debug` level with the tool name and the cause (client cancel or connection close), and SHALL NOT itself log it as a handler failure, panic or error. rmcp logs its own `warn` (`response error`) for the discarded result of a cancelled call; that line is accepted | should |
 
 ### LSP cancellation
 
@@ -216,7 +217,7 @@ failed in bulk.
 | FR-009 | THE `$/cancelRequest` SHALL be enqueued on the same ordered channel as the request it cancels, so it is never written before that request | must |
 | FR-010 | WHEN the future awaiting an LSP request is dropped for any reason (cancellation, abort of a spawned subtask, panic containment) THE SYSTEM SHALL cancel the outstanding id as in FR-005 | must |
 | FR-011 | THE SYSTEM SHALL NOT fail, block indefinitely, or surface an error to any caller because a `$/cancelRequest` could not be sent (server dead, channel closed, queue full); such a failure is logged at `debug` | must |
-| FR-012 | THE SYSTEM SHALL NOT send `$/cancelRequest` to a server once its `shutdown` request has been issued, and SHALL NOT send it to a client instance that has been failed in bulk, restarted or respawned | must |
+| FR-012 | THE SYSTEM SHALL NOT send `$/cancelRequest` to a server once its `shutdown` request has been issued (including when that request itself times out), and SHALL NOT send it to a client instance that has been failed in bulk, restarted or respawned | must |
 
 ### Retry and reply handling
 
@@ -242,34 +243,37 @@ failed in bulk.
 |----|------------|----------|
 | FR-021 | WHEN a server is restarted or respawned and its pending requests are failed in bulk THE SYSTEM SHALL fail the waiting callers as today (`ServerRestarted` or `ServerTerminated`) and SHALL NOT send `$/cancelRequest` to the old process or to its replacement | must |
 | FR-022 | WHEN a call is cancelled while its request is being failed in bulk THE SYSTEM SHALL treat cancellation as the outcome (no result, no error response) and send no `$/cancelRequest` for an id already failed | must |
-| FR-023 | WHEN the connection closes or serve is cancelled THE SYSTEM SHALL cancel every in-flight `tools/call` handler, including on transport EOF where the transport library does not cancel request tokens itself | must |
+| FR-023 | WHEN the connection closes or serve is cancelled THE SYSTEM SHALL cancel every in-flight `tools/call` handler, including on transport EOF where the transport library does not cancel request tokens itself. Connection close is observed by polling `Peer::is_transport_closed` every `PEER_CLOSE_POLL` (250 ms); rmcp turns it true when its serve loop ends, which on EOF and on HTTP session close is after its in-flight drain (5 s at rmcp 3.5.1) | must |
 | FR-024 | WHEN mcpls begins shutting down THE SYSTEM SHALL let the existing LSP `shutdown`/`exit` sequence proceed unchanged and SHALL NOT emit a burst of `$/cancelRequest` that delays it | must |
-| FR-025 | WHEN `restart_server` is cancelled before it has begun restarting a server THE SYSTEM SHALL not start it; once a restart of a server has begun THE SYSTEM SHALL take it to a defined end state (restarted, or failed with the existing outcome) rather than abandon it half-done | must |
+| FR-025 | WHEN `restart_server` is cancelled before the call has begun THE SYSTEM SHALL restart nothing; once the call has begun THE SYSTEM SHALL take every targeted server to a defined end state (restarted, or failed with the existing outcome) rather than abandon any of them half-done. The restart runs detached from the handler, so a cancel after entry only discards the result | must |
 
 ### Cancel-safety of shared state
 
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-026 | WHEN a call is cancelled during `ensure_open` THE SYSTEM SHALL leave the document tracker consistent with what each server was actually sent: a version is recorded as synced to a server only if the matching `didOpen` or `didChange` was enqueued, and a `didOpen` already enqueued is never left unrecorded | must |
-| FR-027 | WHEN a call is cancelled THE SYSTEM SHALL release every per-path lock, pending-close claim, concurrency permit and settle/indexing waiter it holds, with no resource remaining attributable to the call | must |
+| FR-027 | WHEN a call is cancelled THE SYSTEM SHALL release every per-path lock, pending-close claim, concurrency permit and settle/indexing waiter it holds, with no resource remaining attributable to the call. A pending-close claim dropped before its closes were sent puts the unsent ones back as owed | must |
 | FR-028 | WHEN a call that opened a document is cancelled THE SYSTEM SHALL keep that document tracked under the normal lazy-open and eviction policy (cancellation neither closes it nor pins it) | should |
 | FR-029 | WHEN a diagnostics pull is cancelled or its reply is `-32800` after our cancel THE SYSTEM SHALL NOT store anything in the `Pulled` slot, SHALL NOT notify resource subscribers, and SHALL NOT cache an empty result | must |
 | FR-030 | WHEN an indexing-readiness wait, settle wait or any other bounded wait inside a handler is in progress and the call is cancelled THE SYSTEM SHALL end the wait immediately | must |
+
+| FR-033 | WHEN a call is cancelled while it respawns a dead server THE SYSTEM SHALL either leave the dead server registered with nothing recorded (no success, no cache change, no process left), or complete the swap including failing the old client's waiters and telling the subscribers of the cleared diagnostics | must |
+| FR-034 | WHEN a diagnostics pull has stored its `Pulled` slot THE SYSTEM SHALL deliver the resulting subscriber notification even if the call is cancelled right after the store | must |
 
 ### Typing and observability
 
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-031 | THE cancel API SHALL take and carry the typed LSP `RequestId` (or an opaque typed handle that owns one), never a bare integer, and the "this id was cancelled by us" record SHALL be a typed set, not a string or integer flag | must |
-| FR-032 | THE SYSTEM SHOULD expose cancellation counts (cancelled by client, cancelled by timeout, sent, suppressed because already completed) at `debug`/`trace` so live tests can verify exactly-once behavior without a language-server-specific tool | should |
+| FR-032 | THE SYSTEM SHOULD log every `$/cancelRequest` it sends or fails to send at `debug` with the request id and the cause (timeout or abandoned), so live tests can verify exactly-once behavior without a language-server-specific tool. Aggregate counters are not provided | should |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Behavioral non-regression | For a call that is neither cancelled nor timed out, request sequence, request ids, retry sequence and timing, result bytes, error text, log lines at `warn` and above, and document-tracker effects SHALL be identical to HEAD; the golden `tool_surface.json` and `tools/list` payload SHALL be unchanged |
+| NFR-001 | Behavioral non-regression | For a call that is neither cancelled nor timed out, request sequence, request ids, retry sequence and timing, result bytes, error text, log lines at `warn` and above, and document-tracker effects SHALL be identical to HEAD; the golden `tool_surface.json` and `tools/list` payload SHALL NOT change because of the cancellation work. The same PR also carries the #736 change to `restart_server`: its tool description and the `spawn_failed` failure kind differ from HEAD (spec runtime/005); those are the only exceptions, and they are not caused by cancellation. The one intended difference for a timed-out request is that its late reply no longer logs the unknown-id `warn` |
 | NFR-002 | Bounded overhead | Per LSP request: O(1) extra work (one token clone or guard, one map operation under the existing pending lock); no extra LSP traffic or allocation proportional to history; the record of cancelled ids SHALL be bounded by a named constant (oldest evicted first) and cleaned up when the reply or a bulk failure resolves it |
-| NFR-003 | Latency of stop | A cancelled handler SHALL return within 100 ms of the token firing (excluding non-cancellable critical sections bounded by FR-025 and FR-026, each of which SHALL be bounded and documented); after connection close no handler SHALL outlive the serve shutdown drain window |
+| NFR-003 | Latency of stop | A cancelled handler SHALL return within 100 ms of the token firing (excluding non-cancellable critical sections bounded by FR-025, FR-026 and FR-033, each of which SHALL be bounded and documented); after connection close a handler SHALL outlive the close by at most rmcp's in-flight drain window (5 s) plus `PEER_CLOSE_POLL` (250 ms) |
 | NFR-004 | Robustness | A dead, wedged or full-queue server SHALL NOT make a cancel block the cancelled caller (FR-011); the cancel enqueue SHALL be non-blocking or bounded by a named constant |
 | NFR-005 | Type safety | Cancellation state SHALL be modeled with typed values: the existing `RequestId`, a named cancellation scope or token type, and an enum for the cause (client cancel, timeout, connection close); no stringly-typed causes, no raw `i64` ids crossing module boundaries |
 | NFR-006 | Layering | The cancellation signal SHALL be one mechanism threaded from `mcp/` through the translator to `LspClient`; request sites SHALL NOT each re-implement it (DRY); `lsp/` SHALL NOT depend on `mcp/` types |
@@ -308,14 +312,15 @@ No persistent data. Entities touched or introduced:
 | Server never replies to a cancelled request | The cancelled-id record is bounded and swept (NFR-002); no growth proportional to uptime |
 | Server died or channel closed when the cancel is sent | Cancel skipped, `debug` log, caller unaffected (FR-011) |
 | `restart_server` or respawn runs while a call is outstanding | Waiting callers fail as today (FR-021); a cancel racing with the drain sends nothing (FR-022) |
-| Cancel arrives while `restart_server` is mid-restart of a server | The restart of that server finishes to its defined end state (FR-025); servers not yet started are skipped |
+| Cancel while a call respawns a dead server | The respawn is untouched until the replacement is ready, then committed in one synchronous step and announced by a detached tail (FR-033) |
+| Cancel arrives while `restart_server` is mid-restart | Every targeted server finishes its restart to a defined end state (FR-025); the result is discarded. A cancel that arrived before the call began restarts nothing |
 | Cancel during `ensure_open` between reading the file and enqueuing `didOpen` | Tracker is not advanced; the next call re-opens normally (FR-026) |
 | Cancel after `didOpen` was enqueued but before the tracker was updated | The tracker records it (critical section runs to completion) or the step is made idempotent, never a double `didOpen` (FR-026) |
 | Cancel during eviction `didClose` flush holding a pending-close claim | The claim is released, unsent closes stay pending (FR-027) |
 | Cancel of a diagnostics pull | Nothing stored in `Pulled`, no subscriber notification (FR-029) |
 | Cancel during `JoinSet` of code-action resolves | Subtasks aborted, each outstanding resolve id cancelled once (FR-020) |
 | Fan-out where one server is slow and one fast | Fast server's finished request gets no cancel; slow server's gets one (FR-018) |
-| Transport EOF with calls in flight | Handlers stop and outstanding LSP requests are cancelled (FR-023); no process-lifetime leak |
+| Transport EOF or HTTP session close with calls in flight | Handlers stop and outstanding LSP requests are cancelled (FR-023) once rmcp's drain ends, at most 5.25 s later; no process-lifetime leak |
 | Client cancels a request id that is unknown or already completed | Ignored by the transport; no effect |
 | Client cancels `initialize` | Ignored, per the MCP utility; unchanged |
 | Duplicate `notifications/cancelled` for one id | No second `$/cancelRequest` (FR-008) |
@@ -331,16 +336,16 @@ No persistent data. Entities touched or introduced:
 | SC-004 | New LSP request ids allocated after a cancel was observed | up to 3 (retries) plus follow-up steps | 0 |
 | SC-005 | `warn!` or `error!` lines caused by a late reply to a cancelled or timed-out request | 1 per timeout today (unknown-id warning) | 0 |
 | SC-006 | Duplicate `$/cancelRequest` for one id under any race in the test matrix | n/a | 0 |
-| SC-007 | Behavioral diff for uncancelled calls (request sequence, results, warn+ logs, `tool_surface.json`) | n/a | 0 |
+| SC-007 | Behavioral diff for uncancelled calls attributable to cancellation (request sequence, results, warn+ logs, `tool_surface.json`); the #736 `restart_server` description and `spawn_failed` kind are listed exceptions (NFR-001) | n/a | 0 |
 | SC-008 | Document-tracker inconsistencies after cancel at each await point of `ensure_open` (property or exhaustive-await-point test) | untested | 0 |
-| SC-009 | Handlers still running after serve shutdown following stdio EOF | unbounded | 0 |
+| SC-009 | Handlers still running 5.25 s (rmcp drain plus `PEER_CLOSE_POLL`) after stdio EOF or HTTP session close | unbounded | 0 |
 | SC-010 | Deterministic tests: cancel-before-start, mid-request, mid-backoff, timeout, completion race, fan-out, restart race, EOF | 0 | all present and green on 3 OSes |
 
 ## 8. Agent Boundaries
 
 ### Always (without asking)
 - Thread cancellation through the single shared mechanism; reuse the existing `tokio-util` `CancellationToken` and typed `RequestId`.
-- Keep uncancelled behavior byte-identical (NFR-001); run the golden `tool_surface.json` test unchanged.
+- Keep uncancelled behavior byte-identical apart from the exceptions listed in NFR-001; the golden `tool_surface.json` test changes only for those.
 - Write scripted fake-server tests that record `$/cancelRequest`; use paused time, not sleeps.
 - Update `CHANGELOG.md` `[Unreleased]`, the user guide and `.local/testing/` playbooks.
 - Run the commands in the project's "Before Every Commit" section.
@@ -359,16 +364,16 @@ No persistent data. Entities touched or introduced:
 - Convert a cancel into an error response to the client, or log it as a tool failure.
 - Match on error message text to decide "cancelled by us" (FR-016).
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-> [!question] Unresolved
-> - [NEEDS CLARIFICATION: issue number for this enhancement; none exists yet]
-> - [NEEDS CLARIFICATION: how to deliver FR-023 on EOF. Verified that rmcp 3.5.1 does not cancel request tokens at EOF (it waits up to 5 s then closes; handlers are detached). Is an mcpls-owned connection token fired when `serve` returns the accepted approach, or should a drop-guard on the running service be used? Plan assumes the connection token.]
-> - [NEEDS CLARIFICATION: `restart_server` (FR-025): confirm "run a begun restart to its defined end state" rather than abandon-at-await. Plan assumes yes.]
-> - [NEEDS CLARIFICATION: bound for the cancel enqueue (NFR-004): non-blocking `try_send` with a debug log on a full queue (capacity 100), or a short bounded wait? Plan assumes `try_send` plus a spill guarantee that the pending entry is removed regardless.]
-> - [NEEDS CLARIFICATION: scope beyond `tools/call`: do `resources/read` or any non-tool handler issue LSP requests at HEAD? Plan assumes no and keeps them out (Ask First).]
-> - [NEEDS CLARIFICATION: `$/cancelRequest` for requests whose reply mcpls no longer needs but that are idempotent warm-ups (for example indexing probes): cancel as well, or let the probe finish to warm the server cache? Plan assumes cancel for all request-issuing paths, with the probe path called out for live testing.]
-> - [NEEDS CLARIFICATION: which tools fan out across more than one server for a single request at HEAD? Verified: `restart_server` (`buffer_unordered`), code-action resolve (one server, concurrent), enclosing-symbol enrichment (one server per file). Whether per-file multi-claimant diagnostics issue concurrent pulls to several servers needs confirmation in the plan's codebase pass.]
+> [!success] Decisions taken in the implementation
+> - Issue number: #687.
+> - FR-023 on EOF: no mcpls-owned connection token. `call_tool` races the handler against `Peer::is_transport_closed` polled every `PEER_CLOSE_POLL`; rmcp 3.5.1 turns it true when its serve loop ends (after the 5 s drain), for stdio EOF and HTTP session close alike. Both are covered by wire tests. A transport wrapper that cancels at EOF without the drain is a possible follow-up.
+> - `restart_server` (FR-025): the tool body runs the restart detached (`run_detached`); no per-tool cancel policy, no change to `Translator::restart_servers`.
+> - Cancel enqueue (NFR-004): `try_send` with a `debug` log on a full or closed queue; the pending entry is turned into a tombstone regardless.
+> - Scope beyond `tools/call`: none; resources and completion stay out.
+> - Warm-up requests: cancelled like every other request path.
+> - Fan-out: `restart_server` fans out across servers; code-action resolve is concurrent on one server; enclosing-symbol enrichment is one server per file. Per-file multi-claimant diagnostics do not issue concurrent pulls to several servers for one request.
 
 ## 10. See Also
 
