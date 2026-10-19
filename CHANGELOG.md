@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s without a tool call, through a subscription-driven sweep (#648) (#784).
 - Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#784).
 - The diagnostics sweep re-pulls subscribed files when any tracked file of their server changes, walks the 256 most recent unsubscribed files of such servers, and sends `didSave` to servers that advertise `textDocumentSync.save` (#781) (#790).
+- `McplsServer::with_stop` attaches a stop token so a call stopped by shutdown reports `ServerShutdown` instead of `Cancelled` (#815) (#823).
 
 ### Fixed
 
@@ -40,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unanswered diagnostics pull no longer stalls the disk sweep for the other files of its server (#806) (#811).
 - Sweep shutdown waits for its jobs and pulls, a resync and `didSave` are bounded by the request timeout, and `didSave` follows a content digest instead of document versions (#798, #791) (#811).
 - A tool call cancelled by the client or by shutdown returns an error result and logs no warning (#807) (#811).
+- A skipped diagnostics pull pass hands its candidates to the running pass instead of dropping them (#809) (#823).
+- `tools/list` descriptions are whole sentences instead of fragments cut mid-sentence, and `restart_server` names the `refused` reason (#814) (#823).
+- A refused restart no longer starts the restart cooldown, and `restart_server` answers shutdown with a tool error instead of a JSON-RPC error (#815) (#823).
+- A duplicate server id error no longer prints server arguments (#816) (#823).
+- On Windows a file whose canonical path exceeds `MAX_PATH` is opened inside the workspace instead of being refused as outside it (#817) (#823).
+- Config read errors name the path, sweep task panics are logged, and the child-exit warning reports the grace actually applied (#820) (#823).
 
 ### Changed
 
@@ -62,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `DocumentTracker::is_open` is removed, `OpenRequest` fields are private (`OpenRequest::new`), and `spawn_disk_sweep` returns `DiskSweepHandle` (#802, #798) (#811).
 - **Breaking:** `From<toml::de::Error> for Error` is removed and config read failures other than not-found are `Error::FileIo` with the path (#804) (#811).
 - Notification sends share one typed path, `CodeAction` and `WorkspaceSymbol` requests use `RequestTimeout`, and launcher trust, working directory and wrapper grammar are typed (#801, #799, #803, #800, #805) (#811).
+- **Breaking:** `EntrySummary.args` is replaced by `arg_count`; `BuiltinServer::command` is replaced by `as_str` and the type gains `Display` and `#[non_exhaustive]`; `ConfigError::ArgContainsNul` carries a source `InvalidServerArgs`; config read and canonicalize failures return `Error::FileIo` (#816, #819, #820) (#823).
+- **Breaking:** `RestartOutcome`, `InitPhase`, `InvalidEnvKey`, `InvalidToolPrefix`, `InvalidBoundedText`, `InvalidProjectMarker`, `InvalidFileExtension` and `InvalidFileName` are `#[non_exhaustive]`, and `ServerState::can_accept_requests` is removed (#819, #821) (#823).
+- The TypeScript server pin applies to `nodejs`, versioned `node22`-style and `bun` launches, so untrusted mode admits them (#818) (#823).
+- Restart, respawn, sweep, launcher and env code share typed states and single implementations instead of bools, paired fields and duplicated tables (#818, #819) (#823).
 
 ## [0.7.0] - 2026-10-07
 

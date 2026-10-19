@@ -73,13 +73,9 @@ impl WorkspaceRoots {
         path: &WorkspacePath,
         open: impl FnOnce(&std::path::Path, &std::path::Path) -> io::Result<Beneath>,
     ) -> Result<Beneath, Error> {
-        let root = self
-            .canonical_root_of(path.as_path())
+        let (root, relative) = self
+            .split_under_root(path.as_path())
             .ok_or_else(|| outside(path))?;
-        let relative = path
-            .as_path()
-            .strip_prefix(root)
-            .map_err(|_| outside(path))?;
         (!relative.is_empty())
             .ok_or_else(|| Error::NotARegularFile(path.as_path().to_path_buf()))?;
         open(root, relative).map_err(|source| file_io(path, source))
@@ -247,12 +243,11 @@ mod platform {
         /// point (symlink or junction) among them is refused.
         pub(super) fn pin_ancestors(&self, path: &WorkspacePath) -> Result<Vec<File>, Error> {
             let file = path.as_path();
-            let root = self.canonical_root_of(file).ok_or_else(|| outside(path))?;
-            let parent = file.parent().ok_or_else(|| outside(path))?;
-            let relative = parent.strip_prefix(root).map_err(|_| outside(path))?;
+            let (root, relative) = self.split_under_root(file).ok_or_else(|| outside(path))?;
+            let parent = relative.parent().ok_or_else(|| outside(path))?;
             let mut dir = root.to_path_buf();
             let mut pins = vec![pin(path, &dir)?];
-            for component in relative.components() {
+            for component in parent.components() {
                 dir.push(component);
                 pins.push(pin(path, &dir)?);
             }

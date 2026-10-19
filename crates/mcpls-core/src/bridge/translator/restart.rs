@@ -22,10 +22,10 @@ use super::Translator;
 use super::respawn::{BackoffPolicy, RespawnConfig};
 use super::servers::{Backend, Phase};
 use crate::bridge::indexing::IndexingReset;
-use crate::bridge::{DiagnosticsKey, IndexingState};
+use crate::bridge::{DiagnosticsKey, IndexingState, NotificationCache};
 use crate::config::{LanguageId, ServerId};
 use crate::error::{Error, ErrorChain, Result};
-use crate::lsp::{ExitGrace, LspNotification, ServerInitConfig};
+use crate::lsp::{ExitGrace, LspNotification};
 use crate::redaction::{Redactions, ServerText};
 use crate::util::lock_std;
 
@@ -103,11 +103,9 @@ impl ServerIds {
             .into_iter()
             .filter(|id| seen.insert(id.clone()))
             .collect();
-        if unique.is_empty() {
-            Err(ServerIdsError::Empty)
-        } else {
-            Ok(Self(unique))
-        }
+        (!unique.is_empty())
+            .ok_or(ServerIdsError::Empty)
+            .map(|()| Self(unique))
     }
 
     /// Parse the ids of a request, checking the count, blankness and length
@@ -173,8 +171,7 @@ pub enum RestartTarget {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RestartFailure {
-    /// The restart was refused before the old process was stopped, so it was
-    /// not restarted and keeps serving.
+    /// Refused before the old process was stopped, which keeps serving.
     ///
     /// Covers every failure of the pre-stop check of the config the
     /// replacement would start from: an untrusted-workspace refusal, and the
@@ -273,11 +270,11 @@ impl RestartFailure {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RestartOutcome {
     /// The server runs a freshly initialized process.
     Restarted {
-        /// Another restart of the same server finished while this request
-        /// waited, so no second restart was performed.
+        /// Another restart of this server finished while the request waited, so none was repeated.
         coalesced: bool,
         /// Indexing readiness of the new process.
         indexing_state: IndexingState,
@@ -304,6 +301,24 @@ pub enum RestartOutcome {
         /// Why the server is not running.
         message: String,
     },
+}
+
+impl RestartOutcome {
+    /// The outcome for a server that is not registered, or whose process is gone.
+    pub(crate) fn not_running(id: &ServerId) -> Self {
+        Self::NotRunning {
+            message: format!("LSP server '{id}' is not running"),
+        }
+    }
+}
+
+/// Whether a restart request ran the restart itself or found it done already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartRun {
+    /// This request stopped the old process and started the replacement.
+    Performed,
+    /// Another restart of the same server finished while this request waited.
+    Coalesced,
 }
 
 /// One server's entry in a [`RestartServerResult`].
@@ -394,6 +409,38 @@ pub enum DiagnosticsRole {
     Secondary,
 }
 
+/// Whether a server's push diagnostics are live or discarded after a cache reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PushDelivery {
+    /// The replacement's pushes are cached again (manual restart re-wired the pump).
+    Live,
+    /// Pushes are not cached; the server is flagged push-degraded.
+    Degraded,
+}
+
+/// Drops what a stopped or replaced server left in `cache`: its indexing
+/// state per `indexing`, and, for the diagnostics-route server only, its
+/// cached diagnostics, then updates its push-degraded flag per `push`.
+/// Returns the cleared keys so subscribers can be told to re-read them.
+pub(super) fn reset_server_cache(
+    cache: &mut NotificationCache,
+    id: &ServerId,
+    indexing: IndexingReset,
+    role: DiagnosticsRole,
+    push: PushDelivery,
+) -> Vec<DiagnosticsKey> {
+    cache.reset_indexing_state(id, indexing);
+    if role != DiagnosticsRole::Authoritative {
+        return Vec::new();
+    }
+    let cleared = cache.clear_server_diagnostics(id);
+    match push {
+        PushDelivery::Live => cache.clear_push_degraded(id),
+        PushDelivery::Degraded => cache.mark_push_degraded(id),
+    }
+    cleared
+}
+
 impl DiagnosticsRole {
     /// The role of a server that is, or is not, the language's diagnostics route.
     pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
@@ -472,13 +519,16 @@ impl<'a> Deregistered<'a> {
             .then_some(held)
     }
 
-    /// Stop the held server and return the config to respawn it from.
-    /// Termination errors (a wedged server times out) are not fatal.
-    async fn terminate(&mut self) -> Option<ServerInitConfig> {
-        let backend = self.backend.as_mut()?;
+    /// Stop the held server. Termination errors (a wedged server times out)
+    /// are not fatal.
+    async fn terminate(&mut self) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
         backend.client().mark_restarted(self.id.clone());
-        let server = backend.server_mut()?;
-        let config = server.init_config().clone();
+        let Some(server) = backend.server_mut() else {
+            return;
+        };
         let stopped = server
             .terminate(
                 RESTART_HANDSHAKE_BUDGET,
@@ -488,7 +538,6 @@ impl<'a> Deregistered<'a> {
         if let Err(error) = stopped {
             tracing::warn!(id = %self.id, error = %ErrorChain(&error), "old LSP server did not stop cleanly; continuing with restart");
         }
-        Some(config)
     }
 
     /// Put the held backend back; idempotent.
@@ -619,6 +668,13 @@ impl Translator {
         }
     }
 
+    /// Take the task consuming `id`'s notification lanes out of its slot.
+    pub(super) fn take_notification_task(&self, id: &ServerId) -> Option<AbortHandle> {
+        lock_std(&self.servers)
+            .get_mut(id)
+            .and_then(|slot| slot.notification_task.take())
+    }
+
     /// Declare that the initial server startup is still settling; restarts
     /// report `initializing` until the returned guard is dropped, because routes
     /// (and so diagnostics roles) still change while servers settle; a restarted
@@ -644,7 +700,7 @@ impl Translator {
         RESTART_COOLDOWN.checked_sub(elapsed)
     }
 
-    async fn restarted_outcome(&self, id: &ServerId, coalesced: bool) -> RestartOutcome {
+    async fn restarted_outcome(&self, id: &ServerId, run: RestartRun) -> RestartOutcome {
         let (indexing_state, push_notifications_degraded) = match &self.notification_cache {
             Some(cache) => {
                 let cache = cache.lock().await;
@@ -653,7 +709,7 @@ impl Translator {
             None => (IndexingState::Unknown, false),
         };
         RestartOutcome::Restarted {
-            coalesced,
+            coalesced: run == RestartRun::Coalesced,
             indexing_state,
             push_notifications_degraded,
         }
@@ -683,9 +739,7 @@ impl Translator {
                         message: Error::ServerFailedToStart(Box::new(failure.clone())).to_string(),
                     },
                     None if servers.is_expected(id) => RestartOutcome::Initializing,
-                    None => RestartOutcome::NotRunning {
-                        message: format!("LSP server '{id}' is not running"),
-                    },
+                    None => RestartOutcome::not_running(id),
                 });
             drop(servers);
             outcome
@@ -715,23 +769,18 @@ impl Translator {
         let _serialized = lock.lock().await;
 
         if self.restart_generation(id) != seen {
-            return self.restarted_outcome(id, true).await;
+            return self.restarted_outcome(id, RestartRun::Coalesced).await;
         }
         let wiring = match self.restart_permit(id) {
             Ok(wiring) => wiring,
             Err(outcome) => return outcome,
         };
 
-        self.note_restart_attempt(id);
-        tracing::info!(%id, "restarting LSP server on request");
-
         let running = lock_std(&self.servers)
             .server(id)
             .map(|server| server.init_config().clone());
         let Some(running) = running else {
-            return RestartOutcome::NotRunning {
-                message: format!("LSP server '{id}' is not running"),
-            };
+            return RestartOutcome::not_running(id);
         };
         let vetted = match running.for_respawn().await {
             Ok(vetted) => vetted,
@@ -745,19 +794,16 @@ impl Translator {
             }
         };
 
+        // A refusal stopped nothing, so it must not start the restart cooldown.
+        self.note_restart_attempt(id);
+        tracing::info!(%id, "restarting LSP server on request");
+
         let Some(mut old) = Deregistered::take(self, id) else {
-            return RestartOutcome::NotRunning {
-                message: format!("LSP server '{id}' is not running"),
-            };
+            return RestartOutcome::not_running(id);
         };
-        let config = old.terminate().await;
+        let language_id = vetted.server_config().language_id.clone();
+        old.terminate().await;
         drop(old);
-        let Some(config) = config else {
-            return RestartOutcome::NotRunning {
-                message: format!("LSP server '{id}' is not running"),
-            };
-        };
-        let language_id = config.server_config().language_id.clone();
 
         if self.is_shutting_down() {
             self.invalidate_stopped_server(id, &language_id).await;
@@ -793,7 +839,7 @@ impl Translator {
             slot.restart.generation.bump();
         }
         tracing::info!(%id, "LSP server restarted");
-        self.restarted_outcome(id, false).await
+        self.restarted_outcome(id, RestartRun::Performed).await
     }
 
     fn note_restart_attempt(&self, id: &ServerId) {
@@ -808,22 +854,23 @@ impl Translator {
         // Best effort: the old pump goes first, and an aborted task stops at its
         // next await, so it cannot re-cache what the dead server buffered
         // once the cache below is cleared.
-        let stale_pump = lock_std(&self.servers)
-            .get_mut(id)
-            .and_then(|slot| slot.notification_task.take());
-        if let Some(pump) = stale_pump {
+        if let Some(pump) = self.take_notification_task(id) {
             pump.abort();
             tokio::task::yield_now().await;
         }
-        let mut cleared = Vec::new();
-        if let Some(cache) = &self.notification_cache {
-            let mut cache = cache.lock().await;
-            cache.reset_indexing_state(id, IndexingReset::Forget);
-            if self.is_diagnostics_route(language_id, id) {
-                cleared = cache.clear_server_diagnostics(id);
-                cache.mark_push_degraded(id);
+        let cleared = match &self.notification_cache {
+            Some(cache) => {
+                let mut cache = cache.lock().await;
+                reset_server_cache(
+                    &mut cache,
+                    id,
+                    IndexingReset::Forget,
+                    DiagnosticsRole::from_route(self.is_diagnostics_route(language_id, id)),
+                    PushDelivery::Degraded,
+                )
             }
-        }
+            None => Vec::new(),
+        };
         if let Some(wiring) = self.wiring.get() {
             wiring.publish_invalidated(&cleared).await;
         }
@@ -995,6 +1042,86 @@ mod tests {
         assert_eq!(message, "failed to spawn LSP server 'x': permission denied");
     }
 
+    /// #815: a refusal stops nothing, so it must not start the restart
+    /// cooldown. Needs no process: the refusal is the argument recheck, whose
+    /// trigger (an executable file named `tool.exe` in the workspace) holds on
+    /// every host.
+    #[tokio::test]
+    async fn test_refused_restart_leaves_the_cooldown_untouched() {
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::bridge::translator::clock::{Clock, FakeClock};
+        use crate::bridge::{NotificationCache, WorkspaceRoots};
+        use crate::config::{LanguageId, ToolRouter};
+        use crate::mcp::SubscriptionRegistry;
+        use crate::runtime::pump::{DiagnosticsRoles, PumpShared, PumpWiring};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = dir.path().join("tool.exe");
+        std::fs::write(&tool, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
+
+        let id = ServerId::from_static("rust");
+        let cache = Arc::new(Mutex::new(NotificationCache::new()));
+        let clock = Arc::new(FakeClock::new());
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                id.clone(),
+                LanguageId::from_static("rust"),
+            )]))
+            .with_notification_cache(Arc::clone(&cache))
+            .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+        translator.set_workspace_roots(roots.clone());
+        translator.register_server_complete(crate::lsp::fake_lsp_server_with_config(
+            crate::config::LspServerConfig::rust_analyzer(),
+        ));
+        translator.install_wiring(Arc::new(PumpWiring::new(
+            PumpShared {
+                roles: DiagnosticsRoles::default(),
+                notification_cache: cache,
+                subs: SubscriptionRegistry::new(),
+                workspace_roots: translator.workspace_roots.clone(),
+            },
+            CancellationToken::new(),
+        )));
+
+        let init = lock_std(&translator.servers)
+            .server_mut(&id)
+            .unwrap()
+            .init_config()
+            .clone();
+        let command = init.server_config().command.server_command().clone();
+        let mut init = init.with_trust(crate::lsp::SpawnTrust::Untrusted(
+            crate::lsp::vetting::UntrustedVetting::new(roots, command),
+        ));
+        init.server_config_mut().args =
+            crate::config::ServerArgs::new([tool.to_string_lossy().into_owned()]).unwrap();
+        lock_std(&translator.servers)
+            .server_mut(&id)
+            .unwrap()
+            .set_init_config(init);
+
+        let result = translator
+            .restart_servers(RestartTarget::All)
+            .await
+            .unwrap();
+
+        assert_matches!(
+            &result.servers[0].outcome,
+            RestartOutcome::Failed {
+                reason: RestartFailure::Refused { .. }
+            },
+            "{result:?}"
+        );
+        assert_eq!(translator.restart_cooldown_remaining(&id), None);
+    }
+
     #[cfg(unix)]
     mod restart_tests {
         use std::fs;
@@ -1105,8 +1232,8 @@ mod tests {
                     .init_config()
                     .clone();
                 let command = init.server_config().command.server_command().clone();
-                let mut init = init.with_untrusted(crate::lsp::vetting::UntrustedVetting::new(
-                    boundary, command,
+                let mut init = init.with_trust(crate::lsp::SpawnTrust::Untrusted(
+                    crate::lsp::vetting::UntrustedVetting::new(boundary, command),
                 ));
                 let args = init.server_config_mut();
                 args.args = crate::config::ServerArgs::new(
@@ -1214,6 +1341,51 @@ mod tests {
             let log = read_log(&log);
             assert_eq!(log.matches("started").count(), 2, "{log}");
             assert!(fx.registered() && !fx.expected() && !fx.is_dead());
+        }
+
+        /// A refusal stops nothing, so it must not start the restart cooldown.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn test_refused_restart_does_not_start_the_cooldown() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let (fx, _log) = protocol_fixture(None).await;
+            let workspace = fx.root().join("ws");
+            fs::create_dir_all(&workspace).unwrap();
+            let tool = workspace.join("tool");
+            fs::write(&tool, "").unwrap();
+            fx.vet_arguments_against(WorkspaceRoots::from_paths(&[workspace]).unwrap(), &tool);
+            fx.translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+            fx.clock.advance(RESTART_COOLDOWN + Duration::from_secs(1));
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+            let refused = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+            assert_matches!(
+                only_outcome(&refused),
+                RestartOutcome::Failed {
+                    reason: RestartFailure::Refused { .. }
+                },
+                "{refused:?}"
+            );
+
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o644)).unwrap();
+            let retried = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            assert_matches!(
+                only_outcome(&retried),
+                RestartOutcome::Restarted { .. },
+                "{retried:?}"
+            );
         }
 
         #[tokio::test]

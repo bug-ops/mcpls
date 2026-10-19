@@ -44,7 +44,7 @@ related:
 - **Coverage (SC-002 scope).** `npm -g` style symlink installs (verified with Homebrew's node),
   npm `.cmd`/`.ps1`/extensionless shims (`<exe dir>/node_modules/typescript-language-server`), pnpm
   global installs (`<exe dir>/global/<version>/node_modules`, verified live with pnpm 10; more than
-  one match or more than 16 entries is ambiguous) and `node`/`bun` running an absolute `cli.mjs`,
+  one match or more than 16 entries is ambiguous) and `node`/`nodejs`/`bun` (any version suffix, such as `node22`) running an absolute `cli.mjs`,
   each with a `typescript` package next to the server whose `package.json` has a `version`, which the
   server requires of an install before it honors it. Shims are never executed or parsed. Package
   runners (`npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`) are logged as `PackageRunner`;

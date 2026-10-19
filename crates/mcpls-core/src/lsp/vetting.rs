@@ -32,8 +32,13 @@ impl UntrustedBoundary {
         &self.0
     }
 
-    /// Refuses an argument of `args` that names an executable file inside the
-    /// boundary, as [`refuse_workspace_executable_arguments`] does.
+    /// Refuses a configured argument that names an executable file inside the
+    /// boundary, whichever launcher precedes it, so a wrapper missing from the
+    /// launcher table cannot start a workspace program.
+    ///
+    /// Each argument is judged as a path, and so is the text after its first `=`
+    /// (`--exec=<path>`). A file that is not executable, a directory and text
+    /// that is no file are admitted.
     ///
     /// Walks the file system, so async callers run it on the blocking pool.
     pub fn refuse_arguments(
@@ -42,7 +47,18 @@ impl UntrustedBoundary {
         working_dir: &ChildWorkingDir,
         host: HostOs,
     ) -> Result<(), UntrustedRefusal> {
-        refuse_workspace_executable_arguments(args, &self.0, working_dir, host)
+        for (index, arg) in args.iter().enumerate() {
+            let after_equals = arg.split_once('=').map(|(_, value)| value);
+            let candidates = std::iter::once(arg.as_str()).chain(after_equals);
+            for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
+                if let Some(refusal) =
+                    argument_refusal(index, candidate, &self.0, working_dir, host)
+                {
+                    return Err(refusal);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -143,29 +159,4 @@ fn path_refusal(
         }
         Err(_) => None,
     }
-}
-
-/// Refuses a configured argument that names an executable file inside
-/// `boundary`, whichever launcher precedes it, so a wrapper missing from the
-/// launcher table cannot start a workspace program.
-///
-/// Each argument is judged as a path, and so is the text after its first `=`
-/// (`--exec=<path>`). A file that is not executable, a directory and text that
-/// is no file are admitted.
-pub fn refuse_workspace_executable_arguments(
-    args: &[String],
-    boundary: &WorkspaceRoots,
-    working_dir: &ChildWorkingDir,
-    host: HostOs,
-) -> Result<(), UntrustedRefusal> {
-    for (index, arg) in args.iter().enumerate() {
-        let after_equals = arg.split_once('=').map(|(_, value)| value);
-        let candidates = std::iter::once(arg.as_str()).chain(after_equals);
-        for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
-            if let Some(refusal) = argument_refusal(index, candidate, boundary, working_dir, host) {
-                return Err(refusal);
-            }
-        }
-    }
-    Ok(())
 }

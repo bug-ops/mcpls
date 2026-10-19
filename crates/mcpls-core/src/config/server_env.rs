@@ -10,6 +10,7 @@ use super::text_newtype::{contains_nul, impl_text_newtype};
 
 /// Why a string is not a valid [`EnvKey`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidEnvKey {
     /// The name was empty.
     #[error("environment variable name cannot be empty")]
@@ -217,6 +218,10 @@ fn windows_fold(c: char) -> char {
 /// to a process: [`HostOs::max_env_entry_bytes`] for one entry and
 /// [`MAX_ENV_TOTAL_BYTES`] for all.
 ///
+/// The host is not serialized: a deserialized table is always for
+/// [`HostOs::CURRENT`], and converting into a map drops it. Other hosts exist
+/// so tests can model them (Windows name folding on any build).
+///
 /// # Examples
 ///
 /// ```
@@ -242,6 +247,7 @@ pub struct ServerEnv {
     total_bytes: usize,
 }
 
+/// An empty table for [`HostOs::CURRENT`].
 impl Default for ServerEnv {
     fn default() -> Self {
         Self::new(HostOs::CURRENT)
@@ -312,11 +318,7 @@ impl ServerEnv {
     /// or the table would be over [`MAX_ENV_TOTAL_BYTES`], the sizes past which
     /// a spawn fails with `E2BIG`; the table is left as it was.
     pub fn insert(&mut self, key: EnvKey, value: EnvValue) -> Result<(), EnvTooLarge> {
-        let bytes = key
-            .as_str()
-            .len()
-            .saturating_add(value.as_str().len())
-            .saturating_add(ENTRY_OVERHEAD_BYTES);
+        let bytes = entry_bytes(&key, &value);
         let limit = self.host.max_env_entry_bytes();
         if bytes > limit {
             return Err(EnvTooLarge::Entry { key, bytes, limit });
@@ -325,7 +327,7 @@ impl ServerEnv {
         let replaced = self
             .vars
             .get(&host_key)
-            .map_or(0, |(old_key, old_value)| entry_bytes(old_key, old_value));
+            .map_or_default(|(old_key, old_value)| entry_bytes(old_key, old_value));
         let total = self
             .total_bytes
             .saturating_sub(replaced)
@@ -356,6 +358,7 @@ impl ServerEnv {
     }
 }
 
+/// The entries without the table's host, which is not serialized.
 impl From<ServerEnv> for BTreeMap<EnvKey, String> {
     fn from(env: ServerEnv) -> Self {
         env.vars

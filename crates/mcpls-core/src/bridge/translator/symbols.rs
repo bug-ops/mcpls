@@ -1,7 +1,7 @@
 //! Document symbols and workspace symbol search handlers.
 
 use lsp_types::{
-    DocumentSymbol, PartialResultParams, WorkDoneProgressParams,
+    BaseSymbolInformation, DocumentSymbol, PartialResultParams, WorkDoneProgressParams,
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
 };
 
@@ -19,7 +19,7 @@ use super::routing::{
     lookup_workspace_route,
 };
 use crate::bridge::ClientPath;
-use crate::config::ToolKind;
+use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result};
 use crate::util::lock_std;
 
@@ -220,10 +220,6 @@ impl Translator {
     ///
     /// Returns an error if the LSP request fails, no server is configured, or
     /// the routed server does not advertise `workspaceSymbolProvider` support.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear request/response flow; splitting would scatter the steps"
-    )]
     pub async fn handle_workspace_symbol(
         &self,
         query: String,
@@ -233,10 +229,78 @@ impl Translator {
         validate_query_length(&query)?;
         let kind_filter = kind_filter.map(|filter| u32::from(filter.kind()));
 
-        // Workspace search has no document, so it resolves via `resolve_any`
-        // rather than a per-language route. If the resolved server is not
-        // registered yet but is expected, tell the caller to wait and retry
-        // rather than implying nothing is configured.
+        let server_id = self.workspace_symbol_server()?;
+        self.respawn_if_dead(&server_id).await?;
+        let (client, expected) = {
+            let servers = lock_std(&self.servers);
+            (servers.client(&server_id), servers.is_expected(&server_id))
+        };
+        let client = client.ok_or_else(|| {
+            if expected {
+                Error::ServerInitializing {
+                    server_id: server_id.clone(),
+                }
+            } else {
+                Error::NoServerConfigured
+            }
+        })?;
+        self.require_capability(&server_id, Capability::WorkspaceSymbols)?;
+
+        let params = LspWorkspaceSymbolParams {
+            query,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let response = budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params).await?;
+
+        let ctx = self.encoding_ctx(&server_id);
+
+        // Collected without normalizing each symbol's range yet, so
+        // `kind_filter`/`limit` below can drop entries before paying for
+        // `EncodingCtx::normalize_range` (a disk read on a cache miss) on
+        // each one -- bounds the *normalization* loop's cost to `limit`;
+        // this collection loop itself still scans the full response (#474).
+        let mut raw_symbols = raw_workspace_symbols(response, &ctx);
+
+        if let Some(target) = kind_filter {
+            raw_symbols.retain(|s| s.kind == target);
+        }
+        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (else u32::MAX
+        // would reopen the unbounded normalization loop, see #474).
+        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
+        let truncated = raw_symbols.len() > effective_limit;
+        raw_symbols.truncate(effective_limit);
+
+        let mut symbols = Vec::with_capacity(raw_symbols.len());
+        for raw in raw_symbols {
+            let range = ctx.normalize_range(&raw.uri, raw.range).await;
+            symbols.push(WorkspaceSymbol {
+                name: raw.name,
+                kind: raw.kind,
+                location: Location {
+                    uri: raw.uri.to_string(),
+                    range,
+                    out_of_workspace: raw.out_of_workspace,
+                },
+                container_name: raw.container_name,
+            });
+        }
+
+        Ok(WorkspaceSymbolResult {
+            symbols,
+            truncated,
+            positions_degraded: ctx.positions_degraded(),
+        })
+    }
+
+    /// The server a workspace symbol search goes to.
+    ///
+    /// Workspace search has no document, so it resolves via `resolve_any`
+    /// rather than a per-language route. If the resolved server is not
+    /// registered yet but is expected, tell the caller to wait and retry
+    /// rather than implying nothing is configured.
+    fn workspace_symbol_server(&self) -> Result<ServerId> {
         let router = self.router_snapshot();
         let lookup = {
             let servers = lock_std(&self.servers);
@@ -280,112 +344,7 @@ impl Translator {
                     ));
             }
         };
-        self.respawn_if_dead(&server_id).await?;
-        let (client, expected) = {
-            let servers = lock_std(&self.servers);
-            (servers.client(&server_id), servers.is_expected(&server_id))
-        };
-        let client = client.ok_or_else(|| {
-            if expected {
-                Error::ServerInitializing {
-                    server_id: server_id.clone(),
-                }
-            } else {
-                Error::NoServerConfigured
-            }
-        })?;
-        self.require_capability(&server_id, Capability::WorkspaceSymbols)?;
-
-        let params = LspWorkspaceSymbolParams {
-            query,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params).await?;
-
-        let ctx = self.encoding_ctx(&server_id);
-
-        // Collected without normalizing each symbol's range yet, so
-        // `kind_filter`/`limit` below can drop entries before paying for
-        // `EncodingCtx::normalize_range` (a disk read on a cache miss) on
-        // each one -- bounds the *normalization* loop's cost to `limit`;
-        // this collection loop itself still scans the full response (#474).
-        let mut raw_symbols: Vec<RawWorkspaceSymbol> = Vec::new();
-        match response {
-            // Not filtered to workspace roots -- like other read-only
-            // navigation results (see `WorkspaceRoots::admits_uri`'s doc
-            // comment), a legitimate workspace-symbol result routinely
-            // points outside the workspace (stdlib, a dependency), and any
-            // subsequent open/read of it still hits the inbound
-            // `WorkspaceRoots::validate` gate.
-            Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => {
-                for sym in list {
-                    raw_symbols.push(RawWorkspaceSymbol {
-                        name: sym.base_symbol_information.name,
-                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
-                        container_name: sym.base_symbol_information.container_name,
-                        out_of_workspace: ctx.is_out_of_workspace(&sym.location.uri),
-                        uri: sym.location.uri,
-                        range: sym.location.range,
-                    });
-                }
-            }
-            Some(lsp_types::WorkspaceSymbolResponse::WorkspaceSymbolList(list)) => {
-                for sym in list {
-                    let (uri, range) = match sym.location {
-                        lsp_types::WorkspaceSymbolLocation::Location(loc) => (loc.uri, loc.range),
-                        // `LocationUriOnly` carries no range -- the server
-                        // deliberately withheld it (e.g. to avoid computing it
-                        // eagerly for every workspace-search result). The MCP
-                        // `Location` DTO has no way to represent "no range", and
-                        // a fabricated range (e.g. line 1) would be
-                        // indistinguishable from a real symbol there, so the
-                        // symbol is dropped rather than inventing coordinates.
-                        lsp_types::WorkspaceSymbolLocation::LocationUriOnly(_) => continue,
-                    };
-                    raw_symbols.push(RawWorkspaceSymbol {
-                        name: sym.base_symbol_information.name,
-                        kind: lsp_kind_to_u32(sym.base_symbol_information.kind),
-                        container_name: sym.base_symbol_information.container_name,
-                        out_of_workspace: ctx.is_out_of_workspace(&uri),
-                        uri,
-                        range,
-                    });
-                }
-            }
-            None => {}
-        }
-
-        if let Some(target) = kind_filter {
-            raw_symbols.retain(|s| s.kind == target);
-        }
-        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (else u32::MAX
-        // would reopen the unbounded normalization loop, see #474).
-        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
-        let truncated = raw_symbols.len() > effective_limit;
-        raw_symbols.truncate(effective_limit);
-
-        let mut symbols = Vec::with_capacity(raw_symbols.len());
-        for raw in raw_symbols {
-            let range = ctx.normalize_range(&raw.uri, raw.range).await;
-            symbols.push(WorkspaceSymbol {
-                name: raw.name,
-                kind: raw.kind,
-                location: Location {
-                    uri: raw.uri.to_string(),
-                    range,
-                    out_of_workspace: raw.out_of_workspace,
-                },
-                container_name: raw.container_name,
-            });
-        }
-
-        Ok(WorkspaceSymbolResult {
-            symbols,
-            truncated,
-            positions_degraded: ctx.positions_degraded(),
-        })
+        Ok(server_id)
     }
 }
 
@@ -400,6 +359,69 @@ struct RawWorkspaceSymbol {
     out_of_workspace: bool,
     uri: lsp_types::Uri,
     range: lsp_types::Range,
+}
+
+impl RawWorkspaceSymbol {
+    fn new(
+        base: BaseSymbolInformation,
+        uri: lsp_types::Uri,
+        range: lsp_types::Range,
+        ctx: &EncodingCtx,
+    ) -> Self {
+        Self {
+            name: base.name,
+            kind: lsp_kind_to_u32(base.kind),
+            container_name: base.container_name,
+            out_of_workspace: ctx.is_out_of_workspace(&uri),
+            uri,
+            range,
+        }
+    }
+}
+
+/// The symbols of a workspace symbol response, in server order.
+///
+/// Not filtered to workspace roots -- like other read-only navigation results
+/// (see `WorkspaceRoots::admits_uri`'s doc comment), a legitimate
+/// workspace-symbol result routinely points outside the workspace (stdlib, a
+/// dependency), and any subsequent open/read of it still hits the inbound
+/// `WorkspaceRoots::validate` gate.
+fn raw_workspace_symbols(
+    response: Option<lsp_types::WorkspaceSymbolResponse>,
+    ctx: &EncodingCtx,
+) -> Vec<RawWorkspaceSymbol> {
+    match response {
+        Some(lsp_types::WorkspaceSymbolResponse::SymbolInformationList(list)) => list
+            .into_iter()
+            .map(|sym| {
+                RawWorkspaceSymbol::new(
+                    sym.base_symbol_information,
+                    sym.location.uri,
+                    sym.location.range,
+                    ctx,
+                )
+            })
+            .collect(),
+        Some(lsp_types::WorkspaceSymbolResponse::WorkspaceSymbolList(list)) => list
+            .into_iter()
+            .filter_map(|sym| match sym.location {
+                lsp_types::WorkspaceSymbolLocation::Location(loc) => Some(RawWorkspaceSymbol::new(
+                    sym.base_symbol_information,
+                    loc.uri,
+                    loc.range,
+                    ctx,
+                )),
+                // `LocationUriOnly` carries no range -- the server deliberately
+                // withheld it (e.g. to avoid computing it eagerly for every
+                // workspace-search result). The MCP `Location` DTO has no way
+                // to represent "no range", and a fabricated range (e.g. line 1)
+                // would be indistinguishable from a real symbol there, so the
+                // symbol is dropped rather than inventing coordinates.
+                lsp_types::WorkspaceSymbolLocation::LocationUriOnly(_) => None,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]

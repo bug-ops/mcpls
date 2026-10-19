@@ -156,6 +156,16 @@ pub async fn run_http(
     serve_http(listener, mcp_server, cfg, shutdown_signal).await
 }
 
+/// The factory that builds each session's server from `mcp_server`, which
+/// reports `shutdown` as its stop token.
+fn session_factory(
+    mcp_server: crate::mcp::McplsServer,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> impl Fn() -> Result<crate::mcp::McplsServer, std::io::Error> + Send + Sync + 'static {
+    let mcp_for_factory = mcp_server.with_stop(shutdown.clone());
+    move || Ok(mcp_for_factory.for_new_session())
+}
+
 /// The `rmcp` service configuration for `cfg` served on `local_addr`.
 ///
 /// `rmcp` accepts a request without `Origin`, so non-browser clients are
@@ -217,7 +227,7 @@ pub async fn serve_http(
     // `Clone` (#478) so this is the only value the factory below can build
     // new sessions from, rather than a shared instance a caller could
     // accidentally hand to multiple sessions.
-    let mcp_for_factory = mcp_server;
+    let session_factory = session_factory(mcp_server, &cancel);
     let local_addr = listener.local_addr()?;
     let http_cfg = rmcp_service_config(local_addr, &cfg, cancel.clone());
 
@@ -227,11 +237,7 @@ pub async fn serve_http(
     // via a cheap `Arc` bump. On rmcp's stateless path this factory runs once
     // per request, not per session; those instances never subscribe, so they
     // never register with the `SubscriptionRegistry`.
-    let service = StreamableHttpService::new(
-        move || Ok::<_, std::io::Error>(mcp_for_factory.for_new_session()),
-        session_manager,
-        http_cfg,
-    );
+    let service = StreamableHttpService::new(session_factory, session_manager, http_cfg);
 
     let app = axum::Router::new()
         .nest_service(cfg.path.as_str(), service.clone())
@@ -468,6 +474,35 @@ pub(super) const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration =
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_servers_report_the_shutdown_token_as_their_stop() {
+        use std::sync::Arc;
+
+        use tokio::sync::Mutex;
+
+        use crate::bridge::{NotificationCache, Translator, WorkspaceRoots};
+        use crate::config::McpConfig;
+        use crate::mcp::{McplsServer, SubscriptionRegistry};
+
+        let server = McplsServer::new(
+            Arc::new(Translator::new()),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            WorkspaceRoots::default(),
+            SubscriptionRegistry::new(),
+            crate::ProjectConfigStatus::NotIgnored,
+            McpConfig::default(),
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let factory = session_factory(server, &shutdown);
+        let session = factory().unwrap();
+        assert!(!session.stop_token().is_cancelled());
+
+        shutdown.cancel();
+
+        assert!(session.stop_token().is_cancelled());
+        assert!(factory().unwrap().stop_token().is_cancelled());
+    }
 
     /// A client reaching a `:80` bind by IP sends `Host` without a port,
     /// so the bound IP must reach `rmcp` portless.

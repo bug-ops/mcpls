@@ -110,6 +110,8 @@ pub use lease::{LeaseWindow, ListenLease};
 pub use session_manager::IdleTimeout;
 pub(crate) use shutdown::ShutdownSignal;
 pub(crate) use stdio::run_stdio;
+#[cfg(test)]
+pub(crate) use stdio::serve_until;
 
 /// Longest delay a transport deadline may be pushed out to: 30 years, which
 /// no process outlives and `Instant` arithmetic still represents.

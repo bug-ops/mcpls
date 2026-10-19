@@ -15,7 +15,7 @@ use crate::error::Error;
 
 /// Schema description of the opt-in `context` input shared by every tool that
 /// can attach enclosing symbols.
-const CONTEXT_DESCRIPTION: &str = "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost containing symbol (name path, kind, range). Costs one documentSymbol request per distinct file, capped per call.";
+const CONTEXT_DESCRIPTION: &str = "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file).\n\nAttaches the name path, kind and range of the innermost containing symbol. Costs one documentSymbol request per distinct file, capped per call.";
 
 /// Declares a wire struct whose first fields are a file path and a 1-based
 /// position, followed by the tool's own fields.
@@ -104,7 +104,7 @@ macro_rules! target_wire {
             #[serde(default)]
             symbol_kind: Option<KindFilterInput<SymbolKindFilter>>,
             #[schemars(
-                description = "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of this name."
+                description = "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.\n\nOnly symbols directly inside the container match."
             )]
             #[serde(default)]
             container: Option<String>,
@@ -614,10 +614,9 @@ pub struct WorkspaceSymbolParams {
     /// custom kind), so a value that matches no symbol returns an empty
     /// result rather than an error.
     #[schemars(
-        description = "Optional filter by symbol kind: a name (function, class, variable, etc.) \
-                        or the numeric LSP SymbolKind value from a result's kind field. A name \
-                        is validated against the known kinds; a numeric value is accepted as-is \
-                        with no validation, so one that matches no symbol returns an empty \
+        description = "Optional symbol kind filter: a name (function, class) or the numeric LSP `SymbolKind`.\n\nThe number is the `kind` of a result's symbol. \
+                        A name is validated against the known kinds; a numeric value is accepted \
+                        as-is with no validation, so one that matches no symbol returns an empty \
                         result rather than an error."
     )]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -777,7 +776,7 @@ impl From<HierarchyItemInput> for HierarchyItem {
 )]
 struct CallHierarchyCallsWire {
     #[schemars(
-        description = "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy, get_incoming_calls or get_outgoing_calls."
+        description = "The call hierarchy item, exactly as a prepare, incoming or outgoing call result gave it."
     )]
     item: HierarchyItemInput,
 }
@@ -790,7 +789,7 @@ struct CallHierarchyCallsWire {
 )]
 struct TypeHierarchyWalkWire {
     #[schemars(
-        description = "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes or get_subtypes."
+        description = "The type hierarchy item, exactly as a prepare, supertypes or subtypes result gave it."
     )]
     item: HierarchyItemInput,
 }

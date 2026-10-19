@@ -344,12 +344,14 @@ impl SweepState {
         }
     }
 
-    /// The digest of the text the server was told, when it is the current one.
-    pub(crate) const fn digest(self) -> Option<ContentDigest> {
-        match self {
-            Self::Current { digest, .. } => Some(digest),
-            Self::Lagging { .. } => None,
-        }
+    /// Whether both states hold the same text: only two [`Self::Current`]
+    /// states with equal digests do, a state whose text is unknown compares as
+    /// different from everything.
+    pub(crate) fn same_text(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Current { digest: a, .. }, Self::Current { digest: b, .. }) if a == b
+        )
     }
 }
 
@@ -634,7 +636,7 @@ pub struct PendingCloseClaim<'a> {
     servers: Vec<ServerId>,
     tracker: &'a DocumentTracker,
     /// Servers not yet settled, with the generation observed at claim time.
-    unsettled: Vec<(ServerId, u64)>,
+    unsettled: Vec<(ServerId, SyncGeneration)>,
     _path_guard: PathLockGuard<'a>,
 }
 
@@ -656,6 +658,17 @@ impl Drop for PendingCloseClaim<'_> {
             self.tracker
                 .restore_pending_close(&self.path, &self.uri, &server, generation);
         }
+    }
+}
+
+/// How many times a server's sync history was forgotten, so a sync that began
+/// before a respawn recognizes that its result is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SyncGeneration(u64);
+
+impl SyncGeneration {
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -724,8 +737,8 @@ pub struct DocumentTracker {
     /// `ensure_open` captures a server's generation before doing any I/O and
     /// only commits its `synced` update if the generation is unchanged when
     /// it finishes -- see [`Self::forget_server`]'s docs for the race this
-    /// closes. Absent from the map is equivalent to generation `0`.
-    generations: StdMutex<HashMap<ServerId, u64>>,
+    /// closes. Absent from the map is equivalent to the default generation.
+    generations: StdMutex<HashMap<ServerId, SyncGeneration>>,
     /// Resource limits for tracking.
     limits: ResourceLimits,
     /// File extension and name to language ID mappings.
@@ -1132,8 +1145,8 @@ impl DocumentTracker {
     /// that race regardless of exactly when the notify "succeeds".
     pub fn forget_server(&self, server: &ServerId) {
         let mut generations = lock_std(&self.generations);
-        let generation = generations.entry(server.clone()).or_insert(0);
-        *generation = generation.saturating_add(1);
+        let generation = generations.entry(server.clone()).or_default();
+        *generation = generation.next();
         drop(generations);
         for state in lock_std(&self.documents).values_mut() {
             state.forget_server(server);
@@ -1146,11 +1159,11 @@ impl DocumentTracker {
     }
 
     /// Current sync generation for `server` (see [`Self::forget_server`]).
-    fn generation(&self, server: &ServerId) -> u64 {
+    fn generation(&self, server: &ServerId) -> SyncGeneration {
         lock_std(&self.generations)
             .get(server)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     /// Acquire the per-path lock used by [`Self::ensure_open`], creating its
@@ -1283,7 +1296,13 @@ impl DocumentTracker {
     /// check runs under the `pending_closes` lock, which `forget_server`'s
     /// purge also takes after bumping the generation, so one of the two
     /// always wins.
-    fn restore_pending_close(&self, path: &Path, uri: &Uri, server: &ServerId, generation: u64) {
+    fn restore_pending_close(
+        &self,
+        path: &Path,
+        uri: &Uri,
+        server: &ServerId,
+        generation: SyncGeneration,
+    ) {
         let mut pending_closes = lock_std(&self.pending_closes);
         if self.generation(server) != generation {
             return;
@@ -1753,7 +1772,7 @@ impl DocumentTracker {
         server: &ServerId,
         lsp_client: &LspClient,
         decision: Decision,
-        generation: u64,
+        generation: SyncGeneration,
     ) -> Result<Uri> {
         let Decision {
             uri,
@@ -2380,7 +2399,7 @@ mod tests {
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let server = ServerId::from_static("rust");
-        let generation_before_respawn = 0; // fresh tracker: generation starts at 0
+        let generation_before_respawn = SyncGeneration::default();
 
         // A respawn happens "concurrently" with the in-flight call that
         // captured the generation above before this ran.

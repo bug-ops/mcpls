@@ -126,7 +126,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         }
       },
       "required": [
@@ -296,7 +296,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         }
       },
       "required": [
@@ -456,7 +456,7 @@
       "properties": {
         "availability": {
           "$ref": "#/$defs/DiagnosticsAvailability",
-          "description": "Whether the cache has an answer for the file; an empty list next to\n`pending` or `evicted` is not a"
+          "description": "Whether the cache has an answer; an empty list with `pending` or `evicted` is not a clean file."
         },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
@@ -466,15 +466,15 @@
           "type": "array"
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "push_notifications_degraded": {
-          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during",
+          "description": "`true` if this file's diagnostics server crashed and was restarted; push-only diagnostics are lost.",
           "type": "boolean"
         }
       },
@@ -848,10 +848,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `actions`, their diagnostics, or their edits were capped below\nthe LSP server's full",
+          "description": "Whether `actions`, their diagnostics or their edits were capped below the server's response.",
           "type": "boolean"
         }
       },
@@ -976,7 +976,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         }
       },
       "required": [
@@ -1026,7 +1026,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -1035,7 +1035,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1407,7 +1407,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "locations": {
           "description": "Locations found.",
@@ -1418,7 +1418,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -1432,7 +1432,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
+          "description": "Whether `locations` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -1474,7 +1474,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1809,7 +1809,7 @@
       "properties": {
         "availability": {
           "$ref": "#/$defs/DiagnosticsAvailability",
-          "description": "Whether the cache has an answer for the file; an empty list next to\n`pending` or `evicted` is not a"
+          "description": "Whether the cache has an answer; an empty list with `pending` or `evicted` is not a clean file."
         },
         "diagnostics": {
           "description": "List of diagnostics for the document.",
@@ -1820,22 +1820,22 @@
         },
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and the file has\ndiagnostics: how many"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "origin": {
           "$ref": "#/$defs/DiagnosticsOrigin",
-          "description": "`pull` when a `textDocument/diagnostic` request answered (merged with\nthe push cache), `push_cache`"
+          "description": "How the answer was produced: `pull`, `push_cache` or `cache_after_failed_pull`."
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "push_notifications_degraded": {
-          "description": "`true` if the language server publishing this file's diagnostics crashed and was\nrestarted during",
+          "description": "`true` if this file's diagnostics server crashed and was restarted; push-only diagnostics are lost.",
           "type": "boolean"
         }
       },
@@ -1991,10 +1991,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `highlights` was capped below the LSP server's full response\n(see",
+          "description": "Whether `highlights` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -2127,7 +2127,7 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "symbols": {
           "description": "List of symbols in the document.",
@@ -2263,7 +2263,7 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact\n(non-UTF-16 servers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "regions": {
           "description": "The regions, by ascending start line then descending end line.",
@@ -2309,7 +2309,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -2504,7 +2504,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "range": {
           "anyOf": [
@@ -2638,7 +2638,7 @@
       "properties": {
         "item": {
           "$ref": "#/$defs/HierarchyItem",
-          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy,"
+          "description": "The call hierarchy item, exactly as a prepare, incoming or outgoing call result gave it."
         }
       },
       "required": [
@@ -2783,10 +2783,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response",
+          "description": "Whether `calls` (with their `from_ranges`) was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -2943,7 +2943,7 @@
           "type": "array"
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "positions_degraded": {
@@ -2955,10 +2955,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `hints` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`,",
+          "description": "Whether `hints` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -3072,7 +3072,7 @@
       "properties": {
         "item": {
           "$ref": "#/$defs/HierarchyItem",
-          "description": "The call hierarchy item to get calls for, exactly as returned by prepare_call_hierarchy,"
+          "description": "The call hierarchy item, exactly as a prepare, incoming or outgoing call result gave it."
         }
       },
       "required": [
@@ -3217,10 +3217,10 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `calls` (together with their `from_ranges`) was capped below\nthe LSP server's full response",
+          "description": "Whether `calls` (with their `from_ranges`) was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -3271,7 +3271,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -3280,7 +3280,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -3657,7 +3657,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "locations": {
           "description": "Locations found.",
@@ -3668,7 +3668,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -3682,7 +3682,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
+          "description": "Whether `locations` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -3789,10 +3789,10 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when the queried position or some returned `character`\noffsets are inexact (non-UTF-16"
+          "description": "Set only when the queried position or some `character` offsets are inexact (non-UTF-16)."
         },
         "ranges": {
-          "description": "Ranges enclosing the position, innermost first, as the server reported\nthem (not merged, reordered",
+          "description": "Ranges enclosing the position, innermost first, as the server reported them.",
           "items": {
             "$ref": "#/$defs/Range"
           },
@@ -4114,7 +4114,7 @@
               ]
             },
             "label": {
-              "description": "Label of the parameter, or `None` when the server gave an offset pair\ninto the signature label that",
+              "description": "Label of the parameter; absent when the server gave an offset pair that does not resolve.",
               "type": [
                 "string",
                 "null"
@@ -4145,7 +4145,7 @@
           ]
         },
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "positions_degraded": {
@@ -4157,7 +4157,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "signatures": {
           "description": "Available signatures.",
@@ -4277,7 +4277,7 @@
       "properties": {
         "item": {
           "$ref": "#/$defs/HierarchyItem",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes"
+          "description": "The type hierarchy item, exactly as a prepare, supertypes or subtypes result gave it."
         }
       },
       "required": [
@@ -4394,10 +4394,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
+          "description": "Whether `items` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -4510,7 +4510,7 @@
       "properties": {
         "item": {
           "$ref": "#/$defs/HierarchyItem",
-          "description": "The type hierarchy item to walk from, exactly as returned by prepare_type_hierarchy, get_supertypes"
+          "description": "The type hierarchy item, exactly as a prepare, supertypes or subtypes result gave it."
         }
       },
       "required": [
@@ -4627,10 +4627,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
+          "description": "Whether `items` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -4671,7 +4671,7 @@
           "type": "string"
         },
         "RouteShape": {
-          "description": "One route of a tool in the report: the languages sharing this support\nstatus (absent for",
+          "description": "One route of a tool: the languages that share this support status.",
           "oneOf": [
             {
               "description": "The routed server is registered and advertises the tool's capability.",
@@ -4692,7 +4692,7 @@
               "type": "object"
             },
             {
-              "description": "The routed server is registered and publishes diagnostics but advertises\nno pull provider, so",
+              "description": "Registered and publishing diagnostics, but with no pull provider: answers come from the push cache.",
               "properties": {
                 "server": {
                   "$ref": "#/$defs/ServerId",
@@ -4899,7 +4899,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -5170,7 +5170,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "locations": {
           "description": "Locations found.",
@@ -5181,10 +5181,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
+          "description": "Whether `locations` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -5235,7 +5235,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -5244,7 +5244,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -5616,7 +5616,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "locations": {
           "description": "Locations found.",
@@ -5627,7 +5627,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -5641,7 +5641,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
+          "description": "Whether `locations` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -5692,7 +5692,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -5701,7 +5701,7 @@
         "context": {
           "$ref": "#/$defs/ResultContext",
           "default": "none",
-          "description": "Extra context per returned item: `none` (default) or `enclosing_symbol` to attach the innermost"
+          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -6073,7 +6073,7 @@
       "properties": {
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
-          "description": "Set only when `context: \"enclosing_symbol\"` was requested and at least one\nitem was looked up: how"
+          "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
         },
         "locations": {
           "description": "Locations found.",
@@ -6084,7 +6084,7 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -6098,7 +6098,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `locations` was capped below the LSP server's full response\n(see",
+          "description": "Whether `locations` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -6134,7 +6134,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -6360,7 +6360,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "items": {
@@ -6379,7 +6379,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -6393,7 +6393,7 @@
           "description": "Set only for a name-addressed call."
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`,",
+          "description": "Whether `items` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -6525,7 +6525,7 @@
           "type": "object"
         },
         {
-          "description": "The server accepts a rename here but leaves the identifier range to the\nclient's own word-selection",
+          "description": "The server accepts a rename here but leaves the identifier range to the client.",
           "properties": {
             "status": {
               "const": "default_behavior",
@@ -6561,7 +6561,7 @@
       "properties": {
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         }
       },
       "type": "object"
@@ -6706,7 +6706,7 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "indexing_in_progress": {
-          "description": "`true` if the routed language server reported its initial workspace indexing as\nin progress during",
+          "description": "`true` if the routed server reported workspace indexing in progress during this read.",
           "type": "boolean"
         },
         "items": {
@@ -6718,10 +6718,10 @@
         },
         "positions_degraded": {
           "$ref": "#/$defs/PositionDegradation",
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "truncated": {
-          "description": "Whether `items` was capped below the LSP server's full response (see\n`MAX_NORMALIZED_LOCATIONS`).",
+          "description": "Whether `items` was capped below the server's full response.",
           "type": "boolean"
         }
       },
@@ -6758,7 +6758,7 @@
         },
         "container": {
           "default": null,
-          "description": "With `symbol_name`: keep only symbols directly inside a container (type, impl, class, module) of",
+          "description": "With `symbol_name`: keep only symbols inside a container (type, impl, class, module) of this name.",
           "type": [
             "string",
             "null"
@@ -7034,7 +7034,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "resolved_symbol": {
           "anyOf": [
@@ -7063,7 +7063,7 @@
   {
     "name": "restart_server",
     "title": "Restart Server",
-    "description": "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; if its old process was already stopped, the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+    "description": "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (such as after a manifest edit). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; `refused` means nothing was stopped and the old process keeps serving, any other reason means it was stopped and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -7115,7 +7115,7 @@
           "description": "Why a restart failed.",
           "oneOf": [
             {
-              "description": "The restart was refused before the old process was stopped, so it was\nnot restarted and keeps",
+              "description": "Refused before the old process was stopped, which keeps serving.",
               "properties": {
                 "kind": {
                   "const": "refused",
@@ -7194,7 +7194,7 @@
               "description": "The server runs a freshly initialized process.",
               "properties": {
                 "coalesced": {
-                  "description": "Another restart of the same server finished while this request\nwaited, so no second restart was",
+                  "description": "Another restart of this server finished while the request waited, so none was repeated.",
                   "type": "boolean"
                 },
                 "indexing_state": {
@@ -7374,7 +7374,7 @@
               "type": "null"
             }
           ],
-          "description": "Optional filter by symbol kind: a name (function, class, variable, etc.) or the numeric LSP"
+          "description": "Optional symbol kind filter: a name (function, class) or the numeric LSP `SymbolKind`."
         },
         "limit": {
           "default": 100,
@@ -7399,7 +7399,7 @@
           "description": "Location in a document.",
           "properties": {
             "out_of_workspace": {
-              "description": "Whether this location is not provably inside any configured\nworkspace root (e.g.",
+              "description": "Whether this location is not provably inside a configured workspace root (stdlib, a dependency).",
               "type": "boolean"
             },
             "range": {
@@ -7513,7 +7513,7 @@
               "type": "null"
             }
           ],
-          "description": "Set only when some `character` offsets in this result are inexact (non-UTF-16\nservers only);"
+          "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
         },
         "symbols": {
           "description": "List of symbols found.",
@@ -7523,7 +7523,7 @@
           "type": "array"
         },
         "truncated": {
-          "description": "Whether more symbols matched than are returned in `symbols` -- set\nwhenever any are dropped,",
+          "description": "Whether more symbols matched than `symbols` returns.",
           "type": "boolean"
         }
       },

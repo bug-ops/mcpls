@@ -54,7 +54,7 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   - pnpm global installs (verified live on macOS; the Windows layout is covered
     by unit tests), found under `<PNPM_HOME>/global`, where more than one match
     or more than 16 entries is ambiguous and not pinned;
-  - `node` or `bun` running the server's absolute `cli.mjs`.
+  - `node`, `nodejs` or `bun` (also versioned, such as `node22`) running the server's absolute `cli.mjs`.
 
   Shims are located by file existence only and are never executed or parsed.
   On Windows a bare command is looked up as written, so an install that only
@@ -64,7 +64,8 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
     shim;
   - the server is started through `npx`, `bunx`, `pnpm dlx`, `yarn dlx`,
     `deno npm:` or another wrapper that only names it in the arguments, including
-    `node` or `bun` with a relative script path;
+    `node`, `nodejs` or `bun` (also versioned, such as `node22`)
+    with a relative script path;
   - no valid `typescript` package is found next to the server;
   - you set `initialization_options` for the server without `tsserver.path`.
 

@@ -179,13 +179,13 @@ macro_rules! impl_text_newtype {
 pub(crate) use impl_text_newtype;
 
 /// The `explain` of a type whose error is the fault itself.
-pub const fn keep_fault<F>(_: &str, fault: F) -> F {
+pub(super) const fn keep_fault<F>(_: &str, fault: F) -> F {
     fault
 }
 
 /// Whether `text` holds a NUL, which the operating system cannot pass in a
 /// path, argument or environment variable.
-pub const fn contains_nul(text: &str) -> bool {
+pub(super) const fn contains_nul(text: &str) -> bool {
     let mut rest = text.as_bytes();
     while let [byte, tail @ ..] = rest {
         if *byte == 0 {

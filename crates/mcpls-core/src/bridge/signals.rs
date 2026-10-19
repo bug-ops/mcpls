@@ -17,8 +17,9 @@ use crate::redaction::{Redactions, ServerText};
 /// incomplete" rather than "nothing here".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct IndexingSignal {
-    /// `true` if the routed language server reported its initial workspace indexing as
-    /// in progress during this read; the result may reflect a partial index.
+    /// `true` if the routed server reported workspace indexing in progress during this read.
+    ///
+    /// The result may reflect a partial index.
     pub indexing_in_progress: bool,
 }
 
@@ -79,10 +80,11 @@ impl<T: ServerText> ServerText for Indexed<T> {
 /// resource), so the three can never report different keys or semantics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct RouteSignals {
-    /// `true` if the language server publishing this file's diagnostics crashed and was
-    /// restarted during this mcpls session. Diagnostics it delivers only by push (e.g.
-    /// rust-analyzer's flycheck/clippy) are no longer received, so the returned
-    /// diagnostics may be incomplete until mcpls restarts.
+    /// `true` if this file's diagnostics server crashed and was restarted; push-only diagnostics are lost.
+    ///
+    /// The restart happened during this mcpls session. Diagnostics the server delivers only by push
+    /// (e.g. rust-analyzer's flycheck/clippy) are no longer received, so the returned diagnostics
+    /// may be incomplete until mcpls restarts.
     pub push_notifications_degraded: bool,
     /// The indexing half, shared with the tools that only report it.
     #[serde(flatten)]

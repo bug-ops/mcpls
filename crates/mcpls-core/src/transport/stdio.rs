@@ -30,15 +30,44 @@ use super::shutdown::ShutdownSignal;
 /// exit via `std::process::exit` rather than returning normally from `main`,
 /// or an uncancellable `tokio::io::stdin()` blocking thread can stall
 /// runtime shutdown indefinitely (see `mcpls-cli`'s `main.rs` and #308).
+///
+/// The server's stop token is cancelled inside the signal future, so before
+/// `select!` drops the service (whose drop cancels every request token): a tool
+/// call stopped by the teardown reports shutdown rather than a client
+/// cancellation.
 pub async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
+    serve_until(mcp_server, rmcp::transport::stdio(), async move {
+        shutdown_signal.recv().await;
+    })
+    .await
+}
+
+/// Serves `mcp_server` over `transport` until the transport closes or `signal`
+/// resolves; see [`run_stdio`].
+pub async fn serve_until<T, E, A>(
+    mcp_server: crate::mcp::McplsServer,
+    transport: T,
+    signal: impl Future<Output = ()>,
+) -> Result<(), crate::Error>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let stop = mcp_server.stop_token();
+    let signal = async {
+        signal.await;
+        stop.cancel();
+    };
+    let mut signal = std::pin::pin!(signal);
+
     let service = tokio::select! {
-        result = mcp_server.serve(rmcp::transport::stdio()) => {
+        result = mcp_server.serve(transport) => {
             result.map_err(|e| crate::Error::McpServerStart(Box::new(e)))?
         }
-        () = shutdown_signal.recv() => {
+        () = &mut signal => {
             tracing::info!("shutdown signal received during handshake, stopping stdio transport");
             return Ok(());
         }
@@ -51,7 +80,7 @@ pub async fn run_stdio(
                 task: crate::error::BackgroundTask::McpService,
                 source,
             }),
-        () = shutdown_signal.recv() => {
+        () = &mut signal => {
             tracing::info!("shutdown signal received, stopping stdio transport");
             Ok(())
         }

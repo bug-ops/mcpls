@@ -199,8 +199,8 @@ Trusting the config is not trusting the workspace: language servers run workspac
 (build scripts, procedural macros, tsconfig plugins) and mcpls does not sandbox them, so
 analyze an untrusted checkout only inside a container or disposable VM. For the TypeScript
 server, mcpls pins `tsserver` to the one bundled with `typescript-language-server` on npm symlink
-and `.cmd`/`.ps1` shim installs, pnpm global installs and `node`/`bun` running an absolute
-`cli.mjs`; Volta, asdf, mise and `npx`/`bunx`/`deno npm:` launchers are not covered, and
+and `.cmd`/`.ps1` shim installs, pnpm global installs and `node`/`nodejs`/`bun` (also versioned, such as
+`node22`) running an absolute `cli.mjs`; Volta, asdf, mise and `npx`/`bunx`/`deno npm:` launchers are not covered, and
 `initialization_options.tsserver.path` overrides the pin. TypeScript 7 ships no `tsserver`, so the server needs `typescript@6` next to it (or
 configure `tsc --lsp --stdio` explicitly). See [SECURITY.md](https://github.com/bug-ops/mcpls/blob/main/SECURITY.md).
 

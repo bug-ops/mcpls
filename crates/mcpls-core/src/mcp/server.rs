@@ -24,8 +24,9 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler,
 use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use super::cancel::{peer_closed, run_cancellable};
+use super::cancel::{ToolFailure, detached_result, peer_closed, run_cancellable};
 use super::custom_request::{self, SessionKind};
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
@@ -173,8 +174,7 @@ macro_rules! positions_note_response {
 struct CachedDiagnosticsResponse {
     #[serde(flatten)]
     result: DiagnosticsResult,
-    /// Whether the cache has an answer for the file; an empty list next to
-    /// `pending` or `evicted` is not a clean file.
+    /// Whether the cache has an answer; an empty list with `pending` or `evicted` is not a clean file.
     availability: DiagnosticsAvailability,
     #[serde(flatten)]
     signals: RouteSignals,
@@ -197,6 +197,11 @@ pub struct McplsServer {
     /// `self.tool_router.call(..)` auto-derefs through the `Arc`, so this is
     /// transparent to the macro-generated code.
     tool_router: Arc<ToolRouter<Self>>,
+
+    /// Cancelled before a shutdown cancels any request token, so a call
+    /// stopped by the serve loop can report shutdown instead of a client
+    /// cancellation. Shared by every session of one server.
+    stop: CancellationToken,
 }
 
 /// Maps an [`crate::error::Error`] onto the wire-level MCP error, via
@@ -439,13 +444,13 @@ fn hoist_indexing<T>(addressed: Addressed<Indexed<T>>) -> Indexed<Addressed<T>> 
 struct DiagnosticsResponse {
     #[serde(flatten)]
     result: DocumentDiagnosticsResult,
-    /// Whether the cache has an answer for the file; an empty list next to
-    /// `pending` or `evicted` is not a clean file.
+    /// Whether the cache has an answer; an empty list with `pending` or `evicted` is not a clean file.
     availability: DiagnosticsAvailability,
-    /// `pull` when a `textDocument/diagnostic` request answered (merged with
-    /// the push cache), `push_cache` when the server has no pull provider and
-    /// the push cache alone answered, `cache_after_failed_pull` when the pull
-    /// failed and the cache answered.
+    /// How the answer was produced: `pull`, `push_cache` or `cache_after_failed_pull`.
+    ///
+    /// `pull` means a `textDocument/diagnostic` request answered (merged with the push cache);
+    /// `push_cache` that the server has no pull provider and the push cache alone answered;
+    /// `cache_after_failed_pull` that the pull failed and the cache answered.
     origin: DiagnosticsOrigin,
     #[serde(flatten)]
     signals: RouteSignals,
@@ -574,7 +579,44 @@ impl McplsServer {
         Self {
             context,
             tool_router,
+            stop: CancellationToken::new(),
         }
+    }
+
+    /// This server reporting `stop` as its shutdown signal: a tool call that
+    /// is stopped after `stop` was cancelled answers "mcpls is shutting down"
+    /// instead of reporting a client cancellation.
+    ///
+    /// The transport cancels `stop` before it tears the serve loops down.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use mcpls_core::bridge::{NotificationCache, Translator, WorkspaceRoots};
+    /// use mcpls_core::config::{McpConfig, ProjectConfigStatus};
+    /// use mcpls_core::mcp::{McplsServer, SubscriptionRegistry};
+    /// use tokio::sync::Mutex;
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// let stop = CancellationToken::new();
+    /// let _server = McplsServer::new(
+    ///     Arc::new(Translator::new()),
+    ///     Arc::new(Mutex::new(NotificationCache::new())),
+    ///     WorkspaceRoots::default(),
+    ///     SubscriptionRegistry::new(),
+    ///     ProjectConfigStatus::NotIgnored,
+    ///     McpConfig::default(),
+    /// )
+    /// .with_stop(stop.clone());
+    /// // Announce shutdown before tearing the serve loops down.
+    /// stop.cancel();
+    /// ```
+    #[must_use]
+    pub fn with_stop(mut self, stop: CancellationToken) -> Self {
+        self.stop = stop;
+        self
     }
 
     /// Build a new server instance for a new HTTP session, giving it its own
@@ -628,7 +670,13 @@ impl McplsServer {
         Self {
             context,
             tool_router: Arc::clone(&self.tool_router),
+            stop: self.stop.clone(),
         }
+    }
+
+    /// The token a transport cancels to announce shutdown; see [`Self::with_stop`].
+    pub(crate) fn stop_token(&self) -> CancellationToken {
+        self.stop.clone()
     }
 
     /// This instance's [`SubscriptionRegistry`], so a test exercising the
@@ -1330,7 +1378,7 @@ impl McplsServer {
 
     /// Restart LSP servers.
     #[tool(
-        description = "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (e.g. after editing `Cargo.toml` or `package.json`). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; if its old process was already stopped, the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
+        description = "Restart LSP servers: stop the old process (graceful shutdown, then a kill of its whole process group) and start a fresh one, discarding its in-memory state. Use it when a server is wedged or serves a stale index (such as after a manifest edit). Give `servers` (ids) or `all: true`. Per server, `status` is `restarted` (with `indexing_state`; `coalesced: true` if another restart of the same server just finished; `push_notifications_degraded: true` means call it again), `failed` (with a typed `reason`; the server stays registered; `refused` means nothing was stopped and the old process keeps serving, any other reason means it was stopped and the next tool call retries), `throttled` (retry after `retry_in_ms`), `initializing` or `not_running`. Requests in flight on the old process fail with a retryable error. Processes that detach into their own session may survive; shared daemons the server started (e.g. Gradle) are killed. Destructive (it kills processes the server started, which other clients may share), not read-only and not idempotent.",
         title = "Restart Server",
         annotations(
             title = "Restart Server",
@@ -1342,18 +1390,17 @@ impl McplsServer {
     async fn restart_server(
         &self,
         Parameters(RestartServerParams { target }): Parameters<RestartServerParams>,
-    ) -> Result<Json<RestartServerResult>, McpError> {
+    ) -> Result<Json<RestartServerResult>, ToolFailure> {
         // Once begun, a restart must reach a defined end state per server, so it
         // is detached from this handler: a cancel after entry does not abandon
         // a server half-restarted.
         let translator = Arc::clone(&self.context.translator);
-        let restarted =
+        let restarted = detached_result(
             crate::util::run_detached(async move { translator.restart_servers(target).await })
-                .await;
-        restarted.map_or_else(
-            |_| Err(McpError::internal_error("mcpls is shutting down", None)),
-            |result| self.structured_result(result),
-        )
+                .await,
+        )?;
+        self.structured_result(restarted)
+            .map_err(ToolFailure::Protocol)
     }
 
     /// Report which tools are usable for which languages.
@@ -1781,7 +1828,7 @@ impl ServerHandler for McplsServer {
         let (request_token, peer) = (context.ct.clone(), context.peer.clone());
         let tcc = ToolCallContext::new(self, request, context);
         let handler = contain_panic(self.tool_router.call(tcc), "tool call");
-        match run_cancellable(&request_token, peer_closed(&peer), handler).await {
+        match run_cancellable(&request_token, &self.stop, peer_closed(&peer), handler).await {
             Ok(result) => result,
             Err(stop) => {
                 tracing::debug!(%tool, %stop, "tool call stopped before it finished");
@@ -7095,7 +7142,11 @@ sleep 0.3
                         .unwrap(),
                 ))
                 .await
-                .map(|_| ()),
+                .map(|_| ())
+                .map_err(|failure| match failure {
+                    ToolFailure::Protocol(error) => error,
+                    ToolFailure::Stopped(stop) => panic!("unexpected stop: {stop}"),
+                }),
         }
     }
 

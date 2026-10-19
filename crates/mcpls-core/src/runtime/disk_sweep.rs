@@ -108,11 +108,8 @@ struct DiskSweep {
     jobs: JoinSet<()>,
     /// Server each unfinished job sweeps.
     running: HashMap<Id, ServerId>,
-    /// The last subscribed file the previous tick examined, so the next tick
-    /// resumes at the first path after it however the set changed.
-    subscribed_after: Option<PathBuf>,
-    /// As `subscribed_after`, for companions.
-    companions_after: Option<PathBuf>,
+    subscribed: SweepWindow,
+    companions: SweepWindow,
 }
 
 impl DiskSweep {
@@ -135,8 +132,8 @@ impl DiskSweep {
             context,
             jobs: JoinSet::new(),
             running: HashMap::new(),
-            subscribed_after: None,
-            companions_after: None,
+            subscribed: SweepWindow::new(MAX_SWEPT_FILES_PER_TICK),
+            companions: SweepWindow::new(MAX_COMPANION_FILES_PER_TICK),
         }
     }
 
@@ -159,14 +156,20 @@ impl DiskSweep {
         self.context.memo().retain(|path| kept.contains(path));
 
         let mut by_server: HashMap<ServerId, Vec<(PathBuf, Interest)>> = HashMap::new();
-        let window = self.next_subscribed(&subscribed);
+        let busy = self.busy_servers();
+        let window = self
+            .subscribed
+            .advance(&subscribed, |server| busy.contains(server));
         for (path, server) in window {
             by_server
                 .entry(server)
                 .or_default()
                 .push((path, Interest::Subscribed));
         }
-        for (path, server) in self.next_companions(&companions) {
+        let window = self
+            .companions
+            .advance(&companions, |server| busy.contains(server));
+        for (path, server) in window {
             by_server
                 .entry(server)
                 .or_default()
@@ -243,30 +246,9 @@ impl DiskSweep {
             .collect()
     }
 
-    /// The subscribed files this tick visits: at most
-    /// [`MAX_SWEPT_FILES_PER_TICK`], taken in path order from the first path
-    /// after the one the previous tick stopped at. Files of a server whose job
-    /// still runs are passed over without using up the window.
-    fn next_subscribed(&mut self, subscribed: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
-        let running = &self.running;
-        window_after(
-            subscribed,
-            &mut self.subscribed_after,
-            MAX_SWEPT_FILES_PER_TICK,
-            |server| running.values().any(|running| running == server),
-        )
-    }
-
-    /// The companions this tick visits: at most
-    /// [`MAX_COMPANION_FILES_PER_TICK`], windowed like the subscribed files.
-    fn next_companions(&mut self, companions: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
-        let running = &self.running;
-        window_after(
-            companions,
-            &mut self.companions_after,
-            MAX_COMPANION_FILES_PER_TICK,
-            |server| running.values().any(|running| running == server),
-        )
+    /// The servers whose job still runs.
+    fn busy_servers(&self) -> HashSet<ServerId> {
+        self.running.values().cloned().collect()
     }
 
     /// The most recently used [`MAX_COMPANION_FILES`] tracked files that are
@@ -299,39 +281,55 @@ impl DiskSweep {
     }
 }
 
-/// At most `max` of `items`, sorted by path, taken from the first path after
-/// `cursor` and round again; `cursor` becomes the last path examined. Items of
-/// a server `busy` says is occupied are passed over without using up the
-/// window.
-fn window_after(
-    items: &[(PathBuf, ServerId)],
-    cursor: &mut Option<PathBuf>,
+/// A bounded view of a path-sorted set that moves round it tick by tick.
+#[derive(Debug)]
+struct SweepWindow {
+    /// The last path the previous tick examined, so the next tick resumes at
+    /// the first path after it however the set changed.
+    after: Option<PathBuf>,
+    /// Most items one tick takes.
     max: usize,
-    busy: impl Fn(&ServerId) -> bool,
-) -> Vec<(PathBuf, ServerId)> {
-    let len = items.len();
-    let start = cursor
-        .as_ref()
-        .map_or(0, |after| items.partition_point(|(path, _)| path <= after));
-    let mut window = Vec::new();
-    let mut last = None;
-    for (path, server) in items
-        .iter()
-        .cycle()
-        .skip(start.checked_rem(len).unwrap_or(0))
-        .take(len)
-    {
-        if window.len() >= max {
-            break;
-        }
-        last = Some(path);
-        if busy(server) {
-            continue;
-        }
-        window.push((path.clone(), server.clone()));
+}
+
+impl SweepWindow {
+    const fn new(max: usize) -> Self {
+        Self { after: None, max }
     }
-    *cursor = last.cloned();
-    window
+
+    /// At most `max` of `items`, sorted by path, taken from the first path
+    /// after the cursor and round again; the cursor becomes the last path
+    /// examined. Items of a server `busy` says is occupied are passed over
+    /// without using up the window.
+    fn advance(
+        &mut self,
+        items: &[(PathBuf, ServerId)],
+        busy: impl Fn(&ServerId) -> bool,
+    ) -> Vec<(PathBuf, ServerId)> {
+        let len = items.len();
+        let start = self
+            .after
+            .as_ref()
+            .map_or(0, |after| items.partition_point(|(path, _)| path <= after));
+        let mut window = Vec::new();
+        let mut last = None;
+        for (path, server) in items
+            .iter()
+            .cycle()
+            .skip(start.checked_rem(len).unwrap_or(0))
+            .take(len)
+        {
+            if window.len() >= self.max {
+                break;
+            }
+            last = Some(path);
+            if busy(server) {
+                continue;
+            }
+            window.push((path.clone(), server.clone()));
+        }
+        self.after = last.cloned();
+        window
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +356,24 @@ mod tests {
     };
 
     impl DiskSweep {
+        fn next_subscribed(
+            &mut self,
+            subscribed: &[(PathBuf, ServerId)],
+        ) -> Vec<(PathBuf, ServerId)> {
+            let busy = self.busy_servers();
+            self.subscribed
+                .advance(subscribed, |server| busy.contains(server))
+        }
+
+        fn next_companions(
+            &mut self,
+            companions: &[(PathBuf, ServerId)],
+        ) -> Vec<(PathBuf, ServerId)> {
+            let busy = self.busy_servers();
+            self.companions
+                .advance(companions, |server| busy.contains(server))
+        }
+
         /// Waits for every running job and every pull pass that answers.
         async fn settle(&mut self) {
             while let Some(finished) = self.jobs.join_next_with_id().await {
@@ -1254,6 +1270,34 @@ mod tests {
         );
     }
 
+    /// A file edited while its server's pass is still waiting on hung pulls is
+    /// resynced at once and pulled by that pass, not a window cycle later
+    /// (#809).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_file_edited_while_the_pass_runs_is_handed_to_it() {
+        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        for name in ["a.rs", "c.rs"] {
+            fleet.wedge.hang(name);
+            fleet.edit(name);
+        }
+        let pulls_of_b = fleet.wedge.count(PULL, "b.rs");
+        fleet.sweep.tick().await;
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+        fleet.edit("b.rs");
+
+        fleet.sweep.tick().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(fleet.wedge.count(CHANGE, "b.rs"), 1);
+        assert_eq!(fleet.wedge.count(PULL, "b.rs"), pulls_of_b);
+        let rust = ServerId::from_static("rust");
+        assert_eq!(fleet.sweep.context.memo().queued_files(&rust), 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(fleet.wedge.count(PULL, "b.rs"), pulls_of_b + 1);
+        assert_eq!(fleet.sweep.context.memo().queued_files(&rust), 0);
+    }
+
     /// A pull that never answers is sent the capped number of times for its
     /// state, one at a time and a request timeout apart (spec 016 SC-006).
     #[tokio::test(start_paused = true)]
@@ -1311,6 +1355,40 @@ mod tests {
             .sum::<usize>()
             - pulls_before;
         assert_eq!(pulls, hung.len());
+    }
+
+    /// Handing files to a running pass never makes the sweep ask a hung file
+    /// again within the same pass: a pass outlasts a tick, so over many ticks
+    /// a file is pulled at most once per two ticks (spec 016 NFR-002).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_hung_file_is_pulled_at_most_once_per_pass_over_many_ticks() {
+        const TICKS: usize = 10;
+        let hung = ["h1.rs", "h2.rs", "h3.rs", "h4.rs", "h5.rs", "h6.rs"];
+        let mut fleet = Fleet::new(&hung, &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        for name in hung {
+            fleet.wedge.hang(name);
+            fleet.edit(name);
+        }
+        let before: Vec<usize> = hung
+            .iter()
+            .map(|name| fleet.wedge.count(PULL, name))
+            .collect();
+
+        for _ in 0..TICKS {
+            fleet.sweep.tick().await;
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+        }
+
+        let pulls: Vec<usize> = hung
+            .iter()
+            .zip(before)
+            .map(|(name, before)| fleet.wedge.count(PULL, name) - before)
+            .collect();
+        assert!(
+            pulls.iter().all(|&n| (1..=TICKS / 2).contains(&n)),
+            "pulls per hung file over {TICKS} ticks: {pulls:?}"
+        );
     }
 
     /// Edits `hung` and `z.rs` together, hangs the pulls of `hung`, and returns

@@ -26,22 +26,24 @@ use rmcp::model::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::error::spelled_enum;
 use crate::util::{MAX_ECHOED_NAME_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
 
-/// A method mcpls serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Served {
-    Initialize,
-    Ping,
-    Discover,
-    ToolsList,
-    ToolsCall,
-    ResourcesList,
-    ResourcesTemplatesList,
-    ResourcesRead,
-    ResourcesSubscribe,
-    ResourcesUnsubscribe,
-    SubscriptionsListen,
+spelled_enum! {
+    /// A method mcpls serves.
+    Served {
+        Initialize => InitializeResultMethod::VALUE,
+        Ping => PingRequestMethod::VALUE,
+        Discover => DiscoverRequestMethod::VALUE,
+        ToolsList => ListToolsRequestMethod::VALUE,
+        ToolsCall => CallToolRequestMethod::VALUE,
+        ResourcesList => ListResourcesRequestMethod::VALUE,
+        ResourcesTemplatesList => ListResourceTemplatesRequestMethod::VALUE,
+        ResourcesRead => ReadResourceRequestMethod::VALUE,
+        ResourcesSubscribe => SubscribeRequestMethod::VALUE,
+        ResourcesUnsubscribe => UnsubscribeRequestMethod::VALUE,
+        SubscriptionsListen => SubscriptionsListenRequestMethod::VALUE,
+    }
 }
 
 /// How a session was opened.
@@ -64,38 +66,10 @@ enum Lifecycle {
 }
 
 impl Served {
-    const ALL: [Self; 11] = [
-        Self::Initialize,
-        Self::Ping,
-        Self::Discover,
-        Self::ToolsList,
-        Self::ToolsCall,
-        Self::ResourcesList,
-        Self::ResourcesTemplatesList,
-        Self::ResourcesRead,
-        Self::ResourcesSubscribe,
-        Self::ResourcesUnsubscribe,
-        Self::SubscriptionsListen,
-    ];
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Initialize => InitializeResultMethod::VALUE,
-            Self::Ping => PingRequestMethod::VALUE,
-            Self::Discover => DiscoverRequestMethod::VALUE,
-            Self::ToolsList => ListToolsRequestMethod::VALUE,
-            Self::ToolsCall => CallToolRequestMethod::VALUE,
-            Self::ResourcesList => ListResourcesRequestMethod::VALUE,
-            Self::ResourcesTemplatesList => ListResourceTemplatesRequestMethod::VALUE,
-            Self::ResourcesRead => ReadResourceRequestMethod::VALUE,
-            Self::ResourcesSubscribe => SubscribeRequestMethod::VALUE,
-            Self::ResourcesUnsubscribe => UnsubscribeRequestMethod::VALUE,
-            Self::SubscriptionsListen => SubscriptionsListenRequestMethod::VALUE,
-        }
-    }
-
     fn of(method: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|served| served.name() == method)
+        Self::ALL
+            .into_iter()
+            .find(|served| served.as_str() == method)
     }
 
     const fn lifecycle(self) -> Lifecycle {
@@ -174,7 +148,7 @@ pub(super) fn answer(request: &CustomRequest, kind: SessionKind) -> McpError {
     if !served.available(kind) {
         return method_not_found(&request.method);
     }
-    let name = served.name();
+    let name = served.as_str();
     match served.decode(request.params.as_ref()) {
         Err(error) => McpError::invalid_params(
             format!(

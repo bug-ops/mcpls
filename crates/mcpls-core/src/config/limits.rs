@@ -274,7 +274,7 @@ impl_bounded_number!(
     InvalidSizeLimit,
     default = 10 * 1024 * 1024,
     "The built-in default, 10 MiB.",
-    into = |limit: SizeLimit| limit.0.map_or(0, NonZeroU64::get)
+    into = |limit: SizeLimit| limit.0.map_or_default(NonZeroU64::get)
 );
 
 /// A count limit that is either absent or a positive number of documents.
@@ -317,11 +317,12 @@ impl_bounded_number!(
     infallible,
     default = 100,
     "The built-in default, 100 documents.",
-    into = |limit: DocumentLimit| limit.0.map_or(0, NonZeroUsize::get)
+    into = |limit: DocumentLimit| limit.0.map_or_default(NonZeroUsize::get)
 );
 
 /// Why a string is not a valid [`BoundedText`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidBoundedText {
     /// The text was empty or whitespace-only.
     #[error("cannot be empty")]

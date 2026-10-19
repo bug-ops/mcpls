@@ -116,7 +116,7 @@ compiled in but not in the default pipeline until the clarifications are resolve
 | Step | Rule | Spec |
 |------|------|------|
 | `StripRustdocSections` | In every `description`: cut at the first line that starts with `#` or with three backticks; trim trailing blank lines. Idempotent | FR-004 |
-| `ShortenDescriptions` | Keep the first paragraph; if longer than the cap, cut at the last sentence end within it, else at the last whitespace; never leave an odd number of backticks or an open fence. Definitions with a `DefUsage` count of 2 or more use the shared cap | FR-003, FR-005, FR-010 |
+| `ShortenDescriptions` | Keep the first paragraph; if longer than the cap, keep the longest run of whole sentences within it, or no description when none fits (a cut is valid after `.`, `!` or `?`, optionally followed by `)`, that is no abbreviation and leaves balanced backticks and parentheses). Definitions with a `DefUsage` count of 2 or more use the shared cap | FR-003, FR-005, FR-010 |
 | `DropUnsignedIntegerNoise` (optional) | On `type: integer` schemas drop `format` of `uint*`; keep or drop `minimum: 0` per the clarification | FR-009 |
 | `InlineSmallDefs` (optional) | For a definition that is non-recursive and whose shaped size is at most `max_inlined_bytes`, replace each `{"$ref": "#/$defs/X"}` with the body (keeping any sibling `description`), then delete the definition once no `$ref` to it remains. Recursion is detected by a depth-first walk of `$ref` edges; `Symbol` is skipped | FR-006, FR-007 |
 
@@ -149,7 +149,7 @@ No MCP or Rust public API change. Internal surface:
 
 | Level | Framework | What to Test | Coverage Target |
 |-------|-----------|-------------|-----------------|
-| Unit (transforms) | `cargo nextest`, `rstest` | Each step on synthetic schemas: rustdoc section removal, fence removal, first-paragraph cut at sentence end, no unterminated backtick span, multibyte text not split, `$ref` sibling description preserved, idempotence | Every step, every branch |
+| Unit (transforms) | `cargo nextest`, `rstest` | Each step on synthetic schemas: rustdoc section removal, fence removal, first-paragraph cut at sentence end (whole sentences or none), abbreviation and unbalanced-span rejection, multibyte text not split, `$ref` sibling description preserved, idempotence | Every step, every branch |
 | Property | `proptest` (already a dev-dependency) | `shape(shape(s)) == shape(s)` and `len(shape(s)) <= len(s)` over generated descriptions and small schemas | Idempotence and monotonicity |
 | Unit (budget, FR-012) | nextest | Serialize `build_tool_router(None).list_all()` compactly; assert total, per-tool and schema-description sums against the constants; on failure print a per-tool table with measured and permitted bytes | One test, whole surface |
 | Unit (lint, FR-013) | nextest | Walk every schema `description`; fail on a fence, a heading line or a rustdoc section name, reporting tool, JSON path and offending line | One test |

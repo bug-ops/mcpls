@@ -307,6 +307,15 @@ enum WrapperGrammar {
     Other,
 }
 
+impl WrapperGrammar {
+    const fn kind(self) -> WrapperKind {
+        match self {
+            Self::Env(_) => WrapperKind::Env,
+            Self::Other => WrapperKind::Other,
+        }
+    }
+}
+
 /// The parts of `env`'s grammar the other wrappers lack: a lone `-` and
 /// `NAME=value` assignments before the command, an option that splits a string
 /// into arguments, and options that change the directory a relative program is
@@ -559,6 +568,22 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
     },
 ];
 
+/// The names of node's executable.
+const NODE_NAMES: &[&str] = &["node", "nodejs"];
+
+/// The names of bun's executable.
+const BUN_NAMES: &[&str] = &["bun"];
+
+/// Whether `stem` is an interpreter that runs a script file given as an
+/// argument (`node`, `nodejs`, `bun`, with a version or distribution suffix),
+/// by the rule the launcher analysis applies to them.
+pub fn is_script_interpreter(stem: &CommandStem) -> bool {
+    NODE_NAMES
+        .iter()
+        .chain(BUN_NAMES)
+        .any(|name| is_interpreter(stem.as_str(), name))
+}
+
 /// Interpreters that run a program given on the command line, with the short
 /// flag letters and long flags that introduce it. A match is by stem prefix so
 /// `python3.12` counts as `python`.
@@ -568,12 +593,7 @@ const INLINE_EVAL: &[InlineEval] = &[
         flag_longs: NODE_FLAGS,
         flag_prefixes: &["--no-"],
         value_longs: NODE_VALUE_LONGS,
-        ..InlineEval::new(
-            &["node", "nodejs"],
-            &['e', 'p'],
-            &['r', 'C'],
-            LONG_EVAL_PRINT,
-        )
+        ..InlineEval::new(NODE_NAMES, &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
     },
     InlineEval {
         data_url_flags: DATA_URL_LOADERS,
@@ -581,7 +601,7 @@ const INLINE_EVAL: &[InlineEval] = &[
         flag_prefixes: &["--smol"],
         value_longs: NODE_VALUE_LONGS,
         chdir_longs: &["--cwd"],
-        ..InlineEval::new(&["bun"], &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
+        ..InlineEval::new(BUN_NAMES, &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
     },
     InlineEval::new(&["lua"], &['e'], &['l'], &[]),
     InlineEval {
@@ -1007,10 +1027,7 @@ impl<'a> Analysis<'a> {
                     UnanalyzableLaunch::RelativeProgramAfterChdir,
                 ));
             }
-            let starter = match wrapper.grammar {
-                WrapperGrammar::Env(_) => WrapperKind::Env,
-                WrapperGrammar::Other => WrapperKind::Other,
-            };
+            let starter = wrapper.grammar.kind();
             let frame = Frame {
                 base,
                 depth,
