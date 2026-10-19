@@ -371,9 +371,35 @@ fn take_one(pending: &StdMutex<HashSet<DiagnosticsResourceUri>>) -> Option<Diagn
 pub struct SessionState {
     subs: ResourceSubscriptions,
     delivery: OnceLock<Delivery>,
+    handshake: AtomicBool,
+}
+
+/// Outcome of [`SessionState::claim_handshake`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeClaim {
+    /// This request is the session's first successful `initialize`.
+    First,
+    /// The session already completed `initialize`.
+    Repeat,
 }
 
 impl SessionState {
+    /// Atomically claims the session's one `initialize`; exactly one caller
+    /// ever receives [`HandshakeClaim::First`].
+    pub(crate) fn claim_handshake(&self) -> HandshakeClaim {
+        if self.handshake.swap(true, Ordering::AcqRel) {
+            HandshakeClaim::Repeat
+        } else {
+            HandshakeClaim::First
+        }
+    }
+
+    /// Whether an `initialize` already claimed this session.
+    #[cfg(test)]
+    pub(crate) fn handshake_claimed(&self) -> bool {
+        self.handshake.load(Ordering::Acquire)
+    }
+
     /// Whether this session has no subscriptions.
     pub(crate) async fn is_empty(&self) -> bool {
         self.subs.is_empty().await
@@ -716,6 +742,7 @@ impl ListenPermit {
                 uris.canonical().map(|(uri, _)| uri.clone()),
             ),
             delivery: OnceLock::new(),
+            handshake: AtomicBool::new(false),
         });
         bind_delivery(&state, &self.registry, || target(uris));
         ListenRegistration {
@@ -789,7 +816,6 @@ impl SessionHandle {
         self.registry.clone()
     }
 
-    #[cfg(test)]
     pub(crate) const fn state(&self) -> &Arc<SessionState> {
         &self.state
     }
@@ -1016,6 +1042,31 @@ mod tests {
             registry.register(&Arc::new(SessionState::default()));
         }
         assert_eq!(registry.raw_len(), 1);
+    }
+
+    #[test]
+    fn test_handshake_is_claimed_once() {
+        let state = SessionState::default();
+        assert!(!state.handshake_claimed());
+        assert_eq!(state.claim_handshake(), HandshakeClaim::First);
+        assert!(state.handshake_claimed());
+        assert_eq!(state.claim_handshake(), HandshakeClaim::Repeat);
+    }
+
+    #[test]
+    fn test_concurrent_handshake_claims_have_one_winner() {
+        let state = Arc::new(SessionState::default());
+        let winners = (0..8)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || state.claim_handshake())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|claim| *claim == HandshakeClaim::First)
+            .count();
+        assert_eq!(winners, 1);
     }
 
     #[test]

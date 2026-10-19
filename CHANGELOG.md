@@ -11,9 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s without a tool call, through a subscription-driven sweep (#648) (#784).
 - Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#784).
+- The diagnostics sweep re-pulls subscribed files when any tracked file of their server changes, walks the 256 most recent unsubscribed files of such servers, and sends `didSave` to servers that advertise `textDocumentSync.save` (#781) (#PR).
 
 ### Fixed
 
+- The untrusted launcher refuses shells and interpreters that read their program from stdin (`bash -s`, `python -`, `pwsh -File -`, bare `deno`, `/dev/stdin` operands) (#782) (#PR).
+- Tool calls and the diagnostics sweep open a file first and verify the opened handle's path against the workspace roots (#783) (#PR).
+- `DocumentNotFound` and `PathToUri` render the client path through `EchoedPath` (#780) (#PR).
+- Recording lost files under the diagnostics cache lock is no longer quadratic (#779) (#PR).
+- A repeated well-formed `initialize` on an established session answers `-32600` instead of renegotiating (#776) (#PR).
+- A NUL byte in a server `env` value is rejected when the config is loaded (#751) (#PR).
 - The untrusted launcher refuses further code-running spellings: pwsh dash lookalikes, padded flags, Windows PowerShell 5.1 unknown or valued parameters and bare commands, elvish `--c`, fish flag prefixes, cabal and stack run, eval and repl aliases, `cargo r`/`t`, and `data:` URLs with tab or newline (#734) (#784).
 - The untrusted launcher refuses distribution names of listed shells and interpreters (`bash-static`, `pwsh-preview`, `pythonw3`, `py`, `lksh`) and the php `-R`/`-B`/`-E`/`-F` and long code flags (#740) (#784).
 - The untrusted argument backstop runs again before every spawn, and a restart it refuses keeps the running server; `restart_server` reports `spawn_failed` instead of `initialize_failed` for a failed start (#736) (#784).
@@ -27,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Error::LspServerError` carries a `JsonRpcError` and `ServerErrorResponse` is removed (#777) (#PR).
+- **Breaking:** `ServerEnv::insert`, `from_entries` and `iter` use the new `EnvValue`, and `ConfigError::InvalidEnvValue` is added (#751) (#PR).
+- **Breaking:** `DocumentTracker::ensure_open` takes an `OpenRequest` with `Access::{Use, Probe}` (#783) (#PR).
+- **Breaking:** `Error::TomlDe` wraps the new `TomlParseError` instead of `toml::de::Error` and shows the message with line and column, never the source line (#751) (#PR).
+- **Breaking:** the untrusted launcher refuses a shell or interpreter without a script (`node --version`, `deno`, REPLs), adding `LaunchTrigger::ProgramFromStdin` and `UnanalyzableLaunch::RelativeOperandAfterChdir` (#782) (#PR).
+- `JsonRpcError` is re-exported from `lsp`, and the `initialize` claim type `HandshakeClaim` is public (#777, #776) (#PR).
 - **Breaking:** `InlineFlag` is `Short(char)` or `Long(LongInlineFlag)`, `ShellFlag::PlusC` reports `+c` as written, wrapped programs name their wrapper, and `cmd` is refused as a runner (`CmdSwitch` and `ShellFlag::SlashC` are removed) (#747) (#784).
 - Error variants no longer repeat their source in `Display`, and `ErrorChain` renders every cause once (#735) (#778).
 - A diagnostics list is serialized once per publish; its size is recorded when it is bounded (#743) (#778).

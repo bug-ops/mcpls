@@ -37,6 +37,30 @@ const fn keep_env_key_fault(_: &str, fault: InvalidEnvKey) -> InvalidEnvKey {
     fault
 }
 
+/// Why a string is not a valid [`EnvValue`].
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidEnvValue {
+    /// The value contained a NUL, which the operating system cannot pass in
+    /// an environment.
+    #[error("environment variable value cannot contain NUL")]
+    ContainsNul,
+}
+
+const fn env_value_fault(value: &str) -> Option<InvalidEnvValue> {
+    let mut rest = value.as_bytes();
+    while let [byte, tail @ ..] = rest {
+        if *byte == 0 {
+            return Some(InvalidEnvValue::ContainsNul);
+        }
+        rest = tail;
+    }
+    None
+}
+
+const fn keep_env_value_fault(_: &str, fault: InvalidEnvValue) -> InvalidEnvValue {
+    fault
+}
+
 /// The name of an environment variable: non-empty, with no `=` and no NUL, so
 /// the operating system accepts it as one.
 ///
@@ -67,6 +91,35 @@ impl_text_newtype!(
     fault = env_key_fault,
     explain = keep_env_key_fault,
     "environment variable name"
+);
+
+/// The value of an environment variable: any text without a NUL, so the
+/// operating system accepts it as one.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::EnvValue;
+///
+/// assert_eq!(EnvValue::new("debug").unwrap(), "debug");
+/// assert!(EnvValue::new("").is_ok());
+/// assert!(EnvValue::new("a\0b").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnvValue(Cow<'static, str>);
+
+impl AsRef<std::ffi::OsStr> for EnvValue {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.as_str().as_ref()
+    }
+}
+
+impl_text_newtype!(
+    EnvValue,
+    InvalidEnvValue,
+    fault = env_value_fault,
+    explain = keep_env_value_fault,
+    "environment variable value"
 );
 
 /// Two keys of one `env` table name the same variable on the host.
@@ -123,23 +176,23 @@ fn windows_fold(c: char) -> char {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::config::{EnvKey, HostOs, ServerEnv};
+/// use mcpls_core::config::{EnvKey, EnvValue, HostOs, ServerEnv};
 ///
 /// let mut env = ServerEnv::new(HostOs::Windows);
-/// env.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());
+/// env.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap());
 /// assert_eq!(env.get("PATH"), Some("/a"));
 ///
-/// env.insert(EnvKey::new("PATH").unwrap(), "/b".to_owned());
+/// env.insert(EnvKey::new("PATH").unwrap(), EnvValue::new("/b").unwrap());
 /// assert_eq!(env.len(), 1);
 ///
 /// let mut other = ServerEnv::new(HostOs::Other);
-/// other.insert(EnvKey::new("Path").unwrap(), "/a".to_owned());
+/// other.insert(EnvKey::new("Path").unwrap(), EnvValue::new("/a").unwrap());
 /// assert_eq!(other.get("PATH"), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEnv {
     host: HostOs,
-    vars: BTreeMap<HostKey, (EnvKey, String)>,
+    vars: BTreeMap<HostKey, (EnvKey, EnvValue)>,
 }
 
 impl Default for ServerEnv {
@@ -164,7 +217,7 @@ impl ServerEnv {
     ///
     /// [`DuplicateEnvKey`] when two keys name one variable on `host`.
     pub fn from_entries(
-        entries: impl IntoIterator<Item = (EnvKey, String)>,
+        entries: impl IntoIterator<Item = (EnvKey, EnvValue)>,
         host: HostOs,
     ) -> Result<Self, DuplicateEnvKey> {
         let mut env = Self::new(host);
@@ -202,13 +255,13 @@ impl ServerEnv {
 
     /// Sets `key`, replacing the spelling of it that the table's host treats
     /// as the same variable.
-    pub fn insert(&mut self, key: EnvKey, value: String) {
+    pub fn insert(&mut self, key: EnvKey, value: EnvValue) {
         self.vars
             .insert(HostKey::of(key.as_str(), self.host), (key, value));
     }
 
     /// The entries, ordered by the host's comparison of the name.
-    pub fn iter(&self) -> impl Iterator<Item = (&EnvKey, &String)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&EnvKey, &EnvValue)> {
         self.vars.values().map(|(key, value)| (key, value))
     }
 
@@ -227,7 +280,10 @@ impl ServerEnv {
 
 impl From<ServerEnv> for BTreeMap<EnvKey, String> {
     fn from(env: ServerEnv) -> Self {
-        env.vars.into_values().collect()
+        env.vars
+            .into_values()
+            .map(|(key, value)| (key, String::from(value)))
+            .collect()
     }
 }
 
@@ -239,10 +295,14 @@ mod tests {
         EnvKey::new(name).unwrap()
     }
 
-    fn entries(pairs: &[(&str, &str)]) -> Vec<(EnvKey, String)> {
+    fn value(text: &str) -> EnvValue {
+        EnvValue::new(text).unwrap()
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(EnvKey, EnvValue)> {
         pairs
             .iter()
-            .map(|(name, value)| (key(name), (*value).to_owned()))
+            .map(|(name, text)| (key(name), value(text)))
             .collect()
     }
 
@@ -253,6 +313,13 @@ mod tests {
         assert_eq!(EnvKey::new("A\0B"), Err(InvalidEnvKey::ForbiddenChar));
         assert!(EnvKey::new("Mixed_Case1").is_ok());
         assert_eq!(EnvKey::from_static("PATH"), "PATH");
+    }
+
+    #[test]
+    fn env_value_rejects_nul_and_accepts_empty_text() {
+        assert_eq!(EnvValue::new("a\0b"), Err(InvalidEnvValue::ContainsNul));
+        assert!(EnvValue::new("").is_ok());
+        assert_eq!(EnvValue::from_static("1"), "1");
     }
 
     #[test]
@@ -293,14 +360,14 @@ mod tests {
     fn insert_replaces_every_alias_on_windows_and_only_the_exact_key_elsewhere() {
         let mut windows =
             ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Windows).unwrap();
-        windows.insert(key("PATH"), "b".to_owned());
+        windows.insert(key("PATH"), value("b"));
         assert_eq!(
             windows.iter().collect::<Vec<_>>(),
-            [(&key("PATH"), &"b".to_owned())]
+            [(&key("PATH"), &value("b"))]
         );
 
         let mut other = ServerEnv::from_entries(entries(&[("Path", "a")]), HostOs::Other).unwrap();
-        other.insert(key("PATH"), "b".to_owned());
+        other.insert(key("PATH"), value("b"));
         assert_eq!(other.len(), 2);
         assert_eq!(other.get("Path"), Some("a"));
     }

@@ -29,11 +29,11 @@ use crate::bridge::{
 };
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, ErrorChain, Result};
-use crate::lsp::{ConnectionId, UnclassifiedError};
+use crate::lsp::{ConnectionId, JsonRpcError, UnclassifiedError};
 use crate::util::{lock_std, run_detached};
 
 mod sweep;
-pub use sweep::{SweepMemo, SweepStep};
+pub use sweep::{Interest, SweepMemo, SweepStep};
 #[cfg(test)]
 mod sweep_tests;
 
@@ -183,7 +183,7 @@ impl Notices {
 fn is_method_not_found(error: &Error) -> bool {
     matches!(
         error,
-        Error::LspServerError { code, .. }
+        Error::LspServerError(JsonRpcError { code, .. })
             if lsp_types::ErrorCodes::from(*code) == lsp_types::ErrorCodes::MethodNotFound
     )
 }
@@ -193,7 +193,7 @@ fn is_method_not_found(error: &Error) -> bool {
 fn is_transient_server_error(error: &Error) -> bool {
     matches!(
         error,
-        Error::LspServerError { code, .. }
+        Error::LspServerError(JsonRpcError { code, .. })
             if matches!(
                 lsp_types::LspErrorCodes::from(*code),
                 lsp_types::LspErrorCodes::RequestCancelled

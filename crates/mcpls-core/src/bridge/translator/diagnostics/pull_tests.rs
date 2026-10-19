@@ -610,7 +610,10 @@ async fn test_transient_probe_errors_leave_the_probe_unchanged() {
 async fn test_other_probe_errors_surface_and_leave_the_probe_unchanged() {
     let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
     let failed = answer_with_error(&fx, &mut server, -32603).await;
-    assert_matches!(failed, Err(Error::LspServerError { code: -32603, .. }));
+    assert_matches!(
+        failed,
+        Err(Error::LspServerError(JsonRpcError { code: -32603, .. }))
+    );
     assert_eq!(
         fx.translator.pull_support(&Fixture::rust()),
         PullSupport::Probing

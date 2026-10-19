@@ -54,6 +54,7 @@ mod pull_support;
 mod respawn;
 mod restart;
 mod routing;
+mod save_support;
 mod selection_range;
 mod servers;
 mod support;
@@ -67,7 +68,7 @@ pub use addressing::{
     ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
-pub use diagnostics::{SweepMemo, SweepStep};
+pub use diagnostics::{Interest, SweepMemo, SweepStep};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
@@ -1423,12 +1424,12 @@ mod tests {
 
         translator
             .document_tracker
-            .ensure_open(&path_a, &server_id, &client)
+            .ensure_open_for_test(&path_a, &server_id, &client)
             .await
             .unwrap();
         translator
             .document_tracker
-            .ensure_open(&path_b, &server_id, &client)
+            .ensure_open_for_test(&path_b, &server_id, &client)
             .await
             .unwrap();
         assert_eq!(translator.document_tracker.len(), 1);
@@ -1472,12 +1473,12 @@ mod tests {
 
         translator
             .document_tracker
-            .ensure_open(&path_a, &server_id, &client)
+            .ensure_open_for_test(&path_a, &server_id, &client)
             .await
             .unwrap();
         translator
             .document_tracker
-            .ensure_open(&path_b, &server_id, &client)
+            .ensure_open_for_test(&path_b, &server_id, &client)
             .await
             .unwrap();
         assert_eq!(translator.document_tracker.len(), 1);

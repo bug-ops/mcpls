@@ -776,14 +776,12 @@ impl LspClient {
                         )
                     });
                 }
-                Err(Error::LspServerError {
-                    code,
-                    message,
-                    data,
-                }) if (LspErrorCodes::from(code) == LspErrorCodes::ServerCancelled
-                    || (LspErrorCodes::from(code) == LspErrorCodes::ContentModified
-                        && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
-                    && Self::should_retrigger(data.as_ref()) =>
+                Err(Error::LspServerError(response))
+                    if (LspErrorCodes::from(response.code) == LspErrorCodes::ServerCancelled
+                        || (LspErrorCodes::from(response.code)
+                            == LspErrorCodes::ContentModified
+                            && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
+                        && Self::should_retrigger(response.data.as_ref()) =>
                 {
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
                         // Same "LSP error response: ..." prefix as the
@@ -792,36 +790,24 @@ impl LspClient {
                         // surfaced to the caller, retry exhaustion included.
                         error!(
                             "LSP error response: {} (code {}) on '{}' (id={:?}), retries exhausted",
-                            Self::truncate_error_message_for_log(&message),
-                            code,
+                            Self::truncate_error_message_for_log(&response.message),
+                            response.code,
                             method,
                             id
                         );
-                        return Err(UnclassifiedError::logged(Error::LspServerError {
-                            code,
-                            message,
-                            data,
-                        }));
+                        return Err(UnclassifiedError::logged(Error::LspServerError(response)));
                     }
                     warn!(
                         "LSP error response: {} (code {}) on '{}' (id={:?}), will retry",
-                        Self::truncate_error_message_for_log(&message),
-                        code,
+                        Self::truncate_error_message_for_log(&response.message),
+                        response.code,
                         method,
                         id
                     );
                     // continue loop for next attempt
                 }
-                Err(Error::LspServerError {
-                    code,
-                    message,
-                    data,
-                }) => {
-                    return Err(UnclassifiedError::server_response(
-                        ServerErrorResponse::new(code, message, data),
-                        method,
-                        id,
-                    ));
+                Err(Error::LspServerError(response)) => {
+                    return Err(UnclassifiedError::server_response(response, method, id));
                 }
                 Err(e) => return Err(UnclassifiedError::logged(e)),
             }
@@ -1312,11 +1298,11 @@ impl LspClient {
                     // errors before the model ever sees them (S2).
                     let caller_message =
                         crate::util::truncate_str(&message, MAX_ERROR_MESSAGE_CALLER_BYTES);
-                    let _ = sender.send(Err(Error::LspServerError {
+                    let _ = sender.send(Err(Error::LspServerError(JsonRpcError {
                         code: error.code,
                         message: caller_message,
                         data: error.data,
-                    }));
+                    })));
                 }
                 JsonRpcOutcome::Result(result) => {
                     let _ = sender.send(Ok(result));
@@ -1526,68 +1512,24 @@ fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
 #[must_use = "call `surface()` or `handled()` to log and unwrap the error"]
 pub struct UnclassifiedError(Box<Unclassified>);
 
-// TODO(#777): drop the OnceLock copy once LspServerError has a struct payload
-/// An error response from the server, kept as the [`Error::LspServerError`] it
-/// becomes so a caller can classify it, and constructible from nothing else.
-#[derive(Debug)]
-struct ServerErrorResponse {
-    code: i32,
-    message: String,
-    data: Option<Value>,
-    /// The [`Error`] built from the fields above, once a caller asked to see it.
-    error: std::sync::OnceLock<Error>,
-}
-
-impl ServerErrorResponse {
-    const fn new(code: i32, message: String, data: Option<Value>) -> Self {
-        Self {
-            code,
-            message,
-            data,
-            error: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// The code and message of the response.
-    const fn code_and_message(&self) -> (i32, &str) {
-        (self.code, self.message.as_str())
-    }
-
-    /// The response as the error it becomes, for classification.
-    fn as_error(&self) -> &Error {
-        self.error.get_or_init(|| Error::LspServerError {
-            code: self.code,
-            message: self.message.clone(),
-            data: self.data.clone(),
-        })
-    }
-
-    fn into_error(self) -> Error {
-        self.error.into_inner().unwrap_or(Error::LspServerError {
-            code: self.code,
-            message: self.message,
-            data: self.data,
-        })
-    }
-}
-
 /// The two states of an [`UnclassifiedError`]: a failure already logged where
 /// it happened, and a server error response nobody has logged yet.
 #[derive(Debug)]
 enum Unclassified {
     Logged(Error),
+    /// Always an [`Error::LspServerError`]: built only by
+    /// [`UnclassifiedError::server_response`].
     ServerResponse {
-        response: ServerErrorResponse,
+        error: Error,
         method: String,
         id: RequestId,
     },
 }
 
 impl Unclassified {
-    fn error(&self) -> &Error {
+    const fn error(&self) -> &Error {
         match self {
-            Self::Logged(error) => error,
-            Self::ServerResponse { response, .. } => response.as_error(),
+            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
         }
     }
 
@@ -1596,14 +1538,19 @@ impl Unclassified {
     fn finish(self, report: impl FnOnce(&str, &RequestId, i32, &str)) -> Error {
         match self {
             Self::Logged(error) => error,
-            Self::ServerResponse {
-                response,
-                method,
-                id,
-            } => {
-                let (code, message) = response.code_and_message();
-                report(&method, &id, code, message);
-                response.into_error()
+            Self::ServerResponse { error, method, id } => {
+                if let Error::LspServerError(response) = &error {
+                    report(&method, &id, response.code, &response.message);
+                } else {
+                    // Unreachable by construction; never drop an error unlogged.
+                    log_surfaced_error(
+                        &method,
+                        &id,
+                        0,
+                        &crate::error::ErrorChain(&error).to_string(),
+                    );
+                }
+                error
             }
         }
     }
@@ -1624,9 +1571,9 @@ impl UnclassifiedError {
         Self(Box::new(Unclassified::Logged(error)))
     }
 
-    fn server_response(response: ServerErrorResponse, method: &str, id: RequestId) -> Self {
+    fn server_response(response: JsonRpcError, method: &str, id: RequestId) -> Self {
         Self(Box::new(Unclassified::ServerResponse {
-            response,
+            error: Error::LspServerError(response),
             method: method.to_owned(),
             id,
         }))
@@ -1696,7 +1643,11 @@ mod tests {
     #[test]
     fn test_unclassified_server_response_always_reports_code_and_message() {
         let unclassified = UnclassifiedError::server_response(
-            ServerErrorResponse::new(-32001, "boom".to_owned(), None),
+            JsonRpcError {
+                code: -32001,
+                message: "boom".to_owned(),
+                data: None,
+            },
             "textDocument/hover",
             RequestId::Number(3),
         );
@@ -1715,7 +1666,10 @@ mod tests {
                 "boom".to_owned()
             ))
         );
-        assert_matches!(error, Error::LspServerError { code: -32001, .. });
+        assert_matches!(
+            error,
+            Error::LspServerError(JsonRpcError { code: -32001, .. })
+        );
     }
 
     /// The `trace!` of a forwarded notification must not print a configured
@@ -2317,17 +2271,13 @@ mod tests {
         if let Resolution::Waiting(sender) = pending_requests.resolve(&error_response.id)
             && let JsonRpcOutcome::Error(error) = error_response.outcome
         {
-            let _ = sender.send(Err(Error::LspServerError {
-                code: error.code,
-                message: error.message,
-                data: error.data,
-            }));
+            let _ = sender.send(Err(Error::LspServerError(error)));
         }
 
         let result = response_rx.await.unwrap();
         assert!(result.is_err(), "Should receive error");
 
-        if let Err(Error::LspServerError { code, message, .. }) = result {
+        if let Err(Error::LspServerError(JsonRpcError { code, message, .. })) = result {
             assert_eq!(code, -32601);
             assert_eq!(message, "Method not found");
         } else {
@@ -2989,11 +2939,11 @@ mod tests {
             let result = request_task.await.unwrap();
 
             match result {
-                Err(Error::LspServerError {
+                Err(Error::LspServerError(JsonRpcError {
                     code,
                     message,
                     data,
-                }) => {
+                })) => {
                     // Assert the exact original error surfaces, not merely
                     // "some error with this code" -- a freshly constructed
                     // placeholder error would satisfy a code-only check.
@@ -3070,7 +3020,7 @@ mod tests {
                 .unwrap();
 
             match result {
-                Err(Error::LspServerError { code, .. }) => {
+                Err(Error::LspServerError(JsonRpcError { code, .. })) => {
                     assert_eq!(code, i32::from(LspErrorCodes::ServerCancelled));
                 }
                 other => panic!("expected immediate ServerCancelled error, got {other:?}"),
@@ -3166,11 +3116,11 @@ mod tests {
             let result = request_task.await.unwrap();
 
             match result {
-                Err(Error::LspServerError {
+                Err(Error::LspServerError(JsonRpcError {
                     code,
                     message,
                     data,
-                }) => {
+                })) => {
                     // Assert the exact original error surfaces, not merely
                     // "some error with this code" -- a freshly constructed
                     // placeholder error would satisfy a code-only check.
@@ -3218,7 +3168,7 @@ mod tests {
                 .unwrap();
 
             match result {
-                Err(Error::LspServerError { code, .. }) => {
+                Err(Error::LspServerError(JsonRpcError { code, .. })) => {
                     assert_eq!(code, i32::from(LspErrorCodes::ContentModified));
                 }
                 other => panic!("expected immediate ContentModified error, got {other:?}"),
@@ -3367,7 +3317,7 @@ mod tests {
                 .unwrap();
 
             match result {
-                Err(Error::LspServerError { code, .. }) => {
+                Err(Error::LspServerError(JsonRpcError { code, .. })) => {
                     assert_eq!(code, i32::from(LspErrorCodes::ContentModified));
                 }
                 other => panic!("expected immediate ContentModified error, got {other:?}"),
@@ -3412,7 +3362,7 @@ mod tests {
             let result = request_task.await.unwrap();
 
             match result {
-                Err(Error::LspServerError { code, message, .. }) => {
+                Err(Error::LspServerError(JsonRpcError { code, message, .. })) => {
                     assert_eq!(code, -32603);
                     assert!(
                         message.len() < oversized_message.len(),
@@ -3453,9 +3403,9 @@ mod tests {
             let result = request_task.await.unwrap();
 
             match result {
-                Err(Error::LspServerError {
+                Err(Error::LspServerError(JsonRpcError {
                     message: returned, ..
-                }) => {
+                })) => {
                     assert_eq!(
                         returned, message,
                         "message under the caller cap must not be truncated"

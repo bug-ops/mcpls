@@ -199,7 +199,7 @@ impl RestartFailure {
             | Error::TaskFailed { .. }
             | Error::StdioCapture(_)
             | Error::Timeout(_)
-            | Error::LspServerError { .. }
+            | Error::LspServerError(..)
             | Error::LspProtocolError(_)
             | Error::ShutdownTimeout
             | Error::Io(_)
@@ -370,7 +370,8 @@ pub(super) enum NotificationRouting<'a> {
 /// diagnostics server for its language fails afterwards. Pushes the catch-all
 /// made while it was `Secondary` are not replayed; the cache fills with its
 /// next publish for each file (the next `didOpen`/`didChange`). A file nobody
-/// opens may never get one, since mcpls sends no `didSave`.
+/// opens may never get one, since only the disk sweep sends `didSave`, and
+/// only for changed files of a server with a subscribed file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticsRole {
     /// The server is the language's diagnostics route: its pushes are cached

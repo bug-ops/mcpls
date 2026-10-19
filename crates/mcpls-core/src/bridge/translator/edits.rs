@@ -21,7 +21,7 @@ use crate::bridge::{ClientPath, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{Error, ErrorChain, McpErrorKind, Result};
 use crate::escape_control;
-use crate::lsp::{LspClient, UnclassifiedError};
+use crate::lsp::{JsonRpcError, LspClient, UnclassifiedError};
 use crate::redaction::Redactions;
 
 /// Convert a raw LSP `WorkspaceEdit` into MCP `DocumentChanges`.
@@ -478,7 +478,7 @@ fn prepare_rename_rejection(
     redactions: &Redactions,
 ) -> Result<PrepareRenameOutcome> {
     let (message, code) = match err.error() {
-        Error::LspServerError { code, message, .. }
+        Error::LspServerError(JsonRpcError { code, message, .. })
             if let Some(code) = not_renameable_code(*code)
                 && !matches!(
                     err.error().mcp_error_kind(),

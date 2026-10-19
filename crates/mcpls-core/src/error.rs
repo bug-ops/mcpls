@@ -15,9 +15,11 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, DuplicateEnvKey, EntrySummary, FileKey, FilePattern, InvalidAutoSelection,
-    LanguageId, ServerCommand, ServerId, ToolKind, UnsupportedFilePattern,
+    BuiltinServer, DuplicateEnvKey, EntrySummary, EnvKey, FileKey, FilePattern,
+    InvalidAutoSelection, InvalidEnvValue, LanguageId, ServerCommand, ServerId, ToolKind,
+    UnsupportedFilePattern,
 };
+use crate::lsp::JsonRpcError;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
 pub use crate::util::SizeExceeded;
@@ -676,6 +678,38 @@ impl fmt::Display for OperandKind {
     }
 }
 
+/// Why a shell or interpreter would read its program from standard input,
+/// which carries the LSP frames mcpls writes to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StdinSource {
+    /// No script, module or other program source is given.
+    NoProgram,
+    /// `-s`, alone or inside a cluster.
+    DashS,
+    /// The script operand is `-`.
+    DashOperand,
+    /// The script operand lies under `/dev/` or `/proc/`, where a path can
+    /// name the process's standard input.
+    DeviceOperand,
+    /// The script operand has a `..` component, which can reach a device path.
+    ParentTraversal,
+}
+
+impl fmt::Display for StdinSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoProgram => "no script is given, so it reads its program from standard input",
+            Self::DashS => "`-s` makes it read its program from standard input",
+            Self::DashOperand => "a `-` operand makes it read its program from standard input",
+            Self::DeviceOperand => {
+                "its script is under /dev or /proc, where a path can name standard input"
+            }
+            Self::ParentTraversal => "its script path has a `..` component, which can reach /dev",
+        })
+    }
+}
+
 /// What about a launcher lets the workspace choose the program that runs.
 ///
 /// The values are matched from closed tables, never from configured text.
@@ -695,6 +729,8 @@ pub enum LaunchTrigger {
     InlineProgram(InlineFlag),
     /// An argument names an npm package to run (`npm:`).
     NpmSpecifier,
+    /// It reads its program from standard input, which carries LSP frames.
+    ProgramFromStdin(StdinSource),
 }
 
 impl fmt::Display for LaunchTrigger {
@@ -713,6 +749,7 @@ impl fmt::Display for LaunchTrigger {
             ),
             Self::InlineProgram(flag) => write!(f, "`{flag}` gives it a program to run"),
             Self::NpmSpecifier => f.write_str("an `npm:` argument names a package to run"),
+            Self::ProgramFromStdin(source) => write!(f, "{source}"),
         }
     }
 }
@@ -736,6 +773,8 @@ pub enum UnanalyzableLaunch {
     SplitString,
     /// A relative program follows a directory change.
     RelativeProgramAfterChdir,
+    /// A relative script operand follows a directory change.
+    RelativeOperandAfterChdir,
     /// The program name is empty.
     BlankProgram,
 }
@@ -751,6 +790,9 @@ impl fmt::Display for UnanalyzableLaunch {
             Self::SplitString => f.write_str("it splits a string into arguments"),
             Self::RelativeProgramAfterChdir => {
                 f.write_str("it starts a relative program after changing directory")
+            }
+            Self::RelativeOperandAfterChdir => {
+                f.write_str("it reads a relative script after changing directory")
             }
             Self::BlankProgram => f.write_str("the program name is empty"),
         }
@@ -1653,6 +1695,17 @@ pub enum ConfigError {
         error: DuplicateEnvKey,
     },
 
+    /// A server's `env` table holds a value the operating system cannot pass.
+    #[error("lsp_servers entry '{server}': environment variable '{key}': {error}")]
+    InvalidEnvValue {
+        /// The id of the entry that holds the table.
+        server: ServerId,
+        /// The variable whose value is invalid.
+        key: EnvKey,
+        /// Why the value is invalid.
+        error: InvalidEnvValue,
+    },
+
     /// A config path has no directory to resolve relative entries against.
     #[error("configuration path has no parent directory: {}", .path.display())]
     NoParentDirectory {
@@ -1787,18 +1840,13 @@ pub enum Error {
     },
 
     /// LSP server returned an error response.
-    #[error("LSP server error: {code} - {}", sanitize_lsp_server_message(message))]
-    LspServerError {
-        /// JSON-RPC error code.
-        code: i32,
-        /// Raw error message from the server, kept verbatim for diagnostics
-        /// (logging, `Debug`, pattern matching). The `Display` impl for this
-        /// variant rewrites known-internal upstream text before it reaches
-        /// an MCP caller, so this field is not always what the caller sees.
-        message: String,
-        /// Optional additional data from the JSON-RPC error object.
-        data: Option<serde_json::Value>,
-    },
+    ///
+    /// The payload keeps the message verbatim for diagnostics (logging,
+    /// `Debug`, pattern matching). The `Display` impl rewrites known-internal
+    /// upstream text before it reaches an MCP caller, so `message` is not
+    /// always what the caller sees.
+    #[error("LSP server error: {} - {}", .0.code, sanitize_lsp_server_message(&.0.message))]
+    LspServerError(JsonRpcError),
 
     /// The MCP server could not complete its handshake with the client.
     #[error("failed to start MCP server")]
@@ -1829,7 +1877,7 @@ pub enum Error {
     },
 
     /// Document was not found or could not be opened.
-    #[error("document not found: {0}")]
+    #[error("document not found: {}", EchoedPath::new(.0))]
     DocumentNotFound(PathBuf),
 
     /// No LSP server configured for the given language.
@@ -1959,8 +2007,13 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 
     /// TOML deserialization error.
-    #[error(transparent)]
-    TomlDe(#[from] toml::de::Error),
+    ///
+    /// Displays the parser's message and position, never the source line it
+    /// prints: that line can hold a secret from an `env` table. The parser
+    /// error is deliberately not a `source`, so no error chain prints it
+    /// either.
+    #[error("{0}")]
+    TomlDe(TomlParseError),
 
     /// TOML serialization error.
     #[error(transparent)]
@@ -2034,7 +2087,7 @@ pub enum Error {
     ResourceUri(#[from] ResourceUriError),
 
     /// A path mcpls itself derived could not be represented as a URI.
-    #[error("cannot convert path to URI: {}", .0.display())]
+    #[error("cannot convert path to URI: {}", EchoedPath::new(.0))]
     PathToUri(PathBuf),
 
     /// Server process terminated unexpectedly.
@@ -2511,14 +2564,15 @@ impl Error {
             // request's line/character falls outside the target document --
             // caller-fault. Every other `LspServerError` shape is a genuine
             // server-side problem and stays `Internal`.
-            Self::LspServerError { code, message, .. }
-                if message.contains(INVALID_OFFSET_MARKER) =>
-            {
-                McpErrorKind::InvalidPosition(RewrittenServerError::new(*code, message))
+            Self::LspServerError(response) if response.message.contains(INVALID_OFFSET_MARKER) => {
+                McpErrorKind::InvalidPosition(RewrittenServerError::new(
+                    response.code,
+                    &response.message,
+                ))
             }
 
             Self::LspInitFailed { .. }
-            | Self::LspServerError { .. }
+            | Self::LspServerError(..)
             | Self::McpServerStart(_)
             | Self::TaskFailed { .. }
             | Self::StdioCapture(_)
@@ -2568,7 +2622,7 @@ impl Error {
             | Self::PathOutsideWorkspace(..)
             | Self::NoWorkspaceRoots(..) => true,
             Self::LspInitFailed { .. }
-            | Self::LspServerError { .. }
+            | Self::LspServerError(..)
             | Self::McpServerStart(..)
             | Self::TaskFailed { .. }
             | Self::StdioCapture(..)
@@ -2618,6 +2672,78 @@ impl Error {
             | Self::CapabilityNotSupported { .. }
             | Self::WorkspaceIndexing { .. } => false,
         }
+    }
+}
+
+/// A TOML parse error that names where it happened without quoting the source.
+///
+/// The parser's own `Display` quotes the offending source line, which can hold
+/// a secret from an `env` table. This type shows the parser's message and the
+/// line and column of the error, or its byte span when the source is not at
+/// hand.
+#[derive(Debug, Clone)]
+pub struct TomlParseError {
+    error: toml::de::Error,
+    line_column: Option<(usize, usize)>,
+}
+
+impl TomlParseError {
+    /// Wraps `error`, locating it in the `source` text that was parsed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::error::TomlParseError;
+    ///
+    /// let src = "a = = 1";
+    /// let err = toml::from_str::<toml::Table>(src).unwrap_err();
+    /// let shown = TomlParseError::new(err, src).to_string();
+    /// assert!(shown.contains("line 1"));
+    /// assert!(!shown.contains(src));
+    /// ```
+    #[must_use]
+    pub fn new(error: toml::de::Error, source: &str) -> Self {
+        let line_column = error
+            .span()
+            .and_then(|span| source.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count().saturating_add(1);
+                let column = before
+                    .rsplit('\n')
+                    .next()
+                    .map_or(0, |last| last.chars().count())
+                    .saturating_add(1);
+                (line, column)
+            });
+        Self { error, line_column }
+    }
+
+    /// The parser's message, without the source line.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        self.error.message()
+    }
+}
+
+impl fmt::Display for TomlParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())?;
+        if let Some((line, column)) = self.line_column {
+            write!(f, " (line {line}, column {column})")
+        } else if let Some(span) = self.error.span() {
+            write!(f, " (at bytes {}..{})", span.start, span.end)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl From<toml::de::Error> for Error {
+    fn from(error: toml::de::Error) -> Self {
+        Self::TomlDe(TomlParseError {
+            error,
+            line_column: None,
+        })
     }
 }
 
@@ -2970,11 +3096,11 @@ mod tests {
 
     #[test]
     fn test_error_display_lsp_server_error() {
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32600,
             message: "Invalid request".to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             err.to_string(),
             "LSP server error: -32600 - Invalid request"
@@ -2983,12 +3109,12 @@ mod tests {
 
     #[test]
     fn test_error_display_lsp_server_error_sanitizes_invalid_offset() {
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "Invalid offset LineCol { line: 2291, col: 0 } (line index length: 100417)"
                 .to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             err.to_string(),
             "LSP server error: -32603 - position out of range for this document"
@@ -3000,13 +3126,13 @@ mod tests {
         // Guards the `contains` (not `starts_with`) match: an upstream
         // wrapper (e.g. an `anyhow::Context`) or a future mcpls-side prefix
         // could prepend text ahead of rust-analyzer's raw message.
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32803,
             message: "request handler panicked: Invalid offset LineCol { line: 5, col: 0 } \
                       (line index length: 3)"
                 .to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             err.to_string(),
             "LSP server error: -32803 - position out of range for this document"
@@ -3015,11 +3141,11 @@ mod tests {
 
     #[test]
     fn test_error_display_lsp_server_error_passes_through_unrelated_message() {
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32602,
             message: "Invalid params: expected object".to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             err.to_string(),
             "LSP server error: -32602 - Invalid params: expected object"
@@ -3200,7 +3326,7 @@ mod tests {
 
         let mut cases = io_sourced_cases();
         cases.extend([
-            (Error::from(toml_err.clone()), toml_err.to_string()),
+            (Error::from(toml_err.clone()), toml_err.message().to_owned()),
             (Error::from(json_err), json_text),
             (
                 Error::McpServerStart("mcp-marker".into()),
@@ -3332,6 +3458,8 @@ mod tests {
             Error::PathOutsideWorkspace(path.clone()),
             Error::NoWorkspaceRoots(path.clone()),
             Error::NotARegularFile(path.clone()),
+            Error::DocumentNotFound(path.clone()),
+            Error::PathToUri(path.clone()),
             Error::FileIo {
                 path: path.clone(),
                 source: io(),
@@ -3370,6 +3498,16 @@ mod tests {
     }
 
     #[test]
+    fn test_document_not_found_and_path_to_uri_escape_control_characters() {
+        let path = || PathBuf::from("/a\nERROR forged\u{1b}[31m");
+
+        for error in [Error::DocumentNotFound(path()), Error::PathToUri(path())] {
+            let text = error.to_string();
+            assert!(!text.contains('\n') && !text.contains('\u{1b}'), "{text}");
+        }
+    }
+
+    #[test]
     fn test_error_chain_joins_causes_once() {
         let not_found = || std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
         let file_io = Error::FileIo {
@@ -3397,6 +3535,34 @@ mod tests {
         let toml_err = toml::from_str::<toml::Value>(toml_str).unwrap_err();
         let err: Error = toml_err.into();
         assert_matches!(err, Error::TomlDe(_));
+    }
+
+    #[test]
+    fn test_toml_parse_error_reports_line_and_column_without_the_line() {
+        let text = "a = 1\nsecret = \"sk-SECRET\" bad\n";
+        let error = toml::from_str::<toml::Value>(text).unwrap_err();
+
+        let rendered = TomlParseError::new(error, text).to_string();
+
+        assert!(rendered.contains("(line 2, column "), "{rendered}");
+        assert!(!rendered.contains("sk-SECRET"), "{rendered}");
+    }
+
+    /// #751: the parser quotes the source line of a failed entry; an `env`
+    /// secret on it must not reach the error text or its chain.
+    #[test]
+    fn test_toml_error_never_quotes_an_env_secret() {
+        let text = "lsp_servers = [{ language_id = \"rust\", command = \"ra\", \
+                    env = { API_TOKEN = \"sk-SECRET\\u0000\" } }]";
+        let err = Error::from(toml::from_str::<crate::config::ServerConfig>(text).unwrap_err());
+
+        let rendered = ErrorChain(&err).to_string();
+        assert!(!rendered.contains("sk-SECRET"), "{rendered}");
+        assert!(
+            rendered.contains("environment variable 'API_TOKEN'"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("cannot contain NUL"), "{rendered}");
     }
 
     #[test]
@@ -4098,12 +4264,12 @@ mod tests {
     /// for display) is caller-fault, not a generic internal failure.
     #[test]
     fn test_mcp_error_kind_lsp_server_error_invalid_offset_is_invalid_params() {
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "Invalid offset LineCol { line: 2291, col: 0 } (line index length: 100417)"
                 .to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             err.mcp_error_kind(),
             McpErrorKind::InvalidPosition(RewrittenServerError::new(
@@ -4117,11 +4283,11 @@ mod tests {
     /// raw, so a logged or echoed error cannot forge log lines.
     #[test]
     fn test_display_escapes_control_characters_from_the_server() {
-        let server_error = Error::LspServerError {
+        let server_error = Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "boom\nERROR forged\x1b[31m".to_string(),
             data: None,
-        };
+        });
         assert_eq!(
             server_error.to_string(),
             "LSP server error: -32603 - boom\\nERROR forged\\u{1b}[31m"
@@ -4145,11 +4311,11 @@ mod tests {
     /// problem and must stay `Internal`.
     #[test]
     fn test_mcp_error_kind_lsp_server_error_other_message_stays_internal() {
-        let err = Error::LspServerError {
+        let err = Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "internal error".to_string(),
             data: None,
-        };
+        });
         assert_eq!(err.mcp_error_kind(), McpErrorKind::Internal);
     }
 

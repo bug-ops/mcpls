@@ -51,7 +51,9 @@ pub use server::{
     BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
     ServerCommand, ServerHeuristics, ServerSelection,
 };
-pub use server_env::{DuplicateEnvKey, EnvKey, InvalidEnvKey, ServerEnv};
+pub use server_env::{
+    DuplicateEnvKey, EnvKey, EnvValue, InvalidEnvKey, InvalidEnvValue, ServerEnv,
+};
 pub use settings::{InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;
@@ -59,7 +61,7 @@ pub use trust::{ServerAllowlist, WorkspaceTrust};
 pub use workspace_root::{ConfiguredRoot, InvalidWorkspaceRoot};
 
 use crate::bridge::{ResourceLimits, WorkspaceRoots, probe_root};
-use crate::error::{ConfigError, Error, Result};
+use crate::error::{ConfigError, Error, Result, TomlParseError};
 use crate::util::{OpenRegularFileError, ReadBoundedError, RegularFile};
 
 /// Maps file extensions to LSP language identifiers.
@@ -230,8 +232,8 @@ pub type McpInstructions = BoundedText<MAX_MCP_INSTRUCTIONS_BYTES>;
 /// name on the wire, an MCP protocol violation), and
 /// [`McplsServer::new`](crate::mcp::McplsServer::new) is `pub` and infallible,
 /// so this type validates eagerly during deserialization and surfaces
-/// failures as [`Error::TomlDe`], which additionally carries the offending
-/// line from the TOML source.
+/// failures as [`Error::TomlDe`], which gives the line and column of the
+/// offending value but not the source line itself.
 ///
 /// # Examples
 ///
@@ -1093,7 +1095,8 @@ impl ServerConfig {
             })?;
         let content = String::from_utf8(buf).map_err(ConfigError::NotUtf8)?;
 
-        let mut config: Self = toml::from_str(&content)?;
+        let mut config: Self = toml::from_str(&content)
+            .map_err(|error| Error::TomlDe(TomlParseError::new(error, &content)))?;
 
         rebase_relative_roots(&mut config.workspace.roots, path, relative_root_base)?;
 

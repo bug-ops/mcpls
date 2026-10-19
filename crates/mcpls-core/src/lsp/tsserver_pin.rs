@@ -1736,7 +1736,7 @@ mod tests {
         let mut config = config(SERVER_STEM);
         config.env.insert(
             crate::config::EnvKey::from_static("PATH"),
-            layout.bin.to_str().unwrap().into(),
+            crate::config::EnvValue::new(layout.bin.to_str().unwrap()).unwrap(),
         );
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));

@@ -96,6 +96,46 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   plugins (checked live). This does not make an untrusted workspace safe. Remove
   `selection` to run `command` as written.
 
+- **Workspace file reads check the opened file.** A document a tool opens is
+  checked through the handle that was opened, not through the path validated
+  earlier, so replacing a parent directory with a symlink out of the roots
+  between the check and the open does not read the target. Linux and Android
+  read `/proc/self/fd/<fd>` of the handle, macOS asks the handle for its path
+  (`F_GETPATH`); the result must lie inside a root. Without `/proc` a read
+  fails with an I/O error and one warning is logged (it fails closed). A file
+  reached through a hardlink named inside the roots is admitted, as its other
+  names are not examined.
+  The reported path is compared with the roots by exact case (macOS reports the
+  on-disk spelling, so opening a file through another spelling of its name does
+  not change the result). Windows has no safe handle-to-path call, so every directory from the
+  root to the file's parent is held open without delete sharing while the file
+  is opened and verified, a symlink or junction among them is refused, and the file is
+  compared with a no-follow open of the same entry. Residual on Windows:
+  during that check (milliseconds) other tools cannot rename or remove an ancestor
+  directory of the file, such as `git checkout` dropping a directory, an IDE
+  move or a rename of the root; with Developer Mode a file symlink needs no
+  privilege, and the pins plus the last-entry check (identity and not a
+  symlink) cover a swapped final entry; a hardlink there names a file that is
+  already reachable and is admitted; SMB or FUSE volumes that report a zero
+  file index compare equal (fail-open), and ReFS 128-bit indexes are
+  truncated. Other Unix systems compare device and inode with the canonical
+  path after canonicalizing it, and are racy. On Linux and macOS a swap of the
+  roots themselves or of the directories above a root is caught by the
+  handle-path check; on Windows and other Unix systems it is not covered. On
+  Windows a directory below a root that is a junction or a volume mounted in a
+  folder is a reparse point and is refused.
+
+- **Save notifications.** While a file of a server is subscribed, mcpls sends
+  `textDocument/didSave` to that server, from the diagnostics sweep only, for
+  each tracked file it sees changed on disk (at most 64 subscribed and 32
+  unsubscribed files per 2 s tick), when the server advertises
+  `textDocumentSync.save` (the client capabilities declare
+  `synchronization.didSave`). Servers then re-run
+  their on-save checks, such as rust-analyzer's build scripts and procedural
+  macros, after each edit. The risk class (workspace code the server runs)
+  already existed; the frequency is new. Dynamic `didSave` registration is not
+  tracked.
+
 - **Explicitly configured workspace binaries.** A server `command` you configure,
   for example a TypeScript 7 `tsc` for the native server (`tsc --lsp --stdio`),
   is run as written. A `tsc` from the workspace's `node_modules`, or one that
@@ -167,8 +207,8 @@ enforces the following, and nothing more:
   `corepack`, `deno npm:`), task runners (`make`, `just`, `task`, `rake`, `mvn`,
   `sbt`), programs that run their arguments (`xargs`, `find`, `awk`, `gawk`,
   `mawk`, `nawk`, `script`, `su`, `flock`, `watch`, and `cmd`, which without `/c`
-  reads the LSP frames on its stdin as commands; a bare POSIX shell or a
-  program reading its program from stdin is not refused, see below), wrappers
+  reads the LSP frames on its stdin as commands; a shell or interpreter that
+  reads its program from stdin is refused too, see below), wrappers
   whose options are not
   analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`, `setpriv`,
   `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`,
@@ -213,8 +253,34 @@ enforces the following, and nothing more:
   `-M` or `-m` value that is more than a module name and an import list
   (`-MPOSIX;code`), and a `data:` URL (tabs and newlines inside it are ignored,
   as URL parsing does) given to `--import`, `--loader` or `--experimental-loader`
-  of `node`, `nodejs` and `bun`. Implementations with the same command line
-  (`pypy`, `luajit`, `jruby`, `truffleruby`) are not listed.
+  of `node`, `nodejs` and `bun`. `pypy` is read as python; `luajit`, `jruby`
+  and `truffleruby` are not listed.
+  mcpls writes LSP frames to the server's stdin, so a shell or interpreter that
+  reads its program from it would run them. These shells and interpreters are
+  refused when no script, module or other program source is given (a REPL
+  or `bash` alone), for `-s` anywhere in a POSIX shell's option cluster, for a
+  `-` script operand (`bash -`, `python -`, `pwsh -File -`), for a script under
+  `/dev/` or `/proc/` (`/dev/stdin`, `/proc/self/fd/0`; compared on the text of
+  the operand, case-insensitively, with `//` and `/./` collapsed and `\` read as
+  `/`), and for a script path with a `..` component. The script is the first
+  operand after the options: POSIX shells read every letter of an option cluster
+  and each value letter (`o`, `O`, `T`, `R`) takes the next argument, so
+  `bash -os pipefail` is refused and `bash -o pipefail s.sh` is not; fish uses
+  getopt rules; `zsh -o shinstdin` and `--shinstdin` are refused like `-s`;
+  `nu`, `elvish`, `fish`, `pwsh` and every interpreter read an option that is
+  not in their closed list as taking a value. The value is checked like a
+  script (`-`, `/dev/`, `/proc/`, `..` are refused), and when no script is left
+  the launch is refused as having an unknown option, so a boolean option that
+  was not listed (`node --nolazy srv.js`) is named in the refusal. Flags that
+  provide the program themselves are admitted without a script: `python -m`,
+  `nu --lsp` and `--ide-*`, `elvish -lsp` (unless set to false);
+  `php -f FILE` and `pwsh -File FILE` give the script as their value;
+  `deno <subcommand>` such as `deno lsp`
+  is admitted and `deno` alone, `bun repl` and `xonsh --rc` (which takes
+  several arguments, and which argparse accepts abbreviated) are refused. A
+  relative script after `env -C`, `ruby -C`, `bun --cwd` or
+  `pwsh -WorkingDirectory` is refused, since it would resolve in the new
+  directory. `--version` and `--help` alone have no script and are refused.
   The wrappers with a small option grammar (`time`, `nice`, `nohup`, `timeout`,
   `setsid`, `stdbuf`, `caffeinate`, `arch`, and `env`, also under their Homebrew GNU
   names `gtime`, `gnice`, `gnohup`, `gtimeout`, `gstdbuf`, `genv` and as `busybox`,
@@ -301,11 +367,12 @@ What the mode does not cover:
   program executes it is not caught. A restart whose spawn is refused after the
   old process was stopped (the file changed in between) leaves the server
   stopped, not running unchecked.
-- Known gap: a shell or interpreter that is given no command string but reads
-  its program from stdin, which carries the LSP frames (`bash`, `bash -s`,
-  `pwsh -File -`, `python -`), is not refused. Only the workspace folder path
-  in the `initialize` frame is outside the trusted config, and no file content
-  is sent before `initialize` succeeds.
+- Programs that read their program from stdin are refused only for the shells
+  and interpreters on the lists above. Not covered: shells, interpreters and
+  REPLs that are not on them; options that start a REPL or read stdin next to a
+  script (`python -i`, `node -i`) and environment keys that do the same
+  (`PYTHONINSPECT`); a script operand that is a workspace symlink to a device;
+  and Windows console devices (`CONIN$`).
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not
