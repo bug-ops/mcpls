@@ -260,6 +260,7 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let mut translator = Translator::new()
         .with_startup_redactions(Arc::clone(&startup_redactions))
         .with_resource_limits(config.workspace.resource_limits())
+        .with_workspace_trust(config.workspace_trust.clone())
         .with_extensions(language_map)
         .with_file_patterns(
             config

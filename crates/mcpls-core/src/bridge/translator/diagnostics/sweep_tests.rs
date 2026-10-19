@@ -15,7 +15,9 @@ use tokio::time::timeout;
 use super::pull_tests::{Fixture, answer, error_item, full_report, next_pull_request};
 use super::sweep::{Interest, SweepMemo, SweepStep};
 use super::*;
+use crate::bridge::state::ResourceLimits;
 use crate::bridge::translator::testing::*;
+use crate::config::{DocumentLimit, WorkspaceTrust};
 use crate::test_lsp::client_path;
 
 type Sweep = JoinHandle<SweepStep>;
@@ -583,6 +585,127 @@ async fn test_sweep_sends_did_save_once_per_change() {
         .filter(|method| *method == "textDocument/didSave")
         .count();
     assert_eq!(saves, 1);
+}
+
+fn count_of(sent: &[Value], method: &str) -> usize {
+    methods(sent)
+        .into_iter()
+        .filter(|sent| *sent == method)
+        .count()
+}
+
+/// Untrusted mode withholds `didSave`: it makes servers run build scripts.
+#[tokio::test]
+async fn test_sweep_sends_no_did_save_in_an_untrusted_workspace() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = translator.with_workspace_trust(WorkspaceTrust::untrusted([id]));
+    let file = canonical_dir(&dir).join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+
+    translator
+        .sweep_file(
+            &file,
+            Interest::Subscribed,
+            &SweepMemo::default(),
+            &Mutex::new(NotificationCache::new()),
+        )
+        .await;
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    assert_eq!(
+        methods(&sent),
+        ["textDocument/didOpen", "textDocument/didChange"]
+    );
+}
+
+/// A file evicted and opened again with new content is saved too.
+#[tokio::test]
+async fn test_sweep_sends_did_save_for_a_reopened_file() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = translator.with_resource_limits(ResourceLimits {
+        max_documents: DocumentLimit::new(1),
+        ..ResourceLimits::default()
+    });
+    let (file, other) = (
+        canonical_dir(&dir).join("lib.rs"),
+        canonical_dir(&dir).join("other.rs"),
+    );
+    fs::write(&file, "fn main() {}").unwrap();
+    fs::write(&other, "fn other() {}").unwrap();
+    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    translator
+        .sweep_file(&file, Interest::Subscribed, &memo, &cache)
+        .await;
+    drop(
+        translator
+            .prepare_document(&client_path(other), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+
+    translator
+        .sweep_file(&file, Interest::Subscribed, &memo, &cache)
+        .await;
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    assert_eq!(count_of(&sent, "textDocument/didSave"), 1);
+}
+
+/// A file edited on disk after its memo entry was trimmed is saved at its next
+/// visit: the tracker's own state is the baseline.
+#[tokio::test]
+async fn test_sweep_sends_did_save_for_an_edit_made_after_the_memo_forgot_the_file() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let file = canonical_dir(&dir).join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
+    translator
+        .sweep_file(&file, Interest::Companion, &memo, &cache)
+        .await;
+    memo.retain(|_| false);
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+
+    translator
+        .sweep_file(&file, Interest::Companion, &memo, &cache)
+        .await;
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    assert_eq!(count_of(&sent, "textDocument/didSave"), 1);
 }
 
 impl Fixture {

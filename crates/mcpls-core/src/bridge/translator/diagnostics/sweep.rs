@@ -21,7 +21,7 @@ use crate::bridge::notifications::DocumentStamp;
 use crate::bridge::translator::routing::PreparedDocument;
 use crate::bridge::translator::save_support::SaveSupport;
 use crate::bridge::{Access, ClientPath, NotificationCache, WorkspacePath};
-use crate::config::{ServerId, ToolKind};
+use crate::config::{ServerId, ToolKind, WorkspaceTrust};
 use crate::error::Error;
 use crate::lsp::LspClient;
 use crate::util::lock_std;
@@ -346,8 +346,9 @@ impl Translator {
     /// pulled slot does not answer the resulting state yet, which publishes
     /// what that changed.
     ///
-    /// A resync that found the content changed sends `didSave` when the server
-    /// advertises it, so servers that produce diagnostics only on save re-run.
+    /// A resync that found the content changed (edited or reopened) sends
+    /// `didSave` when the server advertises it and the workspace is trusted,
+    /// so servers that produce diagnostics only on save re-run.
     /// A pull is sent only when the server is known to answer pulls (it
     /// advertises a provider, or a tool call's probe showed that it answers),
     /// and either the file's own state or its server's epoch moved since the
@@ -401,7 +402,7 @@ impl Translator {
         };
         let current = self.stamp_of(doc.path(), doc.server_id())?;
         let seen = memo.observe(doc.server_id(), path, before, current);
-        if seen.change == Change::Edited {
+        if seen.change != Change::None {
             self.send_did_save(&doc).await;
         }
         Some(Resynced { doc, current, seen })
@@ -457,7 +458,13 @@ impl Translator {
 
     /// Tells the server of `doc` that the document was saved, when it asked
     /// for `didSave`, with the text when it asked for that too.
+    ///
+    /// Never sent in an untrusted workspace: a save makes servers such as
+    /// rust-analyzer run build scripts and proc macros.
     async fn send_did_save(&self, doc: &PreparedDocument) {
+        if matches!(self.workspace_trust, WorkspaceTrust::Untrusted(_)) {
+            return;
+        }
         let support = lock_std(&self.servers).save_support(doc.server_id());
         let text = match support {
             SaveSupport::NotAdvertised => return,

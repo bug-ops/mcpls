@@ -118,12 +118,17 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   symlink) cover a swapped final entry; a hardlink there names a file that is
   already reachable and is admitted; SMB or FUSE volumes that report a zero
   file index compare equal (fail-open), and ReFS 128-bit indexes are
-  truncated. Other Unix systems compare device and inode with the canonical
-  path after canonicalizing it, and are racy. On Linux and macOS a swap of the
-  roots themselves or of the directories above a root is caught by the
-  handle-path check; on Windows and other Unix systems it is not covered. On
-  Windows a directory below a root that is a junction or a volume mounted in a
-  folder is a reparse point and is refused.
+  truncated. On Linux the file is opened with `openat2` confined beneath the
+  root (no symlink or magic link is followed, so an outside target is never
+  opened), falling back to a per-component `O_NOFOLLOW` walk where `openat2`
+  is unavailable; other Unix systems use that walk, which refuses a symlink in
+  any component. On Linux and macOS a swap of the roots themselves or of the
+  directories above a root is caught by the handle-path check; on Windows and
+  other Unix systems it is not covered (on other Unix a directory moved out of
+  the roots after the walk entered it is not detected). macOS still opens a
+  symlink target outside the roots (non-blocking) before refusing it, so an
+  outside FIFO or device is opened. On Windows a directory below a root that is
+  a junction or a volume mounted in a folder is a reparse point and is refused.
 
 - **Save notifications.** While a file of a server is subscribed, mcpls sends
   `textDocument/didSave` to that server, from the diagnostics sweep only, for
@@ -262,7 +267,10 @@ enforces the following, and nothing more:
   `-` script operand (`bash -`, `python -`, `pwsh -File -`), for a script under
   `/dev/` or `/proc/` (`/dev/stdin`, `/proc/self/fd/0`; compared on the text of
   the operand, case-insensitively, with `//` and `/./` collapsed and `\` read as
-  `/`), and for a script path with a `..` component. The script is the first
+  `/`), for a script path with a `..` component, and for a script that resolves to
+  a device, FIFO or socket when looked up from the directory the server starts
+  in (a symlink or an alias such as `/Volumes/Macintosh HD/dev/stdin`); a
+  missing path or a directory is left to the interpreter. The script is the first
   operand after the options: POSIX shells read every letter of an option cluster
   and each value letter (`o`, `O`, `T`, `R`) takes the next argument, so
   `bash -os pipefail` is refused and `bash -o pipefail s.sh` is not; fish uses
@@ -371,8 +379,10 @@ What the mode does not cover:
   and interpreters on the lists above. Not covered: shells, interpreters and
   REPLs that are not on them; options that start a REPL or read stdin next to a
   script (`python -i`, `node -i`) and environment keys that do the same
-  (`PYTHONINSPECT`); a script operand that is a workspace symlink to a device;
-  and Windows console devices (`CONIN$`).
+  (`PYTHONINSPECT`); a script that is replaced by a device alias between the
+  check and the spawn; an alias such as `/dev/fd/0`, which is resolved in the
+  mcpls process, not the child's (best-effort); and Windows console devices
+  (`CONIN$`), which the file-type check does not see.
 - A server restarted or respawned runs the path resolved at startup. If that
   path goes through a symlink inside the workspace, the symlink can be
   repointed later; only the resolved path's own directory is checked, not

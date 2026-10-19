@@ -15,7 +15,7 @@ use crate::bridge::{
     Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
 };
 use crate::config::{
-    BuiltinServer, DuplicateEnvKey, EntrySummary, EnvKey, FileKey, FilePattern,
+    BuiltinServer, DuplicateEnvKey, EntrySummary, EnvKey, EnvTooLarge, FileKey, FilePattern,
     InvalidAutoSelection, InvalidEnvValue, LanguageId, ServerCommand, ServerId, ToolKind,
     UnsupportedFilePattern,
 };
@@ -694,6 +694,9 @@ pub enum StdinSource {
     DeviceOperand,
     /// The script operand has a `..` component, which can reach a device path.
     ParentTraversal,
+    /// The script operand resolves, where the server starts, to a device,
+    /// FIFO or socket, so it may be an alias of a device path.
+    SpecialFile,
 }
 
 impl fmt::Display for StdinSource {
@@ -706,6 +709,9 @@ impl fmt::Display for StdinSource {
                 "its script is under /dev or /proc, where a path can name standard input"
             }
             Self::ParentTraversal => "its script path has a `..` component, which can reach /dev",
+            Self::SpecialFile => {
+                "its script is a device, FIFO or socket, which may be an alias of standard input"
+            }
         })
     }
 }
@@ -1704,6 +1710,25 @@ pub enum ConfigError {
         key: EnvKey,
         /// Why the value is invalid.
         error: InvalidEnvValue,
+    },
+
+    /// A server's `env` table is too large to pass to a process.
+    #[error("lsp_servers entry '{server}': {error}")]
+    EnvTooLarge {
+        /// The id of the entry that holds the table.
+        server: ServerId,
+        /// Which size limit the table is over.
+        error: EnvTooLarge,
+    },
+
+    /// An entry of a server's `args` holds a NUL, which the operating system
+    /// cannot pass in an argument.
+    #[error("lsp_servers entry '{server}': args[{index}] cannot contain NUL")]
+    ArgContainsNul {
+        /// The id of the entry that holds the argument.
+        server: ServerId,
+        /// The position of the argument in `args`.
+        index: usize,
     },
 
     /// A config path has no directory to resolve relative entries against.
