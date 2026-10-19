@@ -29,7 +29,7 @@ use crate::bridge::{
 };
 use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, ErrorChain, Result};
-use crate::lsp::{ConnectionId, JsonRpcError, UnclassifiedError};
+use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::{lock_std, run_detached};
 
 mod sweep;
@@ -179,30 +179,6 @@ impl Notices {
     }
 }
 
-/// Whether a server answered a request with JSON-RPC "method not found".
-fn is_method_not_found(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::LspServerError(JsonRpcError { code, .. })
-            if lsp_types::ErrorCodes::from(*code) == lsp_types::ErrorCodes::MethodNotFound
-    )
-}
-
-/// Whether a server answered a request with an LSP code that says the result
-/// is not available right now, not that it never will be.
-fn is_transient_server_error(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::LspServerError(JsonRpcError { code, .. })
-            if matches!(
-                lsp_types::LspErrorCodes::from(*code),
-                lsp_types::LspErrorCodes::RequestCancelled
-                    | lsp_types::LspErrorCodes::ContentModified
-                    | lsp_types::LspErrorCodes::ServerCancelled
-            )
-    )
-}
-
 /// How a failed probe pull moves the probe of its server.
 enum ProbeOutcome {
     /// The server does not know the method: refused at once.
@@ -214,14 +190,21 @@ enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// The finding in `error`, or `None` when it is no probe finding and
+    /// The finding in `failure`, or `None` when it is no probe finding and
     /// surfaces as it would for any pull.
-    fn of(error: &Error) -> Option<Self> {
-        if is_method_not_found(error) {
+    fn of(failure: &UnclassifiedError) -> Option<Self> {
+        if failure.timed_out() {
+            return Some(Self::TimedOut);
+        }
+        let code = failure.server_error()?.code;
+        if lsp_types::ErrorCodes::from(code) == lsp_types::ErrorCodes::MethodNotFound {
             Some(Self::Refuse)
-        } else if matches!(error, Error::Timeout(_)) {
-            Some(Self::TimedOut)
-        } else if is_transient_server_error(error) {
+        } else if matches!(
+            lsp_types::LspErrorCodes::from(code),
+            lsp_types::LspErrorCodes::RequestCancelled
+                | lsp_types::LspErrorCodes::ContentModified
+                | lsp_types::LspErrorCodes::ServerCancelled
+        ) {
             Some(Self::Transient)
         } else {
             None
@@ -553,7 +536,7 @@ impl Translator {
         sent_with: PullProbe,
         unclassified: UnclassifiedError,
     ) -> PullAttempt {
-        let Some(outcome) = ProbeOutcome::of(unclassified.error()) else {
+        let Some(outcome) = ProbeOutcome::of(&unclassified) else {
             return PullAttempt::Failed(unclassified.surface());
         };
         let error = unclassified.handled();

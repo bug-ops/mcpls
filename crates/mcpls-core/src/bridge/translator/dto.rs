@@ -12,6 +12,7 @@ use super::kind_filter::{self, KindFilter};
 use crate::bridge::notifications::ReportedSeverity;
 use crate::config::text_newtype::impl_text_newtype;
 use crate::config::{BoundedText, InvalidBoundedText};
+use crate::error::spelled_enum;
 use crate::redaction::{Redactions, ServerText};
 
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
@@ -53,28 +54,18 @@ pub enum InvalidPosition {
 /// No real identifier approaches this length in any language mcpls targets.
 pub const MAX_NEW_NAME_LENGTH: usize = 1_000;
 
-/// The client-supplied text fields that are validated as bounded text, named
-/// as they are on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextField {
-    /// `new_name` of `rename_symbol`.
-    NewName,
-    /// `trigger` of `get_completions`.
-    Trigger,
-    /// `symbol_name` of a name-addressed tool.
-    SymbolName,
-    /// `container` of a name-addressed tool.
-    Container,
-}
-
-impl std::fmt::Display for TextField {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NewName => "new_name",
-            Self::Trigger => "trigger",
-            Self::SymbolName => "symbol_name",
-            Self::Container => "container",
-        })
+spelled_enum! {
+    /// The client-supplied text fields that are validated as bounded text, named
+    /// as they are on the wire.
+    TextField {
+        /// `new_name` of `rename_symbol`.
+        NewName => "new_name",
+        /// `trigger` of `get_completions`.
+        Trigger => "trigger",
+        /// `symbol_name` of a name-addressed tool.
+        SymbolName => "symbol_name",
+        /// `container` of a name-addressed tool.
+        Container => "container",
     }
 }
 
@@ -159,7 +150,8 @@ pub const MAX_TRIGGER_CHARACTER_BYTES: usize = 8;
 /// [`MAX_TRIGGER_CHARACTER_BYTES`] bytes.
 ///
 /// Whitespace is a valid trigger (a space triggers completion in some
-/// languages), so only the empty string is refused, not a blank one.
+/// languages), so only the empty string is refused, not a blank one. That is
+/// why it is not a [`BoundedText`], which refuses blank text.
 ///
 /// # Examples
 ///
@@ -186,19 +178,17 @@ impl CompletionTrigger {
     /// [`MAX_TRIGGER_CHARACTER_BYTES`].
     pub fn new(raw: impl Into<String>) -> Result<Self, InvalidTextField> {
         let raw = raw.into();
-        let fault = if raw.is_empty() {
-            Some(InvalidBoundedText::Blank)
-        } else if raw.len() > MAX_TRIGGER_CHARACTER_BYTES {
-            Some(InvalidBoundedText::TooLong {
+        let invalid = InvalidTextField::of(TextField::Trigger);
+        if raw.is_empty() {
+            return Err(invalid(InvalidBoundedText::Blank));
+        }
+        if raw.len() > MAX_TRIGGER_CHARACTER_BYTES {
+            return Err(invalid(InvalidBoundedText::TooLong {
                 len: raw.len(),
                 max: MAX_TRIGGER_CHARACTER_BYTES,
-            })
-        } else {
-            None
-        };
-        fault.map_or(Ok(Self(raw)), |reason| {
-            Err(InvalidTextField::of(TextField::Trigger)(reason))
-        })
+            }));
+        }
+        Ok(Self(raw))
     }
 
     /// The trigger text, owned.

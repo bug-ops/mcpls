@@ -1257,6 +1257,7 @@ impl LspServer {
         let shutdown_request_timeout = Duration::from_secs(5).min(budget);
 
         let handshake: Result<MarkOutcome> = timeout_at(deadline, async {
+            client.suppress_cancels();
             let _: serde_json::Value = client
                 .request(
                     ShutdownRequest::METHOD.as_str(),

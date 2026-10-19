@@ -107,6 +107,12 @@ impl fmt::Display for NotFoundGuidance<'_> {
 /// [`Error::LspServerError`] as caller-fault) so the two stay in sync.
 const INVALID_OFFSET_MARKER: &str = "Invalid offset LineCol";
 
+/// Whether `response` is rust-analyzer's "position out of range" internal
+/// error, which [`Error::mcp_error_kind`] classifies as caller-fault.
+pub(crate) fn is_invalid_offset(response: &JsonRpcError) -> bool {
+    response.message.contains(INVALID_OFFSET_MARKER)
+}
+
 /// Rewrites an LSP server's raw error message for display to the MCP caller,
 /// replacing rust-analyzer's "Invalid offset" internal error with a clean,
 /// client-appropriate message.
@@ -438,8 +444,8 @@ impl fmt::Display for EchoedArgument {
     }
 }
 
-/// Declares a closed enum of command-line spellings: the variants, `ALL`, `as_str`
-/// and `Display`, so a spelling is written once.
+/// Declares a closed enum of spellings: the variants, `ALL`, `as_str` and
+/// `Display`, so a spelling is written once.
 macro_rules! spelled_enum {
     (
         $(#[$meta:meta])*
@@ -458,7 +464,7 @@ macro_rules! spelled_enum {
             /// Every variant, in declaration order.
             pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
 
-            /// The spelling as written on a command line.
+            /// The spelling as written on the wire or a command line.
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
@@ -467,13 +473,15 @@ macro_rules! spelled_enum {
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(self.as_str())
             }
         }
     };
 }
+
+pub(crate) use spelled_enum;
 
 spelled_enum! {
     /// A subcommand of a runner that starts a program the workspace chooses.
@@ -2589,7 +2597,7 @@ impl Error {
             // request's line/character falls outside the target document --
             // caller-fault. Every other `LspServerError` shape is a genuine
             // server-side problem and stays `Internal`.
-            Self::LspServerError(response) if response.message.contains(INVALID_OFFSET_MARKER) => {
+            Self::LspServerError(response) if is_invalid_offset(response) => {
                 McpErrorKind::InvalidPosition(RewrittenServerError::new(
                     response.code,
                     &response.message,

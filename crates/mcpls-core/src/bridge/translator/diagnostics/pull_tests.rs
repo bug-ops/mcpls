@@ -17,6 +17,7 @@ use crate::bridge::resources::PublishedDiagnosticsUri;
 use crate::bridge::translator::testing::*;
 use crate::bridge::{DiagnosticsRole, NotificationReceivers, NotificationWiring};
 use crate::config::{LanguageId, ServerId, ToolRouter};
+use crate::lsp::JsonRpcError;
 use crate::test_lsp::{client_path, fake_lsp_client_with_redactions};
 
 #[derive(Debug, Default)]

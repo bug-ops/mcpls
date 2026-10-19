@@ -307,7 +307,11 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let _cancel_on_drop = cancel.clone().drop_guard();
 
     let lsp_init_handle = if applicable_configs.is_empty() {
-        warn_protocol_only(refusals.is_empty());
+        warn_protocol_only(if refusals.is_empty() {
+            ProtocolOnlyCause::NothingConfigured
+        } else {
+            ProtocolOnlyCause::AllRefused
+        });
         None
     } else {
         info!(
@@ -358,15 +362,25 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     result
 }
 
+/// Why no LSP server is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolOnlyCause {
+    /// The configuration has no server applicable to the workspace.
+    NothingConfigured,
+    /// An untrusted workspace refused every applicable server.
+    AllRefused,
+}
+
 /// Logs why no LSP server is started.
-fn warn_protocol_only(no_refusals: bool) {
-    if no_refusals {
-        warn!("No applicable LSP servers configured — starting in protocol-only mode");
-    } else {
-        warn!(
+fn warn_protocol_only(cause: ProtocolOnlyCause) {
+    match cause {
+        ProtocolOnlyCause::NothingConfigured => {
+            warn!("No applicable LSP servers configured — starting in protocol-only mode");
+        }
+        ProtocolOnlyCause::AllRefused => warn!(
             "The workspace is untrusted and no applicable LSP server was allowed — starting \
              in protocol-only mode; allow servers with `--allow-server <id>`"
-        );
+        ),
     }
 }
 

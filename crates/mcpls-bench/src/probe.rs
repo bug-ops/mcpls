@@ -232,11 +232,7 @@ impl Probe {
 }
 
 fn expect(condition: bool, detail: impl FnOnce() -> String) -> Result<(), Incorrect> {
-    if condition {
-        Ok(())
-    } else {
-        Err(Incorrect(detail()))
-    }
+    condition.ok_or_else(|| Incorrect(detail()))
 }
 
 fn contains_symbol(symbols: &[Symbol], name: &str) -> bool {

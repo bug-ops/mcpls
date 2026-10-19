@@ -44,6 +44,15 @@ enum Served {
     SubscriptionsListen,
 }
 
+/// How a session was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionKind {
+    /// Opened with `initialize`.
+    Legacy,
+    /// Protocol version 2026-07-28 or later, which has no `initialize`.
+    Modern,
+}
+
 /// The sessions a served method is available on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
@@ -105,11 +114,13 @@ impl Served {
         }
     }
 
-    const fn available(self, legacy: bool) -> bool {
-        match self.lifecycle() {
-            Lifecycle::Any => true,
-            Lifecycle::LegacyOnly => legacy,
-            Lifecycle::ModernOnly => !legacy,
+    const fn available(self, kind: SessionKind) -> bool {
+        match (self.lifecycle(), kind) {
+            (Lifecycle::Any, _)
+            | (Lifecycle::LegacyOnly, SessionKind::Legacy)
+            | (Lifecycle::ModernOnly, SessionKind::Modern) => true,
+            (Lifecycle::LegacyOnly, SessionKind::Modern)
+            | (Lifecycle::ModernOnly, SessionKind::Legacy) => false,
         }
     }
 
@@ -144,7 +155,7 @@ fn method_not_found(method: &str) -> McpError {
 
 /// The error a request that fell through to the custom-request hook gets.
 ///
-/// `legacy` says whether the session was opened with `initialize`; the
+/// `kind` says whether the session was opened with `initialize`; the
 /// lifecycle-gated methods (`ping`, `resources/subscribe` and
 /// `resources/unsubscribe` on legacy sessions, `subscriptions/listen` on later
 /// ones) answer "method not found" on the other kind, as the typed path does.
@@ -156,11 +167,11 @@ fn method_not_found(method: &str) -> McpError {
 /// - A served method whose params decode when read as a plain value, yet whose
 ///   request does not (a duplicate field is the case that gets here), is
 ///   "invalid params" with a fixed text.
-pub(super) fn answer(request: &CustomRequest, legacy: bool) -> McpError {
+pub(super) fn answer(request: &CustomRequest, kind: SessionKind) -> McpError {
     let Some(served) = Served::of(&request.method) else {
         return method_not_found(&request.method);
     };
-    if !served.available(legacy) {
+    if !served.available(kind) {
         return method_not_found(&request.method);
     }
     let name = served.name();
@@ -210,7 +221,7 @@ mod tests {
             ("ping", Some(json!(5))),
             ("initialize", Some(json!({}))),
         ] {
-            let error = answer(&request(method, params), true);
+            let error = answer(&request(method, params), SessionKind::Legacy);
             assert_eq!(code(&error), ErrorCode::INVALID_PARAMS, "{method}");
             assert!(
                 error
@@ -224,7 +235,7 @@ mod tests {
 
     #[test]
     fn a_method_mcpls_does_not_serve_is_not_found() {
-        let error = answer(&request("foo/bar", None), true);
+        let error = answer(&request("foo/bar", None), SessionKind::Legacy);
         assert_eq!(code(&error), ErrorCode::METHOD_NOT_FOUND);
         assert_eq!(error.message, "foo/bar");
     }
@@ -232,15 +243,24 @@ mod tests {
     #[test]
     fn lifecycle_gated_methods_are_not_found_on_the_other_kind_of_session() {
         let subscribe = request("resources/subscribe", Some(json!({})));
-        assert_eq!(code(&answer(&subscribe, true)), ErrorCode::INVALID_PARAMS);
         assert_eq!(
-            code(&answer(&subscribe, false)),
+            code(&answer(&subscribe, SessionKind::Legacy)),
+            ErrorCode::INVALID_PARAMS
+        );
+        assert_eq!(
+            code(&answer(&subscribe, SessionKind::Modern)),
             ErrorCode::METHOD_NOT_FOUND
         );
 
         let listen = request("subscriptions/listen", Some(json!({})));
-        assert_eq!(code(&answer(&listen, true)), ErrorCode::METHOD_NOT_FOUND);
-        assert_eq!(code(&answer(&listen, false)), ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            code(&answer(&listen, SessionKind::Legacy)),
+            ErrorCode::METHOD_NOT_FOUND
+        );
+        assert_eq!(
+            code(&answer(&listen, SessionKind::Modern)),
+            ErrorCode::INVALID_PARAMS
+        );
     }
 
     #[test]
@@ -255,7 +275,7 @@ mod tests {
             ("initialize", Some(initialize)),
             ("tools/call", Some(json!({"name": "get_hover"}))),
         ] {
-            let error = answer(&request(method, params), true);
+            let error = answer(&request(method, params), SessionKind::Legacy);
             assert_eq!(code(&error), ErrorCode::INVALID_PARAMS, "{method}");
             assert!(
                 error.message.ends_with("(duplicate field)"),
@@ -268,7 +288,7 @@ mod tests {
     #[test]
     fn methods_the_sdk_answers_but_mcpls_does_not_advertise_stay_not_found() {
         for method in ["completion/complete", "prompts/list"] {
-            let error = answer(&request(method, Some(json!({}))), true);
+            let error = answer(&request(method, Some(json!({}))), SessionKind::Legacy);
             assert_eq!(code(&error), ErrorCode::METHOD_NOT_FOUND, "{method}");
         }
     }
@@ -276,26 +296,38 @@ mod tests {
     #[test]
     fn ping_is_served_on_legacy_sessions_only() {
         let ping = request("ping", Some(json!(5)));
-        assert_eq!(code(&answer(&ping, true)), ErrorCode::INVALID_PARAMS);
-        assert_eq!(code(&answer(&ping, false)), ErrorCode::METHOD_NOT_FOUND);
+        assert_eq!(
+            code(&answer(&ping, SessionKind::Legacy)),
+            ErrorCode::INVALID_PARAMS
+        );
+        assert_eq!(
+            code(&answer(&ping, SessionKind::Modern)),
+            ErrorCode::METHOD_NOT_FOUND
+        );
     }
 
     #[test]
     fn echoed_text_is_bounded() {
         let long = "Z".repeat(1 << 20);
 
-        let unknown = answer(&request(&format!("x/{long}"), None), true);
+        let unknown = answer(&request(&format!("x/{long}"), None), SessionKind::Legacy);
         assert_eq!(code(&unknown), ErrorCode::METHOD_NOT_FOUND);
         assert!(unknown.message.len() <= MAX_ECHOED_NAME_BYTES + TRUNCATION_MARKER.len());
         assert!(unknown.message.ends_with(TRUNCATION_MARKER));
 
-        let invalid = answer(&request("tools/call", Some(json!({"name": long}))), true);
+        let invalid = answer(
+            &request("tools/call", Some(json!({"name": long}))),
+            SessionKind::Legacy,
+        );
         assert!(
             invalid.message.len() <= 2 * MAX_ERROR_MESSAGE_CALLER_BYTES,
             "{}",
             invalid.message.len()
         );
-        let invalid = answer(&request("tools/call", Some(json!(long))), true);
+        let invalid = answer(
+            &request("tools/call", Some(json!(long))),
+            SessionKind::Legacy,
+        );
         assert_eq!(code(&invalid), ErrorCode::INVALID_PARAMS);
         assert!(
             invalid.message.len() <= 2 * MAX_ERROR_MESSAGE_CALLER_BYTES,

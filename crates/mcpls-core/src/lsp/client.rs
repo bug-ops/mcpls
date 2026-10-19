@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{ErrorCodes, LspErrorCodes, PublishDiagnosticsParams};
+use lsp_types::{ErrorCodes, LspErrorCodes, Notification as _, PublishDiagnosticsParams};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -24,8 +24,10 @@ use crate::redaction::{RedactedText, Redactions};
 use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;
 
 mod cancel;
+mod notification;
 
 use cancel::{InFlightRequest, PendingRequests, Resolution};
+use notification::OutboundNotification;
 
 /// Maximum number of retry attempts for server-cancelled requests.
 const SERVER_CANCELLED_MAX_RETRIES: u32 = 3;
@@ -332,15 +334,24 @@ impl Clone for LspClient {
     }
 }
 
-/// Where an inbound notification goes; see [`LspClient::route`].
+/// The lanes inbound notifications are forwarded to; a client has both or
+/// neither.
 #[derive(Debug)]
-enum Route {
+struct Lanes {
+    notifications: NotificationSink,
+    lifecycle: mpsc::Sender<LspNotification>,
+}
+
+/// Where an inbound notification goes, with the sender that takes it; see
+/// [`LspClient::route`].
+#[derive(Debug)]
+enum Route<'a> {
     /// The diagnostics mailbox.
-    Mailbox(PublishDiagnosticsParams),
+    Mailbox(&'a NotificationSink, PublishDiagnosticsParams),
     /// The log and `showMessage` lane.
-    Messages(ServerMessage),
+    Messages(&'a NotificationSink, ServerMessage),
     /// The lifecycle lane.
-    Lifecycle(LspNotification),
+    Lifecycle(&'a mpsc::Sender<LspNotification>, LspNotification),
     /// Nowhere: the notification is deliberately not forwarded.
     Floor,
 }
@@ -436,36 +447,7 @@ impl LspClient {
         config: LspServerConfig,
         transport: (LspTransport, LspTransportReader),
     ) -> Self {
-        let state = Arc::new(Mutex::new(super::ServerState::Initializing));
-        let request_counter = Arc::new(AtomicI64::new(1));
-        let pending_requests = PendingRequests::default();
-        let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
-
-        let (command_tx, command_rx) = mpsc::channel(100);
-
-        let receiver_task = tokio::spawn(Self::message_loop(
-            transport,
-            command_rx,
-            pending_requests.clone(),
-            Arc::clone(&pending_failure),
-            None,
-            None,
-            Arc::default(),
-            Self::shared_settings(&config),
-        ));
-
-        Self {
-            config,
-            state,
-            request_counter,
-            command_tx,
-            pending_requests,
-            closing: Arc::default(),
-            pending_failure,
-            receiver_task: Some(receiver_task),
-            redactions: Arc::default(),
-            connection_id: ConnectionId::next(),
-        }
+        Self::spawn(config, transport, None, Arc::default())
     }
 
     /// Create client from transport with notification forwarding.
@@ -483,8 +465,20 @@ impl LspClient {
         lifecycle_tx: mpsc::Sender<LspNotification>,
         redactions: Arc<Redactions>,
     ) -> Self {
-        let state = Arc::new(Mutex::new(super::ServerState::Initializing));
-        let request_counter = Arc::new(AtomicI64::new(1));
+        let lanes = Lanes {
+            notifications: notification_tx,
+            lifecycle: lifecycle_tx,
+        };
+        Self::spawn(config, transport, Some(lanes), redactions)
+    }
+
+    /// Starts the message loop over `transport` and returns the client that owns it.
+    fn spawn(
+        config: LspServerConfig,
+        transport: (LspTransport, LspTransportReader),
+        lanes: Option<Lanes>,
+        redactions: Arc<Redactions>,
+    ) -> Self {
         let pending_requests = PendingRequests::default();
         let pending_failure = Arc::<StdMutex<PendingFailure>>::default();
 
@@ -495,16 +489,15 @@ impl LspClient {
             command_rx,
             pending_requests.clone(),
             Arc::clone(&pending_failure),
-            Some(notification_tx),
-            Some(lifecycle_tx),
+            lanes,
             Arc::clone(&redactions),
             Self::shared_settings(&config),
         ));
 
         Self {
             config,
-            state,
-            request_counter,
+            state: Arc::new(Mutex::new(super::ServerState::Initializing)),
+            request_counter: Arc::new(AtomicI64::new(1)),
             command_tx,
             pending_requests,
             closing: Arc::default(),
@@ -672,7 +665,7 @@ impl LspClient {
     /// `timeout_duration` is cancelled the same way before
     /// [`Error::Timeout`] is returned. The server's late reply is dropped
     /// quietly. Nothing is sent for a request that already has its reply, was
-    /// failed in bulk, or is the `shutdown` request.
+    /// failed in bulk, or was issued after cancels were suppressed (the client is shutting down).
     ///
     /// This method owns the severity of LSP error-response logging (#392):
     /// a transient error about to be retried logs at `warn!`, while `error!`
@@ -721,9 +714,6 @@ impl LspClient {
         let params_value = Self::omit_null_params(
             serde_json::to_value(params).map_err(|e| UnclassifiedError::logged(e.into()))?,
         );
-        if method == <lsp_types::ShutdownRequest as lsp_types::Request>::METHOD.as_str() {
-            self.suppress_cancels();
-        }
         let mut delay_ms = SERVER_CANCELLED_INITIAL_DELAY_MS;
 
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
@@ -930,19 +920,11 @@ impl LspClient {
     where
         P: Serialize,
     {
-        let params_value = Self::omit_null_params(serde_json::to_value(params)?);
+        let notification = OutboundNotification::new(method, params)?;
 
         debug!("Sending notification: {}", method);
 
-        self.command_tx
-            .send(ClientCommand::SendNotification {
-                method: method.to_string(),
-                params: params_value,
-            })
-            .await
-            .map_err(|_| Error::ServerTerminated)?;
-
-        Ok(())
+        self.send_notification(notification).await
     }
 
     /// Send a typed LSP notification, deriving the method string from `N`'s
@@ -1032,8 +1014,7 @@ impl LspClient {
         mut command_rx: mpsc::Receiver<ClientCommand>,
         pending_requests: PendingRequests,
         pending_failure: Arc<StdMutex<PendingFailure>>,
-        notification_tx: Option<NotificationSink>,
-        lifecycle_tx: Option<mpsc::Sender<LspNotification>>,
+        lanes: Option<Lanes>,
         redactions: Arc<Redactions>,
         settings: Option<Arc<LspSettings>>,
     ) -> Result<()> {
@@ -1048,8 +1029,7 @@ impl LspClient {
                 &mut msg_rx,
                 &mut command_rx,
                 &pending_requests,
-                notification_tx.as_ref(),
-                lifecycle_tx.as_ref(),
+                lanes.as_ref(),
                 &redactions,
                 settings.as_deref(),
             )
@@ -1112,47 +1092,47 @@ impl LspClient {
     /// `LspNotification::Other { method: "$/progress", .. }` at parse time:
     /// otherwise a server whose `report` payloads fail to deserialize could
     /// bypass the `kind`-based filter with malformed frames.
-    fn route(notification: LspNotification, has_sink: bool, has_lifecycle: bool) -> Route {
+    fn route(notification: LspNotification, lanes: Option<&Lanes>) -> Route<'_> {
+        let Some(lanes) = lanes else {
+            return Route::Floor;
+        };
         match notification {
-            LspNotification::PublishDiagnostics(params) if has_sink => Route::Mailbox(params),
-            LspNotification::LogMessage(params) if has_sink => {
-                Route::Messages(ServerMessage::Log(params))
+            LspNotification::PublishDiagnostics(params) => {
+                Route::Mailbox(&lanes.notifications, params)
             }
-            LspNotification::ShowMessage(params) if has_sink => {
-                Route::Messages(ServerMessage::Show(params))
+            LspNotification::LogMessage(params) => {
+                Route::Messages(&lanes.notifications, ServerMessage::Log(params))
+            }
+            LspNotification::ShowMessage(params) => {
+                Route::Messages(&lanes.notifications, ServerMessage::Show(params))
             }
             LspNotification::Progress(params)
-                if has_lifecycle
-                    && crate::lsp::types::ProgressKind::from_value(&params.value).is_some() =>
+                if crate::lsp::types::ProgressKind::from_value(&params.value).is_some() =>
             {
-                Route::Lifecycle(LspNotification::Progress(params))
+                Route::Lifecycle(&lanes.lifecycle, LspNotification::Progress(params))
             }
             LspNotification::Other { method, params }
-                if has_lifecycle && method.as_ref() != "$/progress" =>
+                if method.as_ref() != lsp_types::ProgressNotification::METHOD.as_str() =>
             {
-                Route::Lifecycle(LspNotification::Other { method, params })
+                Route::Lifecycle(&lanes.lifecycle, LspNotification::Other { method, params })
             }
-            _ => Route::Floor,
+            LspNotification::Progress(_) | LspNotification::Other { .. } => Route::Floor,
         }
     }
 
     /// Sends `route` to its lane. The mailbox coalesces per file and records
     /// what it cannot hold, so a diagnostics burst is never dropped
     /// unrecorded; the other lanes report a full or closed channel.
-    fn deliver(
-        route: Route,
-        notification_tx: Option<&NotificationSink>,
-        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
-    ) -> Delivery {
-        let sent = |lane, sent: bool| {
-            if sent {
+    fn deliver(route: Route<'_>) -> Delivery {
+        let delivery = |lane, delivered: bool| {
+            if delivered {
                 Delivery::Delivered
             } else {
                 Delivery::Dropped(lane)
             }
         };
-        match (route, notification_tx, lifecycle_tx) {
-            (Route::Mailbox(params), Some(sink), _) => {
+        match route {
+            Route::Mailbox(sink, params) => {
                 debug!(
                     "Forwarding diagnostics for {}: {} items",
                     params.uri.as_ref(),
@@ -1161,14 +1141,14 @@ impl LspClient {
                 sink.publishes().publish(params);
                 Delivery::Delivered
             }
-            (Route::Messages(message), Some(sink), _) => sent(
+            Route::Messages(sink, message) => delivery(
                 Lane::Notification,
                 sink.messages().try_send(message).is_ok(),
             ),
-            (Route::Lifecycle(notification), _, Some(tx)) => {
-                sent(Lane::Lifecycle, tx.try_send(notification).is_ok())
+            Route::Lifecycle(tx, notification) => {
+                delivery(Lane::Lifecycle, tx.try_send(notification).is_ok())
             }
-            _ => Delivery::Delivered,
+            Route::Floor => Delivery::Delivered,
         }
     }
 
@@ -1182,8 +1162,7 @@ impl LspClient {
         msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
         command_rx: &mut mpsc::Receiver<ClientCommand>,
         pending_requests: &PendingRequests,
-        notification_tx: Option<&NotificationSink>,
-        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+        lanes: Option<&Lanes>,
         redactions: &Redactions,
         settings: Option<&LspSettings>,
     ) -> Result<()> {
@@ -1215,8 +1194,7 @@ impl LspClient {
                                             transport,
                                             m,
                                             pending_requests,
-                                            notification_tx,
-                                            lifecycle_tx,
+                                            lanes,
                                             redactions,
                                             settings,
                                         )
@@ -1251,8 +1229,7 @@ impl LspClient {
                         transport,
                         message,
                         pending_requests,
-                        notification_tx,
-                        lifecycle_tx,
+                        lanes,
                         redactions,
                         settings,
                     )
@@ -1332,8 +1309,7 @@ impl LspClient {
         transport: &mut LspTransport,
         message: InboundMessage,
         pending_requests: &PendingRequests,
-        notification_tx: Option<&NotificationSink>,
-        lifecycle_tx: Option<&mpsc::Sender<LspNotification>>,
+        lanes: Option<&Lanes>,
         redactions: &Redactions,
         settings: Option<&LspSettings>,
     ) -> Result<()> {
@@ -1377,18 +1353,22 @@ impl LspClient {
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
                 Self::redact_notification(&mut typed, redactions);
 
-                let route = Self::route(typed, notification_tx.is_some(), lifecycle_tx.is_some());
-                if tracing::enabled!(tracing::Level::TRACE)
-                    && matches!(route, Route::Messages(_) | Route::Lifecycle(_))
-                {
-                    trace!(
-                        "Forwarding notification: {}",
-                        redactions.apply(&format!("{route:?}"))
-                    );
+                let route = Self::route(typed, lanes);
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    let forwarded: Option<&dyn std::fmt::Debug> = match &route {
+                        Route::Messages(_, message) => Some(message),
+                        Route::Lifecycle(_, notification) => Some(notification),
+                        Route::Mailbox(..) | Route::Floor => None,
+                    };
+                    if let Some(payload) = forwarded {
+                        trace!(
+                            "Forwarding notification: {}",
+                            redactions.apply(&format!("{payload:?}"))
+                        );
+                    }
                 }
 
-                if let Delivery::Dropped(lane) = Self::deliver(route, notification_tx, lifecycle_tx)
-                {
+                if let Delivery::Dropped(lane) = Self::deliver(route) {
                     DropLog::of(lane).record(&notification.method);
                 }
             }
@@ -1517,40 +1497,22 @@ pub struct UnclassifiedError(Box<Unclassified>);
 #[derive(Debug)]
 enum Unclassified {
     Logged(Error),
-    /// Always an [`Error::LspServerError`]: built only by
-    /// [`UnclassifiedError::server_response`].
     ServerResponse {
-        error: Error,
+        error: JsonRpcError,
         method: String,
         id: RequestId,
     },
 }
 
 impl Unclassified {
-    const fn error(&self) -> &Error {
-        match self {
-            Self::Logged(error) | Self::ServerResponse { error, .. } => error,
-        }
-    }
-
     /// Hands over the error, first passing an unlogged server error response
     /// to `report` as (method, id, code, message).
     fn finish(self, report: impl FnOnce(&str, &RequestId, i32, &str)) -> Error {
         match self {
             Self::Logged(error) => error,
             Self::ServerResponse { error, method, id } => {
-                if let Error::LspServerError(response) = &error {
-                    report(&method, &id, response.code, &response.message);
-                } else {
-                    // Unreachable by construction; never drop an error unlogged.
-                    log_surfaced_error(
-                        &method,
-                        &id,
-                        0,
-                        &crate::error::ErrorChain(&error).to_string(),
-                    );
-                }
-                error
+                report(&method, &id, error.code, &error.message);
+                Error::LspServerError(error)
             }
         }
     }
@@ -1573,7 +1535,7 @@ impl UnclassifiedError {
 
     fn server_response(response: JsonRpcError, method: &str, id: RequestId) -> Self {
         Self(Box::new(Unclassified::ServerResponse {
-            error: Error::LspServerError(response),
+            error: response,
             method: method.to_owned(),
             id,
         }))
@@ -1585,9 +1547,20 @@ impl UnclassifiedError {
         std::mem::replace(&mut *self.0, Unclassified::Logged(Error::ServerTerminated))
     }
 
-    /// The wrapped error, for classification before logging.
-    pub(crate) fn error(&self) -> &Error {
-        self.0.error()
+    /// The server's error response, for classification before logging.
+    pub(crate) fn server_error(&self) -> Option<&JsonRpcError> {
+        match &*self.0 {
+            Unclassified::Logged(Error::LspServerError(response))
+            | Unclassified::ServerResponse {
+                error: response, ..
+            } => Some(response),
+            Unclassified::Logged(_) => None,
+        }
+    }
+
+    /// Whether the request timed out.
+    pub(crate) fn timed_out(&self) -> bool {
+        matches!(&*self.0, Unclassified::Logged(Error::Timeout(_)))
     }
 
     /// The error returned to the caller as a failure; a server error response
@@ -1689,7 +1662,7 @@ mod tests {
                 .with(logs.clone()),
         );
         let (mut transport, _reader) = LspTransport::new(tokio::io::sink(), tokio::io::empty());
-        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(4);
+        let (lanes, mut lifecycle_rx) = open_lanes();
         let pending = PendingRequests::default();
         let notification = InboundMessage::Notification(JsonRpcNotification {
             jsonrpc: JsonRpcVersion,
@@ -1701,8 +1674,7 @@ mod tests {
             &mut transport,
             notification,
             &pending,
-            None,
-            Some(&lifecycle_tx),
+            Some(&lanes),
             &redactions,
             None,
         )
@@ -2080,6 +2052,19 @@ mod tests {
         }
     }
 
+    fn open_lanes() -> (Lanes, mpsc::Receiver<LspNotification>) {
+        let (messages_tx, _messages_rx) = mpsc::channel(1);
+        let (notifications, _reader) = NotificationSink::new(messages_tx);
+        let (lifecycle, lifecycle_rx) = mpsc::channel(4);
+        (
+            Lanes {
+                notifications,
+                lifecycle,
+            },
+            lifecycle_rx,
+        )
+    }
+
     /// S3 (Fix 7): a `report`-kind `$/progress` frame must never be
     /// enqueued on either notification lane -- the actual mechanism
     /// protecting against a `report`-per-package emitter like gopls
@@ -2088,7 +2073,9 @@ mod tests {
     fn test_report_progress_frame_goes_to_the_floor() {
         let report = progress(serde_json::json!({ "kind": "report", "percentage": 50 }));
 
-        assert_matches!(LspClient::route(report, true, true), Route::Floor);
+        let (lanes, _rx) = open_lanes();
+
+        assert_matches!(LspClient::route(report, Some(&lanes)), Route::Floor);
     }
 
     /// Fix 3 / M1: an unparseable `$/progress` notification (e.g. missing
@@ -2099,8 +2086,10 @@ mod tests {
     /// bypass the kind-based filter entirely.
     #[test]
     fn test_malformed_progress_other_goes_to_the_floor() {
+        let (lanes, _rx) = open_lanes();
+
         assert_matches!(
-            LspClient::route(other("$/progress"), true, true),
+            LspClient::route(other("$/progress"), Some(&lanes)),
             Route::Floor
         );
     }
@@ -2114,10 +2103,12 @@ mod tests {
         let begin = progress(serde_json::json!({ "kind": "begin", "title": "Indexing" }));
         let end = progress(serde_json::json!({ "kind": "end" }));
 
+        let (lanes, _rx) = open_lanes();
+
         for notification in [begin, end, other("experimental/serverStatus")] {
             assert_matches!(
-                LspClient::route(notification, true, true),
-                Route::Lifecycle(_)
+                LspClient::route(notification, Some(&lanes)),
+                Route::Lifecycle(..)
             );
         }
     }
@@ -2144,23 +2135,31 @@ mod tests {
             })
         };
 
-        assert_matches!(LspClient::route(publish(), true, false), Route::Mailbox(_));
+        let (lanes, _rx) = open_lanes();
+
         assert_matches!(
-            LspClient::route(log(), true, false),
-            Route::Messages(ServerMessage::Log(_))
+            LspClient::route(publish(), Some(&lanes)),
+            Route::Mailbox(..)
         );
         assert_matches!(
-            LspClient::route(show(), true, false),
-            Route::Messages(ServerMessage::Show(_))
+            LspClient::route(log(), Some(&lanes)),
+            Route::Messages(_, ServerMessage::Log(_))
         );
-        for notification in [publish(), log(), show()] {
-            assert_matches!(LspClient::route(notification, false, true), Route::Floor);
-        }
+        assert_matches!(
+            LspClient::route(show(), Some(&lanes)),
+            Route::Messages(_, ServerMessage::Show(_))
+        );
         for notification in [
             progress(serde_json::json!({ "kind": "begin" })),
             other("experimental/serverStatus"),
         ] {
-            assert_matches!(LspClient::route(notification, true, false), Route::Floor);
+            assert_matches!(
+                LspClient::route(notification, Some(&lanes)),
+                Route::Lifecycle(..)
+            );
+        }
+        for notification in [publish(), log(), show(), other("custom/x")] {
+            assert_matches!(LspClient::route(notification, None), Route::Floor);
         }
     }
 
@@ -2169,17 +2168,13 @@ mod tests {
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
         drop(lifecycle_rx);
 
-        let delivery = LspClient::deliver(
-            Route::Lifecycle(other("experimental/serverStatus")),
-            None,
-            Some(&lifecycle_tx),
-        );
+        let delivery = LspClient::deliver(Route::Lifecycle(
+            &lifecycle_tx,
+            other("experimental/serverStatus"),
+        ));
 
         assert_eq!(delivery, Delivery::Dropped(Lane::Lifecycle));
-        assert_eq!(
-            LspClient::deliver(Route::Floor, None, Some(&lifecycle_tx)),
-            Delivery::Delivered
-        );
+        assert_eq!(LspClient::deliver(Route::Floor), Delivery::Delivered);
     }
 
     #[test]
@@ -3559,7 +3554,6 @@ mod tests {
                 &mut command_rx,
                 &pending_requests,
                 None,
-                None,
                 &Redactions::default(),
                 None,
             )
@@ -3596,7 +3590,6 @@ mod tests {
                 &mut msg_rx,
                 &mut command_rx,
                 &pending_requests,
-                None,
                 None,
                 &Redactions::default(),
                 None,
@@ -3646,7 +3639,6 @@ mod tests {
                 &mut command_rx,
                 &pending_requests,
                 None,
-                None,
                 &Redactions::default(),
                 None,
             )
@@ -3684,7 +3676,6 @@ mod tests {
                 command_rx,
                 pending_requests.clone(),
                 Arc::default(),
-                None,
                 None,
                 Arc::default(),
                 None,
@@ -3736,7 +3727,6 @@ mod tests {
                 &mut msg_rx,
                 &mut command_rx,
                 &pending_requests,
-                None,
                 None,
                 &Redactions::default(),
                 None,
