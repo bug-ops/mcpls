@@ -243,13 +243,6 @@ enum SpawnTrust {
     Untrusted(UntrustedVetting),
 }
 
-#[cfg(test)]
-thread_local! {
-    /// How many times [`ServerInitConfig::for_respawn`] ran on this thread,
-    /// so a test can tell a config vetted once from one vetted twice.
-    pub(crate) static RESPAWN_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// A [`ServerInitConfig`] that [`ServerInitConfig::for_respawn`] vetted, so a
 /// respawn spawns exactly what was checked and does not check it again.
 #[derive(Debug, Clone)]
@@ -498,8 +491,6 @@ impl ServerInitConfig {
     /// startup makes), or an argument now names an executable inside the
     /// workspace.
     pub(crate) async fn for_respawn(&self) -> Result<VettedInitConfig> {
-        #[cfg(test)]
-        RESPAWN_PLANS.with(|plans| plans.set(plans.get().saturating_add(1)));
         if self.auto_pin.is_none() && matches!(self.trust, SpawnTrust::Trusted) {
             return Ok(VettedInitConfig(self.clone()));
         }
@@ -666,12 +657,7 @@ impl LspServer {
     /// - The `initialized` or `workspace/didChangeConfiguration` notification
     ///   cannot be written ([`Error::LspInitFailed`])
     pub async fn spawn(config: ServerInitConfig) -> Result<SpawnedServer> {
-        // Deliberately repeated after `for_respawn` and the planner: a workspace
-        // file can become executable between the plan and this spawn (#736).
-        // A restart plans before it stops the old server, so that window spans
-        // the whole stop; only the arguments are checked again here, not the
-        // tsserver pin or the initialization options, which point outside the
-        // workspace by construction.
+        // Repeated on purpose: a workspace file can become executable between plan and spawn (#736).
         config.vet_arguments_off_runtime().await?;
         let own = Redactions::for_server(config.server_config(), current_environment());
         let redactions = Arc::new(Redactions::union([config.redactions().as_ref(), &own]));

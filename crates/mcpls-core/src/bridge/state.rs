@@ -2293,11 +2293,6 @@ mod tests {
         assert!(tracker.is_empty());
     }
 
-    /// #249: after a respawn, `forget_server` must clear only the respawned
-    /// server's sync history so the next `ensure_open` call for it sends
-    /// `didOpen` again -- while leaving other servers synced to the same
-    /// document untouched (a path can be synced to more than one server,
-    /// e.g. hover routed to one, diagnostics to another).
     /// The pair a sweep reads is one state of one opening: reopening a path
     /// changes the opening in the same read, and a document the server was not
     /// told the latest version of is `Lagging`.
@@ -2333,6 +2328,11 @@ mod tests {
         assert_eq!(second.opening(), tracker.opening(&path));
     }
 
+    /// #249: after a respawn, `forget_server` must clear only the respawned
+    /// server's sync history so the next `ensure_open` call for it sends
+    /// `didOpen` again -- while leaving other servers synced to the same
+    /// document untouched (a path can be synced to more than one server,
+    /// e.g. hover routed to one, diagnostics to another).
     #[test]
     fn test_forget_server_clears_only_that_servers_synced_version() {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());

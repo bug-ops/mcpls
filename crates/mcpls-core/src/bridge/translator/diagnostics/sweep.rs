@@ -13,8 +13,8 @@
 //! server, so one unanswered pull delays only its own file. Once a pull ran
 //! out of patience, the pass waits only [`PULL_GRACE`] for each pull after it,
 //! so a file that answers is not kept waiting behind several that do not. When
-//! the background slots are full the pull is cancelled and counted as a
-//! timeout, and the retries wait for a later tick. A pass never delays the
+//! the background slots are full the pull is cancelled without counting as a
+//! failure, and the retries wait for a later tick. A pass never delays the
 //! resync of the next tick.
 
 use std::collections::{HashMap, HashSet};
@@ -700,7 +700,8 @@ pub enum SweepStep {
     /// The pull has not answered in time and waits in the background.
     Detached,
     /// The pull has not answered in time and the server has no slot for it
-    /// in the background, so it was cancelled and counted as a timeout.
+    /// in the background, so it was cancelled; it is not counted as a failure
+    /// and the file stays due.
     GaveUp,
     /// The pull is left for a later tick: the job already paid for an
     /// unanswered pull at full cap.
@@ -728,7 +729,7 @@ enum Bounded<T> {
 }
 
 /// A subscribed file that may be pulled after the resyncs of its job.
-struct PullCandidate {
+pub(super) struct PullCandidate {
     path: PathBuf,
     resynced: Resynced,
 }
@@ -820,8 +821,7 @@ impl SweepContext {
     /// running, in which case the files due stay due for a later tick.
     pub(crate) async fn run_job(&self, visits: Vec<(PathBuf, Interest)>) {
         let (mut steps, candidates) = self.resync_pass(&visits).await;
-        // TODO(#809): a skipped pass drops its candidates while the window cursor has
-        // moved on (spec 016 edge cases); files wait a window cycle for their pull.
+        // TODO(#809): a skipped pass drops its candidates, which wait a window cycle.
         let pass = candidates
             .first()
             .and_then(|(_, candidate)| self.memo.begin_pull_pass(&candidate.resynced.server));
@@ -843,7 +843,7 @@ impl SweepContext {
 
     /// Resyncs every visit and collects the subscribed files that may be
     /// pulled, with the index of their step.
-    async fn resync_pass(
+    pub(super) async fn resync_pass(
         &self,
         visits: &[(PathBuf, Interest)],
     ) -> (Vec<SweepStep>, Vec<(usize, PullCandidate)>) {
@@ -887,7 +887,11 @@ impl SweepContext {
 
     /// Pulls the candidates that are due: new states first, then files
     /// another file's change made stale, then failed pulls to retry.
-    async fn pull_due(&self, candidates: Vec<(usize, PullCandidate)>, steps: &mut [SweepStep]) {
+    pub(super) async fn pull_due(
+        &self,
+        candidates: Vec<(usize, PullCandidate)>,
+        steps: &mut [SweepStep],
+    ) {
         let mut due: Vec<(Due, SweepEpoch, usize, PullCandidate)> = candidates
             .into_iter()
             .filter_map(|(index, candidate)| {
@@ -943,9 +947,6 @@ impl SweepContext {
         else {
             return SweepStep::Synced;
         };
-        if why == Due::Epoch && !self.memo.take_epoch_pull(&resynced.server, Instant::now()) {
-            return SweepStep::Synced;
-        }
         let doc = match self
             .translator
             .open_bounded(path, Access::Use, &self.memo)
@@ -955,17 +956,16 @@ impl SweepContext {
             Bounded::Skipped => return SweepStep::Skipped,
             Bounded::TimedOut => return SweepStep::TimedOut,
         };
-        // The opening above brought the server up to date with a change made
-        // since this job's resync, but did not observe it: its `didSave` and
-        // epoch move wait for the next visit, which sees the file moved. The
-        // pull is left to that visit too, so no pull answers a state the sweep
-        // has not observed.
+        // A change since this job's resync is observed, and pulled, by the next visit.
         if self
             .translator
             .document_tracker
             .stamp(doc.path(), doc.server_id())
             != Some(resynced.current)
         {
+            return SweepStep::Synced;
+        }
+        if why == Due::Epoch && !self.memo.take_epoch_pull(&resynced.server, Instant::now()) {
             return SweepStep::Synced;
         }
         let mut pull: BoxedPull = Box::pin(run_pull(
@@ -989,8 +989,7 @@ impl SweepContext {
                     SweepStep::Detached
                 }
                 Err(claim) => {
-                    drop(pull);
-                    claim.finish(PullOutcome::Failed(FailureKind::TimedOut));
+                    drop((pull, claim));
                     pass.at_cap = true;
                     SweepStep::GaveUp
                 }

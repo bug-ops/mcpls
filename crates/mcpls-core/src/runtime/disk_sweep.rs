@@ -1003,6 +1003,8 @@ mod tests {
     /// What the scripted server leaves unanswered, and what it received.
     #[derive(Debug, Clone, Default)]
     struct Wedge {
+        /// How long the server takes to answer a pull.
+        delay: Arc<std::sync::Mutex<Duration>>,
         hung: Arc<std::sync::Mutex<HashSet<String>>>,
         seen: Arc<std::sync::Mutex<Vec<Seen>>>,
     }
@@ -1033,9 +1035,14 @@ mod tests {
 
     /// Answers every pull that `wedge` does not hang with a report that
     /// differs every time, and records everything it receives.
-    fn spawn_wedging_responder(mut server: FakeServer, wedge: Wedge) -> JoinHandle<()> {
+    fn spawn_wedging_responder(server: FakeServer, wedge: Wedge) -> JoinHandle<()> {
+        let FakeServer {
+            read_half_stdin,
+            mut write_stdout,
+        } = server;
+        let writer = Arc::new(Mutex::new(read_half_stdin));
         tokio::spawn(async move {
-            let mut wire = BufReader::new(&mut server.write_stdout);
+            let mut wire = BufReader::new(&mut write_stdout);
             let mut answered = 0_u32;
             loop {
                 let message = next_framed_message(&mut wire).await;
@@ -1056,12 +1063,21 @@ mod tests {
                     continue;
                 }
                 answered += 1;
+                let delay = *wedge.delay.lock().unwrap();
                 let report = json!({"kind": "full", "items": [{
                     "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
                     "severity": 1,
                     "message": format!("pull {answered}"),
                 }]});
-                write_response(&mut server.read_half_stdin, &message["id"], report).await;
+                if delay.is_zero() {
+                    write_response(&mut *writer.lock().await, &message["id"], report).await;
+                    continue;
+                }
+                let (writer, id) = (Arc::clone(&writer), message["id"].clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    write_response(&mut *writer.lock().await, &id, report).await;
+                });
             }
         })
     }
@@ -1182,6 +1198,32 @@ mod tests {
     }
 
     const BOUND: Duration = Duration::from_secs(5);
+
+    /// A server slow to answer, with more due files than background slots,
+    /// still gets every file pulled: a pull cancelled for the full slots is not
+    /// a failure of the file.
+    #[tokio::test(start_paused = true)]
+    async fn test_files_beyond_the_background_slots_are_pulled_once_slots_free() {
+        let names = ["a.rs", "b.rs", "c.rs", "d.rs"];
+        let mut fleet = Fleet::new(&names, &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        *fleet.wedge.delay.lock().unwrap() = Duration::from_secs(10);
+        for name in names {
+            fleet.edit(name);
+        }
+        let mut notified = HashSet::new();
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(120) && notified.len() < names.len() {
+            fleet.sweep.tick().await;
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            while let Ok(uri) = fleet.updates.try_recv() {
+                notified.insert(uri);
+            }
+        }
+
+        assert_eq!(notified.len(), names.len(), "{notified:?}");
+    }
 
     /// An unanswered pull delays only its own file (spec 016 SC-001).
     #[tokio::test(start_paused = true)]

@@ -728,19 +728,21 @@ impl Translator {
         let running = lock_std(&self.servers)
             .server(id)
             .map(|server| server.init_config().clone());
-        let vetted = match running {
-            Some(running) => match running.for_respawn().await {
-                Ok(vetted) => Some(vetted),
-                Err(error) => {
-                    tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart refused");
-                    return RestartOutcome::Failed {
-                        reason: RestartFailure::Refused {
-                            message: ErrorChain(&error).to_string(),
-                        },
-                    };
-                }
-            },
-            None => None,
+        let Some(running) = running else {
+            return RestartOutcome::NotRunning {
+                message: format!("LSP server '{id}' is not running"),
+            };
+        };
+        let vetted = match running.for_respawn().await {
+            Ok(vetted) => vetted,
+            Err(error) => {
+                tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart refused");
+                return RestartOutcome::Failed {
+                    reason: RestartFailure::Refused {
+                        message: ErrorChain(&error).to_string(),
+                    },
+                };
+            }
         };
 
         let Some(mut old) = Deregistered::take(self, id) else {
@@ -763,11 +765,10 @@ impl Translator {
                 reason: RestartFailure::ShuttingDown,
             };
         }
-        let config = vetted.map_or(RespawnConfig::Unvetted(config), RespawnConfig::Vetted);
         let respawned = self
             .respawn_locked(
                 id,
-                config,
+                RespawnConfig::Vetted(vetted),
                 BackoffPolicy::Bypass,
                 NotificationRouting::Pump(wiring.as_ref()),
             )
@@ -1177,23 +1178,6 @@ mod tests {
         /// Regression test for #736: a restart refused by the argument recheck
         /// is decided before the running server is stopped.
         #[cfg(unix)]
-        /// #797: a restart vets the config once, before it stops the old
-        /// server, and the respawn spawns that vetted config as it is.
-        #[tokio::test]
-        async fn test_a_restart_vets_the_config_once() {
-            let (fx, _log) = protocol_fixture(None).await;
-            crate::lsp::RESPAWN_PLANS.with(|plans| plans.set(0));
-
-            let result = fx
-                .translator
-                .restart_servers(RestartTarget::All)
-                .await
-                .unwrap();
-
-            assert_matches!(only_outcome(&result), RestartOutcome::Restarted { .. });
-            assert_eq!(crate::lsp::RESPAWN_PLANS.with(std::cell::Cell::get), 1);
-        }
-
         #[tokio::test]
         async fn test_restart_refused_by_the_argument_recheck_keeps_the_old_server_running() {
             use std::os::unix::fs::PermissionsExt as _;

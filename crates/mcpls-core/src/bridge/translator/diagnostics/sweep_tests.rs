@@ -938,3 +938,38 @@ fn test_epoch_driven_pulls_are_budgeted_per_window() {
     assert!(!memo.take_epoch_pull(&rust, start + Duration::from_millis(1999)));
     assert!(memo.take_epoch_pull(&rust, start + Duration::from_secs(2)));
 }
+
+/// An epoch-driven pull that is not sent leaves the window's budget alone.
+#[tokio::test]
+async fn test_an_epoch_pull_that_finds_the_file_moved_spends_no_budget() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    let companion = fx.track_companion().await;
+    let memo = SweepMemo::default();
+    let context = sweep_context(&fx.translator, &fx.cache, &memo);
+    sweep_file(
+        &fx.translator,
+        &fx.path,
+        Interest::Subscribed,
+        &memo,
+        &fx.cache,
+    )
+    .await;
+    fs::write(&companion, "fn other() { let y = 2; }").unwrap();
+    let (mut steps, candidates) = context
+        .resync_pass(&[
+            (companion, Interest::Companion),
+            (fx.path.clone(), Interest::Subscribed),
+        ])
+        .await;
+    fx.edit("fn main() { let moved = 1; }");
+
+    context.pull_due(candidates, &mut steps).await;
+
+    let granted = (0..20)
+        .filter(|_| memo.take_epoch_pull(&Fixture::rust(), tokio::time::Instant::now()))
+        .count();
+    assert_eq!(granted, 8);
+}
