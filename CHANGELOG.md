@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A JSON-RPC response carrying both `result` and `error` keeps the error code, so a `-32801` still retries (#737) (#778).
 - A lost-publish batch re-checks the diagnostics role after resolving, announces only files whose view changed, and republished files are delivered in arrival order (#742) (#778).
 - A lost mark under a lexical fallback path marks the symlinked file's entry, the mailbox byte budget counts URI bytes, the dropped-frame log escapes the method, and Windows environment variable names fold case over the Basic Multilingual Plane only (#738) (#778).
+- `restart_server` reports a refusal before the old process is stopped as `refused` instead of `spawn_failed` and vets the config once (#797) (#811).
+- An unanswered diagnostics pull no longer stalls the disk sweep for the other files of its server (#806) (#811).
+- Sweep shutdown waits for its jobs and pulls, a resync and `didSave` are bounded by the request timeout, and `didSave` follows a content digest instead of document versions (#798, #791) (#811).
+- A tool call cancelled by the client or by shutdown returns an error result and logs no warning (#807) (#811).
 
 ### Changed
 
@@ -53,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `NewName`, `CompletionTrigger` and `SymbolName` use `new` instead of `try_new` and report `InvalidTextField`/`TextField`; `InvalidNewName`, `InvalidCompletionTrigger` and `SymbolNameError` are removed, and an empty `trigger` is invalid (#745) (#778).
 - **Breaking:** `Error::ServerNotFound` renames `source` to `io`, and the `Display` of `McpServerStart`, `TaskFailed`, `HttpBind`, `Json`, `ServerSpawnFailed` and `ConfigError::UnsupportedFilePattern` no longer includes the cause; use `ErrorChain` (#735) (#778).
 - **Breaking:** the `DefinitionResult`, `ReferencesResult` and `DiagnosticSeverity` aliases, `Translator::is_document_open` (now `open_state`), the `lsp::HostOs` re-export and `Serialize` on `JsonRpcResponse` are removed, and the launcher detail enums are `#[non_exhaustive]` (#748) (#778).
+- **Breaking:** `RestartFailure` is `#[non_exhaustive]` with the new `Refused` variant (wire kind `refused`), and `TextField` is `#[non_exhaustive]` (#797, #800) (#811).
+- **Breaking:** `LspServerConfig::args` is `ServerArgs`, `ServerEnv::insert` returns `Result`, `InvalidServerCommand` is an enum, and `MAX_ENV_ENTRY_BYTES` and `ServerEnv::check_size` are removed (#793, #799) (#811).
+- **Breaking:** `DocumentTracker::is_open` is removed, `OpenRequest` fields are private (`OpenRequest::new`), and `spawn_disk_sweep` returns `DiskSweepHandle` (#802, #798) (#811).
+- **Breaking:** `From<toml::de::Error> for Error` is removed and config read failures other than not-found are `Error::FileIo` with the path (#804) (#811).
+- Notification sends share one typed path, `CodeAction` and `WorkspaceSymbol` requests use `RequestTimeout`, and launcher trust, working directory and wrapper grammar are typed (#801, #799, #803, #800, #805) (#811).
 
 ## [0.7.0] - 2026-10-07
 
