@@ -2298,6 +2298,41 @@ mod tests {
     /// `didOpen` again -- while leaving other servers synced to the same
     /// document untouched (a path can be synced to more than one server,
     /// e.g. hover routed to one, diagnostics to another).
+    /// The pair a sweep reads is one state of one opening: reopening a path
+    /// changes the opening in the same read, and a document the server was not
+    /// told the latest version of is `Lagging`.
+    #[test]
+    fn test_stamp_and_sweep_state_read_one_opening_and_version() {
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from_static("rust");
+        let path = PathBuf::from("/test/stamp.rs");
+        tracker.open(path.clone(), "fn a() {}".to_string()).unwrap();
+        assert_eq!(tracker.stamp(&path, &server), None);
+        assert_eq!(tracker.sweep_state(&path, &server), None);
+
+        tracker.set_synced_version_for_test(&path, &server, 1);
+        let first = tracker.stamp(&path, &server).unwrap();
+        assert_eq!(first.opening(), tracker.opening(&path));
+        assert_eq!(first.version(), DocumentVersion::new(1));
+        assert_matches!(
+            tracker.sweep_state(&path, &server),
+            Some(SweepState::Current { stamp, .. }) if stamp == first
+        );
+
+        tracker.set_synced_version_for_test(&path, &server, 0);
+        assert_matches!(
+            tracker.sweep_state(&path, &server),
+            Some(SweepState::Lagging { .. })
+        );
+
+        tracker.close(&path);
+        tracker.open(path.clone(), "fn a() {}".to_string()).unwrap();
+        tracker.set_synced_version_for_test(&path, &server, 1);
+        let second = tracker.stamp(&path, &server).unwrap();
+        assert_ne!(second.opening(), first.opening());
+        assert_eq!(second.opening(), tracker.opening(&path));
+    }
+
     #[test]
     fn test_forget_server_clears_only_that_servers_synced_version() {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());

@@ -68,12 +68,12 @@ pub use addressing::{
     ResolvedTarget, SymbolName, SymbolQuery, SymbolTarget,
 };
 pub use availability::{DiagnosticsAnswer, DiagnosticsAvailability, DiagnosticsOrigin};
+#[cfg(test)]
+pub use diagnostics::MAX_FAILED_PULLS_PER_STATE;
 pub use diagnostics::{
     Interest, MAX_COMPANION_FILES, MAX_SWEPT_FILES_PER_TICK, SWEEP_INTERVAL, SweepContext,
     SweepMemo,
 };
-#[cfg(test)]
-pub use diagnostics::{MAX_DETACHED_PULLS_PER_SERVER, MAX_FAILED_PULLS_PER_STATE};
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,

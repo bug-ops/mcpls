@@ -33,12 +33,12 @@ use crate::lsp::{ConnectionId, UnclassifiedError};
 use crate::util::{lock_std, run_detached};
 
 mod sweep;
+#[cfg(test)]
+pub use sweep::MAX_FAILED_PULLS_PER_STATE;
 pub use sweep::{
     Interest, MAX_COMPANION_FILES, MAX_SWEPT_FILES_PER_TICK, SWEEP_INTERVAL, SweepContext,
     SweepMemo,
 };
-#[cfg(test)]
-pub use sweep::{MAX_DETACHED_PULLS_PER_SERVER, MAX_FAILED_PULLS_PER_STATE};
 #[cfg(test)]
 mod sweep_tests;
 

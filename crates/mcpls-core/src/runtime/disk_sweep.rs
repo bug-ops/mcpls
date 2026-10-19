@@ -347,8 +347,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::{
-        MAX_DETACHED_PULLS_PER_SERVER, MAX_FAILED_PULLS_PER_STATE, ResourceLimits, ResultContext,
-        WorkspaceRoots,
+        MAX_FAILED_PULLS_PER_STATE, ResourceLimits, ResultContext, WorkspaceRoots,
     };
     use crate::config::{DocumentLimit, LanguageId, ToolRouter};
     use crate::mcp::{SessionHandle, Target};
@@ -1241,11 +1240,11 @@ mod tests {
         }
     }
 
-    /// With the background slots full, a pass pays for one more patience
-    /// only; the rest of its files wait for a later tick, and the resync of
-    /// the next ticks is not held up either.
+    /// With the background slots full, the pulls after the first expiry get a
+    /// grace only, each hung file is still asked once, and the resync of the
+    /// next ticks is not held up.
     #[tokio::test(start_paused = true)]
-    async fn test_a_full_cap_costs_a_pass_one_patience_and_never_delays_a_resync() {
+    async fn test_a_full_cap_costs_a_pass_little_and_never_delays_a_resync() {
         let hung = ["h1.rs", "h2.rs", "h3.rs", "h4.rs", "h5.rs", "h6.rs"];
         let mut fleet = Fleet::new(&hung, &["d.rs"]).await;
         fleet.sweep.tick_and_settle().await;
@@ -1269,7 +1268,82 @@ mod tests {
             .map(|name| fleet.wedge.count(PULL, name))
             .sum::<usize>()
             - pulls_before;
-        assert_eq!(pulls, MAX_DETACHED_PULLS_PER_SERVER + 1);
+        assert_eq!(pulls, hung.len());
+    }
+
+    /// Edits `hung` and `z.rs` together, hangs the pulls of `hung`, and returns
+    /// how long after the edit the answering `z.rs` is pulled (spec 016
+    /// FR-002, "two files hang at once").
+    async fn answering_file_pulled_after(hung: &[&str]) -> Duration {
+        let mut names: Vec<&str> = hung.to_vec();
+        names.push("z.rs");
+        let mut fleet = Fleet::new(&names, &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        for name in hung {
+            fleet.wedge.hang(name);
+            fleet.edit(name);
+        }
+        let before = fleet.wedge.count(PULL, "z.rs");
+        fleet.edit("z.rs");
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        loop {
+            fleet.sweep.tick().await;
+            for _ in 0..20 {
+                tokio::time::sleep(SWEEP_INTERVAL / 20).await;
+                if fleet.wedge.count(PULL, "z.rs") > before {
+                    return start.elapsed();
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "never pulled");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_two_hung_files_do_not_delay_an_answering_one() {
+        let elapsed = Box::pin(answering_file_pulled_after(&["a1.rs", "a2.rs"])).await;
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_three_hung_files_do_not_delay_an_answering_one() {
+        let elapsed = Box::pin(answering_file_pulled_after(&["a1.rs", "a2.rs", "a3.rs"])).await;
+        assert!(elapsed <= BOUND, "{elapsed:?}");
+    }
+
+    /// Files whose own state is new are pulled before one that another file's
+    /// change made stale, whatever their path order.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_pass_pulls_new_states_before_stale_ones() {
+        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        fleet.sweep.tick_and_settle().await;
+        let seen_before = fleet.wedge.seen.lock().unwrap().len();
+        fleet.edit("a.rs");
+        fleet.edit("c.rs");
+
+        fleet.sweep.tick_and_settle().await;
+
+        let pulled: Vec<String> = fleet.wedge.seen.lock().unwrap()[seen_before..]
+            .iter()
+            .filter(|seen| seen.method == PULL)
+            .map(|seen| seen.file.clone())
+            .collect();
+        assert_eq!(pulled, ["a.rs", "c.rs", "b.rs"]);
+    }
+
+    /// Stopping the sweep ends a job that is still running before it returns.
+    #[tokio::test]
+    async fn test_stopping_the_sweep_ends_a_job_in_flight() {
+        let (mut sweep, rust, _ts) = sweep_over_two_servers();
+        let in_flight = sweep.jobs.spawn(std::future::pending()).id();
+        sweep.running.insert(in_flight, rust);
+
+        tokio::time::timeout(Duration::from_secs(5), sweep.shutdown())
+            .await
+            .expect("the shutdown waited for a job that never ends");
+
+        assert!(sweep.jobs.is_empty());
+        assert!(sweep.running.is_empty());
     }
 
     /// Stopping the sweep ends the pulls it left in the background before it

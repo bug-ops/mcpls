@@ -51,8 +51,29 @@ impl ServerArgs {
 }
 
 impl ServerArgs {
+    /// Arguments written as literals in the source.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a literal holds a NUL, which a source literal never should.
+    #[must_use]
+    pub fn from_static(args: &'static [&'static str]) -> Self {
+        assert!(
+            !args.iter().any(|arg| contains_nul(arg)),
+            "a literal argument must not hold a NUL"
+        );
+        Self(args.iter().map(ToString::to_string).collect())
+    }
+
+    /// These arguments preceded by `program`, which holds no NUL by its type.
+    pub(crate) fn with_leading(mut self, program: ServerCommand) -> Self {
+        self.0.insert(0, String::from(program));
+        self
+    }
+
     /// These arguments with the one at each key of `programs` replaced by the
-    /// program, which holds no NUL by its type.
+    /// program, which holds no NUL by its type. Programs are found by index,
+    /// so no ordering of the analysis can make a replacement be skipped.
     pub(crate) fn with_programs(self, mut programs: BTreeMap<usize, ServerCommand>) -> Self {
         Self(
             self.0

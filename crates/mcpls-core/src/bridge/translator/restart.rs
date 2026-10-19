@@ -1177,6 +1177,23 @@ mod tests {
         /// Regression test for #736: a restart refused by the argument recheck
         /// is decided before the running server is stopped.
         #[cfg(unix)]
+        /// #797: a restart vets the config once, before it stops the old
+        /// server, and the respawn spawns that vetted config as it is.
+        #[tokio::test]
+        async fn test_a_restart_vets_the_config_once() {
+            let (fx, _log) = protocol_fixture(None).await;
+            crate::lsp::RESPAWN_PLANS.with(|plans| plans.set(0));
+
+            let result = fx
+                .translator
+                .restart_servers(RestartTarget::All)
+                .await
+                .unwrap();
+
+            assert_matches!(only_outcome(&result), RestartOutcome::Restarted { .. });
+            assert_eq!(crate::lsp::RESPAWN_PLANS.with(std::cell::Cell::get), 1);
+        }
+
         #[tokio::test]
         async fn test_restart_refused_by_the_argument_recheck_keeps_the_old_server_running() {
             use std::os::unix::fs::PermissionsExt as _;

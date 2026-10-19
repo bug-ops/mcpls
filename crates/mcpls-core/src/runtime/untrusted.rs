@@ -189,9 +189,6 @@ fn vetted_wrapped_programs(
         .collect()
 }
 
-/// `args` with each program at a key of `programs` replaced by its vetted
-/// path. Programs are found by index, so no ordering of the analysis can make
-/// a replacement be skipped.
 /// `effective` pinned to what untrusted mode vetted: the executable resolved
 /// to an absolute path, and a `PATH` without workspace, relative or empty
 /// entries.

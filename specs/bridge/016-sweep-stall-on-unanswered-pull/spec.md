@@ -183,11 +183,12 @@ THEN b.fk is delivered within 5 s of the edit, not after roughly 128 s
   hands the subscribed files that are due to a pull pass that runs in the background, one pass per
   server at a time. The schedule skips a server only while its resync runs, so a pull never delays
   the next tick's `didChange` or `didSave` (FR-001, FR-002).
-- **Patience, then background.** The pass waits 2 s (one sweep interval) for a pull. A pull that has
-  not answered moves to a background task when its server has fewer than 2 pulls waiting there;
-  the pass continues with the next file. When the cap is full the pull is cancelled and counted as
-  a timeout, the pass defers its retries and the files whose background slot is taken, and ends
-  after at most that one extra patience.
+- **Patience, then grace, then background.** The pass waits 2 s (one sweep interval) for the first
+  pull that does not answer, and 250 ms for each pull after it, so files that answer are not kept
+  waiting behind several that do not. A pull that has not answered moves to a background task when
+  its server has fewer than 2 pulls waiting there; the pass continues with the next file. When the
+  cap is full the pull is cancelled and counted as a timeout, and the pass defers its retries.
+  A file that is new or stale is never deferred for the cap: it gets its grace like the others.
 - **One claim per file.** A pull holds a claim on its file (FR-004). A claim dropped unfinished
   restores the earlier attempt; a claim that outlived its memo entry cannot touch a later one.
 - **Counted failures.** Timeouts and errors are counted per document state: timeouts whatever the
@@ -230,8 +231,10 @@ THEN b.fk is delivered within 5 s of the edit, not after roughly 128 s
 | The stuck file's pull answers after the retry cap was reached | The report is stored under the usual rules; the file's state is current, so no further pull is made |
 | Server hangs on `didChange` or `didSave` rather than on the pull | Out of scope here; the bounded resync is tracked in #798 |
 | Two files of one server hang at once | Both are retried independently; neither delays the other or any third file (FR-001) |
-| More hung files than the background cap holds | The pull pass pays one more patience for the first pull that finds the cap full (it is cancelled and counted as a timeout) and leaves the retries and the files that are due for a later tick; the next tick's resync is not held up (Design) |
-| A slow but answering file (about 5 s) meets a full cap three times | Its pulls are cancelled and counted as timeouts, which settle a state whatever the epoch, so it stays stale until its content changes or a tool call pulls it. Accepted: it takes three consecutive full-cap ticks, and a server with more than two unanswered pulls is already degraded |
+| More hung files than the background cap holds | The first unanswered pull of a pass waits the full patience; each later pull waits only a 250 ms grace, then moves to the background or, with the slots full, is cancelled and counted as a timeout. Retries wait for a later tick. A file that answers promptly is pulled within about 2 s plus 250 ms per hung file ahead of it, and the next tick's resync is not held up (Design) |
+| A slow but answering file (about 5 s) meets a full cap or a grace three times | Its pulls are cancelled and counted as timeouts, which settle a state whatever the epoch, so it stays stale until its content changes or a tool call pulls it. Accepted: it takes three passes, and a server with unanswered pulls is already degraded |
+| A pass is still running when the next tick finds files due | The new pass is skipped and its candidates are dropped; the files stay due, but the window cursor has moved, so with more than 64 subscribed files on one server a file may wait a window cycle for its pull. Accepted: its resync, `didChange` and `didSave` are not delayed |
+| A `didSave` times out | The visit ends the job and the file owes the `didSave`; the next visit sends it again |
 | A file changes between the resync and the pull of one pass | The pass opens the file again, brings the server up to date, and skips the pull: the change is observed (`didSave`, epoch) and pulled by the next tick's visit, never observed twice |
 | A file resynced by a tool call after the sweep stopped visiting it | The sweep compares it with the state it last saw (a bounded set of 256 tombstones): `didSave` goes out when the text differs, and not when an evicted file is opened again with the same text (#791). Beyond 256 other files visited since, the path counts as new and gets no `didSave` for a change made before its next visit |
 | Shutdown while a pull is outstanding | Pull abandoned with the job (FR-008); no request reaches the server after shutdown |

@@ -10,10 +10,12 @@
 //! that runs in the background, one pass per server at a time. A pull that has
 //! not answered after [`PULL_PATIENCE`] moves out of the pass, to wait in the
 //! background where at most [`MAX_DETACHED_PULLS_PER_SERVER`] may wait per
-//! server, so one unanswered pull delays only its own file. At full cap one
-//! patience expiry per pass is the most it pays: the pull is cancelled and
-//! counted as a timeout, and the remaining files that are due wait for a later
-//! tick. A pass never delays the resync of the next tick.
+//! server, so one unanswered pull delays only its own file. Once a pull ran
+//! out of patience, the pass waits only [`PULL_GRACE`] for each pull after it,
+//! so a file that answers is not kept waiting behind several that do not. When
+//! the background slots are full the pull is cancelled and counted as a
+//! timeout, and the retries wait for a later tick. A pass never delays the
+//! resync of the next tick.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -52,12 +54,18 @@ pub const MAX_SWEPT_FILES_PER_TICK: usize = 64;
 /// subscribed file that count as companions.
 pub const MAX_COMPANION_FILES: usize = 256;
 
-/// How long a job waits for one pull before the pull moves to the background.
+/// How long a pull pass waits for the first pull that does not answer before
+/// the pull moves to the background.
 const PULL_PATIENCE: Duration = SWEEP_INTERVAL;
+
+/// How long a pass waits for each pull after one has run out of patience: the
+/// pass has paid for an unanswered pull already, so a file that answers
+/// promptly is not kept waiting behind several that do not.
+const PULL_GRACE: Duration = Duration::from_millis(250);
 
 /// Most pulls per server that wait in the background past [`PULL_PATIENCE`];
 /// the pull a job waits for in the foreground comes on top.
-pub const MAX_DETACHED_PULLS_PER_SERVER: usize = 2;
+const MAX_DETACHED_PULLS_PER_SERVER: usize = 2;
 
 /// How often the sweep pulls a document state whose pull failed before it
 /// leaves the file to the next tool call or edit.
@@ -252,8 +260,18 @@ struct FileMemo {
     /// `None` when the sweep could not read it, which compares as different.
     digest: Option<ContentDigest>,
     pull: FilePull,
+    /// Whether a `didSave` for the last change is still to be sent.
+    save: SaveDebt,
     /// The tick of the last visit.
     last_tick: u64,
+}
+
+/// Whether the server still has to be told that a changed file was saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveDebt {
+    Settled,
+    /// The `didSave` timed out, so the next visit sends it again.
+    Owed,
 }
 
 /// How long one budget of epoch-driven pulls lasts: one sweep interval.
@@ -408,6 +426,7 @@ impl SweepMemo {
                     seen: after.stamp(),
                     digest: after.digest(),
                     pull: FilePull::Idle(Attempt::NotPulled),
+                    save: SaveDebt::Settled,
                     last_tick: tick,
                 },
             );
@@ -433,6 +452,23 @@ impl SweepMemo {
         }
         drop(state);
         change
+    }
+
+    /// Takes the `didSave` a timed-out visit left owing for `path`.
+    fn take_save_debt(&self, path: &Path) -> SaveDebt {
+        lock_std(&self.0)
+            .files
+            .get_mut(path)
+            .map_or(SaveDebt::Settled, |memo| {
+                std::mem::replace(&mut memo.save, SaveDebt::Settled)
+            })
+    }
+
+    /// Records that the `didSave` of `path` is still to be sent.
+    fn owe_save(&self, path: &Path) {
+        if let Some(memo) = lock_std(&self.0).files.get_mut(path) {
+            memo.save = SaveDebt::Owed;
+        }
     }
 
     fn epoch(&self, server: &ServerId) -> SweepEpoch {
@@ -499,6 +535,7 @@ impl SweepMemo {
     }
 
     /// Whether `server` may take one more pull into the background.
+    #[cfg(test)]
     fn detached_slot_free(&self, server: &ServerId) -> bool {
         Self::detached_count(&lock_std(&self.0), server) < MAX_DETACHED_PULLS_PER_SERVER
     }
@@ -696,6 +733,25 @@ struct PullCandidate {
     resynced: Resynced,
 }
 
+/// What one pull pass has met so far.
+#[derive(Debug, Default)]
+struct PassState {
+    /// A pull ran out of patience, so the pulls after it get only a grace.
+    paid_patience: bool,
+    /// A pull ran out of patience with the server's background slots full.
+    at_cap: bool,
+}
+
+impl PassState {
+    const fn patience(&self) -> Duration {
+        if self.paid_patience {
+            PULL_GRACE
+        } else {
+            PULL_PATIENCE
+        }
+    }
+}
+
 type BoxedPull = Pin<Box<dyn Future<Output = PullOutcome> + Send>>;
 
 /// Everything a per-server sweep job needs, cheap to clone into each job.
@@ -764,6 +820,8 @@ impl SweepContext {
     /// running, in which case the files due stay due for a later tick.
     pub(crate) async fn run_job(&self, visits: Vec<(PathBuf, Interest)>) {
         let (mut steps, candidates) = self.resync_pass(&visits).await;
+        // TODO(#809): a skipped pass drops its candidates while the window cursor has
+        // moved on (spec 016 edge cases); files wait a window cycle for their pull.
         let pass = candidates
             .first()
             .and_then(|(_, candidate)| self.memo.begin_pull_pass(&candidate.resynced.server));
@@ -841,18 +899,16 @@ impl SweepContext {
             })
             .collect();
         due.sort_by_key(|(why, ..)| *why);
-        let mut at_cap = false;
+        let mut pass = PassState::default();
         for (why, epoch, index, candidate) in due {
             if self.stop.is_cancelled() {
                 return;
             }
-            if at_cap
-                && (why == Due::Retry || !self.memo.detached_slot_free(&candidate.resynced.server))
-            {
+            if pass.at_cap && why == Due::Retry {
                 set_step(steps, index, SweepStep::Deferred);
                 continue;
             }
-            let step = self.pull_one(why, epoch, &candidate, &mut at_cap).await;
+            let step = self.pull_one(why, epoch, &candidate, &mut pass).await;
             set_step(steps, index, step);
             if step == SweepStep::TimedOut {
                 return;
@@ -861,14 +917,15 @@ impl SweepContext {
     }
 
     /// Pulls one file that is `why` due. A pull that does not answer within
-    /// [`PULL_PATIENCE`] moves to the background if its server has a slot;
+    /// the pass's patience ([`PULL_PATIENCE`] until one pull ran out of it,
+    /// [`PULL_GRACE`] after) moves to the background if its server has a slot;
     /// otherwise it is cancelled, counted as a timeout, and `at_cap` set.
     async fn pull_one(
         &self,
         why: Due,
         epoch: SweepEpoch,
         candidate: &PullCandidate,
-        at_cap: &mut bool,
+        pass: &mut PassState,
     ) -> SweepStep {
         let PullCandidate { path, resynced } = candidate;
         if why == Due::Own {
@@ -917,7 +974,10 @@ impl SweepContext {
             doc,
             path.clone(),
         ));
-        let waited = timeout(PULL_PATIENCE, &mut pull).await;
+        let waited = timeout(pass.patience(), &mut pull).await;
+        if waited.is_err() {
+            pass.paid_patience = true;
+        }
         match waited {
             Ok(outcome) => {
                 claim.finish(outcome);
@@ -931,7 +991,7 @@ impl SweepContext {
                 Err(claim) => {
                     drop(pull);
                     claim.finish(PullOutcome::Failed(FailureKind::TimedOut));
-                    *at_cap = true;
+                    pass.at_cap = true;
                     SweepStep::GaveUp
                 }
             },
@@ -1056,10 +1116,12 @@ impl Translator {
             return Bounded::Skipped;
         };
         let change = memo.observe(doc.server_id(), path, before, after);
-        if change.content_changed() {
+        let owed = memo.take_save_debt(path);
+        if change.content_changed() || owed == SaveDebt::Owed {
             let limit = doc.client().request_timeout();
             if timeout(limit, self.send_did_save(&doc)).await.is_err() {
                 debug!(path = %path.display(), "disk sweep timed out sending didSave");
+                memo.owe_save(path);
                 return Bounded::TimedOut;
             }
         }
@@ -1341,6 +1403,18 @@ mod tests {
         drop(refused);
         drop(detached);
         assert!(memo.detached_slot_free(&rust()));
+    }
+
+    #[test]
+    fn a_save_that_timed_out_stays_owed_until_it_is_taken() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let path = Path::new("/w/a.rs");
+        assert_eq!(memo.take_save_debt(path), SaveDebt::Settled);
+
+        memo.owe_save(path);
+
+        assert_eq!(memo.take_save_debt(path), SaveDebt::Owed);
+        assert_eq!(memo.take_save_debt(path), SaveDebt::Settled);
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub use state::{
     path_to_uri, uri_to_path,
 };
 pub(crate) use state::{InFlightGuard, LinePresence, Opening, try_path_to_uri};
+#[cfg(test)]
+pub(crate) use translator::MAX_FAILED_PULLS_PER_STATE;
 pub use translator::{
     AddressableTool, Addressed, BoundedRange, Capability, CheckedHierarchyItem,
     CodeActionKindFilter, Completion, CompletionTrigger, CompletionsResult, Contextual,
@@ -69,8 +71,6 @@ pub(crate) use translator::{
     ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SweepContext, SweepMemo,
     ToolSupportSnapshot, WorkspaceSymbolResult,
 };
-#[cfg(test)]
-pub(crate) use translator::{MAX_DETACHED_PULLS_PER_SERVER, MAX_FAILED_PULLS_PER_STATE};
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};
 pub use workspace_roots::{WorkspacePath, WorkspaceRoots};

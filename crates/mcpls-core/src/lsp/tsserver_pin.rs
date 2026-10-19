@@ -53,7 +53,7 @@ const NATIVE_TSC_WINDOWS_SHIM: &str = "tsc.cmd";
 const NODE_NAME: &str = "node";
 const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
-const NATIVE_TSC_ARGS: [&str; 2] = ["--lsp", "--stdio"];
+const NATIVE_TSC_ARGS: &[&str] = &["--lsp", "--stdio"];
 const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
 const PNPM_GLOBAL_DIR: &str = "global";
 /// Most `global/<store version>` entries a pnpm install is searched through;
@@ -594,16 +594,13 @@ impl NativeTsc {
     }
 
     /// The `command` and `args` that start the native server.
-    fn launch_parts(&self) -> (ServerCommand, Vec<String>) {
-        let lsp_args = NATIVE_TSC_ARGS.iter().map(ToString::to_string);
+    fn launch_parts(&self) -> (ServerCommand, ServerArgs) {
+        let lsp_args = ServerArgs::from_static(NATIVE_TSC_ARGS);
         match &self.launch {
-            NativeLaunch::Direct => (self.tsc.clone(), lsp_args.collect()),
-            NativeLaunch::ThroughNode(node) => (
-                node.clone(),
-                std::iter::once(self.tsc.to_string())
-                    .chain(lsp_args)
-                    .collect(),
-            ),
+            NativeLaunch::Direct => (self.tsc.clone(), lsp_args),
+            NativeLaunch::ThroughNode(node) => {
+                (node.clone(), lsp_args.with_leading(self.tsc.clone()))
+            }
         }
     }
 }
@@ -814,8 +811,7 @@ pub fn with_selected_typescript_server<'a>(
             let mut native = config.clone();
             let (command, args) = tsc.launch_parts();
             native.command = LaunchCommand::explicit(command);
-            // NOTE: `args` are literals and a `ServerCommand`, none of which holds a NUL.
-            native.args = ServerArgs::new(args).unwrap_or_default();
+            native.args = args;
             Cow::Owned(native)
         }
         Some(TypescriptServerChoice::Tsserver(reason)) => {

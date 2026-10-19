@@ -882,14 +882,14 @@ impl LspServerConfig {
     fn builtin(
         language_id: LanguageId,
         server: BuiltinServer,
-        args: &[&str],
+        args: &'static [&'static str],
         file_patterns: &[&'static str],
         markers: impl IntoIterator<Item = &'static str>,
     ) -> Self {
         Self {
             language_id,
             command: ServerCommand::from_static(server.command()).into(),
-            args: ServerArgs::new(args.iter().copied()).unwrap_or_default(),
+            args: ServerArgs::from_static(args),
             env: crate::config::ServerEnv::default(),
             file_patterns: file_patterns
                 .iter()

@@ -20,6 +20,8 @@ pub(crate) use client::{CONTENT_MODIFIED_RETRY_METHODS, ConnectionId, Unclassifi
 pub use client::{LspClient, MAX_CONSECUTIVE_UNDECODABLE_FRAMES, SHUTDOWN_TIMEOUT};
 pub(crate) use env::{ManagedEnvVar, ParentEnv, process_env};
 #[cfg(test)]
+pub(crate) use lifecycle::RESPAWN_PLANS;
+#[cfg(test)]
 #[cfg(unix)]
 pub(crate) use lifecycle::fake_lsp_server_with_dead_loop_and_live_child;
 pub use lifecycle::{
