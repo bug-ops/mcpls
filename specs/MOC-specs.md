@@ -75,7 +75,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | implemented (#668) | #668 |
 | 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | implemented (coverage-based exclusion, learned pull sources) | #703 |
 | 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | draft | #796 |
-| 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | draft | #806 (related #798) |
+| 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
 
 ## runtime
 
