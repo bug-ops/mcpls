@@ -898,7 +898,8 @@ fn cache_overlay(items: Vec<LspDiagnostic>) -> DiagnosticSources {
 fn test_pull_supersession_rule() {
     use DocumentSync::{NotOpen, Unattached};
 
-    let synced = |n| DocumentSync::Synced(DocumentVersion::new(n));
+    let stamp = |n| DocumentStamp::new(None, DocumentVersion::new(n));
+    let synced = |n| DocumentSync::Synced(stamp(n));
 
     let cases = [
         (4, Some(5), synced(4), true),
@@ -919,11 +920,7 @@ fn test_pull_supersession_rule() {
     ];
     for (pulled, pushed, sync, superseded) in cases {
         assert_eq!(
-            pull_is_superseded(
-                DocumentVersion::new(pulled),
-                pushed.map(DocumentVersion::new),
-                sync
-            ),
+            pull_is_superseded(stamp(pulled), pushed.map(DocumentVersion::new), sync),
             superseded,
             "pulled {pulled}, pushed {pushed:?}, {sync:?}"
         );

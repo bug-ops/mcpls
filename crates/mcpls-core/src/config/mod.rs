@@ -1081,12 +1081,11 @@ impl ServerConfig {
     /// [`load_from`](Self::load_from)) uses
     /// [`RelativeRootBase::ConfigDir`], preserving #345's original behavior.
     fn load_from_with_root_base(path: &Path, relative_root_base: RelativeRootBase) -> Result<Self> {
-        let file = RegularFile::open(path).map_err(|e| match e {
+        let file = RegularFile::open(path).map_err(|error| match error {
             OpenRegularFileError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Error::ConfigNotFound(path.to_path_buf())
             }
-            OpenRegularFileError::Io(e) => Error::Io(e),
-            OpenRegularFileError::NotRegular => Error::NotARegularFile(path.to_path_buf()),
+            other => other.into_error(path),
         })?;
         let buf = file
             .read_bounded(MAX_CONFIG_FILE_BYTES)

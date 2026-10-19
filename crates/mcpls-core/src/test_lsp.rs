@@ -166,6 +166,16 @@ pub async fn read_framed_message(reader: &mut BufReader<&mut DuplexStream>) -> V
         .expect("timed out waiting for a complete framed JSON-RPC message")
 }
 
+/// As [`read_framed_message`], but waits as long as the next frame takes, for a
+/// scripted server that sits idle between requests.
+///
+/// # Panics
+///
+/// Panics if the stream reaches EOF before a complete frame is read.
+pub async fn next_framed_message(reader: &mut BufReader<&mut DuplexStream>) -> Value {
+    read_framed_message_inner(reader).await
+}
+
 async fn read_framed_message_inner(reader: &mut BufReader<&mut DuplexStream>) -> Value {
     let mut content_length = None;
     let mut line = String::new();

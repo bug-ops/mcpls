@@ -27,7 +27,7 @@ use std::io;
 use self::beneath::Beneath;
 use super::{WorkspacePath, WorkspaceRoots};
 use crate::error::Error;
-use crate::util::{OpenRegularFileError, RegularFile};
+use crate::util::RegularFile;
 
 impl WorkspaceRoots {
     /// Opens the validated `path` and verifies that the opened file lies under
@@ -51,22 +51,7 @@ impl WorkspaceRoots {
 
 #[cfg(any(target_os = "macos", windows, test))]
 fn open_regular(path: &WorkspacePath) -> Result<RegularFile, Error> {
-    RegularFile::open(path.as_path()).map_err(|error| open_error(path, error))
-}
-
-fn open_error(path: &WorkspacePath, error: OpenRegularFileError) -> Error {
-    match error {
-        // Windows refuses to open a directory without backup semantics
-        OpenRegularFileError::Io(source)
-            if cfg!(windows)
-                && source.kind() == io::ErrorKind::PermissionDenied
-                && path.as_path().is_dir() =>
-        {
-            Error::NotARegularFile(path.as_path().to_path_buf())
-        }
-        OpenRegularFileError::Io(source) => file_io(path, source),
-        OpenRegularFileError::NotRegular => Error::NotARegularFile(path.as_path().to_path_buf()),
-    }
+    RegularFile::open(path.as_path()).map_err(|error| error.into_error(path.as_path()))
 }
 
 fn file_io(path: &WorkspacePath, source: io::Error) -> Error {
@@ -89,17 +74,14 @@ impl WorkspaceRoots {
         open: impl FnOnce(&std::path::Path, &std::path::Path) -> io::Result<Beneath>,
     ) -> Result<Beneath, Error> {
         let root = self
-            .canonical
-            .iter()
-            .find(|root| path.as_path().starts_with(root))
+            .canonical_root_of(path.as_path())
             .ok_or_else(|| outside(path))?;
         let relative = path
             .as_path()
             .strip_prefix(root)
             .map_err(|_| outside(path))?;
-        if relative.as_os_str().is_empty() {
-            return Err(Error::NotARegularFile(path.as_path().to_path_buf()));
-        }
+        (!relative.is_empty())
+            .ok_or_else(|| Error::NotARegularFile(path.as_path().to_path_buf()))?;
         open(root, relative).map_err(|source| file_io(path, source))
     }
 }
@@ -109,7 +91,7 @@ impl WorkspaceRoots {
 fn regular_from(path: &WorkspacePath, beneath: Beneath) -> Result<RegularFile, Error> {
     match beneath {
         Beneath::Opened(file) => {
-            RegularFile::from_file(file).map_err(|error| open_error(path, error))
+            RegularFile::from_file(file).map_err(|error| error.into_error(path.as_path()))
         }
         Beneath::Escaped => Err(outside(path)),
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -128,10 +110,7 @@ fn require_linked(path: &WorkspacePath, file: &RegularFile) -> Result<(), Error>
         .metadata()
         .map_err(|source| file_io(path, source))?
         .nlink();
-    if links == 0 {
-        return Err(file_io(path, io::ErrorKind::NotFound.into()));
-    }
-    Ok(())
+    (links != 0).ok_or_else(|| file_io(path, io::ErrorKind::NotFound.into()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -185,11 +164,9 @@ mod platform {
                     file_io(path, source)
                 })?;
             require_linked(path, &file)?;
-            if self.contains_canonical(&actual) {
-                Ok(file)
-            } else {
-                Err(outside(path))
-            }
+            self.contains_canonical(&actual)
+                .ok_or_else(|| outside(path))?;
+            Ok(file)
         }
     }
 }
@@ -215,11 +192,9 @@ mod platform {
                 rustix::fs::getpath(file.file()).map_err(|errno| file_io(path, errno.into()))?;
             let actual = Path::new(std::ffi::OsStr::from_bytes(raw.to_bytes()));
             require_linked(path, &file)?;
-            if self.contains_canonical(actual) {
-                Ok(file)
-            } else {
-                Err(outside(path))
-            }
+            self.contains_canonical(actual)
+                .ok_or_else(|| outside(path))?;
+            Ok(file)
         }
     }
 }
@@ -255,7 +230,6 @@ mod platform {
     use std::path::Path;
 
     use super::{WorkspacePath, WorkspaceRoots, file_io, open_regular, outside};
-    use crate::bridge::workspace_roots::{CaseRule, is_within};
     use crate::error::Error;
     use crate::util::{FileIdentity, RegularFile};
 
@@ -273,14 +247,10 @@ mod platform {
         /// point (symlink or junction) among them is refused.
         pub(super) fn pin_ancestors(&self, path: &WorkspacePath) -> Result<Vec<File>, Error> {
             let file = path.as_path();
-            let root = self
-                .canonical
-                .iter()
-                .find(|root| is_within(file, root, CaseRule::Exact))
-                .ok_or_else(|| outside(path))?;
+            let root = self.canonical_root_of(file).ok_or_else(|| outside(path))?;
             let parent = file.parent().ok_or_else(|| outside(path))?;
             let relative = parent.strip_prefix(root).map_err(|_| outside(path))?;
-            let mut dir = root.clone();
+            let mut dir = root.to_path_buf();
             let mut pins = vec![pin(path, &dir)?];
             for component in relative.components() {
                 dir.push(component);

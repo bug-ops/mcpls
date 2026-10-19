@@ -22,13 +22,12 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
+use super::notifications::DocumentStamp;
 use super::{WorkspacePath, WorkspaceRoots};
 use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
-use crate::util::{
-    BoundedUtf8Error, OpenRegularFileError, RegularFile, SizeExceeded, check_bounded_utf8, lock_std,
-};
+use crate::util::{BoundedUtf8Error, RegularFile, SizeExceeded, check_bounded_utf8, lock_std};
 
 /// Debounce window for re-reading a file's content when its mtime is not yet
 /// [`mtime_settled`]. The stat itself is never debounced -- only this
@@ -99,6 +98,7 @@ fn line_bounds(content: &str, start: usize) -> (usize, Option<usize>) {
 #[derive(Clone)]
 pub(super) struct DocumentText {
     content: String,
+    digest: ContentDigest,
     stride: usize,
     /// `checkpoints[k]` is the byte offset where line `k * stride` starts.
     checkpoints: Box<[usize]>,
@@ -142,11 +142,17 @@ impl DocumentText {
             .and_then(NonZeroU32::new)
             .unwrap_or(NonZeroU32::MAX);
         Self {
+            digest: ContentDigest::of(&content),
             content,
             stride,
             checkpoints: checkpoints.into_boxed_slice(),
             line_count,
         }
+    }
+
+    /// The digest of the full text, computed once with the line index.
+    pub(super) const fn digest(&self) -> ContentDigest {
+        self.digest
     }
 
     /// As [`Self::new`], but indexes content above [`INLINE_INDEX_MAX_BYTES`]
@@ -291,6 +297,59 @@ impl DocumentVersion {
     #[must_use]
     pub(crate) const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
+    }
+}
+
+/// A digest of a document's text, so two states of a document can be told
+/// to hold the same content without keeping or comparing the text.
+///
+/// Equal texts have equal digests; the reverse holds up to hash collisions,
+/// which the sweep tolerates (a missed `didSave` until the next edit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentDigest(u64);
+
+impl ContentDigest {
+    pub(crate) fn of(text: &str) -> Self {
+        use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+/// What the tracker knows about the state of a document a server was told
+/// about, read under one lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepState {
+    /// The server was told the document's current version.
+    Current {
+        /// The opening and version the server has.
+        stamp: DocumentStamp,
+        /// The digest of that version's text.
+        digest: ContentDigest,
+    },
+    /// The document moved past the version the server was told.
+    Lagging {
+        /// The opening and version the server has.
+        stamp: DocumentStamp,
+    },
+}
+
+impl SweepState {
+    /// The opening and version the server was told.
+    pub(crate) const fn stamp(self) -> DocumentStamp {
+        match self {
+            Self::Current { stamp, .. } | Self::Lagging { stamp } => stamp,
+        }
+    }
+
+    /// The digest of the text the server was told, when it is the current one.
+    pub(crate) const fn digest(self) -> Option<ContentDigest> {
+        match self {
+            Self::Current { digest, .. } => Some(digest),
+            Self::Lagging { .. } => None,
+        }
     }
 }
 
@@ -572,7 +631,7 @@ pub struct PendingCloseClaim<'a> {
     /// URI of the evicted document, as sent to any server that had it open.
     pub(crate) uri: Uri,
     /// Servers that still need a `textDocument/didClose` for `uri`.
-    pub(crate) servers: Vec<ServerId>,
+    servers: Vec<ServerId>,
     tracker: &'a DocumentTracker,
     /// Servers not yet settled, with the generation observed at claim time.
     unsettled: Vec<(ServerId, u64)>,
@@ -580,6 +639,11 @@ pub struct PendingCloseClaim<'a> {
 }
 
 impl PendingCloseClaim<'_> {
+    /// Servers that still need a `textDocument/didClose` for the claim's URI.
+    pub(crate) fn servers(&self) -> impl Iterator<Item = &ServerId> {
+        self.servers.iter()
+    }
+
     /// Marks `server`'s close as dealt with: sent, or given up on.
     pub(crate) fn settle(&mut self, server: &ServerId) {
         self.unsettled.retain(|(unsettled, _)| unsettled != server);
@@ -729,6 +793,43 @@ impl DocumentTracker {
         lock_std(&self.documents).get(path)?.synced_version(server)
     }
 
+    /// The opening and version of `path` that `server` was last told about,
+    /// read under one lock so the pair never mixes two openings; `None` when
+    /// `path` is not tracked or `server` never saw it.
+    #[must_use]
+    pub(crate) fn stamp(&self, path: &Path, server: &ServerId) -> Option<DocumentStamp> {
+        let documents = lock_std(&self.documents);
+        let stamp = documents.get(path).and_then(|state| {
+            Some(DocumentStamp::new(
+                Some(state.opened),
+                state.synced_version(server)?,
+            ))
+        });
+        drop(documents);
+        stamp
+    }
+
+    /// As [`Self::stamp`], also telling whether the version `server` has is the
+    /// document's current one, and if so the digest of its text.
+    #[must_use]
+    pub(crate) fn sweep_state(&self, path: &Path, server: &ServerId) -> Option<SweepState> {
+        let documents = lock_std(&self.documents);
+        let sweep_state = documents.get(path).and_then(|state| {
+            let synced = state.synced_version(server)?;
+            let stamp = DocumentStamp::new(Some(state.opened), synced);
+            Some(if synced == state.version {
+                SweepState::Current {
+                    stamp,
+                    digest: state.text.digest(),
+                }
+            } else {
+                SweepState::Lagging { stamp }
+            })
+        });
+        drop(documents);
+        sweep_state
+    }
+
     /// Which opening of `path` is tracked; `None` when it is not tracked.
     #[must_use]
     pub(crate) fn opening(&self, path: &Path) -> Option<Opening> {
@@ -754,12 +855,6 @@ impl DocumentTracker {
         } else {
             DocumentOpenState::NotOpen
         }
-    }
-
-    /// Check if a document is currently open.
-    #[must_use]
-    pub fn is_open(&self, path: &Path) -> bool {
-        self.open_state(path) == DocumentOpenState::Open
     }
 
     /// Get a clone of the state of an open document.
@@ -1408,13 +1503,7 @@ impl DocumentTracker {
             OpenGate::Ungated(path) => {
                 let owned = path.to_path_buf();
                 tokio::task::spawn_blocking(move || {
-                    RegularFile::open(&owned).map_err(|e| match e {
-                        OpenRegularFileError::Io(source) => Error::FileIo {
-                            path: owned,
-                            source,
-                        },
-                        OpenRegularFileError::NotRegular => Error::NotARegularFile(owned),
-                    })
+                    RegularFile::open(&owned).map_err(|error| error.into_error(&owned))
                 })
             }
         }
@@ -1596,20 +1685,20 @@ impl DocumentTracker {
             text,
             version,
         } = document;
-        let open = LspClient::outbound_notification::<DidOpenTextDocumentNotification>(
-            DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: uri.clone(),
-                    language_id: String::from(language_id).into(),
-                    version: version.get(),
-                    text,
-                },
+        let open = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: String::from(language_id).into(),
+                version: version.get(),
+                text,
             },
-        )?;
+        };
         if !self.owes_pending_close(path, server) {
-            lsp_client.reserve_notification().await?.send(open);
-            return Ok(());
+            return lsp_client
+                .notify_typed::<DidOpenTextDocumentNotification>(open)
+                .await;
         }
+        let open = LspClient::outbound_notification::<DidOpenTextDocumentNotification>(open)?;
         let close = LspClient::outbound_notification::<DidCloseTextDocumentNotification>(
             DidCloseTextDocumentParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -1631,8 +1720,8 @@ impl DocumentTracker {
         text: String,
         version: DocumentVersion,
     ) -> Result<()> {
-        let change = LspClient::outbound_notification::<DidChangeTextDocumentNotification>(
-            DidChangeTextDocumentParams {
+        lsp_client
+            .notify_typed::<DidChangeTextDocumentNotification>(DidChangeTextDocumentParams {
                 text_document: VersionedTextDocumentIdentifier {
                     version: version.get(),
                     text_document_identifier: lsp_types::TextDocumentIdentifier {
@@ -1644,10 +1733,8 @@ impl DocumentTracker {
                         lsp_types::TextDocumentContentChangeWholeDocument { text },
                     ),
                 ],
-            },
-        )?;
-        lsp_client.reserve_notification().await?.send(change);
-        Ok(())
+            })
+            .await
     }
 
     /// Per-server sync phase of `ensure_open`: sends `didOpen`, `didChange`,
@@ -1939,13 +2026,13 @@ impl DocumentTracker {
         {
             roots.push(canonical);
         }
-        self.ensure_open(OpenRequest {
-            path: &WorkspacePath::for_test(path.to_path_buf()),
-            roots: &WorkspaceRoots::for_test(roots, Vec::new()),
+        self.ensure_open(OpenRequest::new(
+            &WorkspacePath::for_test(path.to_path_buf()),
+            &WorkspaceRoots::for_test(roots, Vec::new()),
             server,
             client,
             access,
-        })
+        ))
         .await
     }
 }
@@ -1969,19 +2056,34 @@ pub enum Access {
 /// validation is refused (#783).
 #[derive(Debug, Clone, Copy)]
 pub struct OpenRequest<'a> {
-    /// The validated, canonical path of the document.
-    pub path: &'a WorkspacePath,
-    /// The roots `path` was validated against and the opened file must lie in.
-    pub roots: &'a WorkspaceRoots,
-    /// The server to sync the document to.
-    pub server: &'a ServerId,
-    /// The connection to `server`.
-    pub client: &'a LspClient,
-    /// Whether the call touches the document's LRU position.
-    pub access: Access,
+    path: &'a WorkspacePath,
+    roots: &'a WorkspaceRoots,
+    server: &'a ServerId,
+    client: &'a LspClient,
+    access: Access,
 }
 
 impl<'a> OpenRequest<'a> {
+    /// A request to open `path`, validated against `roots`, for `server`
+    /// over `client`; `access` says whether it touches the document's LRU
+    /// position.
+    #[must_use]
+    pub const fn new(
+        path: &'a WorkspacePath,
+        roots: &'a WorkspaceRoots,
+        server: &'a ServerId,
+        client: &'a LspClient,
+        access: Access,
+    ) -> Self {
+        Self {
+            path,
+            roots,
+            server,
+            client,
+            access,
+        }
+    }
+
     const fn gate(&self) -> OpenGate<'a> {
         OpenGate::Contained {
             roots: self.roots,
@@ -2174,12 +2276,12 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), map);
         let path = PathBuf::from("/test/file.rs");
 
-        assert!(!tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::NotOpen);
 
         tracker
             .open(path.clone(), "fn main() {}".to_string())
             .unwrap();
-        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::Open);
         assert_eq!(tracker.len(), 1);
 
         let state = tracker.get(&path).unwrap();
@@ -2187,7 +2289,7 @@ mod tests {
         assert_eq!(state.language_id(), "rust");
 
         tracker.close(&path);
-        assert!(!tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::NotOpen);
         assert!(tracker.is_empty());
     }
 
@@ -2349,9 +2451,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(tracker.len(), 2);
-        assert!(!tracker.is_open(Path::new("/test/file1.rs")));
-        assert!(tracker.is_open(Path::new("/test/file2.rs")));
-        assert!(tracker.is_open(Path::new("/test/file3.rs")));
+        assert_eq!(
+            tracker.open_state(Path::new("/test/file1.rs")),
+            DocumentOpenState::NotOpen
+        );
+        assert_eq!(
+            tracker.open_state(Path::new("/test/file2.rs")),
+            DocumentOpenState::Open
+        );
+        assert_eq!(
+            tracker.open_state(Path::new("/test/file3.rs")),
+            DocumentOpenState::Open
+        );
 
         assert!(
             tracker.pending_close_paths().is_empty(),
@@ -2381,7 +2492,7 @@ mod tests {
         let result = tracker.open(PathBuf::from("/test/other.rs"), "fn other() {}".to_string());
         assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert!(
-            tracker.is_open(&locked_path),
+            tracker.open_state(&locked_path) == DocumentOpenState::Open,
             "the locked document must not be evicted"
         );
         assert!(tracker.pending_close_paths().is_empty());
@@ -2437,13 +2548,13 @@ mod tests {
         let (client, _guard) = fake_lsp_client();
 
         let result = tracker
-            .ensure_open(OpenRequest {
-                path: &validated,
-                roots: &roots,
-                server: &server,
-                client: &client,
-                access: Access::Use,
-            })
+            .ensure_open(OpenRequest::new(
+                &validated,
+                &roots,
+                &server,
+                &client,
+                Access::Use,
+            ))
             .await;
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
@@ -2524,13 +2635,13 @@ mod tests {
 
         let result = tracker.open(path_b.clone(), "BBBB".to_string());
         assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
-        assert!(tracker.is_open(&path_a));
+        assert_eq!(tracker.open_state(&path_a), DocumentOpenState::Open);
         assert!(tracker.pending_close_paths().is_empty());
 
         drop(guard);
         tracker.open(path_b.clone(), "BBBB".to_string()).unwrap();
-        assert!(!tracker.is_open(&path_a));
-        assert!(tracker.is_open(&path_b));
+        assert_eq!(tracker.open_state(&path_a), DocumentOpenState::NotOpen);
+        assert_eq!(tracker.open_state(&path_b), DocumentOpenState::Open);
         assert_eq!(tracker.pending_close_paths(), vec![path_a.clone()]);
         assert_eq!(
             pending_servers(&tracker, &path_a),
@@ -2565,7 +2676,7 @@ mod tests {
         drop(second);
         assert!(lock_std(&tracker.in_flight).is_empty());
         tracker.open(path_b, "BBBB".to_string()).unwrap();
-        assert!(!tracker.is_open(&path_a));
+        assert_eq!(tracker.open_state(&path_a), DocumentOpenState::NotOpen);
     }
 
     /// #503: a guard held inside a future that is cancelled mid-await is
@@ -2605,7 +2716,7 @@ mod tests {
         );
         assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert!(
-            tracker.is_open(&first),
+            tracker.open_state(&first) == DocumentOpenState::Open,
             "the not-disk-verified document must not be evicted"
         );
         assert!(tracker.pending_close_paths().is_empty());
@@ -2658,14 +2769,14 @@ mod tests {
             .unwrap();
 
         assert!(
-            tracker.is_open(&path_a),
+            tracker.open_state(&path_a) == DocumentOpenState::Open,
             "recently re-accessed, must survive"
         );
         assert!(
-            !tracker.is_open(&path_b),
+            tracker.open_state(&path_b) == DocumentOpenState::NotOpen,
             "least-recently-used, must be evicted"
         );
-        assert!(tracker.is_open(&path_c));
+        assert_eq!(tracker.open_state(&path_c), DocumentOpenState::Open);
 
         assert_eq!(tracker.pending_close_paths(), vec![path_b.clone()]);
         assert_eq!(
@@ -3239,16 +3350,16 @@ mod tests {
         tracker.open(path2.clone(), "content2".to_string()).unwrap();
 
         assert_eq!(tracker.len(), 2);
-        assert!(tracker.is_open(&path1));
-        assert!(tracker.is_open(&path2));
+        assert_eq!(tracker.open_state(&path1), DocumentOpenState::Open);
+        assert_eq!(tracker.open_state(&path2), DocumentOpenState::Open);
 
         assert_eq!(tracker.get(&path1).unwrap().content(), "content1");
         assert_eq!(tracker.get(&path2).unwrap().content(), "content2");
 
         tracker.close(&path1);
         assert_eq!(tracker.len(), 1);
-        assert!(!tracker.is_open(&path1));
-        assert!(tracker.is_open(&path2));
+        assert_eq!(tracker.open_state(&path1), DocumentOpenState::NotOpen);
+        assert_eq!(tracker.open_state(&path2), DocumentOpenState::Open);
     }
 
     #[test]
@@ -3263,7 +3374,7 @@ mod tests {
         let path = PathBuf::from("/test/empty.rs");
 
         tracker.open(path.clone(), String::new()).unwrap();
-        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::Open);
         assert_eq!(tracker.get(&path).unwrap().content(), "");
     }
 
@@ -3313,8 +3424,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(tracker.len(), 5);
-        assert!(!tracker.is_open(Path::new("/test/file0.rs")));
-        assert!(tracker.is_open(Path::new("/test/file6.rs")));
+        assert_eq!(
+            tracker.open_state(Path::new("/test/file0.rs")),
+            DocumentOpenState::NotOpen
+        );
+        assert_eq!(
+            tracker.open_state(Path::new("/test/file6.rs")),
+            DocumentOpenState::Open
+        );
     }
 
     #[test]
@@ -3787,7 +3904,7 @@ mod tests {
             .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
-        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::Open);
         assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
     }
@@ -3873,7 +3990,7 @@ mod tests {
 
         assert!(result.is_err(), "notify failure must propagate as an error");
         assert!(
-            !tracker.is_open(&path),
+            tracker.open_state(&path) == DocumentOpenState::NotOpen,
             "a failed didOpen must not leave the document tracked, or the server \
              and tracker would stay permanently desynced"
         );
@@ -4075,7 +4192,7 @@ mod tests {
         // before this call, so the next attempt retries from the same
         // starting point rather than drifting the tracker out of sync with
         // what was actually acknowledged over the wire.
-        assert!(tracker.is_open(&path));
+        assert_eq!(tracker.open_state(&path), DocumentOpenState::Open);
         assert_eq!(tracker.get(&path).unwrap().content(), "fn main() {}");
         assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
         assert_eq!(

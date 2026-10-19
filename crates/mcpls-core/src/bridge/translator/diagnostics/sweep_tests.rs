@@ -2,7 +2,7 @@
 //! and what the pull publishes.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -11,9 +11,11 @@ use tempfile::TempDir;
 use tokio::io::BufReader;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::pull_tests::{Fixture, answer, error_item, full_report, next_pull_request};
-use super::sweep::{Interest, SweepMemo, SweepStep};
+use super::sweep::{Interest, SweepContext, SweepMemo, SweepStep};
 use super::*;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::translator::testing::*;
@@ -21,6 +23,36 @@ use crate::config::{DocumentLimit, WorkspaceTrust};
 use crate::test_lsp::client_path;
 
 type Sweep = JoinHandle<SweepStep>;
+
+fn sweep_context(
+    translator: &Arc<Translator>,
+    cache: &Arc<Mutex<NotificationCache>>,
+    memo: &SweepMemo,
+) -> SweepContext {
+    SweepContext::new(
+        Arc::clone(translator),
+        Arc::clone(cache),
+        memo.clone(),
+        TaskTracker::new(),
+        CancellationToken::new(),
+    )
+}
+
+/// Sweeps `path` alone, as a job of one visit.
+async fn sweep_file(
+    translator: &Arc<Translator>,
+    path: &Path,
+    interest: Interest,
+    memo: &SweepMemo,
+    cache: &Arc<Mutex<NotificationCache>>,
+) -> SweepStep {
+    sweep_context(translator, cache, memo)
+        .run(vec![(path.to_path_buf(), interest)])
+        .await
+        .into_iter()
+        .next()
+        .expect("the visit was reached")
+}
 
 impl Fixture {
     fn spawn_sweep(&self, memo: &SweepMemo) -> Sweep {
@@ -30,7 +62,7 @@ impl Fixture {
     fn spawn_sweep_of(&self, path: PathBuf, interest: Interest, memo: &SweepMemo) -> Sweep {
         let (translator, cache) = (Arc::clone(&self.translator), Arc::clone(&self.cache));
         let memo = memo.clone();
-        tokio::spawn(async move { translator.sweep_file(&path, interest, &memo, &cache).await })
+        tokio::spawn(async move { sweep_file(&translator, &path, interest, &memo, &cache).await })
     }
 
     async fn finish_sweep(sweep: Sweep) -> SweepStep {
@@ -223,6 +255,7 @@ async fn test_sweep_leaves_a_dead_server_alone() {
     translator.set_workspace_roots(WorkspaceRoots::from_paths(&[canonical_dir(&dir)]).unwrap());
     translator.register_client(id.clone(), dead.client().clone());
     translator.register_server(id.clone(), dead);
+    let translator = Arc::new(translator);
     lock_std(&translator.servers)
         .server_mut(&id)
         .unwrap()
@@ -241,10 +274,15 @@ async fn test_sweep_leaves_a_dead_server_alone() {
     fs::write(&file, "fn main() {}").unwrap();
 
     assert_eq!(translator.sweep_server(&file), None);
-    let cache = Mutex::new(NotificationCache::new());
-    let step = translator
-        .sweep_file(&file, Interest::Subscribed, &SweepMemo::default(), &cache)
-        .await;
+    let cache = Arc::new(Mutex::new(NotificationCache::new()));
+    let step = sweep_file(
+        &translator,
+        &file,
+        Interest::Subscribed,
+        &SweepMemo::default(),
+        &cache,
+    )
+    .await;
 
     assert_eq!(step, SweepStep::Skipped);
     assert!(translator.dead_server_config(&id).is_some());
@@ -340,9 +378,9 @@ async fn test_sweep_skips_a_tracked_file_replaced_by_a_symlink_out_of_the_roots(
     assert!(sent.iter().all(|m| !m.contains("textDocument/didChange")));
 }
 
-/// A server that does not answer the pull ends the sweep of its files.
+/// A pull that does not answer in time waits in the background; the job moves on.
 #[tokio::test(start_paused = true)]
-async fn test_sweep_reports_a_timed_out_pull() {
+async fn test_sweep_detaches_a_pull_that_does_not_answer() {
     let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
     fx.attach_tracker().await;
     fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
@@ -354,10 +392,10 @@ async fn test_sweep_reports_a_timed_out_pull() {
         fx.spawn_sweep(&SweepMemo::default()),
     )
     .await
-    .expect("the pull never timed out")
+    .expect("the pull held the job")
     .unwrap();
 
-    assert_eq!(step, SweepStep::TimedOut);
+    assert_eq!(step, SweepStep::Detached);
 }
 
 /// A server that fails the pull while it churns (`ContentModified` after a
@@ -476,6 +514,7 @@ async fn messages_for_a_swept_edit(capabilities: lsp_types::ServerCapabilities) 
     let dir = TempDir::new().unwrap();
     let id = Fixture::rust();
     let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = Arc::new(translator);
     let file = canonical_dir(&dir).join("lib.rs");
     fs::write(&file, "fn main() {}").unwrap();
     drop(
@@ -485,10 +524,15 @@ async fn messages_for_a_swept_edit(capabilities: lsp_types::ServerCapabilities) 
             .unwrap(),
     );
     fs::write(&file, "fn main() { let x = 1; }").unwrap();
-    let cache = Mutex::new(NotificationCache::new());
-    translator
-        .sweep_file(&file, Interest::Subscribed, &SweepMemo::default(), &cache)
-        .await;
+    let cache = Arc::new(Mutex::new(NotificationCache::new()));
+    sweep_file(
+        &translator,
+        &file,
+        Interest::Subscribed,
+        &SweepMemo::default(),
+        &cache,
+    )
+    .await;
     drain(&mut BufReader::new(&mut server.write_stdout)).await
 }
 
@@ -562,6 +606,7 @@ async fn test_sweep_sends_did_save_once_per_change() {
     let id = Fixture::rust();
     let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
     let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = Arc::new(translator);
     let file = canonical_dir(&dir).join("lib.rs");
     fs::write(&file, "fn main() {}").unwrap();
     drop(
@@ -570,13 +615,14 @@ async fn test_sweep_sends_did_save_once_per_change() {
             .await
             .unwrap(),
     );
-    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
+    let (memo, cache) = (
+        SweepMemo::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
     fs::write(&file, "fn main() { let x = 1; }").unwrap();
 
     for _ in 0..3 {
-        translator
-            .sweep_file(&file, Interest::Subscribed, &memo, &cache)
-            .await;
+        sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
     }
 
     let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
@@ -601,7 +647,7 @@ async fn test_sweep_sends_no_did_save_in_an_untrusted_workspace() {
     let id = Fixture::rust();
     let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
     let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
-    let translator = translator.with_workspace_trust(WorkspaceTrust::untrusted([id]));
+    let translator = Arc::new(translator.with_workspace_trust(WorkspaceTrust::untrusted([id])));
     let file = canonical_dir(&dir).join("lib.rs");
     fs::write(&file, "fn main() {}").unwrap();
     drop(
@@ -612,14 +658,14 @@ async fn test_sweep_sends_no_did_save_in_an_untrusted_workspace() {
     );
     fs::write(&file, "fn main() { let x = 1; }").unwrap();
 
-    translator
-        .sweep_file(
-            &file,
-            Interest::Subscribed,
-            &SweepMemo::default(),
-            &Mutex::new(NotificationCache::new()),
-        )
-        .await;
+    sweep_file(
+        &translator,
+        &file,
+        Interest::Subscribed,
+        &SweepMemo::default(),
+        &Arc::new(Mutex::new(NotificationCache::new())),
+    )
+    .await;
 
     let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
     assert_eq!(
@@ -635,26 +681,27 @@ async fn test_sweep_sends_did_save_for_a_reopened_file() {
     let id = Fixture::rust();
     let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
     let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
-    let translator = translator.with_resource_limits(ResourceLimits {
+    let translator = Arc::new(translator.with_resource_limits(ResourceLimits {
         max_documents: DocumentLimit::new(1),
         ..ResourceLimits::default()
-    });
+    }));
     let (file, other) = (
         canonical_dir(&dir).join("lib.rs"),
         canonical_dir(&dir).join("other.rs"),
     );
     fs::write(&file, "fn main() {}").unwrap();
     fs::write(&other, "fn other() {}").unwrap();
-    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
+    let (memo, cache) = (
+        SweepMemo::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
     drop(
         translator
             .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
             .await
             .unwrap(),
     );
-    translator
-        .sweep_file(&file, Interest::Subscribed, &memo, &cache)
-        .await;
+    sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
     drop(
         translator
             .prepare_document(&client_path(other), ToolKind::Diagnostics)
@@ -669,22 +716,59 @@ async fn test_sweep_sends_did_save_for_a_reopened_file() {
             .unwrap(),
     );
 
-    translator
-        .sweep_file(&file, Interest::Subscribed, &memo, &cache)
-        .await;
+    sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
 
     let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
     assert_eq!(count_of(&sent, "textDocument/didSave"), 1);
 }
 
-/// A file edited on disk after its memo entry was trimmed is saved at its next
-/// visit: the tracker's own state is the baseline.
+/// Evicting a file and opening it again with the content it had is no change
+/// to save (#791).
 #[tokio::test]
-async fn test_sweep_sends_did_save_for_an_edit_made_after_the_memo_forgot_the_file() {
+async fn test_sweep_sends_no_did_save_for_a_reopen_with_identical_content() {
     let dir = TempDir::new().unwrap();
     let id = Fixture::rust();
     let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
     let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = Arc::new(translator.with_resource_limits(ResourceLimits {
+        max_documents: DocumentLimit::new(1),
+        ..ResourceLimits::default()
+    }));
+    let (file, other) = (
+        canonical_dir(&dir).join("lib.rs"),
+        canonical_dir(&dir).join("other.rs"),
+    );
+    fs::write(&file, "fn main() {}").unwrap();
+    fs::write(&other, "fn other() {}").unwrap();
+    let (memo, cache) = (
+        SweepMemo::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
+    for tracked in [&file, &other, &file] {
+        drop(
+            translator
+                .prepare_document(&client_path(tracked.clone()), ToolKind::Diagnostics)
+                .await
+                .unwrap(),
+        );
+        if *tracked == file {
+            sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
+        }
+    }
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    assert_eq!(count_of(&sent, "textDocument/didSave"), 0);
+}
+
+/// A file a tool call resynced after the sweep stopped visiting it is saved at
+/// its next visit: the tombstone holds what the sweep last saw (#791).
+#[tokio::test]
+async fn test_sweep_sends_did_save_for_a_change_a_tool_call_resynced_outside_the_visit_set() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = Arc::new(translator);
     let file = canonical_dir(&dir).join("lib.rs");
     fs::write(&file, "fn main() {}").unwrap();
     drop(
@@ -693,16 +777,52 @@ async fn test_sweep_sends_did_save_for_an_edit_made_after_the_memo_forgot_the_fi
             .await
             .unwrap(),
     );
-    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
-    translator
-        .sweep_file(&file, Interest::Companion, &memo, &cache)
-        .await;
+    let (memo, cache) = (
+        SweepMemo::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
+    sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
+    memo.retain(|_| false);
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+
+    sweep_file(&translator, &file, Interest::Subscribed, &memo, &cache).await;
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    assert_eq!(count_of(&sent, "textDocument/didSave"), 1);
+}
+
+/// A file edited on disk after its memo entry was trimmed is saved at its next
+/// visit: the tombstone is the baseline.
+#[tokio::test]
+async fn test_sweep_sends_did_save_for_an_edit_made_after_the_memo_forgot_the_file() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let translator = Arc::new(translator);
+    let file = canonical_dir(&dir).join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    let (memo, cache) = (
+        SweepMemo::default(),
+        Arc::new(Mutex::new(NotificationCache::new())),
+    );
+    sweep_file(&translator, &file, Interest::Companion, &memo, &cache).await;
     memo.retain(|_| false);
     fs::write(&file, "fn main() { let x = 1; }").unwrap();
 
-    translator
-        .sweep_file(&file, Interest::Companion, &memo, &cache)
-        .await;
+    sweep_file(&translator, &file, Interest::Companion, &memo, &cache).await;
 
     let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
     assert_eq!(count_of(&sent, "textDocument/didSave"), 1);

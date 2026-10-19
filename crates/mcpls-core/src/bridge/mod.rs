@@ -64,10 +64,13 @@ pub use translator::{
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,
-    InlayHintsResult, Interest, NotificationReceivers, NotificationWiring, OutgoingCallsResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SweepMemo, SweepStep,
+    InlayHintsResult, Interest, MAX_COMPANION_FILES, MAX_SWEPT_FILES_PER_TICK,
+    NotificationReceivers, NotificationWiring, OutgoingCallsResult, SWEEP_INTERVAL,
+    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SweepContext, SweepMemo,
     ToolSupportSnapshot, WorkspaceSymbolResult,
 };
+#[cfg(test)]
+pub(crate) use translator::{MAX_DETACHED_PULLS_PER_SERVER, MAX_FAILED_PULLS_PER_STATE};
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};
 pub use workspace_roots::{WorkspacePath, WorkspaceRoots};

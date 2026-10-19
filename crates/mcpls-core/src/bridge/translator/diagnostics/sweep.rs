@@ -1,34 +1,71 @@
-//! Resync and re-pull of a tracked file on behalf of its subscribers (#648,
-//! #781).
+//! Resync and re-pull of tracked files on behalf of their subscribers (#648,
+//! #781, #806).
 //!
 //! The schedule (interval, subscribed files, companions, per-server jobs)
-//! belongs to `runtime::disk_sweep`; this module is the unit it runs per file.
+//! belongs to `runtime::disk_sweep`; this module is the unit it runs per
+//! server: [`SweepContext::run`].
+//!
+//! A job resyncs every file it was given first, which is all the schedule
+//! waits for, then hands the subscribed files that are due to a pull pass
+//! that runs in the background, one pass per server at a time. A pull that has
+//! not answered after [`PULL_PATIENCE`] moves out of the pass, to wait in the
+//! background where at most [`MAX_DETACHED_PULLS_PER_SERVER`] may wait per
+//! server, so one unanswered pull delays only its own file. At full cap one
+//! patience expiry per pass is the most it pays: the pull is cancelled and
+//! counted as a timeout, and the remaining files that are due wait for a later
+//! tick. A pass never delays the resync of the next tick.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use lsp_types::{
-    DidSaveTextDocumentNotification, DidSaveTextDocumentParams, TextDocumentIdentifier,
+    DidSaveTextDocumentNotification, DidSaveTextDocumentParams, TextDocumentIdentifier, Uri,
 };
 use tokio::sync::Mutex;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::debug;
 
 use super::{PullSupport, Translator};
 use crate::bridge::notifications::DocumentStamp;
+use crate::bridge::state::{ContentDigest, SweepState};
 use crate::bridge::translator::routing::PreparedDocument;
 use crate::bridge::translator::save_support::SaveSupport;
 use crate::bridge::{Access, ClientPath, NotificationCache, WorkspacePath};
 use crate::config::{ServerId, ToolKind, WorkspaceTrust};
-use crate::error::Error;
+use crate::error::{Error, ErrorChain};
 use crate::lsp::LspClient;
 use crate::util::lock_std;
 
+/// Time between two sweeps.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Most subscribed files one sweep visits; the rest follow on later ticks.
+pub const MAX_SWEPT_FILES_PER_TICK: usize = 64;
+
+/// Most recently used tracked, unsubscribed files of a server with a
+/// subscribed file that count as companions.
+pub const MAX_COMPANION_FILES: usize = 256;
+
+/// How long a job waits for one pull before the pull moves to the background.
+const PULL_PATIENCE: Duration = SWEEP_INTERVAL;
+
+/// Most pulls per server that wait in the background past [`PULL_PATIENCE`];
+/// the pull a job waits for in the foreground comes on top.
+pub const MAX_DETACHED_PULLS_PER_SERVER: usize = 2;
+
 /// How often the sweep pulls a document state whose pull failed before it
 /// leaves the file to the next tool call or edit.
-const MAX_FAILED_PULLS_PER_STATE: u8 = 3;
+pub const MAX_FAILED_PULLS_PER_STATE: u8 = 3;
+
+/// Memo entries kept for files the sweep no longer visits, so a later visit
+/// still compares with what the sweep last saw of them.
+const MAX_MEMO_TOMBSTONES: usize = MAX_COMPANION_FILES;
 
 /// A counter of the content changes the sweep observed on one server's files.
 ///
@@ -44,20 +81,52 @@ impl SweepEpoch {
     }
 }
 
-/// What the sweep made of its pulls of one file at one document state.
-#[derive(Debug, Clone, Copy)]
+/// Why a pull failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// The server did not answer in time.
+    TimedOut,
+    /// The server or the connection reported an error.
+    Errored,
+}
+
+/// How one pull ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullOutcome {
+    Answered,
+    Failed(FailureKind),
+}
+
+/// Why a file is due for a pull; the order is the order of the pulls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Due {
+    /// The file's own document state is new to the sweep.
+    Own,
+    /// Another file of the server changed since the file was pulled.
+    Epoch,
+    /// The last pull of the current state failed and may be tried again.
+    Retry,
+}
+
+/// What the sweep made of its pulls of one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempt {
+    NotPulled,
     /// The server answered; whether the cache stored the report or not, a
     /// pull of the same state would add nothing.
     Answered {
         state: DocumentStamp,
         epoch: SweepEpoch,
     },
-    /// The pull failed this many times.
+    /// The pulls of `state` failed. Timeouts are counted whatever the epoch,
+    /// so a file whose server never answers is pulled a bounded number of
+    /// times per state; errors are counted per epoch, so a file that failed
+    /// fast is pulled again when another file changed.
     Failed {
         state: DocumentStamp,
         epoch: SweepEpoch,
-        failures: u8,
+        timeouts: u8,
+        errors: u8,
     },
 }
 
@@ -65,86 +134,135 @@ impl Attempt {
     /// Whether another pull at `current` and `epoch` is pointless.
     fn settles(self, current: DocumentStamp, epoch: SweepEpoch) -> bool {
         match self {
+            Self::NotPulled => false,
             Self::Answered { state, epoch: at } => state == current && at == epoch,
             Self::Failed {
                 state,
                 epoch: at,
-                failures,
-            } => state == current && at == epoch && failures >= MAX_FAILED_PULLS_PER_STATE,
+                timeouts,
+                errors,
+            } => {
+                state == current
+                    && (timeouts >= MAX_FAILED_PULLS_PER_STATE
+                        || (at == epoch && errors >= MAX_FAILED_PULLS_PER_STATE))
+            }
         }
     }
 
-    /// The attempt after one more pull at `current` and `epoch`, which
-    /// `failed` or not.
-    fn after(
-        previous: Option<Self>,
-        current: DocumentStamp,
-        epoch: SweepEpoch,
-        failed: bool,
-    ) -> Self {
-        if !failed {
+    /// Why a pull at `current` and `epoch` is due, if it is.
+    fn due(self, current: DocumentStamp, epoch: SweepEpoch) -> Option<Due> {
+        match self {
+            Self::NotPulled => Some(Due::Own),
+            Self::Answered { state, .. } | Self::Failed { state, .. } if state != current => {
+                Some(Due::Own)
+            }
+            Self::Answered { epoch: at, .. } => (at != epoch).then_some(Due::Epoch),
+            Self::Failed { .. } => (!self.settles(current, epoch)).then_some(Due::Retry),
+        }
+    }
+
+    /// The attempt after one more pull at `current` and `epoch` that ended
+    /// as `outcome`.
+    fn after(self, current: DocumentStamp, epoch: SweepEpoch, outcome: PullOutcome) -> Self {
+        let PullOutcome::Failed(kind) = outcome else {
             return Self::Answered {
                 state: current,
                 epoch,
             };
-        }
-        let failures = match previous {
-            Some(Self::Failed {
+        };
+        let (timeouts, errors) = match self {
+            Self::Failed {
                 state,
                 epoch: at,
-                failures,
-            }) if state == current && at == epoch => failures,
-            Some(Self::Failed { .. } | Self::Answered { .. }) | None => 0,
+                timeouts,
+                errors,
+            } if state == current => (timeouts, if at == epoch { errors } else { 0 }),
+            Self::NotPulled | Self::Answered { .. } | Self::Failed { .. } => (0, 0),
+        };
+        let (timeouts, errors) = match kind {
+            FailureKind::TimedOut => (timeouts.saturating_add(1), errors),
+            FailureKind::Errored => (timeouts, errors.saturating_add(1)),
         };
         Self::Failed {
             state: current,
             epoch,
-            failures: failures.saturating_add(1),
+            timeouts,
+            errors,
         }
     }
+}
+
+/// Whether a content change moved a file's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Content {
+    /// The text is the one the sweep saw before (a reopen of the same file).
+    Same,
+    /// The text differs, or the sweep cannot tell.
+    Different,
 }
 
 /// How a visit found a file's document state relative to the last visit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     /// The state is the one the memo holds.
-    None,
-    /// The content changed within one opening of the file.
-    Edited,
-    /// The file was opened again.
-    Reopened,
+    Unchanged,
+    /// The file was edited or opened again.
+    Moved(Content),
 }
 
-/// What one visit to a file observed.
-#[derive(Debug, Clone, Copy)]
-struct Observation {
-    /// No earlier visit is remembered.
-    first_sight: bool,
-    change: Change,
-}
-
-impl Observation {
-    /// Whether this visit itself found the file new or moved, as opposed to
-    /// another file of the server having moved.
-    fn is_own(self) -> bool {
-        self.first_sight || self.change != Change::None
+impl Change {
+    /// Whether the file's text changed, which is when `didSave` goes out and
+    /// the server's epoch moves.
+    const fn content_changed(self) -> bool {
+        matches!(self, Self::Moved(Content::Different))
     }
+}
+
+/// Identifies one claim on a file's pull, so a claim that outlived its memo
+/// entry cannot touch the entry of a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaimId(u64);
+
+/// Where an outstanding pull waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// A job waits for it.
+    Inline,
+    /// It waits in the background, counted against its server's cap.
+    Detached,
+}
+
+/// The state of a file's pull.
+#[derive(Debug, Clone, Copy)]
+enum FilePull {
+    Idle(Attempt),
+    /// A claim holds the file; `previous` is what it restores when dropped.
+    Outstanding {
+        previous: Attempt,
+        claim: ClaimId,
+        placement: Placement,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct FileMemo {
     server: ServerId,
     seen: DocumentStamp,
-    pull: Option<Attempt>,
+    /// The digest of the text the server was told when `seen` was recorded;
+    /// `None` when the sweep could not read it, which compares as different.
+    digest: Option<ContentDigest>,
+    pull: FilePull,
+    /// The tick of the last visit.
+    last_tick: u64,
 }
 
 /// How long one budget of epoch-driven pulls lasts: one sweep interval.
-const EPOCH_PULL_WINDOW: Duration = Duration::from_secs(2);
+const EPOCH_PULL_WINDOW: Duration = SWEEP_INTERVAL;
 
 /// Most pulls per server and [`EPOCH_PULL_WINDOW`] that are due only because
 /// another file of the server changed, so a mass change (a branch switch, a
-/// rewritten companion) spreads the re-pulls of up to 64 subscribed files over
-/// several ticks instead of sending them together.
+/// rewritten companion) spreads the re-pulls of up to [`MAX_SWEPT_FILES_PER_TICK`]
+/// subscribed files over several ticks instead of sending them together.
 const MAX_EPOCH_PULLS_PER_WINDOW: u8 = 8;
 
 /// The epoch-driven pulls a server spent in its current window.
@@ -159,6 +277,10 @@ struct MemoState {
     files: HashMap<PathBuf, FileMemo>,
     epochs: HashMap<ServerId, SweepEpoch>,
     budgets: HashMap<ServerId, PullBudget>,
+    next_claim: u64,
+    tick: u64,
+    /// Servers with a pull pass running.
+    pulling: HashSet<ServerId>,
 }
 
 /// The document state each file was last seen at by the sweep, and the pull
@@ -170,55 +292,147 @@ struct MemoState {
 /// [`MAX_FAILED_PULLS_PER_STATE`] times for one state: a server busy right
 /// after a checkout answers `ContentModified` for a few seconds.
 ///
-/// A visit that finds the document state moved (the sweep's own resync or a
+/// A visit that finds the text of a file changed (the sweep's own resync or a
 /// tool call's) advances the epoch of the file's server, which makes every
 /// subscribed file of that server due for a pull.
+///
+/// Entries of files the sweep stopped visiting stay as tombstones, the most
+/// recent [`MAX_MEMO_TOMBSTONES`] of them, so a file resynced by a tool call
+/// in the meantime is still compared with what the sweep last saw. Past that
+/// cap a path is new to the sweep again and gets no `didSave` for a change
+/// made before its next visit.
 #[derive(Debug, Clone, Default)]
 pub struct SweepMemo(Arc<StdMutex<MemoState>>);
 
+/// The rights and duties of one outstanding pull of a file.
+#[derive(Debug)]
+struct ClaimTicket {
+    path: PathBuf,
+    id: ClaimId,
+    state: DocumentStamp,
+    epoch: SweepEpoch,
+}
+
+/// The exclusive right to pull one file. Finishing it records how the pull
+/// ended; dropping it unfinished (the pull was cancelled) restores the file's
+/// earlier attempt.
+#[derive(Debug)]
+#[must_use = "dropping the claim abandons the pull"]
+struct PullClaim {
+    memo: SweepMemo,
+    ticket: Option<ClaimTicket>,
+}
+
+impl PullClaim {
+    fn finish(mut self, outcome: PullOutcome) {
+        if let Some(ticket) = self.ticket.take() {
+            self.memo.complete(&ticket, outcome);
+        }
+    }
+}
+
+impl Drop for PullClaim {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.memo.abort(&ticket);
+        }
+    }
+}
+
+/// The right to run the pull pass of one server; there is one at a time.
+#[derive(Debug)]
+#[must_use = "dropping the pass lets the next one start"]
+struct PullPass {
+    memo: SweepMemo,
+    server: ServerId,
+}
+
+impl Drop for PullPass {
+    fn drop(&mut self) {
+        lock_std(&self.memo.0).pulling.remove(&self.server);
+    }
+}
+
+/// What claiming a file's pull found.
+#[derive(Debug)]
+enum ClaimResult {
+    Claimed(PullClaim),
+    /// Another pull of the file is outstanding.
+    Outstanding,
+    /// A pull is no longer due.
+    Settled,
+}
+
 impl SweepMemo {
+    /// Takes the right to run a pull pass for `server`, when none runs.
+    fn begin_pull_pass(&self, server: &ServerId) -> Option<PullPass> {
+        lock_std(&self.0)
+            .pulling
+            .insert(server.clone())
+            .then(|| PullPass {
+                memo: self.clone(),
+                server: server.clone(),
+            })
+    }
+
+    /// Starts a new tick, which the visits that follow are stamped with.
+    pub(crate) fn begin_tick(&self) {
+        let mut state = lock_std(&self.0);
+        state.tick = state.tick.saturating_add(1);
+    }
+
     /// Records that `path` of `server` is at `after`, reached from `before`
     /// (the state just before the visit's resync), and advances the server's
-    /// epoch when that is a change.
+    /// epoch when the text changed.
     fn observe(
         &self,
         server: &ServerId,
         path: &Path,
-        before: Option<DocumentStamp>,
-        after: DocumentStamp,
-    ) -> Observation {
+        before: Option<SweepState>,
+        after: SweepState,
+    ) -> Change {
         let mut state = lock_std(&self.0);
-        let (first_sight, previous) = if let Some(memo) = state.files.get_mut(path) {
-            let previous = Some(memo.seen);
-            memo.seen = after;
+        let tick = state.tick;
+        let (previous, previous_digest) = if let Some(memo) = state.files.get_mut(path) {
+            let previous = (Some(memo.seen), memo.digest);
+            memo.seen = after.stamp();
+            memo.digest = after.digest();
             memo.server = server.clone();
-            (false, previous)
+            memo.last_tick = tick;
+            previous
         } else {
             state.files.insert(
                 path.to_path_buf(),
                 FileMemo {
                     server: server.clone(),
-                    seen: after,
-                    pull: None,
+                    seen: after.stamp(),
+                    digest: after.digest(),
+                    pull: FilePull::Idle(Attempt::NotPulled),
+                    last_tick: tick,
                 },
             );
-            (true, before)
+            (
+                before.map(SweepState::stamp),
+                before.and_then(SweepState::digest),
+            )
         };
         let change = match previous {
-            None => Change::None,
-            Some(previous) if previous == after => Change::None,
-            Some(previous) if previous.same_opening(after) => Change::Edited,
-            Some(_) => Change::Reopened,
+            Some(previous) if previous != after.stamp() => {
+                let same = previous_digest.is_some() && previous_digest == after.digest();
+                Change::Moved(if same {
+                    Content::Same
+                } else {
+                    Content::Different
+                })
+            }
+            Some(_) | None => Change::Unchanged,
         };
-        if change != Change::None {
+        if change.content_changed() {
             let epoch = state.epochs.entry(server.clone()).or_default();
             *epoch = epoch.next();
         }
         drop(state);
-        Observation {
-            first_sight,
-            change,
-        }
+        change
     }
 
     fn epoch(&self, server: &ServerId) -> SweepEpoch {
@@ -229,34 +443,168 @@ impl SweepMemo {
             .unwrap_or_default()
     }
 
-    fn settles(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> bool {
-        lock_std(&self.0)
-            .files
-            .get(path)
-            .and_then(|memo| memo.pull)
-            .is_some_and(|attempt| attempt.settles(current, epoch))
-    }
-
-    fn record(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch, failed: bool) {
-        if let Some(memo) = lock_std(&self.0).files.get_mut(path) {
-            memo.pull = Some(Attempt::after(memo.pull, current, epoch, failed));
+    /// Why `path` is due for a pull at `current` and `epoch`, if it is and no
+    /// pull of it is outstanding.
+    fn due(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> Option<Due> {
+        let pull = lock_std(&self.0).files.get(path)?.pull;
+        match pull {
+            FilePull::Idle(attempt) => attempt.due(current, epoch),
+            FilePull::Outstanding { .. } => None,
         }
     }
 
-    fn forget(&self, path: &Path) {
-        lock_std(&self.0).files.remove(path);
+    /// Records that a pull of `current` would add nothing: the cache holds
+    /// the report for it already.
+    fn record_answered(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) {
+        if let Some(memo) = lock_std(&self.0).files.get_mut(path)
+            && matches!(memo.pull, FilePull::Idle(_))
+        {
+            memo.pull = FilePull::Idle(Attempt::Answered {
+                state: current,
+                epoch,
+            });
+        }
     }
 
-    /// Forgets every file `keep` rejects, so the memo never outgrows the set
-    /// of subscribed and companion files.
+    /// Takes the right to pull `path` at `current` and `epoch`.
+    fn claim_pull(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> ClaimResult {
+        let mut state = lock_std(&self.0);
+        let id = ClaimId(state.next_claim);
+        let Some(memo) = state.files.get_mut(path) else {
+            return ClaimResult::Settled;
+        };
+        let previous = match memo.pull {
+            FilePull::Outstanding { .. } => return ClaimResult::Outstanding,
+            FilePull::Idle(attempt) if attempt.due(current, epoch).is_none() => {
+                return ClaimResult::Settled;
+            }
+            FilePull::Idle(attempt) => attempt,
+        };
+        memo.pull = FilePull::Outstanding {
+            previous,
+            claim: id,
+            placement: Placement::Inline,
+        };
+        state.next_claim = state.next_claim.saturating_add(1);
+        drop(state);
+        ClaimResult::Claimed(PullClaim {
+            memo: self.clone(),
+            ticket: Some(ClaimTicket {
+                path: path.to_path_buf(),
+                id,
+                state: current,
+                epoch,
+            }),
+        })
+    }
+
+    /// Whether `server` may take one more pull into the background.
+    fn detached_slot_free(&self, server: &ServerId) -> bool {
+        Self::detached_count(&lock_std(&self.0), server) < MAX_DETACHED_PULLS_PER_SERVER
+    }
+
+    fn detached_count(state: &MemoState, server: &ServerId) -> usize {
+        state
+            .files
+            .values()
+            .filter(|memo| {
+                memo.server == *server
+                    && matches!(
+                        memo.pull,
+                        FilePull::Outstanding {
+                            placement: Placement::Detached,
+                            ..
+                        }
+                    )
+            })
+            .count()
+    }
+
+    /// Moves the pull `claim` holds into the background when its server has a
+    /// slot for it; otherwise hands the claim back unchanged.
+    fn detach(&self, claim: PullClaim) -> Result<PullClaim, PullClaim> {
+        let mut state = lock_std(&self.0);
+        let Some(ticket) = &claim.ticket else {
+            return Err(claim);
+        };
+        let Some(server) = state
+            .files
+            .get(&ticket.path)
+            .map(|memo| memo.server.clone())
+        else {
+            return Err(claim);
+        };
+        if Self::detached_count(&state, &server) >= MAX_DETACHED_PULLS_PER_SERVER {
+            return Err(claim);
+        }
+        if let Some(memo) = state.files.get_mut(&ticket.path)
+            && let FilePull::Outstanding {
+                claim: held,
+                placement,
+                ..
+            } = &mut memo.pull
+            && *held == ticket.id
+        {
+            *placement = Placement::Detached;
+        }
+        drop(state);
+        Ok(claim)
+    }
+
+    fn complete(&self, ticket: &ClaimTicket, outcome: PullOutcome) {
+        if let Some(memo) = lock_std(&self.0).files.get_mut(&ticket.path)
+            && let FilePull::Outstanding {
+                previous, claim, ..
+            } = memo.pull
+            && claim == ticket.id
+        {
+            memo.pull = FilePull::Idle(previous.after(ticket.state, ticket.epoch, outcome));
+        }
+    }
+
+    fn abort(&self, ticket: &ClaimTicket) {
+        if let Some(memo) = lock_std(&self.0).files.get_mut(&ticket.path)
+            && let FilePull::Outstanding {
+                previous, claim, ..
+            } = memo.pull
+            && claim == ticket.id
+        {
+            memo.pull = FilePull::Idle(previous);
+        }
+    }
+
+    /// Forgets `path` unless a pull of it is outstanding.
+    fn forget(&self, path: &Path) {
+        let mut state = lock_std(&self.0);
+        if state
+            .files
+            .get(path)
+            .is_some_and(|memo| matches!(memo.pull, FilePull::Idle(_)))
+        {
+            state.files.remove(path);
+        }
+    }
+
+    /// Keeps the files `keep` accepts, the files with an outstanding pull and
+    /// the most recently visited [`MAX_MEMO_TOMBSTONES`] of the others, so the
+    /// memo never outgrows the set the sweep visits by more than that.
     pub(crate) fn retain(&self, keep: impl Fn(&Path) -> bool) {
         let mut state = lock_std(&self.0);
         let MemoState {
             files,
             epochs,
             budgets,
+            ..
         } = &mut *state;
-        files.retain(|path, _| keep(path));
+        let mut tombstones: Vec<(u64, PathBuf)> = files
+            .iter()
+            .filter(|(path, memo)| !keep(path) && matches!(memo.pull, FilePull::Idle(_)))
+            .map(|(path, memo)| (memo.last_tick, path.clone()))
+            .collect();
+        tombstones.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
+        for (_, path) in tombstones.into_iter().skip(MAX_MEMO_TOMBSTONES) {
+            files.remove(&path);
+        }
         epochs.retain(|server, _| files.values().any(|memo| memo.server == *server));
         budgets.retain(|server, _| files.values().any(|memo| memo.server == *server));
         drop(state);
@@ -310,18 +658,327 @@ pub enum SweepStep {
     /// The document is in sync with the server and nothing was pulled: the
     /// server does not pull, or it was pulled at this state already.
     Synced,
-    /// The document was pulled.
+    /// The document was pulled and the server answered or failed.
     Pulled,
-    /// The pull timed out, so the server is not answering; the caller should
-    /// leave its remaining files for a later tick.
+    /// The pull has not answered in time and waits in the background.
+    Detached,
+    /// The pull has not answered in time and the server has no slot for it
+    /// in the background, so it was cancelled and counted as a timeout.
+    GaveUp,
+    /// The pull is left for a later tick: the job already paid for an
+    /// unanswered pull at full cap.
+    Deferred,
+    /// The resync did not finish in time, so the server's queue is wedged;
+    /// the job ended and its remaining files wait for a later tick.
     TimedOut,
 }
 
 /// A tracked file brought up to date with the disk, as the sweep left it.
 struct Resynced {
-    doc: PreparedDocument,
+    server: ServerId,
+    uri: Uri,
     current: DocumentStamp,
-    seen: Observation,
+}
+
+/// How a step that waits on the server's queue ended.
+enum Bounded<T> {
+    /// The file is not swept: no running server routes it, or it could not
+    /// be opened.
+    Skipped,
+    /// The step did not finish within the request timeout.
+    TimedOut,
+    Done(T),
+}
+
+/// A subscribed file that may be pulled after the resyncs of its job.
+struct PullCandidate {
+    path: PathBuf,
+    resynced: Resynced,
+}
+
+type BoxedPull = Pin<Box<dyn Future<Output = PullOutcome> + Send>>;
+
+/// Everything a per-server sweep job needs, cheap to clone into each job.
+#[derive(Clone)]
+pub struct SweepContext {
+    translator: Arc<Translator>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    memo: SweepMemo,
+    pulls: TaskTracker,
+    stop: CancellationToken,
+}
+
+impl SweepContext {
+    /// A context whose background pulls are tracked by `pulls` and end when
+    /// `stop` fires.
+    pub(crate) const fn new(
+        translator: Arc<Translator>,
+        notification_cache: Arc<Mutex<NotificationCache>>,
+        memo: SweepMemo,
+        pulls: TaskTracker,
+        stop: CancellationToken,
+    ) -> Self {
+        Self {
+            translator,
+            notification_cache,
+            memo,
+            pulls,
+            stop,
+        }
+    }
+
+    pub(crate) const fn memo(&self) -> &SweepMemo {
+        &self.memo
+    }
+
+    pub(crate) const fn pulls(&self) -> &TaskTracker {
+        &self.pulls
+    }
+
+    /// Sweeps `visits`, all of one server: resyncs every file, then pulls the
+    /// subscribed files that are due, and returns what became of each visit
+    /// that was reached, in order.
+    ///
+    /// A [`Interest::Companion`] file is resynced with [`Access::Probe`]: its
+    /// LRU position stays as tool calls left it and an evicted file is not
+    /// opened again. A resync that found the text changed sends `didSave` when
+    /// the server advertises it and the workspace is trusted, so servers that
+    /// produce diagnostics only on save re-run.
+    ///
+    /// A pull is sent only when the server is known to answer pulls (it
+    /// advertises a provider, or a tool call's probe showed that it answers),
+    /// and either the file's own state or its server's epoch moved since the
+    /// last pull, and the cache's pulled slot does not already answer the
+    /// state. A file whose state moved is therefore pulled once, however many
+    /// ticks follow.
+    #[cfg(test)]
+    pub(crate) async fn run(&self, visits: Vec<(PathBuf, Interest)>) -> Vec<SweepStep> {
+        let (mut steps, candidates) = self.resync_pass(&visits).await;
+        self.pull_due(candidates, &mut steps).await;
+        log_steps(&visits, &steps);
+        steps
+    }
+
+    /// As [`Self::run`], but returns once the files are resynced: the pulls
+    /// run in the background, unless the server's previous pull pass is still
+    /// running, in which case the files due stay due for a later tick.
+    pub(crate) async fn run_job(&self, visits: Vec<(PathBuf, Interest)>) {
+        let (mut steps, candidates) = self.resync_pass(&visits).await;
+        let pass = candidates
+            .first()
+            .and_then(|(_, candidate)| self.memo.begin_pull_pass(&candidate.resynced.server));
+        let Some(pass) = pass else {
+            log_steps(&visits, &steps);
+            return;
+        };
+        let context = self.clone();
+        self.pulls.spawn(async move {
+            let _pass = pass;
+            tokio::select! {
+                biased;
+                () = context.stop.cancelled() => {}
+                () = context.pull_due(candidates, &mut steps) => {}
+            }
+            log_steps(&visits, &steps);
+        });
+    }
+
+    /// Resyncs every visit and collects the subscribed files that may be
+    /// pulled, with the index of their step.
+    async fn resync_pass(
+        &self,
+        visits: &[(PathBuf, Interest)],
+    ) -> (Vec<SweepStep>, Vec<(usize, PullCandidate)>) {
+        let mut steps = Vec::with_capacity(visits.len());
+        let mut candidates = Vec::new();
+        for (path, interest) in visits {
+            if self.stop.is_cancelled() {
+                break;
+            }
+            let access = match interest {
+                Interest::Subscribed => Access::Use,
+                Interest::Companion => Access::Probe,
+            };
+            match self.translator.resync(path, access, &self.memo).await {
+                Bounded::Skipped => steps.push(SweepStep::Skipped),
+                Bounded::TimedOut => {
+                    steps.push(SweepStep::TimedOut);
+                    break;
+                }
+                Bounded::Done(resynced) => {
+                    if *interest == Interest::Subscribed
+                        && matches!(
+                            self.translator.pull_support(&resynced.server),
+                            PullSupport::Advertised | PullSupport::Answers
+                        )
+                    {
+                        candidates.push((
+                            steps.len(),
+                            PullCandidate {
+                                path: path.clone(),
+                                resynced,
+                            },
+                        ));
+                    }
+                    steps.push(SweepStep::Synced);
+                }
+            }
+        }
+        (steps, candidates)
+    }
+
+    /// Pulls the candidates that are due: new states first, then files
+    /// another file's change made stale, then failed pulls to retry.
+    async fn pull_due(&self, candidates: Vec<(usize, PullCandidate)>, steps: &mut [SweepStep]) {
+        let mut due: Vec<(Due, SweepEpoch, usize, PullCandidate)> = candidates
+            .into_iter()
+            .filter_map(|(index, candidate)| {
+                let epoch = self.memo.epoch(&candidate.resynced.server);
+                let why = self
+                    .memo
+                    .due(&candidate.path, candidate.resynced.current, epoch)?;
+                Some((why, epoch, index, candidate))
+            })
+            .collect();
+        due.sort_by_key(|(why, ..)| *why);
+        let mut at_cap = false;
+        for (why, epoch, index, candidate) in due {
+            if self.stop.is_cancelled() {
+                return;
+            }
+            if at_cap
+                && (why == Due::Retry || !self.memo.detached_slot_free(&candidate.resynced.server))
+            {
+                set_step(steps, index, SweepStep::Deferred);
+                continue;
+            }
+            let step = self.pull_one(why, epoch, &candidate, &mut at_cap).await;
+            set_step(steps, index, step);
+            if step == SweepStep::TimedOut {
+                return;
+            }
+        }
+    }
+
+    /// Pulls one file that is `why` due. A pull that does not answer within
+    /// [`PULL_PATIENCE`] moves to the background if its server has a slot;
+    /// otherwise it is cancelled, counted as a timeout, and `at_cap` set.
+    async fn pull_one(
+        &self,
+        why: Due,
+        epoch: SweepEpoch,
+        candidate: &PullCandidate,
+        at_cap: &mut bool,
+    ) -> SweepStep {
+        let PullCandidate { path, resynced } = candidate;
+        if why == Due::Own {
+            let stored = self
+                .notification_cache
+                .lock()
+                .await
+                .pulled_stamp(&resynced.server, &resynced.uri);
+            if stored == Some(resynced.current) {
+                self.memo.record_answered(path, resynced.current, epoch);
+                return SweepStep::Synced;
+            }
+        }
+        let ClaimResult::Claimed(claim) = self.memo.claim_pull(path, resynced.current, epoch)
+        else {
+            return SweepStep::Synced;
+        };
+        if why == Due::Epoch && !self.memo.take_epoch_pull(&resynced.server, Instant::now()) {
+            return SweepStep::Synced;
+        }
+        let doc = match self
+            .translator
+            .open_bounded(path, Access::Use, &self.memo)
+            .await
+        {
+            Bounded::Done((doc, _)) => doc,
+            Bounded::Skipped => return SweepStep::Skipped,
+            Bounded::TimedOut => return SweepStep::TimedOut,
+        };
+        // The opening above brought the server up to date with a change made
+        // since this job's resync, but did not observe it: its `didSave` and
+        // epoch move wait for the next visit, which sees the file moved. The
+        // pull is left to that visit too, so no pull answers a state the sweep
+        // has not observed.
+        if self
+            .translator
+            .document_tracker
+            .stamp(doc.path(), doc.server_id())
+            != Some(resynced.current)
+        {
+            return SweepStep::Synced;
+        }
+        let mut pull: BoxedPull = Box::pin(run_pull(
+            Arc::clone(&self.translator),
+            Arc::clone(&self.notification_cache),
+            doc,
+            path.clone(),
+        ));
+        let waited = timeout(PULL_PATIENCE, &mut pull).await;
+        match waited {
+            Ok(outcome) => {
+                claim.finish(outcome);
+                SweepStep::Pulled
+            }
+            Err(_elapsed) => match self.memo.detach(claim) {
+                Ok(claim) => {
+                    self.spawn_detached(pull, claim);
+                    SweepStep::Detached
+                }
+                Err(claim) => {
+                    drop(pull);
+                    claim.finish(PullOutcome::Failed(FailureKind::TimedOut));
+                    *at_cap = true;
+                    SweepStep::GaveUp
+                }
+            },
+        }
+    }
+
+    /// Lets `pull` finish in the background, until the sweep stops.
+    fn spawn_detached(&self, pull: BoxedPull, claim: PullClaim) {
+        let stop = self.stop.clone();
+        self.pulls.spawn(async move {
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => {}
+                outcome = pull => claim.finish(outcome),
+            }
+        });
+    }
+}
+
+fn set_step(steps: &mut [SweepStep], index: usize, step: SweepStep) {
+    if let Some(slot) = steps.get_mut(index) {
+        *slot = step;
+    }
+}
+
+fn log_steps(visits: &[(PathBuf, Interest)], steps: &[SweepStep]) {
+    for ((path, interest), step) in visits.iter().zip(steps) {
+        debug!(path = %path.display(), ?interest, ?step, "disk sweep visited a file");
+    }
+}
+
+/// Pulls `doc`, which keeps the file in flight until the pull ends.
+async fn run_pull(
+    translator: Arc<Translator>,
+    notification_cache: Arc<Mutex<NotificationCache>>,
+    doc: PreparedDocument,
+    path: PathBuf,
+) -> PullOutcome {
+    let round = translator.pull_round(&doc, &notification_cache).await;
+    match round.failure {
+        None => PullOutcome::Answered,
+        Some(Error::Timeout(_)) => PullOutcome::Failed(FailureKind::TimedOut),
+        Some(error) => {
+            debug!(path = %path.display(), error = %ErrorChain(&error), "disk sweep pull failed");
+            PullOutcome::Failed(FailureKind::Errored)
+        }
+    }
 }
 
 impl Translator {
@@ -341,119 +998,76 @@ impl Translator {
             .then_some((id, client))
     }
 
-    /// Brings the tracked document at `path` up to date with the disk and,
-    /// for a [`Interest::Subscribed`] file, pulls its diagnostics when the
-    /// pulled slot does not answer the resulting state yet, which publishes
-    /// what that changed.
+    /// Opens the tracked document at `path` for the sweep, bounded by the
+    /// server's request timeout, and returns it with the state the server
+    /// had of it before.
     ///
-    /// A resync that found the content changed (edited or reopened) sends
-    /// `didSave` when the server advertises it and the workspace is trusted,
-    /// so servers that produce diagnostics only on save re-run.
-    /// A pull is sent only when the server is known to answer pulls (it
-    /// advertises a provider, or a tool call's probe showed that it answers),
-    /// and either the file's own state or its server's epoch moved since the
-    /// last pull, and the cache's pulled slot does not already answer the
-    /// state. A file whose state moved is therefore pulled once, however many
-    /// ticks follow.
-    ///
-    /// A [`Interest::Companion`] file is resynced with [`Access::Probe`]: its
-    /// LRU position stays as tool calls left it and an evicted file is not
-    /// opened again.
-    pub(crate) async fn sweep_file(
+    /// The document is validated as a tool call would, which fails for a
+    /// file that became a symlink out of the workspace roots or into another
+    /// file, and is never opened again once the tracker evicted it.
+    async fn open_bounded(
         &self,
         path: &Path,
-        interest: Interest,
+        access: Access,
         memo: &SweepMemo,
-        notification_cache: &Mutex<NotificationCache>,
-    ) -> SweepStep {
-        let access = match interest {
-            Interest::Subscribed => Access::Use,
-            Interest::Companion => Access::Probe,
+    ) -> Bounded<(PreparedDocument, Option<SweepState>)> {
+        let Some((server_id, client)) = self.sweep_target(path) else {
+            return Bounded::Skipped;
         };
-        let Some(resynced) = self.resync(path, access, memo).await else {
-            return SweepStep::Skipped;
-        };
-        match interest {
-            Interest::Subscribed => {
-                self.pull_if_due(path, resynced, memo, notification_cache)
-                    .await
-            }
-            Interest::Companion => SweepStep::Synced,
+        if self.document_tracker.opening(path).is_none() {
+            return Bounded::Skipped;
         }
-    }
-
-    async fn resync(&self, path: &Path, access: Access, memo: &SweepMemo) -> Option<Resynced> {
-        let (server_id, client) = self.sweep_target(path)?;
-        self.document_tracker.opening(path)?;
-        let before = self.stamp_of(path, &server_id);
+        let before = self.document_tracker.sweep_state(path, &server_id);
         let Some(validated) = self.revalidated(path).await else {
             memo.forget(path);
-            return None;
+            return Bounded::Skipped;
         };
-        let doc = match self
-            .open_prepared(server_id, client, &validated, access)
-            .await
+        let limit = client.request_timeout();
+        match timeout(
+            limit,
+            self.open_prepared(server_id, client, &validated, access),
+        )
+        .await
         {
-            Ok(doc) => doc,
-            Err(error) => {
-                debug!(path = %path.display(), %error, "disk sweep could not open the file");
-                return None;
+            Ok(Ok(doc)) => Bounded::Done((doc, before)),
+            Ok(Err(error)) => {
+                debug!(path = %path.display(), error = %ErrorChain(&error), "disk sweep could not open the file");
+                Bounded::Skipped
             }
-        };
-        let current = self.stamp_of(doc.path(), doc.server_id())?;
-        let seen = memo.observe(doc.server_id(), path, before, current);
-        if seen.change != Change::None {
-            self.send_did_save(&doc).await;
-        }
-        Some(Resynced { doc, current, seen })
-    }
-
-    async fn pull_if_due(
-        &self,
-        path: &Path,
-        resynced: Resynced,
-        memo: &SweepMemo,
-        notification_cache: &Mutex<NotificationCache>,
-    ) -> SweepStep {
-        let Resynced { doc, current, seen } = resynced;
-        let epoch = memo.epoch(doc.server_id());
-        if !matches!(
-            self.pull_support(doc.server_id()),
-            PullSupport::Advertised | PullSupport::Answers
-        ) || memo.settles(path, current, epoch)
-        {
-            return SweepStep::Synced;
-        }
-        let stored = notification_cache
-            .lock()
-            .await
-            .pulled_stamp(doc.server_id(), doc.uri());
-        if stored == Some(current) && seen.is_own() {
-            memo.record(path, current, epoch, false);
-            return SweepStep::Synced;
-        }
-        if !seen.is_own() && !memo.take_epoch_pull(doc.server_id(), Instant::now()) {
-            return SweepStep::Synced;
-        }
-        let round = self.pull_round(&doc, notification_cache).await;
-        memo.record(path, current, epoch, round.failure.is_some());
-        match round.failure {
-            Some(Error::Timeout(_)) => SweepStep::TimedOut,
-            Some(error) => {
-                debug!(path = %path.display(), %error, "disk sweep pull failed");
-                SweepStep::Pulled
+            Err(_elapsed) => {
+                debug!(path = %path.display(), "disk sweep timed out opening the file");
+                Bounded::TimedOut
             }
-            None => SweepStep::Pulled,
         }
     }
 
-    /// The document state `server` was last told about `path`, if it was told.
-    fn stamp_of(&self, path: &Path, server: &ServerId) -> Option<DocumentStamp> {
-        let version = self.document_tracker.synced_version(path, server)?;
-        Some(DocumentStamp::new(
-            self.document_tracker.opening(path),
-            version,
-        ))
+    /// Brings the tracked document at `path` up to date with the disk and
+    /// records what changed.
+    async fn resync(&self, path: &Path, access: Access, memo: &SweepMemo) -> Bounded<Resynced> {
+        let (doc, before) = match self.open_bounded(path, access, memo).await {
+            Bounded::Done(opened) => opened,
+            Bounded::Skipped => return Bounded::Skipped,
+            Bounded::TimedOut => return Bounded::TimedOut,
+        };
+        let Some(after) = self
+            .document_tracker
+            .sweep_state(doc.path(), doc.server_id())
+        else {
+            return Bounded::Skipped;
+        };
+        let change = memo.observe(doc.server_id(), path, before, after);
+        if change.content_changed() {
+            let limit = doc.client().request_timeout();
+            if timeout(limit, self.send_did_save(&doc)).await.is_err() {
+                debug!(path = %path.display(), "disk sweep timed out sending didSave");
+                return Bounded::TimedOut;
+            }
+        }
+        Bounded::Done(Resynced {
+            server: doc.server_id().clone(),
+            uri: doc.uri().clone(),
+            current: after.stamp(),
+        })
     }
 
     /// Tells the server of `doc` that the document was saved, when it asked
@@ -482,18 +1096,12 @@ impl Translator {
             },
             text,
         };
-        let sent = async {
-            let notification =
-                LspClient::outbound_notification::<DidSaveTextDocumentNotification>(params)?;
-            doc.client()
-                .reserve_notification()
-                .await?
-                .send(notification);
-            Ok::<(), Error>(())
-        }
-        .await;
-        if let Err(error) = sent {
-            debug!(path = %doc.path().display(), %error, "disk sweep could not send didSave");
+        if let Err(error) = doc
+            .client()
+            .notify_typed::<DidSaveTextDocumentNotification>(params)
+            .await
+        {
+            debug!(path = %doc.path().display(), error = %ErrorChain(&error), "disk sweep could not send didSave");
         }
     }
 
@@ -509,9 +1117,242 @@ impl Translator {
                 None
             }
             Err(error) => {
-                debug!(path = %path.display(), %error, "disk sweep skips a tracked file that fails validation");
+                debug!(path = %path.display(), error = %ErrorChain(&error), "disk sweep skips a tracked file that fails validation");
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+    use crate::bridge::DocumentVersion;
+
+    fn stamp(version: i32) -> DocumentStamp {
+        DocumentStamp::new(None, DocumentVersion::new(version))
+    }
+
+    fn state(version: i32, text: &str) -> SweepState {
+        SweepState::Current {
+            stamp: stamp(version),
+            digest: ContentDigest::of(text),
+        }
+    }
+
+    fn rust() -> ServerId {
+        ServerId::from_static("rust")
+    }
+
+    fn memo_with(paths: &[&str]) -> SweepMemo {
+        let memo = SweepMemo::default();
+        for path in paths {
+            memo.observe(&rust(), Path::new(path), None, state(1, path));
+        }
+        memo
+    }
+
+    const fn epoch(n: u64) -> SweepEpoch {
+        SweepEpoch(n)
+    }
+
+    fn failed(kind: FailureKind) -> PullOutcome {
+        PullOutcome::Failed(kind)
+    }
+
+    fn claim_of(memo: &SweepMemo, path: &str) -> PullClaim {
+        match memo.claim_pull(Path::new(path), stamp(1), epoch(0)) {
+            ClaimResult::Claimed(claim) => claim,
+            other => panic!("claim of {path}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_state_that_keeps_timing_out_gets_the_cap_of_pulls_whatever_the_epoch() {
+        let mut attempt = Attempt::NotPulled;
+        let mut pulls = 0_u8;
+        let mut at = 0;
+        while attempt.due(stamp(1), epoch(at)).is_some() {
+            attempt = attempt.after(stamp(1), epoch(at), failed(FailureKind::TimedOut));
+            pulls += 1;
+            at += 1;
+            assert!(pulls <= MAX_FAILED_PULLS_PER_STATE, "never settles");
+        }
+        assert_eq!(pulls, MAX_FAILED_PULLS_PER_STATE);
+    }
+
+    #[test]
+    fn errors_are_counted_per_epoch() {
+        let mut attempt = Attempt::NotPulled;
+        for _ in 0..MAX_FAILED_PULLS_PER_STATE {
+            attempt = attempt.after(stamp(1), epoch(0), failed(FailureKind::Errored));
+        }
+        assert_eq!(attempt.due(stamp(1), epoch(0)), None);
+        assert_eq!(attempt.due(stamp(1), epoch(1)), Some(Due::Retry));
+        attempt = attempt.after(stamp(1), epoch(1), failed(FailureKind::Errored));
+        assert_eq!(attempt.due(stamp(1), epoch(1)), Some(Due::Retry));
+    }
+
+    #[test]
+    fn a_new_state_or_a_moved_epoch_makes_a_pull_due() {
+        let answered = Attempt::NotPulled.after(stamp(1), epoch(0), PullOutcome::Answered);
+        assert_eq!(answered.due(stamp(1), epoch(0)), None);
+        assert_eq!(answered.due(stamp(1), epoch(1)), Some(Due::Epoch));
+        assert_eq!(answered.due(stamp(2), epoch(0)), Some(Due::Own));
+        assert_eq!(Attempt::NotPulled.due(stamp(1), epoch(0)), Some(Due::Own));
+    }
+
+    #[test]
+    fn pulls_are_ordered_own_then_epoch_then_retry() {
+        assert!(Due::Own < Due::Epoch && Due::Epoch < Due::Retry);
+    }
+
+    #[test]
+    fn a_text_change_moves_the_epoch_and_an_identical_reopen_does_not() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let path = Path::new("/w/a.rs");
+
+        let reopened = memo.observe(&rust(), path, None, state(2, "/w/a.rs"));
+        assert_eq!(reopened, Change::Moved(Content::Same));
+        assert_eq!(memo.epoch(&rust()), epoch(0));
+
+        let edited = memo.observe(&rust(), path, None, state(3, "edited"));
+        assert_eq!(edited, Change::Moved(Content::Different));
+        assert_eq!(memo.epoch(&rust()), epoch(1));
+
+        let unreadable = memo.observe(&rust(), path, None, SweepState::Lagging { stamp: stamp(4) });
+        assert_eq!(unreadable, Change::Moved(Content::Different));
+        assert_eq!(memo.epoch(&rust()), epoch(2));
+    }
+
+    #[test]
+    fn a_file_the_memo_never_saw_is_compared_with_the_state_before_the_resync() {
+        let memo = SweepMemo::default();
+        let unchanged = memo.observe(&rust(), Path::new("/w/a.rs"), None, state(1, "a"));
+        assert_eq!(unchanged, Change::Unchanged);
+
+        let edited = memo.observe(
+            &rust(),
+            Path::new("/w/b.rs"),
+            Some(state(1, "old")),
+            state(2, "new"),
+        );
+        assert_eq!(edited, Change::Moved(Content::Different));
+        let same = memo.observe(
+            &rust(),
+            Path::new("/w/c.rs"),
+            Some(state(1, "x")),
+            state(2, "x"),
+        );
+        assert_eq!(same, Change::Moved(Content::Same));
+    }
+
+    #[test]
+    fn one_claim_holds_a_file_and_dropping_it_restores_the_attempt() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let path = Path::new("/w/a.rs");
+        let claim = claim_of(&memo, "/w/a.rs");
+        assert_eq!(memo.due(path, stamp(1), epoch(0)), None);
+        assert_matches!(
+            memo.claim_pull(path, stamp(1), epoch(0)),
+            ClaimResult::Outstanding
+        );
+
+        drop(claim);
+
+        assert_eq!(memo.due(path, stamp(1), epoch(0)), Some(Due::Own));
+    }
+
+    #[test]
+    fn finishing_a_claim_records_the_outcome() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let claim = claim_of(&memo, "/w/a.rs");
+
+        claim.finish(PullOutcome::Answered);
+
+        assert_matches!(
+            memo.claim_pull(Path::new("/w/a.rs"), stamp(1), epoch(0)),
+            ClaimResult::Settled
+        );
+    }
+
+    #[test]
+    fn a_claim_that_outlived_its_entry_leaves_the_next_entry_alone() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let path = Path::new("/w/a.rs");
+        let old = claim_of(&memo, "/w/a.rs");
+        lock_std(&memo.0).files.remove(path);
+        memo.observe(&rust(), path, None, state(1, "again"));
+
+        old.finish(PullOutcome::Answered);
+
+        assert_eq!(memo.due(path, stamp(1), epoch(0)), Some(Due::Own));
+    }
+
+    #[test]
+    fn forgetting_and_trimming_keep_a_file_with_an_outstanding_pull() {
+        let memo = memo_with(&["/w/a.rs", "/w/b.rs"]);
+        let held = Path::new("/w/a.rs");
+        let _claim = claim_of(&memo, "/w/a.rs");
+
+        memo.forget(held);
+        memo.forget(Path::new("/w/b.rs"));
+        memo.retain(|_| false);
+
+        assert_eq!(memo.tracked_files(), 1);
+        assert!(lock_std(&memo.0).files.contains_key(held));
+    }
+
+    #[test]
+    fn trimming_keeps_the_most_recent_tombstones_only() {
+        let memo = SweepMemo::default();
+        let name = |n: usize| format!("/w/f{n:04}.rs");
+        for n in 0..(MAX_MEMO_TOMBSTONES + 5) {
+            memo.begin_tick();
+            memo.observe(&rust(), Path::new(&name(n)), None, state(1, "x"));
+        }
+
+        memo.retain(|_| false);
+
+        assert_eq!(memo.tracked_files(), MAX_MEMO_TOMBSTONES);
+        let files = &lock_std(&memo.0).files;
+        assert!(!files.contains_key(Path::new(&name(0))));
+        assert!(files.contains_key(Path::new(&name(MAX_MEMO_TOMBSTONES + 4))));
+    }
+
+    #[test]
+    fn a_server_has_a_bounded_number_of_background_pulls() {
+        let paths: Vec<String> = (0..=MAX_DETACHED_PULLS_PER_SERVER)
+            .map(|n| format!("/w/f{n}.rs"))
+            .collect();
+        let memo = memo_with(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut claims: Vec<PullClaim> = paths.iter().map(|path| claim_of(&memo, path)).collect();
+        let last = claims.pop().unwrap();
+
+        let detached: Vec<_> = claims
+            .into_iter()
+            .map(|claim| memo.detach(claim).expect("a slot is free"))
+            .collect();
+
+        assert!(!memo.detached_slot_free(&rust()));
+        let refused = memo.detach(last).expect_err("the cap is full");
+        drop(refused);
+        drop(detached);
+        assert!(memo.detached_slot_free(&rust()));
+    }
+
+    #[test]
+    fn one_pull_pass_runs_per_server() {
+        let memo = SweepMemo::default();
+        let first = memo.begin_pull_pass(&rust()).expect("no pass runs");
+        assert!(memo.begin_pull_pass(&rust()).is_none());
+        assert!(
+            memo.begin_pull_pass(&ServerId::from_static("other"))
+                .is_some()
+        );
+        drop(first);
+        assert!(memo.begin_pull_pass(&rust()).is_some());
     }
 }

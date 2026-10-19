@@ -65,20 +65,6 @@ impl LspClient {
         self.command_tx.try_send(notification.into_command())
     }
 
-    /// Waits for room for one notification and reserves it.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ServerTerminated`] if the server has shut down.
-    pub(crate) async fn reserve_notification(&self) -> Result<NotificationPermit<'_>> {
-        let permit = self
-            .command_tx
-            .reserve()
-            .await
-            .map_err(|_| Error::ServerTerminated)?;
-        Ok(NotificationPermit(permit))
-    }
-
     /// Waits for room for two notifications and reserves both, in send order.
     ///
     /// # Errors
