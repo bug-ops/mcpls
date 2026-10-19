@@ -1452,7 +1452,7 @@ sleep 1
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,
@@ -1467,7 +1467,7 @@ sleep 1
                 LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![],
                     initialization_options: None,

@@ -598,7 +598,7 @@ fn handles_config(name: &str, handles: Vec<ToolKind>) -> LspServerConfig {
     LspServerConfig {
         language_id: LanguageId::from_static("rust"),
         command: ServerCommand::new(name.to_string()).unwrap().into(),
-        args: vec![],
+        args: crate::config::ServerArgs::default(),
         env: crate::config::ServerEnv::default(),
         file_patterns: vec![],
         initialization_options: None,

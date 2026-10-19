@@ -1362,7 +1362,7 @@ mod pump_tests {
             cache.store_published_diagnostics(&id, &published, None, vec![error]);
             cache.clear_server_diagnostics(&id)
         };
-        assert!(!cleared.is_empty());
+        assert_ne!(cleared.len(), 0);
 
         let subs = make_subs();
         let session = SessionHandle::new(subs.clone());

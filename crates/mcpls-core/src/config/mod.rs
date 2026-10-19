@@ -15,6 +15,7 @@ mod patterns;
 mod position_encodings;
 mod routing;
 mod server;
+mod server_args;
 mod server_env;
 mod settings;
 pub(crate) mod text_newtype;
@@ -51,6 +52,7 @@ pub use server::{
     BuiltinServer, InvalidAutoSelection, InvalidServerCommand, LaunchCommand, LspServerConfig,
     ServerCommand, ServerHeuristics, ServerSelection,
 };
+pub use server_args::{InvalidServerArgs, ServerArgs};
 pub use server_env::{
     DuplicateEnvKey, EnvKey, EnvTooLarge, EnvValue, InvalidEnvKey, InvalidEnvValue,
     InvalidServerEnv, MAX_ENV_TOTAL_BYTES, ServerEnv,
@@ -2414,7 +2416,7 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("cpp"),
                 command: ServerCommand::from_static("clangd").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.c"),
@@ -2446,7 +2448,11 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("typescript"),
                 command: ServerCommand::from_static("tsgo").into(),
-                args: vec!["--lsp".to_string(), "--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    "--lsp".to_string(),
+                    "--stdio".to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.ts"),
@@ -2478,7 +2484,7 @@ mod tests {
             lsp_servers: vec![LspServerConfig {
                 language_id: LanguageId::from_static("javascript"),
                 command: ServerCommand::from_static("typescript-language-server").into(),
-                args: vec!["--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![
                     FilePattern::from_static("**/*.js"),

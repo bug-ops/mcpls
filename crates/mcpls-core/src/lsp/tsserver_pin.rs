@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::{
-    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerCommand, ServerId,
+    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerArgs, ServerCommand,
+    ServerId,
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::resolve_named;
@@ -813,7 +814,8 @@ pub fn with_selected_typescript_server<'a>(
             let mut native = config.clone();
             let (command, args) = tsc.launch_parts();
             native.command = LaunchCommand::explicit(command);
-            native.args = args;
+            // NOTE: `args` are literals and a `ServerCommand`, none of which holds a NUL.
+            native.args = ServerArgs::new(args).unwrap_or_default();
             Cow::Owned(native)
         }
         Some(TypescriptServerChoice::Tsserver(reason)) => {
@@ -1186,7 +1188,7 @@ mod launch_tests {
 
     fn config(command: &str, args: &[&str]) -> LspServerConfig {
         let mut config = super::typescript_entry(command);
-        config.args = args.iter().map(ToString::to_string).collect();
+        config.args = ServerArgs::new(args.iter().copied()).unwrap();
         config
     }
 
@@ -1838,7 +1840,7 @@ mod tests {
             ),
         ] {
             let mut config = config(command);
-            config.args = args.into_iter().map(String::from).collect();
+            config.args = ServerArgs::new(args).unwrap();
             assert_eq!(
                 resolve(&config, |_| None),
                 Some(TsserverResolution::Unresolved(reason)),
@@ -1850,7 +1852,7 @@ mod tests {
     #[test]
     fn test_unsupported_launcher_options_stay_unpinned() {
         let mut config = config("npx");
-        config.args = vec!["typescript-language-server".into(), "--stdio".into()];
+        config.args = ServerArgs::new(["typescript-language-server", "--stdio"]).unwrap();
         assert_eq!(
             pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
             None
@@ -2160,7 +2162,7 @@ mod tests {
     #[test]
     fn test_native_command_gets_no_pin() {
         let mut config = config("tsc");
-        config.args = vec!["--lsp".into(), "--stdio".into()];
+        config.args = ServerArgs::new(["--lsp", "--stdio"]).unwrap();
         assert_eq!(resolve(&config, |_| None), None);
         assert_eq!(
             pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None),
@@ -2639,7 +2641,7 @@ mod tests {
     #[test]
     fn test_plan_flags_a_package_runner_as_an_unpinnable_launcher() {
         let mut runner = config("npx");
-        runner.args = vec![SERVER_STEM.to_owned()];
+        runner.args = ServerArgs::new([SERVER_STEM]).unwrap();
 
         let plan = plan_typescript(runner, |_| None);
 

@@ -324,7 +324,7 @@ impl EntrySummary {
         Self {
             language: cfg.language_id.clone(),
             command: cfg.command.clone(),
-            args: cfg.args.clone(),
+            args: cfg.args.to_vec(),
         }
     }
 }
@@ -774,7 +774,7 @@ mod tests {
         LspServerConfig {
             language_id: LanguageId::new(language_id).unwrap(),
             command: ServerCommand::from_static("cmd").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
@@ -866,7 +866,7 @@ mod tests {
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("rust-analyzer").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
@@ -881,7 +881,10 @@ mod tests {
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("rust-analyzer").into(),
-                args: vec!["--dummy-second-instance".to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    "--dummy-second-instance".to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,

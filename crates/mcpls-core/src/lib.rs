@@ -451,7 +451,7 @@ mod tests {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("nonexistent-command-that-will-fail-12345")
                         .into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
@@ -514,7 +514,7 @@ mod tests {
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("sh").into(),
-                    args: vec!["-c".to_owned(), script],
+                    args: crate::config::ServerArgs::new(["-c".to_owned(), script]).unwrap(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,
@@ -699,7 +699,7 @@ mod tests {
                 lsp_servers: vec![LspServerConfig {
                     language_id: LanguageId::from_static("rust"),
                     command: ServerCommand::from_static("rust-analyzer").into(),
-                    args: vec![],
+                    args: crate::config::ServerArgs::default(),
                     env: crate::config::ServerEnv::default(),
                     file_patterns: vec![FilePattern::from_static("**/*.rs")],
                     initialization_options: None,

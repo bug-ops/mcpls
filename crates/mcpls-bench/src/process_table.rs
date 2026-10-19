@@ -349,7 +349,7 @@ mod tests {
         let output = "garbage\n7 1 7 S 5 Sun Oct  4 16:00:00 2026 ok\n x\n";
         assert_eq!(ProcessTable::parse_unix(output).unwrap().rows().len(), 1);
         assert!(ProcessTable::parse_unix("nothing useful here\n").is_err());
-        assert!(ProcessTable::parse_unix("").unwrap().rows().is_empty());
+        assert_eq!(ProcessTable::parse_unix("").unwrap().rows().len(), 0);
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
             row(11, 10, 10, T1, "child"),
         ]);
         let stale = ProcessIdentity::new(10, StartTime::new(T0));
-        assert!(table.tree_of(&stale, ParentLink::Pid).is_empty());
+        assert_eq!(table.tree_of(&stale, ParentLink::Pid).len(), 0);
     }
 
     #[test]

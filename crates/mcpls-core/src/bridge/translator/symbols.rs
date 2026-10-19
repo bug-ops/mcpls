@@ -589,7 +589,7 @@ mod tests {
         let configs = vec![crate::config::LspServerConfig {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

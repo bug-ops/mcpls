@@ -652,10 +652,9 @@ mod tests {
         assert_eq!(read_regular_file_bounded(&path, limit(2)).unwrap(), b"{}");
         let empty = dir.path().join("empty.json");
         std::fs::write(&empty, b"").unwrap();
-        assert!(
-            read_regular_file_bounded(&empty, limit(2))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            read_regular_file_bounded(&empty, limit(2)).unwrap().len(),
+            0
         );
     }
 

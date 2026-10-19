@@ -460,7 +460,7 @@ async fn test_sweep_does_not_reopen_an_untracked_file() {
     let step = Fixture::finish_sweep(fx.spawn_sweep(&SweepMemo::default())).await;
 
     assert_eq!(step, SweepStep::Skipped);
-    assert!(fx.translator.document_tracker().open_paths().is_empty());
+    assert_eq!(fx.translator.document_tracker().open_paths().len(), 0);
 }
 
 /// The sweep never probes: a server that advertises nothing and has not shown

@@ -642,7 +642,7 @@ mod tests {
             running: HashMap::new(),
             registered: HashSet::new(),
         };
-        assert!(snap.languages().is_empty());
+        assert_eq!(snap.languages().len(), 0);
         assert_eq!(
             snap.workspace_support(ToolKind::WorkspaceSymbols),
             RouteSupport::NoServer

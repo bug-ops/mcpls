@@ -2495,7 +2495,7 @@ mod tests {
             tracker.open_state(&locked_path) == DocumentOpenState::Open,
             "the locked document must not be evicted"
         );
-        assert!(tracker.pending_close_paths().is_empty());
+        assert_eq!(tracker.pending_close_paths().len(), 0);
     }
 
     /// Servers currently owed a `didClose` for `path`.
@@ -2558,7 +2558,7 @@ mod tests {
             .await;
 
         assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
-        assert!(tracker.open_paths().is_empty());
+        assert_eq!(tracker.open_paths().len(), 0);
     }
 
     /// #781: a probe never opens a file the tracker does not hold, so a
@@ -2581,7 +2581,7 @@ mod tests {
             .await;
 
         assert_matches!(result, Err(Error::DocumentNotFound(_)));
-        assert!(tracker.open_paths().is_empty());
+        assert_eq!(tracker.open_paths().len(), 0);
     }
 
     /// #781: a probe resyncs a tracked document but leaves the LRU order as
@@ -2636,7 +2636,7 @@ mod tests {
         let result = tracker.open(path_b.clone(), "BBBB".to_string());
         assert_matches!(result, Err(Error::DocumentLimitExceeded { .. }));
         assert_eq!(tracker.open_state(&path_a), DocumentOpenState::Open);
-        assert!(tracker.pending_close_paths().is_empty());
+        assert_eq!(tracker.pending_close_paths().len(), 0);
 
         drop(guard);
         tracker.open(path_b.clone(), "BBBB".to_string()).unwrap();
@@ -2719,7 +2719,7 @@ mod tests {
             tracker.open_state(&first) == DocumentOpenState::Open,
             "the not-disk-verified document must not be evicted"
         );
-        assert!(tracker.pending_close_paths().is_empty());
+        assert_eq!(tracker.pending_close_paths().len(), 0);
     }
 
     /// #495: `ensure_open` must bump a document's LRU recency (via
@@ -5171,7 +5171,7 @@ mod tests {
         }
         drop(claim);
 
-        assert!(tracker.pending_close_paths().is_empty());
+        assert_eq!(tracker.pending_close_paths().len(), 0);
         assert!(tracker.try_claim_pending_close(&path).is_none());
     }
 

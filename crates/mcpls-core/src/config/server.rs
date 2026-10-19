@@ -18,6 +18,7 @@ use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
+use super::server_args::{InvalidServerArgs, ServerArgs};
 use super::server_env::{EnvKey, EnvValue, InvalidServerEnv, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::{contains_nul, impl_text_newtype};
@@ -492,7 +493,7 @@ pub struct LspServerConfig {
     pub command: LaunchCommand,
 
     /// Arguments to pass to the LSP server command.
-    pub args: Vec<String>,
+    pub args: ServerArgs,
 
     /// Environment variables for the LSP server process.
     pub env: ServerEnv,
@@ -625,7 +626,7 @@ impl From<LspServerConfig> for RawLspServerConfig {
         Self {
             language_id,
             command,
-            args,
+            args: args.into(),
             env: env.into(),
             file_patterns: file_patterns.into_iter().map(String::from).collect(),
             initialization_options,
@@ -688,13 +689,12 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
                 error,
             },
         })?;
-        if let Some(index) = args.iter().position(|arg| arg.contains('\0')) {
-            return Err(ConfigError::ArgContainsNul {
-                server: entry,
+        let args = ServerArgs::try_from(args).map_err(|InvalidServerArgs { index }| {
+            ConfigError::ArgContainsNul {
+                server: entry.clone(),
                 index,
             }
-            .into());
-        }
+        })?;
         let file_patterns = file_patterns
             .iter()
             .map(|pattern| {
@@ -889,7 +889,7 @@ impl LspServerConfig {
         Self {
             language_id,
             command: ServerCommand::from_static(server.command()).into(),
-            args: args.iter().map(ToString::to_string).collect(),
+            args: ServerArgs::new(args.iter().copied()).unwrap_or_default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: file_patterns
                 .iter()
@@ -1175,7 +1175,7 @@ mod tests {
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
             command: ServerCommand::from_static("custom-lsp").into(),
-            args: vec!["--flag".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--flag".to_string()]).unwrap(),
             env: env.clone(),
             file_patterns: vec![FilePattern::from_static("**/*.custom")],
             initialization_options: Some(serde_json::json!({"key": "value"})),
@@ -1406,7 +1406,7 @@ mod tests {
         let config = LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("test-lsp").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

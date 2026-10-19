@@ -192,16 +192,6 @@ fn vetted_wrapped_programs(
 /// `args` with each program at a key of `programs` replaced by its vetted
 /// path. Programs are found by index, so no ordering of the analysis can make
 /// a replacement be skipped.
-fn with_vetted_programs(
-    args: Vec<String>,
-    mut programs: BTreeMap<usize, ServerCommand>,
-) -> Vec<String> {
-    args.into_iter()
-        .enumerate()
-        .map(|(index, arg)| programs.remove(&index).map_or(arg, String::from))
-        .collect()
-}
-
 /// `effective` pinned to what untrusted mode vetted: the executable resolved
 /// to an absolute path, and a `PATH` without workspace, relative or empty
 /// entries.
@@ -257,7 +247,7 @@ fn harden_for_untrusted(
             executable: command,
             cause,
         })?;
-    effective.args = with_vetted_programs(std::mem::take(&mut effective.args), wrapped);
+    effective.args = std::mem::take(&mut effective.args).with_programs(wrapped);
     let too_large = |error| UntrustedRefusal::EnvTooLarge { error };
     effective
         .env
@@ -1101,7 +1091,7 @@ mod plan_tests {
                 .untrusted_boundary(&configured_roots, Some(&fx.workspace));
 
             assert_eq!(kept.canonical(), fx.roots.canonical());
-            assert!(dropped.canonical().is_empty());
+            assert_eq!(dropped.canonical().len(), 0);
             assert_eq!(configured.canonical(), fx.roots.canonical());
         }
 
@@ -1713,7 +1703,7 @@ mod plan_tests {
 
         fn rust_launched_by(command: &str, args: &[&str]) -> LspServerConfig {
             let mut config = rust_with(command);
-            config.args = args.iter().map(ToString::to_string).collect();
+            config.args = crate::config::ServerArgs::new(args.iter().copied()).unwrap();
             config
         }
 
@@ -1763,7 +1753,7 @@ mod plan_tests {
         }
 
         fn launched_args(plan: &StartPlan) -> Vec<String> {
-            plan.admitted[0].server_config().args.clone()
+            plan.admitted[0].server_config().args.to_vec()
         }
 
         #[test]
@@ -2098,7 +2088,7 @@ mod plan_tests {
                     &["srv"]
                 };
                 let mut config = wrapped_launch_through_equals_dir(&fx, wrapper);
-                config.args = args.iter().map(ToString::to_string).collect();
+                config.args = crate::config::ServerArgs::new(args.iter().copied()).unwrap();
 
                 let plan = plan_allowing_rust(config, &fx);
 
@@ -2316,7 +2306,10 @@ mod plan_tests {
             config.command = ServerCommand::new(node.to_str().unwrap().to_owned())
                 .unwrap()
                 .into();
-            config.args = vec!["node_modules/typescript-language-server/lib/cli.mjs".to_owned()];
+            config.args = crate::config::ServerArgs::new([
+                "node_modules/typescript-language-server/lib/cli.mjs",
+            ])
+            .unwrap();
 
             let plan = plan(
                 &config_with(vec![config], untrusted_allowing_typescript()),

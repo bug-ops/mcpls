@@ -1566,7 +1566,7 @@ mod tests {
         LspServerConfig {
             language_id: LanguageId::new(language).unwrap(),
             command: ServerCommand::from_static("sh").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,
@@ -2127,7 +2127,7 @@ mod tests {
         let typescript_react_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("typescriptreact"),
             command: ServerCommand::from_static("typescript-language-server").into(),
-            args: vec!["--stdio".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![FilePattern::from_static("**/*.tsx")],
             initialization_options: None,
@@ -2430,7 +2430,7 @@ mod tests {
         let javascript_config = crate::config::LspServerConfig {
             language_id: LanguageId::from_static("javascript"),
             command: ServerCommand::from_static("typescript-language-server").into(),
-            args: vec!["--stdio".to_string()],
+            args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![
                 FilePattern::from_static("**/*.js"),
@@ -3126,7 +3126,7 @@ mod tests {
         let pyright = LspServerConfig {
             language_id: LanguageId::from_static("python"),
             command: ServerCommand::from_static("pyright-langserver").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::default(),
             file_patterns: vec![],
             initialization_options: None,

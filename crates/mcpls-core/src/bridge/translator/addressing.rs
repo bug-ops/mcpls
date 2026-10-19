@@ -786,8 +786,8 @@ mod tests {
             whole_word_occurrences("foo foo_bar xfoo foo", "foo"),
             [0, 17]
         );
-        assert!(whole_word_occurrences("éfoo", "foo").is_empty());
-        assert!(whole_word_occurrences("foo日本", "foo").is_empty());
+        assert_eq!(whole_word_occurrences("éfoo", "foo").len(), 0);
+        assert_eq!(whole_word_occurrences("foo日本", "foo").len(), 0);
         assert_eq!(whole_word_occurrences("(foo)", "foo"), [1]);
     }
 

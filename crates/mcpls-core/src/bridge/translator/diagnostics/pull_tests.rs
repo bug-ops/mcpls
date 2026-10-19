@@ -254,8 +254,8 @@ async fn test_fixing_the_error_publishes_again_and_clears_every_read_path() {
     .await;
     let result = Fixture::finish(pull).await.unwrap();
 
-    assert!(result.diagnostics.is_empty());
-    assert!(fx.sources().await.unwrap().diagnostics.is_empty());
+    assert_eq!(result.diagnostics.len(), 0);
+    assert_eq!(fx.sources().await.unwrap().diagnostics.len(), 0);
     assert_eq!(fx.wiring.changed().len(), 2);
 }
 
@@ -319,7 +319,7 @@ async fn test_failed_pull_of_an_unseen_file_is_still_an_error() {
 
     assert!(Fixture::finish(pull).await.is_err());
     assert!(fx.sources().await.is_none());
-    assert!(fx.wiring.changed().is_empty());
+    assert_eq!(fx.wiring.changed().len(), 0);
 }
 
 /// #688: a failed pull answered from the cache is not reported as a pull.
@@ -402,7 +402,7 @@ async fn test_refused_pull_answers_from_the_push_cache_and_is_not_repeated() {
 
     assert_eq!(first.origin, DiagnosticsOrigin::PushCache);
     assert_eq!(first.availability, DiagnosticsAvailability::Pending);
-    assert!(first.result.diagnostics.is_empty());
+    assert_eq!(first.result.diagnostics.len(), 0);
     assert_eq!(
         fx.translator.pull_support(&Fixture::rust()),
         PullSupport::Unsupported
@@ -436,7 +436,7 @@ async fn test_published_empty_list_of_a_push_only_server_is_clean() {
     fx.publish(Vec::new()).await;
     let answer = Fixture::finish_answer(fx.spawn_answer()).await;
 
-    assert!(answer.result.diagnostics.is_empty());
+    assert_eq!(answer.result.diagnostics.len(), 0);
     assert_eq!(answer.availability, DiagnosticsAvailability::Published);
     assert_eq!(answer.origin, DiagnosticsOrigin::PushCache);
 }
@@ -715,7 +715,7 @@ async fn test_pull_answered_after_a_resync_is_returned_but_not_stored() {
 
     assert_eq!(shown(&result), ["stale"]);
     assert!(fx.sources().await.is_none());
-    assert!(fx.wiring.changed().is_empty());
+    assert_eq!(fx.wiring.changed().len(), 0);
 }
 
 /// S2: replies arriving in the opposite order of the requests.
@@ -772,7 +772,7 @@ async fn test_pull_answered_across_a_server_clear_is_not_stored() {
 
     assert_eq!(shown(&result), ["old process"]);
     assert!(fx.sources().await.is_none());
-    assert!(fx.wiring.changed().is_empty());
+    assert_eq!(fx.wiring.changed().len(), 0);
 }
 
 #[tokio::test]
@@ -847,7 +847,7 @@ async fn test_pull_without_any_subscription_is_stored_but_publishes_nothing() {
     drop(Fixture::finish(pull).await.unwrap());
 
     assert_eq!(fx.sources().await.unwrap().diagnostics.len(), 1);
-    assert!(fx.wiring.changed().is_empty());
+    assert_eq!(fx.wiring.changed().len(), 0);
 }
 
 /// A first pull whose items the pushes already show leaves the merged view as
@@ -879,5 +879,5 @@ async fn test_first_pull_duplicating_pushed_items_publishes_nothing() {
     let result = Fixture::finish(pull).await.unwrap();
 
     assert_eq!(shown(&result), ["E0308"]);
-    assert!(fx.wiring.changed().is_empty());
+    assert_eq!(fx.wiring.changed().len(), 0);
 }

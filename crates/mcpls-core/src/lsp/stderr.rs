@@ -262,7 +262,7 @@ mod tests {
 
         assert_eq!(unread, 1, "the drain must stop at the fifth error");
         assert!(eof, "end-of-file must still be signalled");
-        assert!(ring.lock().unwrap().head.is_empty());
+        assert_eq!(ring.lock().unwrap().head.len(), 0);
     }
 
     #[tokio::test(start_paused = true)]

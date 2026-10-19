@@ -615,7 +615,7 @@ mod tests {
         let table =
             ProcessTable::from_rows(vec![row(11, 1, 10, T0, 1), zombie, row(13, 1, 13, T0, 1)]);
         assert_eq!(watch.survivors(&table, Some(10)), [id(11, T0)]);
-        assert!(watch.survivors(&table, None).is_empty());
+        assert_eq!(watch.survivors(&table, None).len(), 0);
     }
 
     #[cfg(unix)]
@@ -692,7 +692,7 @@ mod tests {
             let mut group = ProcessGroup::spawn(sh("sleep 30 & echo $!")).unwrap();
             let pgid = group.pgid();
             let member = first_line(&mut group).await;
-            assert!(!member.is_empty());
+            assert_ne!(member.len(), 0);
             let watch = TreeWatch::new(group.leader_pid());
             let outcome = group
                 .finish_within(
@@ -791,8 +791,8 @@ mod tests {
         async fn the_live_process_table_contains_this_process_with_a_start_time() {
             let table = capture_table().await.unwrap();
             let me = table.identity_of(std::process::id()).unwrap();
-            assert!(!me.started().as_str().is_empty());
-            assert!(!table.tree_of(me, ParentLink::Pid).is_empty());
+            assert_ne!(me.started().as_str().len(), 0);
+            assert_ne!(table.tree_of(me, ParentLink::Pid).len(), 0);
         }
     }
 }

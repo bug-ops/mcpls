@@ -4703,7 +4703,10 @@ sleep 0.3
             LspServerConfig {
                 language_id: LanguageId::from_static("rust"),
                 command: ServerCommand::from_static("sh").into(),
-                args: vec![script_path.to_string_lossy().to_string()],
+                args: crate::config::ServerArgs::try_from(vec![
+                    script_path.to_string_lossy().to_string(),
+                ])
+                .unwrap(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
@@ -6552,8 +6555,8 @@ sleep 0.3
             .await
             .unwrap();
 
-        assert!(tool.0.result.diagnostics.is_empty());
-        assert!(resource.diagnostics.is_empty());
+        assert_eq!(tool.0.result.diagnostics.len(), 0);
+        assert_eq!(resource.diagnostics.len(), 0);
     }
 
     fn register_listen(

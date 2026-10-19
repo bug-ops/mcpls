@@ -4152,7 +4152,7 @@ mod tests {
         assert_eq!(messages(&merged(&cache).unwrap()), ["e1", "e2"]);
 
         cache.store_published_diagnostics(&server, &published("alias.rs"), None, vec![]);
-        assert!(merged(&cache).unwrap().diagnostics.is_empty());
+        assert_eq!(merged(&cache).unwrap().diagnostics.len(), 0);
     }
 
     #[test]
@@ -4757,13 +4757,12 @@ mod tests {
     #[test]
     fn test_a_push_that_needs_no_room_reports_no_eviction() {
         let mut cache = full_cache(false);
-        assert!(
-            write_error(&mut cache, "file:///first.rs")
-                .evicted()
-                .is_empty()
+        assert_eq!(
+            write_error(&mut cache, "file:///first.rs").evicted().len(),
+            0
         );
         let mut roomy = NotificationCache::new();
-        assert!(write_error(&mut roomy, "file:///a.rs").evicted().is_empty());
+        assert_eq!(write_error(&mut roomy, "file:///a.rs").evicted().len(), 0);
     }
 
     fn route() -> ServerId {

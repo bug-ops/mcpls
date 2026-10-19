@@ -331,7 +331,7 @@ fn test_fixing_the_only_error_is_a_change() {
     let write = pull(&mut cache, vec![]);
 
     assert_eq!(outcome(&cache, write), ChangeOutcome::Changed);
-    assert!(messages(&cache).is_empty());
+    assert_eq!(messages(&cache).len(), 0);
     assert!(merged(&cache).is_some());
 }
 
@@ -362,7 +362,7 @@ fn test_a_clear_between_issue_and_store_discards_the_pull() {
     let mut cache = NotificationCache::new();
     let stamp = cache.begin_pull(&server(), DocumentVersion::new(1));
 
-    assert!(cache.clear_server_diagnostics(&server()).is_empty());
+    assert_eq!(cache.clear_server_diagnostics(&server()).len(), 0);
     let write = cache.store_pulled_diagnostics(
         &server(),
         &file(),
@@ -804,7 +804,7 @@ fn test_merge_at_the_entry_cap_does_not_compare_every_pair() {
         "merge took {:?}",
         started.elapsed()
     );
-    assert!(!info.diagnostics.is_empty());
+    assert_ne!(info.diagnostics.len(), 0);
 }
 
 #[test]
@@ -856,7 +856,7 @@ fn test_a_stored_pulled_slot_is_bounded_like_a_pushed_one() {
     let slot = &cache.entries[&SlotKey::pulled(DiagnosticsKey::of(&file()))];
     let bytes = serde_json::to_vec(&slot.diagnostics).unwrap().len();
     assert!(bytes <= MAX_DIAGNOSTICS_ENTRY_BYTES, "{bytes} bytes");
-    assert!(!slot.diagnostics.is_empty());
+    assert_ne!(slot.diagnostics.len(), 0);
 }
 
 #[test]
@@ -1161,7 +1161,7 @@ fn test_pull_answer_for_the_new_version_hides_the_push_it_already_reported() {
     let write = file.pull_items(&mut cache, 2, vec![]);
 
     assert_eq!(file.outcome_of(&cache, write), ChangeOutcome::Changed);
-    assert!(file.shown(&cache).is_empty());
+    assert_eq!(file.shown(&cache).len(), 0);
     let version = cache.diagnostic_sources(&file.uri).merge().unwrap().version;
     assert_eq!(version, Some(DocumentVersion::new(2)));
     let write = file.pull_items(&mut cache, 2, vec![]);
@@ -1229,7 +1229,7 @@ fn test_late_publish_for_the_old_version_is_hidden_by_its_learned_source() {
 
     file.push_items(&mut cache, &server(), 1, vec![item()]);
 
-    assert!(file.shown(&cache).is_empty());
+    assert_eq!(file.shown(&cache).len(), 0);
 }
 
 /// No pull answered this file before the edit, but another file's pull taught
@@ -1256,7 +1256,7 @@ fn test_first_pull_after_the_edit_uses_sources_learned_from_other_files() {
     file.set_version(2);
     drop(file.pull_items(&mut cache, 2, vec![]));
 
-    assert!(file.shown(&cache).is_empty());
+    assert_eq!(file.shown(&cache).len(), 0);
 }
 
 /// A failed pull leaves no slot at the synced version, so the latest push stays.
@@ -1287,7 +1287,7 @@ fn test_uncovered_sourceless_push_stays_visible_until_republished() {
 
     assert_eq!(file.shown(&cache), ["stale"]);
     file.push_items(&mut cache, &server(), 2, vec![]);
-    assert!(file.shown(&cache).is_empty());
+    assert_eq!(file.shown(&cache).len(), 0);
 }
 
 #[test]

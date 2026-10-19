@@ -1876,7 +1876,7 @@ mod tests {
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pyright-langserver").into(),
-                args: vec!["--stdio".to_string()],
+                args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
                 env,
                 file_patterns: vec![FilePattern::from_static("**/*.py")],
                 initialization_options: Some(init_opts),
@@ -2355,7 +2355,7 @@ echo 'fatal: bad toolchain' >&2
         use crate::test_lsp::CapturedLogs;
 
         let mut config = LspServerConfig::rust_analyzer();
-        config.args = vec!["--api-key=SuperSecretArg456".to_string()];
+        config.args = crate::config::ServerArgs::new(["--api-key=SuperSecretArg456"]).unwrap();
         let redactions = Redactions::for_server(&config, std::iter::empty());
         let logs = CapturedLogs::default();
         let info_only = tracing_subscriber::registry()
@@ -2416,10 +2416,15 @@ sleep 5
             dir.path(),
             &crate::test_lsp::with_read_preamble(script),
         );
-        config
-            .server_config
-            .args
-            .push("--api-key=SuperSecretArg456".to_string());
+        config.server_config.args = crate::config::ServerArgs::new(
+            config
+                .server_config
+                .args
+                .iter()
+                .cloned()
+                .chain(["--api-key=SuperSecretArg456".to_string()]),
+        )
+        .unwrap();
         config
             .server_config
             .env
@@ -2901,7 +2906,7 @@ sleep 5
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
-            args: vec![],
+            args: crate::config::ServerArgs::default(),
             env: crate::config::ServerEnv::from_entries(env, HostOs::CURRENT).unwrap(),
             file_patterns: vec![],
             initialization_options: None,
@@ -3067,7 +3072,8 @@ sleep 5
         let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let mut server_config = LspServerConfig::rust_analyzer();
         server_config.command = ServerCommand::from_static("mcpls-test-no-such-server").into();
-        server_config.args = vec![tool.to_string_lossy().into_owned()];
+        server_config.args =
+            crate::config::ServerArgs::new([tool.to_string_lossy().into_owned()]).unwrap();
         let command = server_config.command.server_command().clone();
         let init = ServerInitConfig::new(
             server_config,
@@ -3243,7 +3249,7 @@ sleep 5
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pyright-langserver").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,
@@ -3258,7 +3264,7 @@ sleep 5
             LspServerConfig {
                 language_id: LanguageId::from_static("python"),
                 command: ServerCommand::from_static("pylsp").into(),
-                args: vec![],
+                args: crate::config::ServerArgs::default(),
                 env: crate::config::ServerEnv::default(),
                 file_patterns: vec![],
                 initialization_options: None,

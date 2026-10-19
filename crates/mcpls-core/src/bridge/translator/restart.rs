@@ -1107,9 +1107,14 @@ mod tests {
                 let mut init = init.with_untrusted(crate::lsp::vetting::UntrustedVetting::new(
                     boundary, command,
                 ));
-                init.server_config_mut()
-                    .args
-                    .push(tool.to_string_lossy().into_owned());
+                let args = init.server_config_mut();
+                args.args = crate::config::ServerArgs::new(
+                    args.args
+                        .iter()
+                        .cloned()
+                        .chain([tool.to_string_lossy().into_owned()]),
+                )
+                .unwrap();
                 lock_std(&self.translator.servers)
                     .server_mut(&self.id)
                     .unwrap()

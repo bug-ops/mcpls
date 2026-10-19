@@ -422,7 +422,7 @@ mod tests {
         assert!(scenarios.len() >= 11, "{} scenarios", scenarios.len());
         for (stem, scenario) in &scenarios {
             assert_eq!(scenario.name.as_str(), stem);
-            assert!(!scenario.probes.is_empty());
+            assert_ne!(scenario.probes.len(), 0);
         }
     }
 

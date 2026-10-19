@@ -182,7 +182,7 @@ mod tests {
     async fn null_response_is_an_empty_result() {
         let (_, result) =
             highlights_with_response("let a = 1;", serde_json::Value::Null, None).await;
-        assert!(result.highlights.is_empty());
+        assert_eq!(result.highlights.len(), 0);
     }
 
     #[tokio::test]
