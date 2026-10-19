@@ -500,7 +500,10 @@ fn methods(messages: &[Value]) -> Vec<&str> {
 /// A server that asked for `didSave` gets it once, right after the change.
 #[tokio::test]
 async fn test_sweep_sends_did_save_after_the_change_without_text() {
-    let sent = messages_for_a_swept_edit(sync_options(Some(lsp_types::Save::Bool(true)))).await;
+    let sent = Box::pin(messages_for_a_swept_edit(sync_options(Some(
+        lsp_types::Save::Bool(true),
+    ))))
+    .await;
 
     assert_eq!(
         methods(&sent),
@@ -519,7 +522,7 @@ async fn test_sweep_sends_the_text_when_the_server_asked_for_it() {
         include_text: Some(true),
     });
 
-    let sent = messages_for_a_swept_edit(sync_options(Some(save))).await;
+    let sent = Box::pin(messages_for_a_swept_edit(sync_options(Some(save)))).await;
 
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[2]["method"], "textDocument/didSave");
@@ -541,7 +544,7 @@ async fn test_sweep_sends_no_did_save_to_a_server_that_did_not_ask() {
         },
         lsp_types::ServerCapabilities::default(),
     ] {
-        let sent = messages_for_a_swept_edit(capabilities).await;
+        let sent = Box::pin(messages_for_a_swept_edit(capabilities)).await;
 
         assert_eq!(
             methods(&sent),
