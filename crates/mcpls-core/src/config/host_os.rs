@@ -31,6 +31,18 @@ impl HostOs {
         }
     }
 
+    /// The largest `NAME=value` entry with its terminator, in bytes, one
+    /// environment variable may take on this host: the documented Windows limit
+    /// (32767 characters), and on other hosts the 128 KiB Linux caps one string
+    /// at (`MAX_ARG_STRLEN`).
+    #[must_use]
+    pub const fn max_env_entry_bytes(self) -> usize {
+        match self {
+            Self::Windows => 32_767,
+            Self::Other => 128 * 1024,
+        }
+    }
+
     /// `path` as spawned: on Windows a path without an extension gets `.exe`.
     pub(crate) fn spawn_name(self, path: &Path) -> PathBuf {
         if self == Self::Windows && path.extension().is_none() {

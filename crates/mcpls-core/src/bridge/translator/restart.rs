@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use super::Translator;
-use super::respawn::BackoffPolicy;
+use super::respawn::{BackoffPolicy, RespawnConfig};
 use super::servers::{Backend, Phase};
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsKey, IndexingState};
@@ -165,13 +165,24 @@ pub enum RestartTarget {
 
 /// Why a restart failed.
 ///
-/// A refusal found before the old process is stopped leaves it running.
-/// Otherwise the old process is already stopped: the server stays registered
-/// as dead, and the next tool call retries the spawn under the normal
-/// crash-loop backoff.
+/// [`Self::Refused`] leaves the old process running. Every other reason means
+/// the old process is already stopped: the server stays registered as dead,
+/// and the next tool call retries the spawn under the normal crash-loop
+/// backoff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RestartFailure {
+    /// The restart was refused before the old process was stopped, so it was
+    /// not restarted and keeps serving.
+    ///
+    /// Covers every failure of the pre-stop check of the config the
+    /// replacement would start from: an untrusted-workspace refusal, and the
+    /// planning work itself failing.
+    Refused {
+        /// Why the restart was refused.
+        message: String,
+    },
     /// The replacement process could not be started.
     SpawnFailed {
         /// Why the spawn failed.
@@ -384,11 +395,6 @@ pub enum DiagnosticsRole {
 }
 
 impl DiagnosticsRole {
-    /// Whether the server's pushes are cached and announced.
-    pub(crate) const fn caches(self) -> bool {
-        matches!(self, Self::Authoritative)
-    }
-
     /// The role of a server that is, or is not, the language's diagnostics route.
     pub(crate) const fn from_route(is_diagnostics_route: bool) -> Self {
         if is_diagnostics_route {
@@ -722,14 +728,20 @@ impl Translator {
         let running = lock_std(&self.servers)
             .server(id)
             .map(|server| server.init_config().clone());
-        if let Some(running) = running
-            && let Err(error) = running.for_respawn().await
-        {
-            tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart refused");
-            return RestartOutcome::Failed {
-                reason: RestartFailure::from_error(&error),
-            };
-        }
+        let vetted = match running {
+            Some(running) => match running.for_respawn().await {
+                Ok(vetted) => Some(vetted),
+                Err(error) => {
+                    tracing::warn!(%id, error = %ErrorChain(&error), "LSP server restart refused");
+                    return RestartOutcome::Failed {
+                        reason: RestartFailure::Refused {
+                            message: ErrorChain(&error).to_string(),
+                        },
+                    };
+                }
+            },
+            None => None,
+        };
 
         let Some(mut old) = Deregistered::take(self, id) else {
             return RestartOutcome::NotRunning {
@@ -751,6 +763,7 @@ impl Translator {
                 reason: RestartFailure::ShuttingDown,
             };
         }
+        let config = vetted.map_or(RespawnConfig::Unvetted(config), RespawnConfig::Vetted);
         let respawned = self
             .respawn_locked(
                 id,
@@ -830,7 +843,9 @@ impl Translator {
 impl ServerText for RestartFailure {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         match self {
-            Self::SpawnFailed { message } | Self::InitializeFailed { message } => {
+            Self::Refused { message }
+            | Self::SpawnFailed { message }
+            | Self::InitializeFailed { message } => {
                 redactions.redact_in_place(message);
             }
             Self::ShuttingDown => {}
@@ -917,6 +932,17 @@ mod tests {
         assert_eq!(
             ServerIds::parse(vec!["x".repeat(MAX_SERVER_ID_BYTES + 1), " ".to_owned()]),
             Err(ServerIdsError::Blank)
+        );
+    }
+
+    #[test]
+    fn a_refusal_serializes_with_its_own_kind() {
+        let refused = RestartFailure::Refused {
+            message: "no".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(refused).unwrap(),
+            serde_json::json!({"kind": "refused", "message": "no"})
         );
     }
 
@@ -1077,7 +1103,10 @@ mod tests {
                     .unwrap()
                     .init_config()
                     .clone();
-                let mut init = init.with_untrusted_boundary(boundary);
+                let command = init.server_config().command.server_command().clone();
+                let mut init = init.with_untrusted(crate::lsp::vetting::UntrustedVetting::new(
+                    boundary, command,
+                ));
                 init.server_config_mut()
                     .args
                     .push(tool.to_string_lossy().into_owned());
@@ -1167,7 +1196,7 @@ mod tests {
                 .unwrap();
 
             let RestartOutcome::Failed {
-                reason: RestartFailure::SpawnFailed { message },
+                reason: RestartFailure::Refused { message },
             } = only_outcome(&result)
             else {
                 panic!("expected a refused restart, got {result:?}");

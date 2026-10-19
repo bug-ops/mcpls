@@ -214,6 +214,55 @@ const SHELLS: &[(&str, ShellFamily)] = &[
     ("xonsh", ShellFamily::Xonsh),
 ];
 
+impl ShellFamily {
+    /// What makes a shell read a command string from `args`, which cannot be
+    /// analyzed.
+    ///
+    /// Most families are read argument by argument: `-c` or a cluster holding it
+    /// (`-lc`) for POSIX shells (case-exact: `-C` is another option), and the
+    /// `-Command`, `-CommandWithArgs` and `-EncodedCommand` parameters of
+    /// PowerShell, which accepts any prefix of them and the alias `-ec`
+    /// (case-insensitively). Whitespace around an argument is ignored, which
+    /// over-refuses (a shell reads `" -c"` as a program name) and so fails closed;
+    /// PowerShell trims its arguments itself. Windows PowerShell 5.1 needs the
+    /// whole argument list.
+    fn trigger(self, args: &[String]) -> Option<LaunchTrigger> {
+        let first_flag = |flag_of: &dyn Fn(&str) -> Option<ShellFlag>| {
+            args.iter()
+                .find_map(|arg| flag_of(arg.trim()))
+                .map(LaunchTrigger::CommandString)
+        };
+        match self {
+            Self::WindowsPowerShell => windows_powershell_trigger(args),
+            Self::PowerShell => first_flag(&powershell_flag),
+            Self::Posix | Self::Xonsh => first_flag(&|arg| grammar_flag(&POSIX_GRAMMAR, arg)),
+            Self::Fish => first_flag(&|arg| grammar_flag(&FISH_GRAMMAR, arg)),
+            Self::Nu => first_flag(&|arg| grammar_flag(&NU_GRAMMAR, arg)),
+            Self::GoFlag => first_flag(&go_flag),
+        }
+    }
+
+    /// Checks that the shell family's launch does not read its program from
+    /// standard input.
+    fn check_stdin_program(
+        self,
+        args: &[String],
+        mut dir: WorkingDir,
+        probe: Option<&Path>,
+    ) -> Result<(), Stop> {
+        let program = match self {
+            Self::Posix => walk_operand(args, &POSIX_OPERANDS, &mut dir)?,
+            Self::Xonsh => walk_operand(args, &XONSH_OPERANDS, &mut dir)?,
+            Self::Fish => walk_operand(args, &FISH_OPERANDS, &mut dir)?,
+            Self::Nu => walk_operand(args, &NU_OPERANDS, &mut dir)?,
+            Self::GoFlag => walk_operand(args, &ELVISH_OPERANDS, &mut dir)?,
+            Self::PowerShell => walk_powershell(args, PARAMETERS_7, &mut dir)?,
+            Self::WindowsPowerShell => walk_powershell(args, PARAMETERS_51, &mut dir)?,
+        };
+        check_program(program, Positional::Script, dir, probe)
+    }
+}
+
 /// Whether `text` has the shape of the operand `kind`.
 fn operand_accepts(kind: OperandKind, text: &str) -> bool {
     match kind {
@@ -245,8 +294,17 @@ struct ExecWrapper {
     /// Single-dash words followed by a value (`arch -arch`).
     word_values: &'static [&'static str],
     operand: Option<OperandKind>,
+    /// Whether the grammar is `env`'s or the common one.
+    grammar: WrapperGrammar,
+}
+
+/// Which grammar a wrapper's arguments follow.
+#[derive(Clone, Copy)]
+enum WrapperGrammar {
     /// What only `env` has on top of the common grammar.
-    env: Option<EnvHooks>,
+    Env(EnvHooks),
+    /// The common grammar of `nice`, `timeout` and the like.
+    Other,
 }
 
 /// The parts of `env`'s grammar the other wrappers lack: a lone `-` and
@@ -275,10 +333,11 @@ struct Step {
     option: Option<OptionName>,
 }
 
-/// Where the command a wrapper starts is in its arguments.
+/// Where the command a wrapper starts is in its arguments, and the directory
+/// state it starts in.
 struct Invocation {
     command: usize,
-    changes_directory: bool,
+    dir: WorkingDir,
 }
 
 impl ExecWrapper {
@@ -292,20 +351,32 @@ impl ExecWrapper {
             word_flags: &[],
             word_values: &[],
             operand: None,
-            env: None,
+            grammar: WrapperGrammar::Other,
         }
     }
 
-    /// Where the command the wrapper starts is in `args`.
-    fn command_index(&self, args: &[String]) -> Result<Invocation, UnanalyzableLaunch> {
+    /// `env`'s extra grammar, when this wrapper is `env`.
+    const fn env(&self) -> Option<EnvHooks> {
+        match self.grammar {
+            WrapperGrammar::Env(hooks) => Some(hooks),
+            WrapperGrammar::Other => None,
+        }
+    }
+
+    /// Where the command the wrapper starts is in `args`, started from the
+    /// directory state `dir`.
+    fn command_index(
+        &self,
+        args: &[String],
+        mut dir: WorkingDir,
+    ) -> Result<Invocation, UnanalyzableLaunch> {
         let mut index = 0;
-        let mut changes_directory = false;
         while let Some(arg) = args.get(index) {
             if arg == "--" {
                 index = index.saturating_add(1);
                 break;
             }
-            if arg == "-" && self.env.is_some() {
+            if arg == "-" && self.env().is_some() {
                 index = index.saturating_add(1);
                 if let Some(next) = args.get(index).filter(|next| next.starts_with('-')) {
                     let letter = next.chars().nth(1).unwrap_or('-');
@@ -318,10 +389,13 @@ impl ExecWrapper {
             let Some(step) = self.option_width(args, index)? else {
                 break;
             };
-            changes_directory |= step
+            if step
                 .option
-                .zip(self.env)
-                .is_some_and(|(option, hooks)| hooks.chdir.contains(&option));
+                .zip(self.env())
+                .is_some_and(|(option, hooks)| hooks.chdir.contains(&option))
+            {
+                dir = WorkingDir::Changed;
+            }
             index = index.saturating_add(step.width);
         }
         if let Some(operand) = self.operand {
@@ -333,7 +407,7 @@ impl ExecWrapper {
             }
             index = index.saturating_add(1);
         }
-        if self.env.is_some() {
+        if self.env().is_some() {
             while let Some((name, _)) = args.get(index).and_then(|arg| arg.split_once('=')) {
                 if name.eq_ignore_ascii_case("PATH") {
                     return Err(UnanalyzableLaunch::PathAssignment);
@@ -344,7 +418,7 @@ impl ExecWrapper {
         args.get(index)
             .map(|_| Invocation {
                 command: index,
-                changes_directory,
+                dir,
             })
             .ok_or(UnanalyzableLaunch::MissingCommand)
     }
@@ -369,7 +443,7 @@ impl ExecWrapper {
         let step = |width, option| Ok(Some(Step { width, option }));
         if arg.starts_with("--") {
             let (name, value) = long_name(arg);
-            if self.env.is_some_and(|hooks| hooks.split_long == name) {
+            if self.env().is_some_and(|hooks| hooks.split_long == name) {
                 return Err(UnanalyzableLaunch::SplitString);
             }
             return if let Some(&known) = self.long_values.iter().find(|long| **long == name) {
@@ -395,7 +469,7 @@ impl ExecWrapper {
                 continue;
             }
             if self.short_values.contains(&letter) {
-                if self.env.is_some() && cluster.len() > letter.len_utf8() {
+                if self.env().is_some() && cluster.len() > letter.len_utf8() {
                     return Err(self.unknown_short(cluster, letter));
                 }
                 let glued = offset.saturating_add(letter.len_utf8()) < cluster.len();
@@ -411,7 +485,7 @@ impl ExecWrapper {
     /// a split string when `env`'s `-S` is anywhere in the cluster.
     fn unknown_short(&self, cluster: &str, letter: char) -> UnanalyzableLaunch {
         if self
-            .env
+            .env()
             .is_some_and(|hooks| cluster.contains(hooks.split_short))
         {
             UnanalyzableLaunch::SplitString
@@ -476,7 +550,7 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
         short_values: &['u', 'C'],
         long_flags: &["--ignore-environment", "--null", "--debug"],
         long_values: &["--unset", "--chdir"],
-        env: Some(EnvHooks {
+        grammar: WrapperGrammar::Env(EnvHooks {
             chdir: &[OptionName::Short('C'), OptionName::Long("--chdir")],
             split_short: 'S',
             split_long: "--split-string",
@@ -494,7 +568,12 @@ const INLINE_EVAL: &[InlineEval] = &[
         flag_longs: NODE_FLAGS,
         flag_prefixes: &["--no-"],
         value_longs: NODE_VALUE_LONGS,
-        ..InlineEval::new("node", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
+        ..InlineEval::new(
+            &["node", "nodejs"],
+            &['e', 'p'],
+            &['r', 'C'],
+            LONG_EVAL_PRINT,
+        )
     },
     InlineEval {
         data_url_flags: DATA_URL_LOADERS,
@@ -502,9 +581,9 @@ const INLINE_EVAL: &[InlineEval] = &[
         flag_prefixes: &["--smol"],
         value_longs: NODE_VALUE_LONGS,
         chdir_longs: &["--cwd"],
-        ..InlineEval::new("bun", &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
+        ..InlineEval::new(&["bun"], &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
     },
-    InlineEval::new("lua", &['e'], &['l'], &[]),
+    InlineEval::new(&["lua"], &['e'], &['l'], &[]),
     InlineEval {
         flag_longs: &[
             "--vanilla",
@@ -516,13 +595,13 @@ const INLINE_EVAL: &[InlineEval] = &[
             "--silent",
             "--verbose",
         ],
-        ..InlineEval::new("rscript", &['e'], &[], &[])
+        ..InlineEval::new(&["rscript"], &['e'], &[], &[])
     },
     InlineEval {
         flag_longs: &["--project", "--quiet", "--color"],
         separate_value_letters: &['L', 'J', 'C', 't', 'p', 'H'],
         ..InlineEval::new(
-            "julia",
+            &["julia"],
             &['e', 'E'],
             &['L', 'J', 'C', 'O', 't', 'p', 'H'],
             LONG_EVAL_PRINT,
@@ -530,38 +609,23 @@ const INLINE_EVAL: &[InlineEval] = &[
     },
     InlineEval {
         separate_value_letters: &['l', 's'],
-        ..InlineEval::new("osascript", &['e'], &['l', 's'], &[])
-    },
-    InlineEval {
-        data_url_flags: DATA_URL_LOADERS,
-        flag_longs: NODE_FLAGS,
-        flag_prefixes: &["--no-"],
-        value_longs: NODE_VALUE_LONGS,
-        ..InlineEval::new("nodejs", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
+        ..InlineEval::new(&["osascript"], &['e'], &['l', 's'], &[])
     },
     InlineEval {
         program: &[ProgramFlag::Short('m')],
-        ..InlineEval::new("python", &['c'], PYTHON_VALUE_LETTERS, &[])
-    },
-    InlineEval {
-        program: &[ProgramFlag::Short('m')],
-        ..InlineEval::new("py", &['c'], PYTHON_VALUE_LETTERS, &[])
-    },
-    InlineEval {
-        program: &[ProgramFlag::Short('m')],
-        ..InlineEval::new("pypy", &['c'], PYTHON_VALUE_LETTERS, &[])
+        ..InlineEval::new(&["python", "py", "pypy"], &['c'], PYTHON_VALUE_LETTERS, &[])
     },
     InlineEval {
         flag_longs: &["--unstable", "--quiet"],
         positional: Positional::Subcommand,
-        ..InlineEval::new("deno", &[], &[], &[])
+        ..InlineEval::new(&["deno"], &[], &[], &[])
     },
     InlineEval {
         module_letters: &['M', 'm'],
         debugger_letters: &['d'],
         separate_value_letters: &['I'],
         ..InlineEval::new(
-            "perl",
+            &["perl"],
             &['e', 'E'],
             &['I', 'M', 'm', 'x', 'i', 'F', 'C', 'd', 'D'],
             &[],
@@ -572,7 +636,7 @@ const INLINE_EVAL: &[InlineEval] = &[
         separate_value_letters: &['r', 'I', 'C', 'E', 'X'],
         chdir_letters: &['C', 'X'],
         ..InlineEval::new(
-            "ruby",
+            &["ruby"],
             &['e'],
             &['r', 'I', 'C', 'E', 'X', 'K', 'x', 'F', 'T'],
             &[],
@@ -581,7 +645,7 @@ const INLINE_EVAL: &[InlineEval] = &[
     InlineEval {
         file_letters: &['f'],
         ..InlineEval::new(
-            "php",
+            &["php"],
             &['r', 'R', 'B', 'E', 'F'],
             &['d', 'c', 'f', 'z'],
             PHP_LONG_PROGRAM_FLAGS,
@@ -642,8 +706,8 @@ const PYTHON_VALUE_LETTERS: &[char] = &['m', 'W', 'X', 'Q'];
 
 /// How an interpreter is given a program on its command line.
 struct InlineEval {
-    /// The interpreter's name; a stem prefix match, so `python3.12` counts.
-    name: &'static str,
+    /// The interpreter's names; a stem prefix match, so `python3.12` counts.
+    names: &'static [&'static str],
     /// Short flag letters that introduce the program.
     program_letters: &'static [char],
     /// Short flag letters that take another value (a module, a path): what
@@ -680,6 +744,11 @@ struct InlineEval {
 }
 
 impl InlineEval {
+    /// Whether `stem` is one of this interpreter's names.
+    fn is(&self, stem: &str) -> bool {
+        self.names.iter().any(|name| is_interpreter(stem, name))
+    }
+
     /// How this interpreter's arguments are read to find its script operand.
     const fn operand_grammar(&self) -> OperandGrammar {
         OperandGrammar {
@@ -730,13 +799,13 @@ impl InlineEval {
     }
 
     const fn new(
-        name: &'static str,
+        names: &'static [&'static str],
         program_letters: &'static [char],
         value_letters: &'static [char],
         long: &'static [LongInlineFlag],
     ) -> Self {
         Self {
-            name,
+            names,
             program_letters,
             value_letters,
             long,
@@ -924,11 +993,11 @@ impl<'a> Analysis<'a> {
             if args.is_empty() {
                 return Ok(());
             }
-            let invocation = match wrapper.command_index(args) {
-                Err(UnanalyzableLaunch::MissingCommand) if wrapper.env.is_some() => return Ok(()),
+            let invocation = match wrapper.command_index(args, dir) {
+                Err(UnanalyzableLaunch::MissingCommand) if wrapper.env().is_some() => return Ok(()),
                 other => other.map_err(|reason| unanalyzable(command, reason))?,
             };
-            if invocation.changes_directory
+            if invocation.dir == WorkingDir::Changed
                 && args
                     .get(invocation.command)
                     .is_some_and(|program| is_relative_path(program))
@@ -938,17 +1007,15 @@ impl<'a> Analysis<'a> {
                     UnanalyzableLaunch::RelativeProgramAfterChdir,
                 ));
             }
-            let starter = if wrapper.env.is_some() {
-                WrapperKind::Env
-            } else {
-                WrapperKind::Other
+            let starter = match wrapper.grammar {
+                WrapperGrammar::Env(_) => WrapperKind::Env,
+                WrapperGrammar::Other => WrapperKind::Other,
             };
-            let dir = if invocation.changes_directory {
-                WorkingDir::Changed
-            } else {
-                dir
+            let frame = Frame {
+                base,
+                depth,
+                dir: invocation.dir,
             };
-            let frame = Frame { base, depth, dir };
             return self.start(command, args, invocation.command, starter, frame);
         }
         if stem.is_any(APPLET_BINARIES) || stem.is(COREUTILS) {
@@ -1035,30 +1102,24 @@ fn refuse_workspace_code(
     command: &str,
     stem: &CommandStem,
     args: &[String],
-    dir: WorkingDir,
+    mut dir: WorkingDir,
     probe: Option<&Path>,
 ) -> Result<(), LauncherRefusal> {
     if let Some((_, family)) = SHELLS
         .iter()
         .find(|(shell, _)| is_interpreter(stem.as_str(), shell))
     {
-        if let Some(trigger) = shell_trigger(*family, args) {
+        if let Some(trigger) = family.trigger(args) {
             return Err(selects(command, trigger));
         }
-        stdin_program(*family, args, dir, probe).map_err(|stop| stop.refusal(command))?;
+        family
+            .check_stdin_program(args, dir, probe)
+            .map_err(|stop| stop.refusal(command))?;
     }
-    if let Some(flag) = INLINE_EVAL
-        .iter()
-        .filter(|eval| is_interpreter(stem.as_str(), eval.name))
-        .find_map(|eval| (0..args.len()).find_map(|index| eval.flag_in(args, index)))
-    {
-        return Err(selects(command, LaunchTrigger::InlineProgram(flag)));
-    }
-    if let Some(eval) = INLINE_EVAL
-        .iter()
-        .find(|eval| is_interpreter(stem.as_str(), eval.name))
-    {
-        let mut dir = dir;
+    if let Some(eval) = INLINE_EVAL.iter().find(|eval| eval.is(stem.as_str())) {
+        if let Some(flag) = (0..args.len()).find_map(|index| eval.flag_in(args, index)) {
+            return Err(selects(command, LaunchTrigger::InlineProgram(flag)));
+        }
         walk_operand(args, &eval.operand_grammar(), &mut dir)
             .and_then(|program| check_program(program, eval.positional, dir, probe))
             .map_err(|stop| stop.refusal(command))?;
@@ -1075,35 +1136,6 @@ fn refuse_workspace_code(
                 Err(selects(command, LaunchTrigger::Subcommand(*subcommand)))
             }),
         None => Ok(()),
-    }
-}
-
-/// What makes a shell read a command string from `args`, which cannot be
-/// analyzed.
-///
-/// Most families are read argument by argument: `-c` or a cluster holding it
-/// (`-lc`) for POSIX shells (case-exact: `-C` is another option), and the
-/// `-Command`, `-CommandWithArgs` and `-EncodedCommand` parameters of
-/// PowerShell, which accepts any prefix of them and the alias `-ec`
-/// (case-insensitively). Whitespace around an argument is ignored, which
-/// over-refuses (a shell reads `" -c"` as a program name) and so fails closed;
-/// PowerShell trims its arguments itself. Windows PowerShell 5.1 needs the
-/// whole argument list.
-fn shell_trigger(family: ShellFamily, args: &[String]) -> Option<LaunchTrigger> {
-    let first_flag = |flag_of: &dyn Fn(&str) -> Option<ShellFlag>| {
-        args.iter()
-            .find_map(|arg| flag_of(arg.trim()))
-            .map(LaunchTrigger::CommandString)
-    };
-    match family {
-        ShellFamily::WindowsPowerShell => windows_powershell_trigger(args),
-        ShellFamily::PowerShell => first_flag(&powershell_flag),
-        ShellFamily::Posix | ShellFamily::Xonsh => {
-            first_flag(&|arg| grammar_flag(&POSIX_GRAMMAR, arg))
-        }
-        ShellFamily::Fish => first_flag(&|arg| grammar_flag(&FISH_GRAMMAR, arg)),
-        ShellFamily::Nu => first_flag(&|arg| grammar_flag(&NU_GRAMMAR, arg)),
-        ShellFamily::GoFlag => first_flag(&go_flag),
     }
 }
 
@@ -1197,8 +1229,13 @@ fn grammar_flag(grammar: &ShellGrammar, arg: &str) -> Option<ShellFlag> {
 /// `-c` as Go's `flag` package reads it: one or two dashes, with or without
 /// `=value`.
 fn go_flag(arg: &str) -> Option<ShellFlag> {
-    let name = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    let name = strip_dashes(arg)?;
     (long_name(name).0 == "c").then_some(ShellFlag::DashC)
+}
+
+/// `arg` without its one or two leading dashes, `None` when it has none.
+fn strip_dashes(arg: &str) -> Option<&str> {
+    arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))
 }
 
 /// A PowerShell argument that spells a parameter.
@@ -1254,14 +1291,14 @@ enum ParameterKind {
     WorkingDirectory,
 }
 
-/// A parameter of Windows PowerShell 5.1 and the shortest prefix it accepts.
-struct Parameter51 {
+/// A parameter of PowerShell and the shortest prefix it accepts.
+struct PowerShellParameterSpec {
     name: &'static str,
     shortest: usize,
     kind: ParameterKind,
 }
 
-impl Parameter51 {
+impl PowerShellParameterSpec {
     const fn new(name: &'static str, shortest: usize, kind: ParameterKind) -> Self {
         Self {
             name,
@@ -1279,29 +1316,29 @@ impl Parameter51 {
 /// the shortest unambiguous prefix its parser accepts. 5.1 starts the command
 /// string at the first parameter it does not recognize, so a spelling missing
 /// here (or shorter than listed) is refused.
-const PARAMETERS_51: &[Parameter51] = &[
-    Parameter51::new("file", 1, ParameterKind::File),
-    Parameter51::new("noexit", 3, ParameterKind::Switch),
-    Parameter51::new("noprofile", 3, ParameterKind::Switch),
-    Parameter51::new("nologo", 3, ParameterKind::Switch),
-    Parameter51::new("noninteractive", 4, ParameterKind::Switch),
-    Parameter51::new("sta", 1, ParameterKind::Switch),
-    Parameter51::new("mta", 3, ParameterKind::Switch),
-    Parameter51::new("help", 1, ParameterKind::Switch),
-    Parameter51::new("?", 1, ParameterKind::Switch),
-    Parameter51::new("importsystemmodules", 3, ParameterKind::Switch),
-    Parameter51::new("executionpolicy", 2, ParameterKind::Value),
-    Parameter51::new("ep", 2, ParameterKind::Value),
-    Parameter51::new("inputformat", 2, ParameterKind::Value),
-    Parameter51::new("if", 2, ParameterKind::Value),
-    Parameter51::new("outputformat", 1, ParameterKind::Value),
-    Parameter51::new("of", 2, ParameterKind::Value),
-    Parameter51::new("windowstyle", 1, ParameterKind::Value),
-    Parameter51::new("version", 1, ParameterKind::Value),
-    Parameter51::new("psconsolefile", 3, ParameterKind::Value),
-    Parameter51::new("configurationname", 6, ParameterKind::Value),
-    Parameter51::new("encodedarguments", 8, ParameterKind::Value),
-    Parameter51::new("ea", 2, ParameterKind::Value),
+const PARAMETERS_51: &[PowerShellParameterSpec] = &[
+    PowerShellParameterSpec::new("file", 1, ParameterKind::File),
+    PowerShellParameterSpec::new("noexit", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("noprofile", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("nologo", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("noninteractive", 4, ParameterKind::Switch),
+    PowerShellParameterSpec::new("sta", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("mta", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("help", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("?", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("importsystemmodules", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("executionpolicy", 2, ParameterKind::Value),
+    PowerShellParameterSpec::new("ep", 2, ParameterKind::Value),
+    PowerShellParameterSpec::new("inputformat", 2, ParameterKind::Value),
+    PowerShellParameterSpec::new("if", 2, ParameterKind::Value),
+    PowerShellParameterSpec::new("outputformat", 1, ParameterKind::Value),
+    PowerShellParameterSpec::new("of", 2, ParameterKind::Value),
+    PowerShellParameterSpec::new("windowstyle", 1, ParameterKind::Value),
+    PowerShellParameterSpec::new("version", 1, ParameterKind::Value),
+    PowerShellParameterSpec::new("psconsolefile", 3, ParameterKind::Value),
+    PowerShellParameterSpec::new("configurationname", 6, ParameterKind::Value),
+    PowerShellParameterSpec::new("encodedarguments", 8, ParameterKind::Value),
+    PowerShellParameterSpec::new("ea", 2, ParameterKind::Value),
 ];
 
 /// Windows PowerShell 5.1 reads the first argument that is not a parameter (or
@@ -1354,22 +1391,22 @@ fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
 /// The parameters of `pwsh` (PowerShell 7) other than the command ones. A
 /// bare argument is the script, and a parameter this table lacks is read as
 /// taking a value, so it cannot hide the script behind it.
-const PARAMETERS_7: &[Parameter51] = &[
-    Parameter51::new("file", 1, ParameterKind::File),
-    Parameter51::new("noexit", 3, ParameterKind::Switch),
-    Parameter51::new("nologo", 3, ParameterKind::Switch),
-    Parameter51::new("noprofile", 3, ParameterKind::Switch),
-    Parameter51::new("noninteractive", 4, ParameterKind::Switch),
-    Parameter51::new("interactive", 1, ParameterKind::Switch),
-    Parameter51::new("login", 1, ParameterKind::Switch),
-    Parameter51::new("mta", 3, ParameterKind::Switch),
-    Parameter51::new("sta", 3, ParameterKind::Switch),
-    Parameter51::new("help", 1, ParameterKind::Switch),
-    Parameter51::new("?", 1, ParameterKind::Switch),
-    Parameter51::new("version", 1, ParameterKind::Switch),
-    Parameter51::new("sshservermode", 4, ParameterKind::Switch),
-    Parameter51::new("workingdirectory", 2, ParameterKind::WorkingDirectory),
-    Parameter51::new("wd", 2, ParameterKind::WorkingDirectory),
+const PARAMETERS_7: &[PowerShellParameterSpec] = &[
+    PowerShellParameterSpec::new("file", 1, ParameterKind::File),
+    PowerShellParameterSpec::new("noexit", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("nologo", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("noprofile", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("noninteractive", 4, ParameterKind::Switch),
+    PowerShellParameterSpec::new("interactive", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("login", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("mta", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("sta", 3, ParameterKind::Switch),
+    PowerShellParameterSpec::new("help", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("?", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("version", 1, ParameterKind::Switch),
+    PowerShellParameterSpec::new("sshservermode", 4, ParameterKind::Switch),
+    PowerShellParameterSpec::new("workingdirectory", 2, ParameterKind::WorkingDirectory),
+    PowerShellParameterSpec::new("wd", 2, ParameterKind::WorkingDirectory),
 ];
 
 /// How a launch names the program an interpreter runs.
@@ -1672,13 +1709,7 @@ impl OperandGrammar {
     }
 
     fn read_go<'a>(&self, arg: &'a str) -> Read<'a> {
-        let name = arg
-            .strip_prefix("--")
-            .or_else(|| arg.strip_prefix('-'))
-            .unwrap_or(arg);
-        let (name, attached) = name
-            .split_once('=')
-            .map_or((name, None), |(name, value)| (name, Some(value)));
+        let (name, attached) = long_name(strip_dashes(arg).unwrap_or(arg));
         let provides_program = self
             .program
             .iter()
@@ -1783,7 +1814,7 @@ fn walk_operand<'a>(
 /// moves `dir`.
 fn walk_powershell<'a>(
     args: &'a [String],
-    parameters: &[Parameter51],
+    parameters: &[PowerShellParameterSpec],
     dir: &mut WorkingDir,
 ) -> Result<Program<'a>, Stop> {
     let mut args = args.iter().map(|arg| arg.trim());
@@ -1823,27 +1854,6 @@ fn walk_powershell<'a>(
         }
     }
     Err(missing_after_guess(guessed))
-}
-
-/// Checks that the shell family's launch does not read its program from
-/// standard input.
-fn stdin_program(
-    family: ShellFamily,
-    args: &[String],
-    dir: WorkingDir,
-    probe: Option<&Path>,
-) -> Result<(), Stop> {
-    let mut dir = dir;
-    let program = match family {
-        ShellFamily::Posix => walk_operand(args, &POSIX_OPERANDS, &mut dir)?,
-        ShellFamily::Xonsh => walk_operand(args, &XONSH_OPERANDS, &mut dir)?,
-        ShellFamily::Fish => walk_operand(args, &FISH_OPERANDS, &mut dir)?,
-        ShellFamily::Nu => walk_operand(args, &NU_OPERANDS, &mut dir)?,
-        ShellFamily::GoFlag => walk_operand(args, &ELVISH_OPERANDS, &mut dir)?,
-        ShellFamily::PowerShell => walk_powershell(args, PARAMETERS_7, &mut dir)?,
-        ShellFamily::WindowsPowerShell => walk_powershell(args, PARAMETERS_51, &mut dir)?,
-    };
-    check_program(program, Positional::Script, dir, probe)
 }
 
 /// Whether `operand` starts at a root, as a string, so the answer is the same

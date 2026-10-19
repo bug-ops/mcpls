@@ -38,6 +38,7 @@ use crate::config::{
 use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::resolve_named;
 use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX};
+use crate::lsp::vetting::UntrustedVetting;
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
 
@@ -944,24 +945,6 @@ pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> T
     }
 }
 
-/// What untrusted mode vets a TypeScript server against, remembered so a
-/// respawn repeats the startup checks and names the same command.
-#[derive(Debug, Clone)]
-pub struct UntrustedVetting {
-    boundary: WorkspaceRoots,
-    configured: ServerCommand,
-}
-
-impl UntrustedVetting {
-    /// Vetting against `boundary` for the server configured as `configured`.
-    pub const fn new(boundary: WorkspaceRoots, configured: ServerCommand) -> Self {
-        Self {
-            boundary,
-            configured,
-        }
-    }
-}
-
 impl TypescriptPlan {
     /// The refusal untrusted mode owes this plan, if any: a pin inside the
     /// boundary, or a launcher no tsserver can be pinned for. Startup and
@@ -973,12 +956,12 @@ impl TypescriptPlan {
     /// [`UntrustedRefusal::UnpinnedTypescriptLauncher`], the latter naming
     /// the command as configured.
     pub fn vet_untrusted(&self, vetting: &UntrustedVetting) -> Result<(), UntrustedRefusal> {
-        if let Some(tsserver) = self.pin_inside(&vetting.boundary) {
+        if let Some(tsserver) = self.pin_inside(vetting.boundary().roots()) {
             return Err(UntrustedRefusal::WorkspaceTsserver { tsserver });
         }
         if self.has_unpinnable_launcher() {
             return Err(UntrustedRefusal::UnpinnedTypescriptLauncher {
-                command: vetting.configured.clone(),
+                command: vetting.configured().clone(),
             });
         }
         Ok(())
@@ -1734,10 +1717,13 @@ mod tests {
     fn test_resolve_config_env_path_overrides_parent() {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
-        config.env.insert(
-            crate::config::EnvKey::from_static("PATH"),
-            crate::config::EnvValue::new(layout.bin.to_str().unwrap()).unwrap(),
-        );
+        config
+            .env
+            .insert(
+                crate::config::EnvKey::from_static("PATH"),
+                crate::config::EnvValue::new(layout.bin.to_str().unwrap()).unwrap(),
+            )
+            .unwrap();
         let resolved = resolve(&config, |_| Some(std::ffi::OsString::from("/nonexistent")));
         assert_eq!(resolved, Some(TsserverResolution::Pinned(layout.tsserver)));
     }
