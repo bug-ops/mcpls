@@ -925,6 +925,11 @@ impl LspServer {
                 ..Default::default()
             }),
             text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
+                    dynamic_registration: Some(false),
+                    did_save: Some(true),
+                    ..Default::default()
+                }),
                 document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
                     dynamic_registration: Some(false),
                     symbol_kind: Some(lsp_types::ClientSymbolKindOptions {
@@ -1549,8 +1554,21 @@ impl LspServer {
         capabilities: ServerCapabilities,
         position_encoding: PositionEncodingKind,
     ) -> Self {
-        let client = LspClient::new(LspServerConfig::rust_analyzer());
+        Self::new_for_test_with_client(
+            capabilities,
+            position_encoding,
+            LspClient::new(LspServerConfig::rust_analyzer()),
+        )
+    }
 
+    /// As [`Self::new_for_test_with_encoding`], but around a caller-built
+    /// client -- for tests that drive the client over a scripted transport
+    /// (see `crate::test_lsp`).
+    pub(crate) fn new_for_test_with_client(
+        capabilities: ServerCapabilities,
+        position_encoding: PositionEncodingKind,
+        client: LspClient,
+    ) -> Self {
         Self {
             client,
             capabilities,
@@ -1569,6 +1587,7 @@ mod tests {
     use super::*;
     use crate::bridge::PositionEncoding;
     use crate::config::{FilePattern, HostOs, LanguageId, TimeoutSecs, ToolSet};
+    use crate::lsp::JsonRpcError;
 
     #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
@@ -1642,6 +1661,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(capabilities.dynamic_registration, Some(false));
+    }
+
+    #[test]
+    fn test_client_capabilities_advertise_did_save_without_dynamic_registration() {
+        let synchronization = LspServer::client_capabilities(&PositionEncodings::DEFAULT, None)
+            .text_document
+            .and_then(|t| t.synchronization)
+            .unwrap();
+
+        assert_eq!(
+            synchronization,
+            lsp_types::TextDocumentSyncClientCapabilities {
+                dynamic_registration: Some(false),
+                did_save: Some(true),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -1814,7 +1850,7 @@ mod tests {
         let mut env = crate::config::ServerEnv::default();
         env.insert(
             crate::config::EnvKey::from_static("PYTHONPATH"),
-            "/usr/lib".to_string(),
+            crate::config::EnvValue::from_static("/usr/lib"),
         );
 
         let config = ServerInitConfig::new(
@@ -2034,11 +2070,11 @@ mod tests {
         assert!(!is_connection_loss(&Error::StdioCapture(
             StdioStream::Stdin
         )));
-        assert!(!is_connection_loss(&Error::LspServerError {
+        assert!(!is_connection_loss(&Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "bad".to_string(),
             data: None,
-        }));
+        })));
     }
 
     /// A server that answers `initialize` with an error and then exits keeps
@@ -2061,7 +2097,7 @@ printf 'Content-Length: %d\r\n\r\n%s' ${#body} "$body"
         assert_matches!(
             &err,
             Error::LspInitFailed { phase: InitPhase::Initialize, cause, .. }
-                if matches!(**cause, Error::LspServerError { code: -32603, .. }),
+                if matches!(**cause, Error::LspServerError(JsonRpcError { code: -32603, .. })),
             "got {err:?}"
         );
         assert!(err.to_string().contains("rejected by server"), "{err}");
@@ -2233,11 +2269,11 @@ echo 'fatal: bad toolchain' >&2
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("OTHER_VALUE"),
-            "bravo-secret-222".to_string(),
+            crate::config::EnvValue::from_static("bravo-secret-222"),
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("API_TOKEN"),
-            "s3cr3t-value".to_string(),
+            crate::config::EnvValue::from_static("s3cr3t-value"),
         );
         config.redactions = std::sync::Arc::new(Redactions::new([(
             "B_TOKEN".to_owned(),
@@ -2262,11 +2298,11 @@ echo 'fatal: bad toolchain' >&2
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
-            "nightly-2024-01-01".to_string(),
+            crate::config::EnvValue::from_static("nightly-2024-01-01"),
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("API_TOKEN"),
-            "s3cr3t-value".to_string(),
+            crate::config::EnvValue::from_static("s3cr3t-value"),
         );
 
         let err = LspServer::spawn(config).await.unwrap_err();
@@ -2351,7 +2387,7 @@ sleep 5
             .push("--api-key=SuperSecretArg456".to_string());
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("API_TOKEN"),
-            "SuperSecretValue123".to_string(),
+            crate::config::EnvValue::from_static("SuperSecretValue123"),
         );
 
         let SpawnedServer {
@@ -2391,7 +2427,7 @@ sleep 5
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("API_TOKEN"),
-            "SuperSecretValue123".to_string(),
+            crate::config::EnvValue::from_static("SuperSecretValue123"),
         );
 
         let err = LspServer::spawn(config).await.unwrap_err();
@@ -2415,7 +2451,7 @@ sleep 5
         );
         config.server_config.env.insert(
             crate::config::EnvKey::from_static("API_TOKEN"),
-            "SuperSecretValue123".to_string(),
+            crate::config::EnvValue::from_static("SuperSecretValue123"),
         );
 
         let err = LspServer::spawn(config).await.unwrap_err();
@@ -2798,7 +2834,7 @@ sleep 5
             config.env = crate::config::ServerEnv::from_entries(
                 [(
                     crate::config::EnvKey::from_static("Path"),
-                    "/over".to_string(),
+                    crate::config::EnvValue::from_static("/over"),
                 )],
                 host,
             )
@@ -2812,7 +2848,9 @@ sleep 5
 
     /// Minimal [`LspServerConfig`] for `build_command` tests, where only
     /// `command`/`args`/`env` matter.
-    fn bare_server_config(env: HashMap<crate::config::EnvKey, String>) -> LspServerConfig {
+    fn bare_server_config(
+        env: HashMap<crate::config::EnvKey, crate::config::EnvValue>,
+    ) -> LspServerConfig {
         LspServerConfig {
             language_id: LanguageId::from_static("test"),
             command: ServerCommand::from_static("irrelevant-for-build-command").into(),
@@ -3068,7 +3106,7 @@ sleep 5
         let mut env = HashMap::new();
         env.insert(
             crate::config::EnvKey::from_static("MCPLS_TEST_CONFIGURED"),
-            "from-server-config".to_string(),
+            crate::config::EnvValue::from_static("from-server-config"),
         );
         let config = bare_server_config(env);
         let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |_| None);
@@ -3089,7 +3127,7 @@ sleep 5
         let mut env = HashMap::new();
         env.insert(
             crate::config::EnvKey::from_static("PATH"),
-            "/configured/override/path".to_string(),
+            crate::config::EnvValue::from_static("/configured/override/path"),
         );
         let config = bare_server_config(env);
         let command = LspServer::build_command(&config, &ChildWorkingDir::Inherit, |key| {

@@ -1,15 +1,25 @@
 //! Tells `lsp-diagnostics://` subscribers about on-disk edits no tool call
-//! observes (#648, spec bridge/009 Option E).
+//! observes (#648, #781, spec bridge/009).
 //!
 //! While some session subscribes to a tracked file, the sweep resyncs the file
 //! with the disk every [`SWEEP_INTERVAL`] and, when that moved the document to
 //! a state the cache holds no pulled report for, pulls it, which publishes the
-//! change like a `get_diagnostics` call would. Files of one server are swept by
-//! one job at a time, so a wedged server stalls only its own files.
+//! change like a `get_diagnostics` call would. A resync that found the content
+//! changed also sends `didSave` to a server that advertises it, so diagnostics
+//! a server produces only on save are refreshed.
 //!
-//! Not covered (spec bridge/009 Options B and C): flycheck-only diagnostics of
-//! subscribed files and diagnostics that change because another file was
-//! edited.
+//! Tracked files nobody subscribes to, served by a server that has a
+//! subscribed file, are visited as companions: resynced (and `didSave`d) but
+//! never pulled, without touching their LRU position. A change to one advances
+//! its server's epoch, which makes that server's subscribed files due for a
+//! pull, so cross-file staleness is caught.
+//!
+//! Both sets are visited through bounded windows ([`MAX_SWEPT_FILES_PER_TICK`],
+//! [`MAX_COMPANION_FILES`], [`MAX_COMPANION_FILES_PER_TICK`]), subscribed files
+//! first. Files of one server are swept by one job at a time, so a wedged
+//! server stalls only its own files.
+//!
+//! Not covered: servers that register `textDocument/didSave` dynamically.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,15 +32,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::bridge::resources::DiagnosticsResourceUri;
-use crate::bridge::{NotificationCache, SweepMemo, SweepStep, Translator, path_to_uri};
+use crate::bridge::{Interest, NotificationCache, SweepMemo, SweepStep, Translator, path_to_uri};
 use crate::config::ServerId;
 use crate::mcp::SubscriptionRegistry;
 
 /// Time between two sweeps.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Most files one sweep visits; the rest follow on later ticks.
+/// Most subscribed files one sweep visits; the rest follow on later ticks.
 const MAX_SWEPT_FILES_PER_TICK: usize = 64;
+
+/// Most recently used tracked, unsubscribed files of a server with a
+/// subscribed file that count as companions.
+const MAX_COMPANION_FILES: usize = 256;
+
+/// Most companions one sweep visits; the rest follow on later ticks.
+const MAX_COMPANION_FILES_PER_TICK: usize = 32;
 
 /// Starts the sweep, which runs until `cancel` fires or the handle is
 /// stopped with [`stop_disk_sweep`].
@@ -85,6 +102,9 @@ struct DiskSweep {
     /// Where the next tick starts in the sorted list of swept files, so a
     /// backlog beyond [`MAX_SWEPT_FILES_PER_TICK`] is visited in turn.
     next_start: usize,
+    /// The last companion the previous tick examined, so the next tick resumes
+    /// at the first path after it however the companion set changed.
+    companions_after: Option<PathBuf>,
 }
 
 impl DiskSweep {
@@ -101,6 +121,7 @@ impl DiskSweep {
             jobs: JoinSet::new(),
             running: HashMap::new(),
             next_start: 0,
+            companions_after: None,
         }
     }
 
@@ -111,20 +132,34 @@ impl DiskSweep {
             return;
         }
         let subscribed = self.subscribed_tracked_files().await;
-        let kept: HashSet<&Path> = subscribed.iter().map(PathBuf::as_path).collect();
+        let companions = self.companion_files(&subscribed);
+        let kept: HashSet<&Path> = subscribed
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(companions.iter().map(|(path, _)| path.as_path()))
+            .collect();
         self.memo.retain(|path| kept.contains(path));
 
-        let mut by_server: HashMap<ServerId, Vec<PathBuf>> = HashMap::new();
+        let mut by_server: HashMap<ServerId, Vec<(PathBuf, Interest)>> = HashMap::new();
         for (path, server) in self.next_window(&subscribed) {
-            by_server.entry(server).or_default().push(path);
+            by_server
+                .entry(server)
+                .or_default()
+                .push((path, Interest::Subscribed));
         }
-        for (server, files) in by_server {
+        for (path, server) in self.next_companions(&companions) {
+            by_server
+                .entry(server)
+                .or_default()
+                .push((path, Interest::Companion));
+        }
+        for (server, visits) in by_server {
             let job = sweep_files(
                 Arc::clone(&self.translator),
                 Arc::clone(&self.notification_cache),
                 self.memo.clone(),
                 cancel.clone(),
-                files,
+                visits,
             );
             let id = self.jobs.spawn(job).id();
             self.running.insert(id, server);
@@ -180,7 +215,7 @@ impl DiskSweep {
             let Some(server) = self.translator.sweep_server(path) else {
                 continue;
             };
-            if self.running.values().any(|running| *running == server) {
+            if self.is_busy(&server) {
                 continue;
             }
             window.push((path.clone(), server));
@@ -188,24 +223,85 @@ impl DiskSweep {
         self.next_start = start.saturating_add(examined).checked_rem(len).unwrap_or(0);
         window
     }
+
+    fn is_busy(&self, server: &ServerId) -> bool {
+        self.running.values().any(|running| running == server)
+    }
+
+    /// The most recently used [`MAX_COMPANION_FILES`] tracked files that are
+    /// not subscribed but are routed to a server with a subscribed file,
+    /// sorted by path.
+    fn companion_files(&self, subscribed: &[PathBuf]) -> Vec<(PathBuf, ServerId)> {
+        let with_subscription: HashSet<ServerId> = subscribed
+            .iter()
+            .filter_map(|path| self.translator.sweep_server(path))
+            .collect();
+        let subscribed: HashSet<&PathBuf> = subscribed.iter().collect();
+        let mut companions: Vec<(PathBuf, ServerId)> = self
+            .translator
+            .document_tracker()
+            .open_paths_by_recency()
+            .into_iter()
+            .filter(|path| !subscribed.contains(path))
+            .filter_map(|path| {
+                let server = self.translator.sweep_server(&path)?;
+                with_subscription
+                    .contains(&server)
+                    .then_some((path, server))
+            })
+            .take(MAX_COMPANION_FILES)
+            .collect();
+        companions.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        companions
+    }
+
+    /// The companions this tick visits: at most
+    /// [`MAX_COMPANION_FILES_PER_TICK`], taken in path order from the first
+    /// path after the one the previous tick stopped at. Companions of a busy
+    /// server are passed over without using up the window.
+    fn next_companions(&mut self, companions: &[(PathBuf, ServerId)]) -> Vec<(PathBuf, ServerId)> {
+        let len = companions.len();
+        let start = self.companions_after.as_ref().map_or(0, |after| {
+            companions.partition_point(|(path, _)| path <= after)
+        });
+        let mut window = Vec::new();
+        let mut last = None;
+        for (path, server) in companions
+            .iter()
+            .cycle()
+            .skip(start.checked_rem(len).unwrap_or(0))
+            .take(len)
+        {
+            if window.len() >= MAX_COMPANION_FILES_PER_TICK {
+                break;
+            }
+            last = Some(path);
+            if self.is_busy(server) {
+                continue;
+            }
+            window.push((path.clone(), server.clone()));
+        }
+        self.companions_after = last.cloned();
+        window
+    }
 }
 
-/// Sweeps `files`, all of one server, one after another.
+/// Sweeps `visits`, all of one server, one after another.
 async fn sweep_files(
     translator: Arc<Translator>,
     notification_cache: Arc<Mutex<NotificationCache>>,
     memo: SweepMemo,
     cancel: CancellationToken,
-    files: Vec<PathBuf>,
+    visits: Vec<(PathBuf, Interest)>,
 ) {
-    for path in files {
+    for (path, interest) in visits {
         if cancel.is_cancelled() {
             return;
         }
         let step = translator
-            .sweep_file(&path, &memo, &notification_cache)
+            .sweep_file(&path, interest, &memo, &notification_cache)
             .await;
-        debug!(path = %path.display(), ?step, "disk sweep visited a file");
+        debug!(path = %path.display(), ?interest, ?step, "disk sweep visited a file");
         if step == SweepStep::TimedOut {
             return;
         }
@@ -223,8 +319,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::bridge::{ResultContext, WorkspaceRoots};
-    use crate::config::{LanguageId, ToolRouter};
+    use crate::bridge::{ResourceLimits, ResultContext, WorkspaceRoots};
+    use crate::config::{DocumentLimit, LanguageId, ToolRouter};
     use crate::mcp::{SessionHandle, Target};
     use crate::runtime::pump::{DiagnosticsRoles, PumpShared, PumpWiring};
     use crate::test_lsp::{
@@ -294,6 +390,10 @@ mod tests {
         /// A tracked file whose first pull was answered, with `answers` pull
         /// requests answered in all.
         async fn new(answers: usize) -> Self {
+            Self::with_limits(answers, ResourceLimits::default()).await
+        }
+
+        async fn with_limits(answers: usize, limits: ResourceLimits) -> Self {
             let dir = TempDir::new().unwrap();
             let root = dunce::canonicalize(dir.path()).unwrap();
             let path = root.join("lib.rs");
@@ -302,6 +402,7 @@ mod tests {
             let cache = Arc::new(Mutex::new(NotificationCache::new()));
             let subs = SubscriptionRegistry::new();
             let mut translator = Translator::new()
+                .with_resource_limits(limits)
                 .with_extensions(test_extensions())
                 .with_router(ToolRouter::catch_all([(
                     server_id.clone(),
@@ -559,7 +660,7 @@ mod tests {
             Arc::clone(&h.cache),
             SweepMemo::default(),
             cancel,
-            vec![h.path.clone()],
+            vec![(h.path.clone(), Interest::Subscribed)],
         )
         .await;
 
@@ -622,5 +723,212 @@ mod tests {
                 .iter()
                 .all(|(path, _)| path.extension().unwrap() == "rs")
         );
+    }
+
+    fn unlimited_documents() -> ResourceLimits {
+        ResourceLimits {
+            max_documents: DocumentLimit::UNLIMITED,
+            ..ResourceLimits::default()
+        }
+    }
+
+    impl Harness {
+        /// Tracks the text of a new file next to the harness's, which no
+        /// session subscribes to.
+        fn track(&self, name: &str) -> PathBuf {
+            let path = self.path.with_file_name(name);
+            fs::write(&path, "fn other() {}").unwrap();
+            self.translator
+                .document_tracker()
+                .open(path.clone(), "fn other() {}".to_owned())
+                .unwrap();
+            path
+        }
+    }
+
+    /// With far more tracked files than the windows hold, a subscribed file's
+    /// own edit is pulled on the next tick: subscribed files go first.
+    #[tokio::test]
+    async fn test_a_subscribed_edit_is_pulled_on_the_next_tick_among_300_tracked_files() {
+        let mut h = Harness::with_limits(usize::MAX, unlimited_documents()).await;
+        for n in 0..300 {
+            h.track(&format!("f{n:03}.rs"));
+        }
+        let (_session, mut rx) = h.subscribe().await;
+        h.tick().await;
+        while rx.try_recv().is_ok() {}
+        let settled = h.pulls();
+        h.edit("fn main() { let x: i32 = \"s\"; }");
+
+        h.tick().await;
+
+        assert_eq!(h.pulls(), settled + 1);
+        assert_eq!(next_update(&mut rx).await, h.resource.as_str());
+    }
+
+    /// An edit to a tracked file nobody subscribes to refreshes the
+    /// subscribed file of the same server once, and idle ticks add nothing.
+    #[tokio::test]
+    async fn test_a_companion_edit_refreshes_the_subscribed_file_once() {
+        let mut h = Harness::new(usize::MAX).await;
+        let other = h.track("other.rs");
+        let (_session, mut rx) = h.subscribe().await;
+        h.tick().await;
+        while rx.try_recv().is_ok() {}
+        let settled = h.pulls();
+        fs::write(&other, "fn other() { let y = 2; }").unwrap();
+
+        h.tick().await;
+        h.tick().await;
+
+        assert_eq!(h.pulls(), settled + 1);
+        assert_eq!(next_update(&mut rx).await, h.resource.as_str());
+        for _ in 0..100 {
+            h.tick().await;
+        }
+        assert_eq!(h.pulls(), settled + 1);
+        assert_quiet(&mut rx).await;
+    }
+
+    /// A tool call that resyncs a companion counts like the sweep's own
+    /// resync: the next tick refreshes the subscribed file.
+    #[tokio::test]
+    async fn test_a_tool_call_resync_of_a_companion_refreshes_the_subscribed_file() {
+        let mut h = Harness::new(usize::MAX).await;
+        let other = h.track("other.rs");
+        let (_session, mut rx) = h.subscribe().await;
+        h.tick().await;
+        while rx.try_recv().is_ok() {}
+        fs::write(&other, "fn other() { let y = 2; }").unwrap();
+        h.translator
+            .handle_diagnostics(client_path(&other), ResultContext::None, &h.cache)
+            .await
+            .unwrap();
+        let after_tool_call = h.pulls();
+
+        h.tick().await;
+        h.tick().await;
+
+        assert_eq!(h.pulls(), after_tool_call + 1);
+    }
+
+    /// The memo holds subscribed and companion files only, whatever the
+    /// tracker holds.
+    #[tokio::test]
+    async fn test_the_memo_is_bounded_by_the_subscribed_and_companion_files() {
+        let mut h = Harness::with_limits(usize::MAX, unlimited_documents()).await;
+        for n in 0..300 {
+            h.track(&format!("f{n:03}.rs"));
+        }
+        let (_session, _rx) = h.subscribe().await;
+
+        for _ in 0..20 {
+            h.tick().await;
+        }
+
+        assert!(h.sweep.memo.tracked_files() <= 1 + MAX_COMPANION_FILES);
+    }
+
+    fn companions(prefix: &str, count: usize) -> Vec<(PathBuf, ServerId)> {
+        files(prefix, "rs", count)
+            .into_iter()
+            .map(|path| (path, ServerId::from_static("rust")))
+            .collect()
+    }
+
+    /// The companion window resumes after the last path it examined, so a
+    /// path inserted before the cursor does not make later ones repeat or skip.
+    #[tokio::test]
+    async fn test_companion_windows_resume_after_the_last_visited_path() {
+        let (mut sweep, ..) = sweep_over_two_servers();
+        let mut all = companions("f", 100);
+
+        let first = sweep.next_companions(&all);
+        all.insert(
+            0,
+            (
+                PathBuf::from("/w/a-new-file.rs"),
+                ServerId::from_static("rust"),
+            ),
+        );
+        let second = sweep.next_companions(&all);
+
+        assert_eq!(first.len(), MAX_COMPANION_FILES_PER_TICK);
+        assert_eq!(first[0].0, PathBuf::from("/w/f000.rs"));
+        assert_eq!(second[0].0, PathBuf::from("/w/f032.rs"));
+        assert_eq!(second.len(), MAX_COMPANION_FILES_PER_TICK);
+    }
+
+    /// Windows follow one another round the whole set.
+    #[tokio::test]
+    async fn test_companion_windows_cover_the_set_in_turn() {
+        let (mut sweep, ..) = sweep_over_two_servers();
+        let all = companions("f", 100);
+
+        let covered: HashSet<PathBuf> = (0..4)
+            .flat_map(|_| sweep.next_companions(&all))
+            .map(|(path, _)| path)
+            .collect();
+
+        assert_eq!(covered.len(), 100);
+    }
+
+    /// Companions of a server whose job still runs do not use up the window.
+    #[tokio::test]
+    async fn test_a_busy_server_does_not_starve_the_companions_of_another() {
+        let (mut sweep, _rust, ts) = sweep_over_two_servers();
+        let busy = sweep.jobs.spawn(std::future::pending()).id();
+        sweep.running.insert(busy, ts.clone());
+        let mut all = companions("b", 70);
+        all.extend(
+            files("a", "tsx", 80)
+                .into_iter()
+                .map(|path| (path, ts.clone())),
+        );
+        all.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let window = sweep.next_companions(&all);
+
+        assert_eq!(window.len(), MAX_COMPANION_FILES_PER_TICK);
+        assert!(window.iter().all(|(_, server)| *server != ts));
+    }
+
+    /// Only the most recently used tracked files of a server with a
+    /// subscribed file are companions, in path order.
+    #[tokio::test(start_paused = true)]
+    async fn test_companions_are_the_most_recent_files_of_a_served_server() {
+        let (rust, ts) = (ServerId::from_static("rust"), ServerId::from_static("ts"));
+        let translator = Translator::new()
+            .with_resource_limits(unlimited_documents())
+            .with_extensions(test_extensions())
+            .with_router(ToolRouter::catch_all([
+                (rust.clone(), LanguageId::from_static("rust")),
+                (ts.clone(), LanguageId::from_static("typescriptreact")),
+            ]));
+        translator.register_client(rust.clone(), fake_lsp_client().0);
+        translator.register_client(ts, fake_lsp_client().0);
+        let tracker = Arc::clone(translator.document_tracker());
+        let all = files("f", "rs", MAX_COMPANION_FILES + 44);
+        for path in &all {
+            tracker.open(path.clone(), String::new()).unwrap();
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        for path in files("t", "tsx", 10) {
+            tracker.open(path, String::new()).unwrap();
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        let sweep = DiskSweep::new(
+            Arc::new(translator),
+            Arc::new(Mutex::new(NotificationCache::new())),
+            SubscriptionRegistry::new(),
+        );
+        let subscribed = vec![all[0].clone()];
+
+        let found = sweep.companion_files(&subscribed);
+
+        let expected: Vec<&PathBuf> = all[44..].iter().collect();
+        let found_paths: Vec<&PathBuf> = found.iter().map(|(path, _)| path).collect();
+        assert_eq!(found_paths, expected);
+        assert!(found.iter().all(|(_, server)| *server == rust));
     }
 }

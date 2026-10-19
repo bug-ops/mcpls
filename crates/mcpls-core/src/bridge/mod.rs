@@ -38,7 +38,8 @@ pub(crate) use published_uri::resolve_one;
 pub(crate) use published_uri::{Publication, PublicationKind, PublishedPathResolver};
 pub use signals::{Indexed, IndexingSignal, RouteSignals};
 pub use state::{
-    DocumentOpenState, DocumentTracker, DocumentVersion, ResourceLimits, path_to_uri, uri_to_path,
+    Access, DocumentOpenState, DocumentTracker, DocumentVersion, OpenRequest, ResourceLimits,
+    path_to_uri, uri_to_path,
 };
 pub(crate) use state::{InFlightGuard, LinePresence, Opening, try_path_to_uri};
 pub use translator::{
@@ -63,7 +64,7 @@ pub use translator::{
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,
-    InlayHintsResult, NotificationReceivers, NotificationWiring, OutgoingCallsResult,
+    InlayHintsResult, Interest, NotificationReceivers, NotificationWiring, OutgoingCallsResult,
     ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SweepMemo, SweepStep,
     ToolSupportSnapshot, WorkspaceSymbolResult,
 };

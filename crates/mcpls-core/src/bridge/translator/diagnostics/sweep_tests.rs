@@ -2,16 +2,18 @@
 //! and what the pull publishes.
 
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::io::BufReader;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::pull_tests::{Fixture, answer, error_item, full_report, next_pull_request};
-use super::sweep::{SweepMemo, SweepStep};
+use super::sweep::{Interest, SweepMemo, SweepStep};
 use super::*;
 use crate::bridge::translator::testing::*;
 use crate::test_lsp::client_path;
@@ -20,9 +22,13 @@ type Sweep = JoinHandle<SweepStep>;
 
 impl Fixture {
     fn spawn_sweep(&self, memo: &SweepMemo) -> Sweep {
+        self.spawn_sweep_of(self.path.clone(), Interest::Subscribed, memo)
+    }
+
+    fn spawn_sweep_of(&self, path: PathBuf, interest: Interest, memo: &SweepMemo) -> Sweep {
         let (translator, cache) = (Arc::clone(&self.translator), Arc::clone(&self.cache));
-        let (path, memo) = (self.path.clone(), memo.clone());
-        tokio::spawn(async move { translator.sweep_file(&path, &memo, &cache).await })
+        let memo = memo.clone();
+        tokio::spawn(async move { translator.sweep_file(&path, interest, &memo, &cache).await })
     }
 
     async fn finish_sweep(sweep: Sweep) -> SweepStep {
@@ -235,7 +241,7 @@ async fn test_sweep_leaves_a_dead_server_alone() {
     assert_eq!(translator.sweep_server(&file), None);
     let cache = Mutex::new(NotificationCache::new());
     let step = translator
-        .sweep_file(&file, &SweepMemo::default(), &cache)
+        .sweep_file(&file, Interest::Subscribed, &SweepMemo::default(), &cache)
         .await;
 
     assert_eq!(step, SweepStep::Skipped);
@@ -439,4 +445,253 @@ async fn test_sweep_does_not_probe_a_server_whose_pull_support_is_unknown() {
         fx.translator.pull_support(&Fixture::rust()),
         PullSupport::Probing
     );
+}
+
+fn sync_options(save: Option<lsp_types::Save>) -> lsp_types::ServerCapabilities {
+    lsp_types::ServerCapabilities {
+        text_document_sync: Some(lsp_types::TextDocumentSync::Options(
+            lsp_types::TextDocumentSyncOptions {
+                save,
+                ..lsp_types::TextDocumentSyncOptions::default()
+            },
+        )),
+        ..lsp_types::ServerCapabilities::default()
+    }
+}
+
+/// Everything the server end of `wire` receives within a short wait.
+async fn drain(wire: &mut BufReader<&mut tokio::io::DuplexStream>) -> Vec<Value> {
+    let mut sent = Vec::new();
+    while let Ok(message) = timeout(Duration::from_millis(300), read_framed_message(wire)).await {
+        sent.push(message);
+    }
+    sent
+}
+
+/// The notifications a server receives from tracking a file, editing it and
+/// sweeping it once.
+async fn messages_for_a_swept_edit(capabilities: lsp_types::ServerCapabilities) -> Vec<Value> {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let file = canonical_dir(&dir).join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+    let cache = Mutex::new(NotificationCache::new());
+    translator
+        .sweep_file(&file, Interest::Subscribed, &SweepMemo::default(), &cache)
+        .await;
+    drain(&mut BufReader::new(&mut server.write_stdout)).await
+}
+
+fn methods(messages: &[Value]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter_map(|message| message["method"].as_str())
+        .collect()
+}
+
+/// A server that asked for `didSave` gets it once, right after the change.
+#[tokio::test]
+async fn test_sweep_sends_did_save_after_the_change_without_text() {
+    let sent = Box::pin(messages_for_a_swept_edit(sync_options(Some(
+        lsp_types::Save::Bool(true),
+    ))))
+    .await;
+
+    assert_eq!(
+        methods(&sent),
+        [
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/didSave"
+        ]
+    );
+    assert!(sent[2]["params"].get("text").is_none());
+}
+
+#[tokio::test]
+async fn test_sweep_sends_the_text_when_the_server_asked_for_it() {
+    let save = lsp_types::Save::SaveOptions(lsp_types::SaveOptions {
+        include_text: Some(true),
+    });
+
+    let sent = Box::pin(messages_for_a_swept_edit(sync_options(Some(save)))).await;
+
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2]["method"], "textDocument/didSave");
+    assert_eq!(sent[2]["params"]["text"], "fn main() { let x = 1; }");
+}
+
+/// Without a save option the notification stays unsent, as the specification
+/// requires.
+#[tokio::test]
+async fn test_sweep_sends_no_did_save_to_a_server_that_did_not_ask() {
+    for capabilities in [
+        sync_options(None),
+        sync_options(Some(lsp_types::Save::Bool(false))),
+        lsp_types::ServerCapabilities {
+            text_document_sync: Some(lsp_types::TextDocumentSync::Kind(
+                lsp_types::TextDocumentSyncKind::Full,
+            )),
+            ..lsp_types::ServerCapabilities::default()
+        },
+        lsp_types::ServerCapabilities::default(),
+    ] {
+        let sent = Box::pin(messages_for_a_swept_edit(capabilities)).await;
+
+        assert_eq!(
+            methods(&sent),
+            ["textDocument/didOpen", "textDocument/didChange"]
+        );
+    }
+}
+
+/// A file that has not changed since the last visit is not saved again.
+#[tokio::test]
+async fn test_sweep_sends_did_save_once_per_change() {
+    let dir = TempDir::new().unwrap();
+    let id = Fixture::rust();
+    let capabilities = sync_options(Some(lsp_types::Save::Bool(true)));
+    let (translator, mut server) = translator_with_capabilities(&dir, &id, capabilities);
+    let file = canonical_dir(&dir).join("lib.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+    drop(
+        translator
+            .prepare_document(&client_path(file.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    let (memo, cache) = (SweepMemo::default(), Mutex::new(NotificationCache::new()));
+    fs::write(&file, "fn main() { let x = 1; }").unwrap();
+
+    for _ in 0..3 {
+        translator
+            .sweep_file(&file, Interest::Subscribed, &memo, &cache)
+            .await;
+    }
+
+    let sent = drain(&mut BufReader::new(&mut server.write_stdout)).await;
+    let saves = methods(&sent)
+        .into_iter()
+        .filter(|method| *method == "textDocument/didSave")
+        .count();
+    assert_eq!(saves, 1);
+}
+
+impl Fixture {
+    /// Tracks a second file next to the fixture's and returns its path.
+    async fn track_companion(&self) -> PathBuf {
+        let path = self.path.with_file_name("other.rs");
+        fs::write(&path, "fn other() {}").unwrap();
+        drop(
+            self.translator
+                .prepare_document(&client_path(path.clone()), ToolKind::Diagnostics)
+                .await
+                .unwrap(),
+        );
+        path
+    }
+}
+
+/// An edit to a companion that nobody subscribes to is resynced without a
+/// pull, and moves the subscribed file of the same server to a new pull.
+#[tokio::test]
+async fn test_a_companion_edit_makes_the_subscribed_file_pull_once() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    let companion = fx.track_companion().await;
+    let memo = SweepMemo::default();
+    assert_eq!(
+        Fixture::finish_sweep(fx.spawn_sweep(&memo)).await,
+        SweepStep::Synced
+    );
+    let visit = |interest| fx.spawn_sweep_of(companion.clone(), interest, &memo);
+    assert_eq!(
+        Fixture::finish_sweep(visit(Interest::Companion)).await,
+        SweepStep::Synced
+    );
+
+    fs::write(&companion, "fn other() { let y = 2; }").unwrap();
+    assert_eq!(
+        Fixture::finish_sweep(visit(Interest::Companion)).await,
+        SweepStep::Synced
+    );
+    let sweep = fx.spawn_sweep(&memo);
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    answer(
+        &mut wire,
+        &mut server.read_half_stdin,
+        full_report(json!([error_item(0, "second")])),
+    )
+    .await;
+
+    assert_eq!(Fixture::finish_sweep(sweep).await, SweepStep::Pulled);
+    for _ in 0..3 {
+        assert_eq!(
+            Fixture::finish_sweep(fx.spawn_sweep(&memo)).await,
+            SweepStep::Synced
+        );
+    }
+}
+
+/// Visiting a companion neither pulls it nor makes it the most recently used
+/// document.
+#[tokio::test]
+async fn test_a_companion_visit_leaves_the_lru_order_alone() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    let companion = fx.track_companion().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(
+        fx.translator
+            .prepare_document(&client_path(fx.path.clone()), ToolKind::Diagnostics)
+            .await
+            .unwrap(),
+    );
+    let order = fx.translator.document_tracker().open_paths_by_recency();
+    assert_eq!(order, [fx.path.clone(), companion.clone()]);
+    fs::write(&companion, "fn other() { let y = 2; }").unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let step = Fixture::finish_sweep(fx.spawn_sweep_of(
+        companion,
+        Interest::Companion,
+        &SweepMemo::default(),
+    ))
+    .await;
+
+    assert_eq!(step, SweepStep::Synced);
+    assert_eq!(
+        fx.translator.document_tracker().open_paths_by_recency(),
+        order
+    );
+}
+
+/// Re-pulls that are due only because another file of the server changed are
+/// limited per window, and the budget returns with the next one.
+#[test]
+fn test_epoch_driven_pulls_are_budgeted_per_window() {
+    let memo = SweepMemo::default();
+    let (rust, other) = (Fixture::rust(), ServerId::from_static("other"));
+    let start = tokio::time::Instant::now();
+
+    let granted = (0..20)
+        .filter(|_| memo.take_epoch_pull(&rust, start))
+        .count();
+
+    assert_eq!(granted, 8);
+    assert!(memo.take_epoch_pull(&other, start));
+    assert!(!memo.take_epoch_pull(&rust, start + Duration::from_millis(1999)));
+    assert!(memo.take_epoch_pull(&rust, start + Duration::from_secs(2)));
 }

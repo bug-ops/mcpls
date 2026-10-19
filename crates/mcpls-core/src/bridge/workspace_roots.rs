@@ -18,6 +18,8 @@ use super::{ClientPath, uri_to_path};
 use crate::config::ConfiguredRoot;
 use crate::error::{BackgroundTask, ConfigError, Error};
 
+mod open_contained;
+
 /// How path components are compared during containment checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseRule {
@@ -449,6 +451,12 @@ impl WorkspacePath {
     #[must_use]
     pub fn into_path_buf(self) -> PathBuf {
         self.0
+    }
+
+    /// Wraps `path` without validating it, for tests that open files directly.
+    #[cfg(test)]
+    pub(crate) const fn for_test(path: PathBuf) -> Self {
+        Self(path)
     }
 }
 

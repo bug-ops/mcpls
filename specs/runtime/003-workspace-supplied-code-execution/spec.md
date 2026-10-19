@@ -108,7 +108,8 @@ related:
   also reads the en dash, em dash and horizontal bar as `-`, Windows PowerShell 5.1 (`powershell`) reads a
   bare argument as `-Command` (`LaunchTrigger::ImplicitCommandString`; `-File` ends the check), fish matches long flags by prefix and elvish
   reads `-c`, `--c` and `-c=true` alike. `cmd` is a runner refused on every use (`LaunchRule::Always`):
-  without `/c` it reads the LSP frames on its stdin as commands. `xargs`, `find` and the `awk` family are refused outright, and so
+  without `/c` it reads the LSP frames on its stdin as commands. A shell or interpreter on these lists that would
+  read its program from stdin is refused too (FR-015, #782). `xargs`, `find` and the `awk` family are refused outright, and so
   are the wrappers whose options are not analyzed (`sudo`, `sudo-rs`, `doas`, `run0`, `pkexec`, `runuser`,
   `setpriv`, `gosu`, `su-exec`, `chpst`, `setuidgid`, `envdir`, `runas`, `wsl`, `strace`, `unshare`,
   `chrt`, `taskset`, `ionice`, `chroot`, `nsenter`, `systemd-run`, `script`): they change the user, root, directory or environment, or take optional arguments (#709).
@@ -320,6 +321,7 @@ the committed minimum, the rest is gated on the open decisions.
 | FR-012 | WHERE untrusted mode exists THE SYSTEM SHALL start the server in a directory outside the workspace and, on Windows, set `NoDefaultCurrentDirectoryInExePath=1`, so no lookup the server makes resolves into the workspace through the current directory | must |
 | FR-013 | THE SYSTEM SHALL resolve the tsserver once per server start so the path checked against the workspace is the path sent, and SHALL resolve a pin it chose again, with the same check, when it no longer resolves to the same file at respawn | must |
 | FR-014 | WHERE untrusted mode exists THE SYSTEM SHALL resolve every program an exec wrapper or `env` starts on the same `PATH` as the server's executable, refuse one that lies inside the workspace (`WorkspaceExecutable`) or is not found (`UnresolvedWrappedProgram`), and spawn the rest by their vetted absolute paths (#710) | must |
+| FR-015 | WHERE untrusted mode exists THE SYSTEM SHALL refuse a listed shell or interpreter that would read its program from the LSP stdin (`LaunchTrigger::ProgramFromStdin`): no script or other program source (`NoProgram`), `-s` anywhere in a POSIX option cluster (`DashS`), a `-` operand (`DashOperand`), an operand under `/dev/` or `/proc/` compared as text, ASCII-case-insensitively with `\` read as `/` and `//`, `/./` collapsed (`DeviceOperand`), or an operand with a `..` component (`ParentTraversal`); and SHALL refuse a relative script operand that follows `env -C`, `env --chdir` or `pwsh -WorkingDirectory` (`UnanalyzableLaunch::RelativeOperandAfterChdir`). The operand walk uses a table per family, separate from the command-string tables; a long option a table does not list takes a value (#782) | must |
 
 ## 4. Non-Functional Requirements
 

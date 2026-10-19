@@ -313,7 +313,7 @@ impl Redactions {
                     .env
                     .iter()
                     .filter(|(name, _)| is_secret_name(name.as_str()))
-                    .map(|(name, value)| (name.to_string(), value.clone())),
+                    .map(|(name, value)| (name.to_string(), value.to_string())),
             );
             collect_secret_args(&config.args, &mut candidates);
             if let Some(options) = &config.initialization_options {
@@ -533,6 +533,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::lsp::JsonRpcError;
 
     fn redactions(pairs: &[(&str, &str)]) -> Redactions {
         Redactions::new(
@@ -555,7 +556,7 @@ mod tests {
         let mut first = server_config();
         first.env.insert(
             crate::config::EnvKey::from_static("FIRST_TOKEN"),
-            "first-secret-value".into(),
+            crate::config::EnvValue::from_static("first-secret-value"),
         );
         let mut second = server_config();
         second.args = vec!["--api-key=second-secret-value".into()];
@@ -790,11 +791,11 @@ mod tests {
     #[test]
     fn test_sanitize_error_redacts_a_secret_and_keeps_a_clean_error() {
         let set = redactions(&[("API_TOKEN", "ghp_abcdefgh")]);
-        let leaking = Error::LspServerError {
+        let leaking = Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "bad token ghp_abcdefgh".into(),
             data: None,
-        };
+        });
 
         let sanitized = set.sanitize_error(leaking);
 
@@ -945,11 +946,11 @@ mod tests {
             [
                 (
                     crate::config::EnvKey::from_static("API_TOKEN"),
-                    "tok-1234567890".to_string(),
+                    crate::config::EnvValue::from_static("tok-1234567890"),
                 ),
                 (
                     crate::config::EnvKey::from_static("RUSTUP_TOOLCHAIN"),
-                    "nightly-2024-01-01".to_string(),
+                    crate::config::EnvValue::from_static("nightly-2024-01-01"),
                 ),
             ],
             crate::config::HostOs::CURRENT,

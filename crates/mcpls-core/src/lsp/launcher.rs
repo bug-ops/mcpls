@@ -22,7 +22,7 @@ use std::path::Path;
 use crate::config::CommandStem;
 use crate::error::{
     EchoedArgument, EchoedPath, InlineFlag, LaunchTrigger, LauncherRefusal, LongCommandName,
-    LongInlineFlag, OperandKind, PowerShellParameter, RunnerSubcommand, ShellFlag,
+    LongInlineFlag, OperandKind, PowerShellParameter, RunnerSubcommand, ShellFlag, StdinSource,
     UnanalyzableLaunch,
 };
 
@@ -87,7 +87,11 @@ const RUNNERS: &[(&str, LaunchRule)] = &[
     ("cmd", LaunchRule::Always),
     (
         "bun",
-        LaunchRule::Subcommands(&[RunnerSubcommand::X, RunnerSubcommand::Run]),
+        LaunchRule::Subcommands(&[
+            RunnerSubcommand::X,
+            RunnerSubcommand::Run,
+            RunnerSubcommand::Repl,
+        ]),
     ),
     (
         "deno",
@@ -182,11 +186,14 @@ enum ShellFamily {
     /// `elvish`, which parses flags with Go's `flag` package: `-c`, `--c` and
     /// `-c=true` mean the same.
     GoFlag,
+    /// `xonsh`: POSIX command-string flags, but argparse options.
+    Xonsh,
 }
 
 const SHELLS: &[(&str, ShellFamily)] = &[
     ("sh", ShellFamily::Posix),
     ("bash", ShellFamily::Posix),
+    ("rbash", ShellFamily::Posix),
     ("zsh", ShellFamily::Posix),
     ("dash", ShellFamily::Posix),
     ("ksh", ShellFamily::Posix),
@@ -204,7 +211,7 @@ const SHELLS: &[(&str, ShellFamily)] = &[
     ("posh", ShellFamily::Posix),
     ("elvish", ShellFamily::GoFlag),
     ("nu", ShellFamily::Nu),
-    ("xonsh", ShellFamily::Posix),
+    ("xonsh", ShellFamily::Xonsh),
 ];
 
 /// Whether `text` has the shape of the operand `kind`.
@@ -484,30 +491,75 @@ const EXEC_WRAPPERS: &[ExecWrapper] = &[
 const INLINE_EVAL: &[InlineEval] = &[
     InlineEval {
         data_url_flags: DATA_URL_LOADERS,
+        flag_longs: NODE_FLAGS,
+        flag_prefixes: &["--no-"],
+        value_longs: NODE_VALUE_LONGS,
         ..InlineEval::new("node", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
     },
     InlineEval {
         data_url_flags: DATA_URL_LOADERS,
+        flag_longs: NODE_FLAGS,
+        flag_prefixes: &["--smol"],
+        value_longs: NODE_VALUE_LONGS,
+        chdir_longs: &["--cwd"],
         ..InlineEval::new("bun", &['e', 'p'], &['r', 'c'], LONG_EVAL_PRINT)
     },
     InlineEval::new("lua", &['e'], &['l'], &[]),
-    InlineEval::new("rscript", &['e'], &[], &[]),
-    InlineEval::new(
-        "julia",
-        &['e', 'E'],
-        &['L', 'J', 'C', 'O', 't', 'p', 'H'],
-        LONG_EVAL_PRINT,
-    ),
-    InlineEval::new("osascript", &['e'], &['l', 's'], &[]),
+    InlineEval {
+        flag_longs: &[
+            "--vanilla",
+            "--no-save",
+            "--no-restore",
+            "--no-environ",
+            "--slave",
+            "--quiet",
+            "--silent",
+            "--verbose",
+        ],
+        ..InlineEval::new("rscript", &['e'], &[], &[])
+    },
+    InlineEval {
+        flag_longs: &["--project", "--quiet", "--color"],
+        separate_value_letters: &['L', 'J', 'C', 't', 'p', 'H'],
+        ..InlineEval::new(
+            "julia",
+            &['e', 'E'],
+            &['L', 'J', 'C', 'O', 't', 'p', 'H'],
+            LONG_EVAL_PRINT,
+        )
+    },
+    InlineEval {
+        separate_value_letters: &['l', 's'],
+        ..InlineEval::new("osascript", &['e'], &['l', 's'], &[])
+    },
     InlineEval {
         data_url_flags: DATA_URL_LOADERS,
+        flag_longs: NODE_FLAGS,
+        flag_prefixes: &["--no-"],
+        value_longs: NODE_VALUE_LONGS,
         ..InlineEval::new("nodejs", &['e', 'p'], &['r', 'C'], LONG_EVAL_PRINT)
     },
-    InlineEval::new("python", &['c'], PYTHON_VALUE_LETTERS, &[]),
-    InlineEval::new("py", &['c'], PYTHON_VALUE_LETTERS, &[]),
+    InlineEval {
+        program: &[ProgramFlag::Short('m')],
+        ..InlineEval::new("python", &['c'], PYTHON_VALUE_LETTERS, &[])
+    },
+    InlineEval {
+        program: &[ProgramFlag::Short('m')],
+        ..InlineEval::new("py", &['c'], PYTHON_VALUE_LETTERS, &[])
+    },
+    InlineEval {
+        program: &[ProgramFlag::Short('m')],
+        ..InlineEval::new("pypy", &['c'], PYTHON_VALUE_LETTERS, &[])
+    },
+    InlineEval {
+        flag_longs: &["--unstable", "--quiet"],
+        positional: Positional::Subcommand,
+        ..InlineEval::new("deno", &[], &[], &[])
+    },
     InlineEval {
         module_letters: &['M', 'm'],
         debugger_letters: &['d'],
+        separate_value_letters: &['I'],
         ..InlineEval::new(
             "perl",
             &['e', 'E'],
@@ -515,18 +567,55 @@ const INLINE_EVAL: &[InlineEval] = &[
             &[],
         )
     },
-    InlineEval::new(
-        "ruby",
-        &['e'],
-        &['r', 'I', 'C', 'E', 'K', 'x', 'F', 'T'],
-        &[],
-    ),
-    InlineEval::new(
-        "php",
-        &['r', 'R', 'B', 'E', 'F'],
-        &['d', 'c', 'f', 'z'],
-        PHP_LONG_PROGRAM_FLAGS,
-    ),
+    InlineEval {
+        flag_longs: &["--verbose", "--yjit", "--jit", "--disable-gems"],
+        separate_value_letters: &['r', 'I', 'C', 'E', 'X'],
+        chdir_letters: &['C', 'X'],
+        ..InlineEval::new(
+            "ruby",
+            &['e'],
+            &['r', 'I', 'C', 'E', 'X', 'K', 'x', 'F', 'T'],
+            &[],
+        )
+    },
+    InlineEval {
+        file_letters: &['f'],
+        ..InlineEval::new(
+            "php",
+            &['r', 'R', 'B', 'E', 'F'],
+            &['d', 'c', 'f', 'z'],
+            PHP_LONG_PROGRAM_FLAGS,
+        )
+    },
+];
+
+/// Long options of node that take no value, so the next argument can still be
+/// the script. Every other long option without `=` is read as taking one.
+const NODE_FLAGS: &[&str] = &[
+    "--enable-source-maps",
+    "--no-warnings",
+    "--no-deprecation",
+    "--trace-warnings",
+    "--expose-gc",
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+    "--experimental-vm-modules",
+    "--experimental-strip-types",
+];
+
+/// Long options of node and bun that take a value.
+const NODE_VALUE_LONGS: &[&str] = &[
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--title",
+    "--conditions",
+    "--input-type",
+    "--env-file",
 ];
 
 const PHP_LONG_PROGRAM_FLAGS: &[LongInlineFlag] = &[
@@ -569,9 +658,43 @@ struct InlineEval {
     debugger_letters: &'static [char],
     /// Long flags whose value must not be a `data:` URL.
     data_url_flags: &'static [LongInlineFlag],
+    /// Long options that take no value; any other long option without `=`
+    /// takes the next argument.
+    flag_longs: &'static [&'static str],
+    /// Prefixes of long options that take no value.
+    flag_prefixes: &'static [&'static str],
+    /// Flags that provide the program themselves (`python -m`).
+    program: &'static [ProgramFlag],
+    /// What the first positional argument is.
+    positional: Positional,
+    /// The `value_letters` whose value may be the next argument: perl reads
+    /// `-d`, `-M` and `-x` only glued, so a script after them is not a value.
+    separate_value_letters: &'static [char],
+    /// Long options that take a value.
+    value_longs: &'static [&'static str],
+    /// Short letters whose value is the script (`php -f`).
+    file_letters: &'static [char],
+    /// Short letters and long options that change the working directory.
+    chdir_letters: &'static [char],
+    chdir_longs: &'static [&'static str],
 }
 
 impl InlineEval {
+    /// How this interpreter's arguments are read to find its script operand.
+    const fn operand_grammar(&self) -> OperandGrammar {
+        OperandGrammar {
+            value_letters: self.separate_value_letters,
+            value_longs: self.value_longs,
+            file_letters: self.file_letters,
+            chdir_letters: self.chdir_letters,
+            chdir_longs: self.chdir_longs,
+            flag_longs: self.flag_longs,
+            flag_prefixes: self.flag_prefixes,
+            program: self.program,
+            ..GETOPT_OPERANDS
+        }
+    }
+
     /// The flag by which `args[index]` gives this interpreter an inline
     /// program, possibly through the argument that follows it.
     fn flag_in(&self, args: &[String], index: usize) -> Option<InlineFlag> {
@@ -620,6 +743,15 @@ impl InlineEval {
             module_letters: &[],
             debugger_letters: &[],
             data_url_flags: &[],
+            flag_longs: &[],
+            flag_prefixes: &[],
+            program: &[],
+            positional: Positional::Script,
+            separate_value_letters: value_letters,
+            value_longs: &[],
+            file_letters: &[],
+            chdir_letters: &[],
+            chdir_longs: &[],
         }
     }
 }
@@ -692,7 +824,7 @@ pub fn analyze_launch<'a>(
         return Err(selects(command, LaunchTrigger::NpmSpecifier));
     }
     let mut analysis = Analysis::default();
-    analysis.command(command, args, 0, 0)?;
+    analysis.command(command, args, 0, 0, WorkingDir::Inherited)?;
     Ok(WrappedPrograms(analysis.programs))
 }
 
@@ -714,6 +846,22 @@ fn deepen(depth: usize) -> Result<(), LauncherRefusal> {
     (depth < MAX_WRAPPER_DEPTH).ok_or(LauncherRefusal::TooDeep)
 }
 
+/// Whether a wrapper earlier in the launch changed the working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingDir {
+    Inherited,
+    Changed,
+}
+
+/// Where a program sits in the launch being analyzed.
+#[derive(Clone, Copy)]
+struct Frame {
+    /// The launch position of the wrapper's first argument.
+    base: usize,
+    depth: usize,
+    dir: WorkingDir,
+}
+
 #[derive(Default)]
 struct Analysis<'a> {
     programs: Vec<WrappedProgram<'a>>,
@@ -721,13 +869,15 @@ struct Analysis<'a> {
 
 impl<'a> Analysis<'a> {
     /// Analyzes `command` run with `args`, where `args[0]` is argument `base`
-    /// of the launch.
+    /// of the launch and `dir` is the directory state the wrappers before it
+    /// left.
     fn command(
         &mut self,
         command: &str,
         args: &'a [String],
         base: usize,
         depth: usize,
+        dir: WorkingDir,
     ) -> Result<(), LauncherRefusal> {
         let stem = CommandStem::of(command);
         if let Some(wrapper) = EXEC_WRAPPERS
@@ -757,7 +907,13 @@ impl<'a> Analysis<'a> {
             } else {
                 WrapperKind::Other
             };
-            return self.start(command, args, invocation.command, starter, base, depth);
+            let dir = if invocation.changes_directory {
+                WorkingDir::Changed
+            } else {
+                dir
+            };
+            let frame = Frame { base, depth, dir };
+            return self.start(command, args, invocation.command, starter, frame);
         }
         if stem.is_any(APPLET_BINARIES) || stem.is(COREUTILS) {
             deepen(depth)?;
@@ -774,9 +930,10 @@ impl<'a> Analysis<'a> {
                 rest,
                 base.saturating_add(1),
                 depth.saturating_add(1),
+                dir,
             );
         }
-        refuse_workspace_code(command, &stem, args)
+        refuse_workspace_code(command, &stem, args, dir)
     }
 
     /// Records `args[index]` as a program the wrapper `wrapper` starts and
@@ -787,9 +944,9 @@ impl<'a> Analysis<'a> {
         args: &'a [String],
         index: usize,
         starter: WrapperKind,
-        base: usize,
-        depth: usize,
+        frame: Frame,
     ) -> Result<(), LauncherRefusal> {
+        let Frame { base, depth, dir } = frame;
         let Some(program) = args.get(index) else {
             return Err(unanalyzable(wrapper, UnanalyzableLaunch::MissingCommand));
         };
@@ -807,6 +964,7 @@ impl<'a> Analysis<'a> {
             rest,
             base.saturating_add(index).saturating_add(1),
             depth.saturating_add(1),
+            dir,
         )
     }
 }
@@ -841,13 +999,16 @@ fn refuse_workspace_code(
     command: &str,
     stem: &CommandStem,
     args: &[String],
+    dir: WorkingDir,
 ) -> Result<(), LauncherRefusal> {
     if let Some((_, family)) = SHELLS
         .iter()
         .find(|(shell, _)| is_interpreter(stem.as_str(), shell))
-        && let Some(trigger) = shell_trigger(*family, args)
     {
-        return Err(selects(command, trigger));
+        if let Some(trigger) = shell_trigger(*family, args) {
+            return Err(selects(command, trigger));
+        }
+        stdin_program(*family, args, dir).map_err(|stop| stop.refusal(command))?;
     }
     if let Some(flag) = INLINE_EVAL
         .iter()
@@ -855,6 +1016,15 @@ fn refuse_workspace_code(
         .find_map(|eval| (0..args.len()).find_map(|index| eval.flag_in(args, index)))
     {
         return Err(selects(command, LaunchTrigger::InlineProgram(flag)));
+    }
+    if let Some(eval) = INLINE_EVAL
+        .iter()
+        .find(|eval| is_interpreter(stem.as_str(), eval.name))
+    {
+        let mut dir = dir;
+        walk_operand(args, &eval.operand_grammar(), &mut dir)
+            .and_then(|program| check_program(program, eval.positional, dir))
+            .map_err(|stop| stop.refusal(command))?;
     }
     if stem.is_any(NPM_PACKAGE_RUNNERS) {
         return Err(selects(command, LaunchTrigger::Always));
@@ -891,7 +1061,9 @@ fn shell_trigger(family: ShellFamily, args: &[String]) -> Option<LaunchTrigger> 
     match family {
         ShellFamily::WindowsPowerShell => windows_powershell_trigger(args),
         ShellFamily::PowerShell => first_flag(&powershell_flag),
-        ShellFamily::Posix => first_flag(&|arg| grammar_flag(&POSIX_GRAMMAR, arg)),
+        ShellFamily::Posix | ShellFamily::Xonsh => {
+            first_flag(&|arg| grammar_flag(&POSIX_GRAMMAR, arg))
+        }
         ShellFamily::Fish => first_flag(&|arg| grammar_flag(&FISH_GRAMMAR, arg)),
         ShellFamily::Nu => first_flag(&|arg| grammar_flag(&NU_GRAMMAR, arg)),
         ShellFamily::GoFlag => first_flag(&go_flag),
@@ -993,11 +1165,11 @@ fn go_flag(arg: &str) -> Option<ShellFlag> {
 }
 
 /// A PowerShell argument that spells a parameter.
-struct PowerShellArgument {
+struct PowerShellArgument<'a> {
     /// The parameter name without its dash, lowercased.
     name: String,
-    /// Whether a value is attached with `:` or `=`.
-    has_value: bool,
+    /// The value attached with `:` or `=`, if any.
+    value: Option<&'a str>,
 }
 
 /// Whether `c` starts a PowerShell parameter: `-`, the en dash, em dash and
@@ -1012,15 +1184,15 @@ const fn is_powershell_dash(c: char) -> bool {
 
 /// The parameter a trimmed PowerShell argument spells, or `None` when it is
 /// a positional argument.
-fn powershell_argument(arg: &str) -> Option<PowerShellArgument> {
+fn powershell_argument(arg: &str) -> Option<PowerShellArgument<'_>> {
     let rest = arg.strip_prefix(is_powershell_prefix)?;
     let rest = rest.strip_prefix(is_powershell_dash).unwrap_or(rest);
-    let (name, has_value) = rest
+    let (name, value) = rest
         .split_once([':', '='])
-        .map_or((rest, false), |(name, _)| (name, true));
+        .map_or((rest, None), |(name, value)| (name, Some(value)));
     Some(PowerShellArgument {
         name: name.to_ascii_lowercase(),
-        has_value,
+        value,
     })
 }
 
@@ -1040,6 +1212,9 @@ enum ParameterKind {
     Value,
     /// `-File`: the script follows, and everything after it is the script's.
     File,
+    /// `-WorkingDirectory`: takes a value, and a relative script is looked up
+    /// in that directory.
+    WorkingDirectory,
 }
 
 /// A parameter of Windows PowerShell 5.1 and the shortest prefix it accepts.
@@ -1109,11 +1284,11 @@ fn windows_powershell_trigger(args: &[String]) -> Option<LaunchTrigger> {
         let known = PARAMETERS_51
             .iter()
             .find(|known| known.accepts(&parameter.name))
-            .filter(|_| !parameter.has_value);
+            .filter(|_| parameter.value.is_none());
         match known.map(|known| known.kind) {
             None => return Some(LaunchTrigger::ImplicitCommandString),
             Some(ParameterKind::File) => return None,
-            Some(ParameterKind::Value) => {
+            Some(ParameterKind::Value | ParameterKind::WorkingDirectory) => {
                 args.next();
             }
             Some(ParameterKind::Switch) => {}
@@ -1137,6 +1312,544 @@ fn powershell_parameter(name: &str) -> Option<PowerShellParameter> {
             .and_then(|full| full.get(..name.len()))
             .is_some_and(|head| head.eq_ignore_ascii_case(name))
     })
+}
+
+/// The parameters of `pwsh` (PowerShell 7) other than the command ones. A
+/// bare argument is the script, and a parameter this table lacks is read as
+/// taking a value, so it cannot hide the script behind it.
+const PARAMETERS_7: &[Parameter51] = &[
+    Parameter51::new("file", 1, ParameterKind::File),
+    Parameter51::new("noexit", 3, ParameterKind::Switch),
+    Parameter51::new("nologo", 3, ParameterKind::Switch),
+    Parameter51::new("noprofile", 3, ParameterKind::Switch),
+    Parameter51::new("noninteractive", 4, ParameterKind::Switch),
+    Parameter51::new("interactive", 1, ParameterKind::Switch),
+    Parameter51::new("login", 1, ParameterKind::Switch),
+    Parameter51::new("mta", 3, ParameterKind::Switch),
+    Parameter51::new("sta", 3, ParameterKind::Switch),
+    Parameter51::new("help", 1, ParameterKind::Switch),
+    Parameter51::new("?", 1, ParameterKind::Switch),
+    Parameter51::new("version", 1, ParameterKind::Switch),
+    Parameter51::new("sshservermode", 4, ParameterKind::Switch),
+    Parameter51::new("workingdirectory", 2, ParameterKind::WorkingDirectory),
+    Parameter51::new("wd", 2, ParameterKind::WorkingDirectory),
+];
+
+/// How a launch names the program an interpreter runs.
+#[derive(Clone, Copy)]
+enum Program<'a> {
+    /// The first operand: a script path, or for [`Positional::Subcommand`] a
+    /// subcommand.
+    Operand(&'a str),
+    /// A flag that is the program source (`python -m`, `nu --lsp`).
+    Flag,
+}
+
+/// What the first positional argument of an interpreter is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Positional {
+    Script,
+    /// A subcommand or a script (`deno lsp`), which is not a path to vet.
+    Subcommand,
+}
+
+/// Why a walk over a launch's arguments refuses it, before it is tied to the
+/// command.
+#[derive(Debug)]
+enum Stop {
+    Stdin(StdinSource),
+    Unanalyzable(UnanalyzableLaunch),
+}
+
+impl Stop {
+    fn refusal(self, command: &str) -> LauncherRefusal {
+        match self {
+            Self::Stdin(source) => selects(command, LaunchTrigger::ProgramFromStdin(source)),
+            Self::Unanalyzable(reason) => unanalyzable(command, reason),
+        }
+    }
+}
+
+/// How short options are read.
+#[derive(Debug, Clone, Copy)]
+enum ShortStyle {
+    /// POSIX shells: every letter of a `-` or `+` cluster is an option, and each
+    /// value letter takes one following argument.
+    Cluster,
+    /// getopt: a value letter takes the rest of its cluster, or the next
+    /// argument when nothing follows it.
+    Getopt,
+    /// Go's `flag` package: one or two dashes and a name, up to `=`.
+    Go,
+}
+
+/// How a long option the grammar does not list is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownLong {
+    /// It takes the next argument, unless one is attached with `=`. Fails
+    /// closed: the script operand can be swallowed, never skipped.
+    Value,
+    Flag,
+}
+
+/// A flag that provides the program itself, so the launch needs no script.
+#[derive(Debug, Clone, Copy)]
+enum ProgramFlag {
+    Short(char),
+    Long(&'static str),
+    LongPrefix(&'static str),
+}
+
+/// What one option reads from the arguments after it.
+enum Read<'a> {
+    /// The option provides the program itself.
+    Program,
+    /// The option takes this many following arguments, as its table says.
+    Values(usize),
+    /// An option the table does not list, named `.0`, taken to have a value:
+    /// the next argument, which may be the script.
+    Guess(&'a str),
+    /// A file option (`php -f`): its glued value or the next argument is the
+    /// script.
+    File(Option<&'a str>),
+}
+
+/// The options of a shell or interpreter, as far as they decide which
+/// argument is the script.
+struct OperandGrammar {
+    style: ShortStyle,
+    long_match: LongMatch,
+    unknown_long: UnknownLong,
+    /// Short letters that take a value.
+    value_letters: &'static [char],
+    /// Long options that take a value.
+    value_longs: &'static [&'static str],
+    /// Long options that take none.
+    flag_longs: &'static [&'static str],
+    /// Prefixes of long options that take none.
+    flag_prefixes: &'static [&'static str],
+    program: &'static [ProgramFlag],
+    /// The letter that makes a shell read its program from standard input.
+    stdin_letter: Option<char>,
+    /// Long options after which the launch cannot be analyzed.
+    unanalyzable_longs: &'static [&'static str],
+    /// Short letters whose value is the script (`php -f FILE`).
+    file_letters: &'static [char],
+    /// Short letters and long options that change the working directory.
+    chdir_letters: &'static [char],
+    chdir_longs: &'static [&'static str],
+    /// The name of the option that makes a shell read its program from
+    /// standard input (`zsh -o shinstdin`), compared without case, `_` or `-`.
+    stdin_option: Option<&'static str>,
+}
+
+const GETOPT_OPERANDS: OperandGrammar = OperandGrammar {
+    style: ShortStyle::Getopt,
+    long_match: LongMatch::Exact,
+    unknown_long: UnknownLong::Value,
+    value_letters: &[],
+    value_longs: &[],
+    flag_longs: &[],
+    flag_prefixes: &[],
+    program: &[],
+    stdin_letter: None,
+    unanalyzable_longs: &[],
+    file_letters: &[],
+    chdir_letters: &[],
+    chdir_longs: &[],
+    stdin_option: None,
+};
+
+/// Unknown POSIX long options are flags, because the shells reject them.
+const POSIX_OPERANDS: OperandGrammar = OperandGrammar {
+    style: ShortStyle::Cluster,
+    unknown_long: UnknownLong::Flag,
+    value_letters: &['o', 'O', 'T', 'R'],
+    value_longs: &["--rcfile", "--init-file", "--emulate"],
+    stdin_letter: Some('s'),
+    stdin_option: Some("shinstdin"),
+    ..GETOPT_OPERANDS
+};
+
+/// `--rc` takes every argument up to the next option, which hides the script;
+/// argparse accepts any unambiguous prefix of it.
+const XONSH_OPERANDS: OperandGrammar = OperandGrammar {
+    long_match: LongMatch::Prefix,
+    value_letters: &['D'],
+    flag_longs: &[
+        "--no-rc",
+        "--login",
+        "--interactive",
+        "--no-env",
+        "--no-script-cache",
+        "--cache-everything",
+        "--timings",
+    ],
+    unanalyzable_longs: &["--rc"],
+    ..GETOPT_OPERANDS
+};
+
+const FISH_OPERANDS: OperandGrammar = OperandGrammar {
+    long_match: LongMatch::Prefix,
+    value_letters: &['d', 'o', 'D', 'f', 'p'],
+    value_longs: &[
+        "--debug",
+        "--debug-output",
+        "--features",
+        "--profile",
+        "--profile-startup",
+    ],
+    flag_longs: &[
+        "--no-config",
+        "--login",
+        "--interactive",
+        "--private",
+        "--no-execute",
+    ],
+    ..GETOPT_OPERANDS
+};
+
+const NU_OPERANDS: OperandGrammar = OperandGrammar {
+    value_letters: &['I', 'm', 't'],
+    flag_longs: &[
+        "--stdin",
+        "--no-config-file",
+        "--no-std-lib",
+        "--no-history",
+        "--login",
+        "--interactive",
+    ],
+    program: &[
+        ProgramFlag::Long("--lsp"),
+        ProgramFlag::LongPrefix("--ide-"),
+    ],
+    ..GETOPT_OPERANDS
+};
+
+const ELVISH_OPERANDS: OperandGrammar = OperandGrammar {
+    style: ShortStyle::Go,
+    flag_longs: &["norc", "i", "compileonly", "json", "daemon"],
+    program: &[ProgramFlag::Long("lsp")],
+    ..GETOPT_OPERANDS
+};
+
+/// Lowercases `name` and drops `_` and `-`, as zsh compares option names.
+fn normalized_option(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `attached` leaves a boolean program flag on: absent or `true`.
+fn flag_stays_on(attached: Option<&str>) -> bool {
+    attached.is_none_or(|value| matches!(value, "true" | "1"))
+}
+
+impl OperandGrammar {
+    /// Whether `name` spells the option that makes a shell read standard input.
+    fn names_stdin_option(&self, name: &str) -> bool {
+        self.stdin_option
+            .is_some_and(|option| normalized_option(name) == option)
+    }
+
+    /// What the option `arg` (which starts with `-`, or `+` for a POSIX shell)
+    /// reads. A directory change it makes is recorded in `dir`.
+    fn read<'a>(&self, arg: &'a str, dir: &mut WorkingDir) -> Result<Read<'a>, Stop> {
+        match self.style {
+            ShortStyle::Go => Ok(self.read_go(arg)),
+            _ if arg.starts_with("--") => self.read_long(arg, dir),
+            _ => self.read_cluster(arg, dir),
+        }
+    }
+
+    fn read_long<'a>(&self, arg: &'a str, dir: &mut WorkingDir) -> Result<Read<'a>, Stop> {
+        let (name, attached) = long_name(arg);
+        let spells = |flag: &&str| self.long_match.accepts(arg, flag);
+        if self.unanalyzable_longs.iter().any(spells) {
+            return Err(Stop::Unanalyzable(UnanalyzableLaunch::UnknownOption(
+                EchoedArgument::name(name),
+            )));
+        }
+        if self.names_stdin_option(name) {
+            return Err(Stop::Stdin(StdinSource::DashS));
+        }
+        if self.chdir_longs.iter().any(spells) {
+            *dir = WorkingDir::Changed;
+        }
+        let provides_program = self.program.iter().any(|flag| match flag {
+            ProgramFlag::Long(long) => self.long_match.accepts(arg, long),
+            ProgramFlag::LongPrefix(prefix) => name.starts_with(prefix),
+            ProgramFlag::Short(_) => false,
+        });
+        if provides_program && flag_stays_on(attached) {
+            return Ok(Read::Program);
+        }
+        if self.value_longs.iter().any(spells) {
+            return Ok(Read::Values(usize::from(attached.is_none())));
+        }
+        let listed = self.flag_longs.iter().any(spells)
+            || provides_program
+            || self
+                .flag_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        if listed || attached.is_some() || self.unknown_long == UnknownLong::Flag {
+            Ok(Read::Values(0))
+        } else {
+            Ok(Read::Guess(name))
+        }
+    }
+
+    fn read_cluster<'a>(&self, arg: &'a str, dir: &mut WorkingDir) -> Result<Read<'a>, Stop> {
+        let cluster = arg.strip_prefix(['-', '+']).unwrap_or(arg);
+        let mut values = 0_usize;
+        for (offset, letter) in cluster.char_indices() {
+            let rest = cluster
+                .get(offset.saturating_add(letter.len_utf8())..)
+                .unwrap_or_default();
+            if self.stdin_letter == Some(letter) {
+                return Err(Stop::Stdin(StdinSource::DashS));
+            }
+            if self.chdir_letters.contains(&letter) {
+                *dir = WorkingDir::Changed;
+            }
+            if self.file_letters.contains(&letter) {
+                return Ok(Read::File(Some(rest).filter(|rest| !rest.is_empty())));
+            }
+            if self
+                .program
+                .iter()
+                .any(|flag| matches!(flag, ProgramFlag::Short(short) if *short == letter))
+            {
+                return Ok(Read::Program);
+            }
+            if self.value_letters.contains(&letter) {
+                if matches!(self.style, ShortStyle::Getopt) {
+                    return Ok(Read::Values(usize::from(rest.is_empty())));
+                }
+                values = values.saturating_add(1);
+            }
+        }
+        Ok(Read::Values(values))
+    }
+
+    fn read_go<'a>(&self, arg: &'a str) -> Read<'a> {
+        let name = arg
+            .strip_prefix("--")
+            .or_else(|| arg.strip_prefix('-'))
+            .unwrap_or(arg);
+        let (name, attached) = name
+            .split_once('=')
+            .map_or((name, None), |(name, value)| (name, Some(value)));
+        let provides_program = self
+            .program
+            .iter()
+            .any(|flag| matches!(flag, ProgramFlag::Long(long) if *long == name));
+        if provides_program && flag_stays_on(attached) {
+            Read::Program
+        } else if provides_program
+            || self.flag_longs.contains(&name)
+            || attached.is_some()
+            || self.unknown_long == UnknownLong::Flag
+        {
+            Read::Values(0)
+        } else {
+            Read::Guess(arg)
+        }
+    }
+}
+
+/// Refuses a value taken for an option the table does not list when it is
+/// standard input: such an option may be a boolean, and then the value is the
+/// script.
+fn vet_guessed_value(value: &str) -> Result<(), Stop> {
+    check_program(
+        Program::Operand(value),
+        Positional::Subcommand,
+        WorkingDir::Inherited,
+    )
+}
+
+/// The refusal for a walk that found no program after taking a value for an
+/// option the table does not list, which may have been the script.
+fn missing_after_guess(guessed: Option<&str>) -> Stop {
+    guessed.map_or(Stop::Stdin(StdinSource::NoProgram), |name| {
+        Stop::Unanalyzable(UnanalyzableLaunch::UnknownOption(EchoedArgument::name(
+            name,
+        )))
+    })
+}
+
+/// The program `args` give a shell or interpreter, reading options as `grammar`
+/// does. A directory change an option makes is recorded in `dir`.
+///
+/// # Errors
+///
+/// [`Stop`] when `-s` makes a shell read standard input, the value of an
+/// option the table does not list is standard input, or the launch cannot be
+/// analyzed.
+fn walk_operand<'a>(
+    args: &'a [String],
+    grammar: &OperandGrammar,
+    dir: &mut WorkingDir,
+) -> Result<Program<'a>, Stop> {
+    let mut args = args.iter().map(|arg| arg.trim());
+    let mut guessed = None;
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => {
+                return args.next().map_or_else(
+                    || Err(missing_after_guess(guessed)),
+                    |op| Ok(Program::Operand(op)),
+                );
+            }
+            "-" => return Ok(Program::Operand(arg)),
+            _ => {}
+        }
+        let is_option = match grammar.style {
+            ShortStyle::Cluster => arg.starts_with(['-', '+']),
+            ShortStyle::Getopt | ShortStyle::Go => arg.starts_with('-'),
+        };
+        if !is_option {
+            return Ok(Program::Operand(arg));
+        }
+        match grammar.read(arg, dir)? {
+            Read::Program => return Ok(Program::Flag),
+            Read::File(glued) => {
+                return glued.or_else(|| args.next()).map_or_else(
+                    || Err(missing_after_guess(guessed)),
+                    |op| Ok(Program::Operand(op)),
+                );
+            }
+            Read::Values(count) => {
+                for value in args.by_ref().take(count) {
+                    if grammar.names_stdin_option(value) {
+                        return Err(Stop::Stdin(StdinSource::DashS));
+                    }
+                }
+            }
+            Read::Guess(name) => {
+                guessed.get_or_insert(name);
+                if let Some(value) = args.next() {
+                    vet_guessed_value(value)?;
+                }
+            }
+        }
+    }
+    Err(missing_after_guess(guessed))
+}
+
+/// The program a PowerShell launch runs: the `-File` value, or a bare
+/// argument, which PowerShell 7 reads as the script. A `-WorkingDirectory`
+/// moves `dir`.
+fn walk_powershell<'a>(
+    args: &'a [String],
+    parameters: &[Parameter51],
+    dir: &mut WorkingDir,
+) -> Result<Program<'a>, Stop> {
+    let mut args = args.iter().map(|arg| arg.trim());
+    let mut guessed = None;
+    while let Some(arg) = args.next() {
+        let Some(parameter) = powershell_argument(arg).filter(|_| arg != "-") else {
+            return Ok(Program::Operand(arg));
+        };
+        let known = parameters
+            .iter()
+            .find(|known| known.accepts(&parameter.name));
+        let kind = known.map_or(ParameterKind::Value, |known| known.kind);
+        let takes_next = parameter.value.is_none();
+        match kind {
+            ParameterKind::Switch => {}
+            ParameterKind::Value | ParameterKind::WorkingDirectory => {
+                if kind == ParameterKind::WorkingDirectory {
+                    *dir = WorkingDir::Changed;
+                }
+                if takes_next {
+                    if known.is_some() {
+                        args.next();
+                    } else {
+                        guessed.get_or_insert(arg);
+                        if let Some(value) = args.next() {
+                            vet_guessed_value(value)?;
+                        }
+                    }
+                }
+            }
+            ParameterKind::File => {
+                return parameter.value.or_else(|| args.next()).map_or_else(
+                    || Err(missing_after_guess(guessed)),
+                    |op| Ok(Program::Operand(op)),
+                );
+            }
+        }
+    }
+    Err(missing_after_guess(guessed))
+}
+
+/// Checks that the shell family's launch does not read its program from
+/// standard input.
+fn stdin_program(family: ShellFamily, args: &[String], dir: WorkingDir) -> Result<(), Stop> {
+    let mut dir = dir;
+    let program = match family {
+        ShellFamily::Posix => walk_operand(args, &POSIX_OPERANDS, &mut dir)?,
+        ShellFamily::Xonsh => walk_operand(args, &XONSH_OPERANDS, &mut dir)?,
+        ShellFamily::Fish => walk_operand(args, &FISH_OPERANDS, &mut dir)?,
+        ShellFamily::Nu => walk_operand(args, &NU_OPERANDS, &mut dir)?,
+        ShellFamily::GoFlag => walk_operand(args, &ELVISH_OPERANDS, &mut dir)?,
+        ShellFamily::PowerShell => walk_powershell(args, PARAMETERS_7, &mut dir)?,
+        ShellFamily::WindowsPowerShell => walk_powershell(args, PARAMETERS_51, &mut dir)?,
+    };
+    check_program(program, Positional::Script, dir)
+}
+
+/// Whether `operand` starts at a root, as a string, so the answer is the same
+/// on every host: `/`, `\` or a drive letter and colon.
+fn is_rooted(operand: &str) -> bool {
+    let mut chars = operand.chars();
+    match (chars.next(), chars.next()) {
+        (Some('/' | '\\'), _) => true,
+        (Some(drive), Some(':')) => drive.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
+/// Checks that the program a launch names is not standard input: not `-`,
+/// not a path under `/dev` or `/proc` (which can name it), and not a path with
+/// `..` (which can reach them). Works on the text of the operand, never on a
+/// `Path`.
+fn check_program(
+    program: Program<'_>,
+    positional: Positional,
+    dir: WorkingDir,
+) -> Result<(), Stop> {
+    let operand = match program {
+        Program::Flag => return Ok(()),
+        Program::Operand(operand) => operand,
+    };
+    if operand == "-" {
+        return Err(Stop::Stdin(StdinSource::DashOperand));
+    }
+    let parts: Vec<&str> = operand
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.contains(&"..") {
+        return Err(Stop::Stdin(StdinSource::ParentTraversal));
+    }
+    let under_device_root = parts.len() > 1
+        && parts.first().is_some_and(|root| {
+            root.eq_ignore_ascii_case("dev") || root.eq_ignore_ascii_case("proc")
+        });
+    if operand.starts_with(['/', '\\']) && under_device_root {
+        return Err(Stop::Stdin(StdinSource::DeviceOperand));
+    }
+    if !is_rooted(operand) && dir == WorkingDir::Changed && positional == Positional::Script {
+        return Err(Stop::Unanalyzable(
+            UnanalyzableLaunch::RelativeOperandAfterChdir,
+        ));
+    }
+    Ok(())
 }
 
 /// The first letter of a single-dash cluster that `reached` accepts, with the
@@ -1244,6 +1957,8 @@ fn is_duration(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use crate::util::MAX_ECHOED_NAME_BYTES;
 
@@ -1301,7 +2016,7 @@ mod tests {
                     "{command} {subcommand}"
                 );
             }
-            assert!(!launches(command, &["--version"]), "{command}");
+            assert!(!launches(command, &["version"]), "{command}");
         }
     }
 
@@ -1677,9 +2392,7 @@ mod tests {
     #[test]
     fn windows_powershell_admits_parameters_values_and_a_script_file() {
         for args in [
-            &[][..],
-            &["-NoProfile", "-NonInteractive"],
-            &["-ep", "Bypass", "-File", "x.ps1"],
+            &["-ep", "Bypass", "-File", "x.ps1"][..],
             &[
                 "-ExecutionPolicy",
                 "Bypass",
@@ -1692,10 +2405,28 @@ mod tests {
             &["-File", "x.ps1", "-c"],
             &["-f", "x.ps1", "-c"],
             &["-WindowStyle", "Hidden", "-File", "x.ps1"],
-            &["-InputFormat", "Text", "-OutputFormat", "Text"],
-            &["-NoLogo", "-Sta"],
+            &[
+                "-InputFormat",
+                "Text",
+                "-OutputFormat",
+                "Text",
+                "-File",
+                "x.ps1",
+            ],
+            &["-NoLogo", "-Sta", "-File", "x.ps1"],
         ] {
             assert!(!launches("powershell", args), "{args:?}");
+        }
+        for args in [
+            &[][..],
+            &["-NoProfile", "-NonInteractive"],
+            &["-NoLogo", "-Sta"],
+        ] {
+            assert_eq!(
+                stdin_source("powershell", args),
+                StdinSource::NoProgram,
+                "{args:?}"
+            );
         }
     }
 
@@ -1744,7 +2475,7 @@ mod tests {
         for args in [
             &["-config", "name", "-File", "x.ps1"][..],
             &["-noe", "-nop", "-nol", "-noni", "-sta", "-File", "x.ps1"],
-            &["-mta", "-imp", "-h"],
+            &["-mta", "-imp", "-h", "-File", "x.ps1"],
             &[
                 "-psc", "c.psc1", "-w", "hidden", "-v", "2", "-File", "x.ps1",
             ],
@@ -1840,7 +2571,7 @@ mod tests {
         }
         assert!(!launches("elvish", &["script.elv"]));
         assert!(!launches("elvish", &["-norc", "script.elv"]));
-        assert!(!launches("elvish", &["--cc", "script.elv"]));
+        assert!(!launches("elvish", &["--cc=1", "script.elv"]));
     }
 
     #[test]
@@ -1866,7 +2597,7 @@ mod tests {
             assert!(!launches("fish", args), "{args:?}");
         }
         assert!(!launches("bash", &["--comm", "script.sh"]));
-        assert!(!launches("nu", &["--comm", "script.nu"]));
+        assert!(!launches("nu", &["--comm=1", "script.nu"]));
     }
 
     #[test]
@@ -1920,7 +2651,10 @@ mod tests {
         ] {
             assert!(launches("php", &[flag, "code"]), "{flag}");
         }
-        assert!(!launches("php", &["--version"]));
+        assert_matches!(
+            unanalyzable_reason("php", &["--version"]),
+            UnanalyzableLaunch::UnknownOption(_)
+        );
         assert!(!launches("php", &["-f", "script.php"]));
         assert!(!launches("php", &["-n", "script.php"]));
         assert!(!launches("php", &["-d", "memory_limit=1G", "script.php"]));
@@ -1989,7 +2723,10 @@ mod tests {
             assert!(launches(command, &[flag, "code"]), "{command} {flag}");
             assert!(!launches(command, &["server.js"]), "{command}");
         }
-        assert!(!launches("node", &["--version"]));
+        assert_matches!(
+            unanalyzable_reason("node", &["--version"]),
+            UnanalyzableLaunch::UnknownOption(_)
+        );
         assert_eq!(
             analyze("python3.12", &["-c", "x"]).unwrap_err(),
             selects(
@@ -2263,7 +3000,10 @@ mod tests {
             assert!(launches(command, &[arg]), "{command} {arg}");
         }
         assert!(!launches("python3", &["-m", "pytest"]));
-        assert!(!launches("node", &["--max-old-space-size=4096"]));
+        assert!(!launches(
+            "node",
+            &["--max-old-space-size=4096", "server.js"]
+        ));
     }
 
     #[test]
@@ -2619,7 +3359,7 @@ mod tests {
             &["--import=./register.mjs", "srv.mjs"][..],
             &["--import", "file:///opt/register.mjs", "srv.mjs"],
             &["--loader=ts-node/esm", "srv.ts"],
-            &["--import"],
+            &["--import", "x.mjs", "srv.mjs"],
             &["--import=dat", "srv.mjs"],
         ] {
             assert!(!launches("node", args), "{args:?}");
@@ -2717,5 +3457,257 @@ mod tests {
             panic!("expected a refusal");
         };
         assert_eq!(program.as_str(), "/opt/Program Files/env");
+    }
+
+    fn stdin_source(command: &str, args: &[&str]) -> StdinSource {
+        match analyze(command, args) {
+            Err(LauncherRefusal::SelectsWorkspaceCode {
+                trigger: LaunchTrigger::ProgramFromStdin(source),
+                ..
+            }) => source,
+            other => panic!("expected a program read from stdin, got {other:?}"),
+        }
+    }
+
+    /// #782: shells and interpreters that read their program from the LSP
+    /// stream are refused.
+    #[test]
+    fn programs_read_from_stdin_are_refused() {
+        let cases: &[(&str, &[&str], StdinSource)] = &[
+            ("bash", &[], StdinSource::NoProgram),
+            ("bash", &["-s"], StdinSource::DashS),
+            ("bash", &["-os", "x"], StdinSource::DashS),
+            ("dash", &["-so", "x"], StdinSource::DashS),
+            ("bash", &["--norc"], StdinSource::NoProgram),
+            ("bash", &["-", "s.sh"], StdinSource::DashOperand),
+            ("bash", &["--", "-"], StdinSource::DashOperand),
+            ("bash", &["/dev//stdin"], StdinSource::DeviceOperand),
+            ("python", &[], StdinSource::NoProgram),
+            ("python", &["-"], StdinSource::DashOperand),
+            ("python", &["--", "-"], StdinSource::DashOperand),
+            ("node", &["--", "-"], StdinSource::DashOperand),
+            (
+                "python",
+                &["/proc/thread-self/fd/0"],
+                StdinSource::DeviceOperand,
+            ),
+            (
+                "python",
+                &["/var/run/../dev/stdin"],
+                StdinSource::ParentTraversal,
+            ),
+            ("python", &["../../dev/stdin"], StdinSource::ParentTraversal),
+            ("python", &["/DEV/stdin"], StdinSource::DeviceOperand),
+            ("python", &["\\dev\\stdin"], StdinSource::DeviceOperand),
+            ("node", &["--require", "/p.js"], StdinSource::NoProgram),
+            ("node", &["--title", "x"], StdinSource::NoProgram),
+            ("fish", &["--profile", "f"], StdinSource::NoProgram),
+            ("nu", &["-m", "compact"], StdinSource::NoProgram),
+            ("deno", &[], StdinSource::NoProgram),
+            ("pwsh", &["-File", "-"], StdinSource::DashOperand),
+            ("pwsh", &["-NoProfile"], StdinSource::NoProgram),
+            (
+                "pwsh",
+                &["-wd", "/dev", "-File", "/dev/stdin"],
+                StdinSource::DeviceOperand,
+            ),
+            (
+                "powershell",
+                &["-NoProfile", "-File", "-"],
+                StdinSource::DashOperand,
+            ),
+            ("elvish", &[], StdinSource::NoProgram),
+        ];
+        for (command, args, expected) in cases {
+            assert_eq!(stdin_source(command, args), *expected, "{command} {args:?}");
+        }
+        assert_matches!(
+            analyze("bun", &["repl"]),
+            Err(LauncherRefusal::SelectsWorkspaceCode {
+                trigger: LaunchTrigger::Subcommand(RunnerSubcommand::Repl),
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn a_chdir_makes_a_relative_script_unanalyzable_but_not_a_subcommand_or_module() {
+        for (command, args) in [
+            ("python", &["stdin"][..]),
+            ("node", &["0"]),
+            ("bash", &["srv.sh"]),
+        ] {
+            let mut wrapped = vec!["-C", "/dev"];
+            wrapped.push(command);
+            wrapped.extend(args);
+            assert_eq!(
+                unanalyzable_reason("env", &wrapped),
+                UnanalyzableLaunch::RelativeOperandAfterChdir,
+                "{wrapped:?}"
+            );
+        }
+        assert_eq!(
+            unanalyzable_reason("env", &["--chdir=/dev/fd", "node", "0"]),
+            UnanalyzableLaunch::RelativeOperandAfterChdir
+        );
+        assert_eq!(
+            unanalyzable_reason("pwsh", &["-wd", "/x", "-File", "s.ps1"]),
+            UnanalyzableLaunch::RelativeOperandAfterChdir
+        );
+        assert!(!launches("env", &["-C", "/x", "deno", "lsp"]));
+        assert!(!launches("env", &["-C", "/x", "python", "-m", "pylsp"]));
+        assert!(!launches("env", &["-C", "/x", "python", "/abs/srv.py"]));
+    }
+
+    #[test]
+    fn real_launch_lines_are_admitted() {
+        for (command, args) in [
+            ("node", &["--enable-source-maps", "/abs/srv.js"][..]),
+            ("node", &["--no-experimental-fetch", "/abs/s.js"]),
+            ("bun", &["--smol", "/abs/s.js"]),
+            ("deno", &["lsp"]),
+            ("bash", &["-o", "pipefail", "s.sh"]),
+            ("bash", &["--rcfile", "rc", "s.sh"]),
+            ("python", &["-m", "pylsp"]),
+            ("python", &["-X", "utf8", "-u", "srv.py"]),
+            ("pypy3", &["-m", "pylsp"]),
+            ("nu", &["--lsp"]),
+            ("nu", &["--ide-check", "10", "s.nu"]),
+            ("nu", &["--stdin", "s.nu"]),
+            ("nu", &["--no-config-file", "s.nu"]),
+            ("elvish", &["-lsp"]),
+            ("fish", &["--no-config", "s.fish"]),
+            ("fish", &["--login", "s.fish"]),
+            ("pwsh", &["-NoProfile", "-File", "s.ps1"]),
+            ("pwsh", &["s.ps1"]),
+            ("Rscript", &["--vanilla", "srv.R"]),
+            ("ruby", &["--yjit", "srv.rb"]),
+            ("julia", &["--project=.", "srv.jl"]),
+        ] {
+            assert!(!launches(command, args), "{command} {args:?}");
+        }
+    }
+
+    #[test]
+    fn xonsh_rc_is_unanalyzable() {
+        assert_matches!(
+            unanalyzable_reason("xonsh", &["--rc", "a", "b"]),
+            UnanalyzableLaunch::UnknownOption(_)
+        );
+        assert!(!launches("xonsh", &["--no-rc", "s.xsh"]));
+    }
+
+    #[test]
+    fn an_unknown_long_option_that_swallows_the_script_is_reported_as_unknown() {
+        for (command, args) in [
+            ("python", &["--unknown", "srv.py"][..]),
+            ("node", &["--openssl-legacy-provider", "/abs/srv.js"]),
+            ("node", &["--nolazy", "srv.js"]),
+            ("pwsh", &["-unknownparam", "s.ps1"]),
+        ] {
+            assert_matches!(
+                unanalyzable_reason(command, args),
+                UnanalyzableLaunch::UnknownOption(_),
+                "{command} {args:?}"
+            );
+        }
+        assert!(!launches("python", &["--unknown=1", "srv.py"]));
+        assert!(!launches(
+            "pwsh",
+            &["-nop", "-nol", "-noe", "-noni", "s.ps1"]
+        ));
+    }
+
+    #[test]
+    fn a_value_taken_for_an_unlisted_option_is_vetted_as_an_operand() {
+        for args in [
+            &["--frozen-intrinsics", "/dev/stdin", "/abs/s.js"][..],
+            &["--frozen-intrinsics", "-", "/abs/s.js"],
+            &["--frozen-intrinsics", "../x", "/abs/s.js"],
+        ] {
+            assert!(
+                matches!(
+                    analyze("node", args),
+                    Err(LauncherRefusal::SelectsWorkspaceCode {
+                        trigger: LaunchTrigger::ProgramFromStdin(_),
+                        ..
+                    })
+                ),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            stdin_source("pwsh", &["-unknownparam", "/dev/stdin", "-File", "s.ps1"]),
+            StdinSource::DeviceOperand
+        );
+    }
+
+    #[test]
+    fn options_that_hide_stdin_behind_a_script_are_refused() {
+        for (command, args, expected) in [
+            ("osascript", &["-s", "h"][..], Some(StdinSource::NoProgram)),
+            ("nu", &["-t", "4"], Some(StdinSource::NoProgram)),
+            ("xonsh", &["--r", "a", "b"], None),
+            (
+                "zsh",
+                &["-o", "shinstdin", "s.sh"],
+                Some(StdinSource::DashS),
+            ),
+            (
+                "zsh",
+                &["-o", "SHIN_STDIN", "s.sh"],
+                Some(StdinSource::DashS),
+            ),
+            ("zsh", &["--shinstdin", "s.sh"], Some(StdinSource::DashS)),
+            (
+                "php",
+                &["-f", "/dev/stdin"],
+                Some(StdinSource::DeviceOperand),
+            ),
+            ("php", &["-f/dev/stdin"], Some(StdinSource::DeviceOperand)),
+            ("elvish", &["-lsp=false"], Some(StdinSource::NoProgram)),
+            ("nu", &["--lsp=false"], Some(StdinSource::NoProgram)),
+        ] {
+            if let Some(source) = expected {
+                assert_eq!(stdin_source(command, args), source, "{command} {args:?}");
+            } else {
+                assert!(launches(command, args), "{command} {args:?}");
+            }
+        }
+        assert!(!launches("osascript", &["-s", "h", "file.scpt"]));
+        assert!(!launches("php", &["-f", "/abs/s.php"]));
+        assert!(!launches("zsh", &["-o", "pipefail", "s.sh"]));
+    }
+
+    #[test]
+    fn interpreter_directory_changes_make_a_relative_script_unanalyzable() {
+        for (command, args) in [
+            ("ruby", &["-C", "/dev", "stdin"][..]),
+            ("ruby", &["-X", "/dev", "stdin"]),
+            ("bun", &["--cwd", "/dev", "stdin"]),
+        ] {
+            assert_eq!(
+                unanalyzable_reason(command, args),
+                UnanalyzableLaunch::RelativeOperandAfterChdir,
+                "{command} {args:?}"
+            );
+        }
+        assert!(!launches("ruby", &["-C", "/x", "/abs/s.rb"]));
+    }
+
+    #[test]
+    fn real_server_launch_lines_stay_admitted() {
+        for (command, args) in [
+            ("node", &["/abs/srv.js", "--stdio"][..]),
+            ("node", &["-r", "x", "srv.js"]),
+            ("node", &["--inspect=9229", "srv.js"]),
+            ("py", &["-3", "-m", "pylsp"]),
+            (
+                "pwsh",
+                &["-NoLogo", "-NoProfile", "-NonInteractive", "-File", "s.ps1"],
+            ),
+        ] {
+            assert!(!launches(command, args), "{command} {args:?}");
+        }
     }
 }

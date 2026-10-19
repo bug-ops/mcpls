@@ -21,7 +21,7 @@ use crate::config::{
     ToolRouter, ToolSet,
 };
 use crate::error::{Error, McpErrorKind, Result};
-use crate::lsp::LspServer;
+use crate::lsp::{JsonRpcError, LspServer};
 use crate::redaction::Redactions;
 use crate::test_lsp::client_path;
 
@@ -294,7 +294,10 @@ async fn prepare_rename_request_failed_stays_a_server_error() {
     let err = prepare_rename_with(Answer::Error(-32803, "boom"))
         .await
         .unwrap_err();
-    assert_matches!(err, Error::LspServerError { code: -32803, .. });
+    assert_matches!(
+        err,
+        Error::LspServerError(JsonRpcError { code: -32803, .. })
+    );
 }
 
 fn tracked_translator(
@@ -566,7 +569,10 @@ async fn prepare_rename_other_server_errors_propagate() {
     let err = prepare_rename_with(Answer::Error(-32603, "boom"))
         .await
         .unwrap_err();
-    assert_matches!(err, Error::LspServerError { code: -32603, .. });
+    assert_matches!(
+        err,
+        Error::LspServerError(JsonRpcError { code: -32603, .. })
+    );
 }
 
 #[tokio::test]

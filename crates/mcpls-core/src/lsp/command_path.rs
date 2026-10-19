@@ -234,7 +234,7 @@ mod tests {
             let mut config = config("tool");
             config.env.insert(
                 crate::config::EnvKey::from_static("PATH"),
-                root.join("bin").to_str().unwrap().into(),
+                crate::config::EnvValue::new(root.join("bin").to_str().unwrap()).unwrap(),
             );
             let resolved = resolve_command(&config, |_| Some(OsString::from("/nonexistent")));
             assert_eq!(resolved.map(|r| r.canonical), Some(root.join("bin/tool")));

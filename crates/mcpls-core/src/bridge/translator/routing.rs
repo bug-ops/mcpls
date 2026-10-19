@@ -7,7 +7,9 @@ use std::sync::Arc;
 use super::Translator;
 use super::positioned::DisclosedDocument;
 use crate::bridge::resources::{DiagnosticsResourceUri, parse_uri};
-use crate::bridge::{ClientPath, InFlightGuard, LinePresence, Position, WorkspacePath};
+use crate::bridge::{
+    Access, ClientPath, InFlightGuard, LinePresence, OpenRequest, Position, WorkspacePath,
+};
 use crate::config::{
     FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
@@ -976,12 +978,12 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         tool: ToolKind,
-    ) -> Result<(ServerId, LspClient, PathBuf)> {
+    ) -> Result<(ServerId, LspClient, WorkspacePath)> {
         let validated_path = self.validate_path(file_path).await?;
         let (server_id, client) = self
             .resolve_client_for_file(validated_path.as_path(), tool)
             .await?;
-        Ok((server_id, client, validated_path.into_path_buf()))
+        Ok((server_id, client, validated_path))
     }
 
     /// As [`Self::resolve_validated_client_for_file`], but for a caller that
@@ -994,9 +996,9 @@ impl Translator {
         &self,
         path: &WorkspacePath,
         tool: ToolKind,
-    ) -> Result<(ServerId, LspClient, PathBuf)> {
+    ) -> Result<(ServerId, LspClient, WorkspacePath)> {
         let (server_id, client) = self.resolve_client_for_file(path.as_path(), tool).await?;
-        Ok((server_id, client, path.as_path().to_path_buf()))
+        Ok((server_id, client, path.clone()))
     }
 
     /// Resolve the LSP client and ensure the document is open.
@@ -1035,7 +1037,8 @@ impl Translator {
     ) -> Result<PreparedDocument> {
         let (server_id, client, validated_path) =
             self.resolve_validated_client_for_path(path, tool).await?;
-        self.open_prepared(server_id, client, &validated_path).await
+        self.open_prepared(server_id, client, &validated_path, Access::Use)
+            .await
     }
 
     /// Marks `validated_path` in flight, then opens it via `ensure_open`.
@@ -1047,9 +1050,12 @@ impl Translator {
         &self,
         server_id: ServerId,
         client: LspClient,
-        validated_path: &Path,
+        validated_path: &WorkspacePath,
+        access: Access,
     ) -> Result<PreparedDocument> {
-        let in_flight = self.document_tracker.mark_in_flight(validated_path);
+        let in_flight = self
+            .document_tracker
+            .mark_in_flight(validated_path.as_path());
         // Drained unconditionally, before propagating `ensure_open`'s
         // result: even on its error path (e.g. a `didOpen`/`didChange`
         // notify failure), `DocumentTracker::open` may already have evicted
@@ -1058,7 +1064,13 @@ impl Translator {
         // leaving the tracker desynced from that server (#495 S5).
         let result = self
             .document_tracker
-            .ensure_open(validated_path, &server_id, &client)
+            .ensure_open(OpenRequest {
+                path: validated_path,
+                roots: &self.workspace_roots,
+                server: &server_id,
+                client: &client,
+                access,
+            })
             .await;
         self.flush_pending_closes().await;
         let uri = result?;
@@ -1066,7 +1078,7 @@ impl Translator {
             server_id,
             client,
             uri,
-            path: validated_path.to_path_buf(),
+            path: validated_path.as_path().to_path_buf(),
             _in_flight: in_flight,
         })
     }
@@ -1232,7 +1244,7 @@ impl Translator {
         &self,
         server_id: ServerId,
         client: LspClient,
-        validated_path: PathBuf,
+        validated_path: WorkspacePath,
         indexing_gate: IndexingGate,
     ) -> Result<PreparedDocument> {
         let wait = match indexing_gate {
@@ -1255,7 +1267,7 @@ impl Translator {
         &self,
         server_id: ServerId,
         client: LspClient,
-        validated_path: &Path,
+        validated_path: &WorkspacePath,
         capability: Capability,
         wait: IndexingWait,
     ) -> Result<PreparedDocument> {
@@ -1263,7 +1275,8 @@ impl Translator {
         if wait == IndexingWait::Wait {
             self.wait_for_indexing_ready(&server_id).await?;
         }
-        self.open_prepared(server_id, client, validated_path).await
+        self.open_prepared(server_id, client, validated_path, Access::Use)
+            .await
     }
 
     fn require_lines_in_document(
@@ -2714,15 +2727,15 @@ mod tests {
             .client(&ServerId::from_static("lang_a"))
             .unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from_static("lang_a"), &client_a)
+            .ensure_open_for_test(&path, &ServerId::from_static("lang_a"), &client_a)
             .await
             .unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from_static("lang_d"), &client_d)
+            .ensure_open_for_test(&path, &ServerId::from_static("lang_d"), &client_d)
             .await
             .unwrap();
         tracker
-            .ensure_open(&other, &ServerId::from_static("lang_a"), &client_a)
+            .ensure_open_for_test(&other, &ServerId::from_static("lang_a"), &client_a)
             .await
             .unwrap();
 
@@ -2764,9 +2777,18 @@ mod tests {
         let other = dir.path().join("q.aa");
         std::fs::write(&other, "q").unwrap();
         let client_a = lock_std(&translator.servers).client(&a).unwrap();
-        tracker.ensure_open(&path, &a, &client_a).await.unwrap();
-        tracker.ensure_open(&path, &d, &client_d).await.unwrap();
-        tracker.ensure_open(&other, &a, &client_a).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &a, &client_a)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open_for_test(&path, &d, &client_d)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open_for_test(&other, &a, &client_a)
+            .await
+            .unwrap();
         translator.register_client(d.clone(), client_d.clone());
         client_d
             .notify("test/fill", serde_json::json!({}))

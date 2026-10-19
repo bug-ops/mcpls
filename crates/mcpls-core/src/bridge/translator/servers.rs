@@ -15,6 +15,7 @@ use tokio::task::AbortHandle;
 use super::pull_support::{PullProbe, PullSupport};
 use super::respawn::RespawnBackoff;
 use super::restart::RestartGeneration;
+use super::save_support::SaveSupport;
 use crate::config::ServerId;
 use crate::error::ServerSpawnFailure;
 use crate::lsp::{ConnectionId, LspClient, LspServer};
@@ -244,6 +245,14 @@ impl Servers {
             .server(id)
             .is_some_and(|server| server.capabilities().diagnostic_provider.is_some());
         PullSupport::of(advertised, self.pull_probe(id))
+    }
+
+    /// Whether the running process of `id` asked for `textDocument/didSave`.
+    pub(super) fn save_support(&self, id: &ServerId) -> SaveSupport {
+        SaveSupport::of(
+            self.server(id)
+                .and_then(|server| server.capabilities().text_document_sync.as_ref()),
+        )
     }
 
     /// The server of a running slot that has one.

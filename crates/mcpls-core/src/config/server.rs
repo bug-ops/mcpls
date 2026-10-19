@@ -18,7 +18,7 @@ use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
-use super::server_env::{EnvKey, ServerEnv};
+use super::server_env::{EnvKey, EnvValue, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::impl_text_newtype;
 use crate::bridge::IndexingPolicy;
@@ -611,6 +611,17 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
                 language: language_id.clone(),
             }
         })?;
+        let env = env
+            .into_iter()
+            .map(|(key, value)| match EnvValue::new(value) {
+                Ok(value) => Ok((key, value)),
+                Err(error) => Err(ConfigError::InvalidEnvValue {
+                    server: entry_id(name.as_ref(), &language_id),
+                    key,
+                    error,
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let env = ServerEnv::from_entries(env, HostOs::CURRENT).map_err(|error| {
             ConfigError::DuplicateEnvKey {
                 server: entry_id(name.as_ref(), &language_id),
@@ -1084,7 +1095,10 @@ mod tests {
     #[test]
     fn test_custom_config() {
         let mut env = ServerEnv::default();
-        env.insert(EnvKey::from_static("RUST_LOG"), "debug".to_string());
+        env.insert(
+            EnvKey::from_static("RUST_LOG"),
+            EnvValue::from_static("debug"),
+        );
 
         let config = LspServerConfig {
             language_id: LanguageId::from_static("custom"),
@@ -1154,6 +1168,22 @@ mod tests {
         assert_eq!(
             round_tripped.indexing,
             crate::bridge::IndexingPolicy::Disabled
+        );
+    }
+
+    /// #751: a NUL in an `env` value is rejected at load, naming the server and
+    /// the variable.
+    #[test]
+    fn test_nul_in_env_value_is_rejected_at_load() {
+        let toml_str =
+            "language_id = \"rust\"\ncommand = \"rust-analyzer\"\n[env]\nA = \"x\\u0000y\"\n";
+        let error = toml::from_str::<LspServerConfig>(toml_str).unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "lsp_servers entry 'rust': environment variable 'A': environment variable value cannot contain NUL"
+            ),
+            "{error}"
         );
     }
 

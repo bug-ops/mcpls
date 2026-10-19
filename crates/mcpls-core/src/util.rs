@@ -192,6 +192,22 @@ impl RegularFile {
         (self.file, self.metadata)
     }
 
+    /// The open handle.
+    #[must_use]
+    pub(crate) const fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// The metadata taken from the open handle.
+    #[must_use]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    ))]
+    pub(crate) const fn metadata(&self) -> &std::fs::Metadata {
+        &self.metadata
+    }
+
     /// Reads the file if it is at most `max` bytes.
     ///
     /// The stat length is checked first, then the read itself is capped at
@@ -210,6 +226,54 @@ impl RegularFile {
             .map_err(ReadBoundedError::Io)?;
         SizeExceeded::check(buf.len() as u64, max).map_err(ReadBoundedError::TooLarge)?;
         Ok(buf)
+    }
+}
+
+/// Volume and file index of an open file, for comparing two handles.
+///
+/// Used where the platform has no safe way to ask an open handle for its path
+/// (Windows and Unix systems other than Linux, Android and macOS). A volume
+/// that reports a zero index (some network or FUSE volumes) makes every file on
+/// it compare equal, so the comparison fails open there.
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    )
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    volume: u64,
+    index: u64,
+}
+
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    )
+))]
+impl FileIdentity {
+    /// Identity from the metadata of a followed path or an open handle.
+    #[cfg(unix)]
+    pub(crate) fn of_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            volume: metadata.dev(),
+            index: metadata.ino(),
+        }
+    }
+
+    /// Identity of an open handle.
+    #[cfg(windows)]
+    pub(crate) fn of_file(file: &std::fs::File) -> std::io::Result<Self> {
+        let info = winapi_util::file::information(file)?;
+        Ok(Self {
+            volume: info.volume_serial_number(),
+            index: info.file_index(),
+        })
     }
 }
 

@@ -162,6 +162,13 @@ impl DocumentStamp {
     pub const fn new(opening: Option<Opening>, version: DocumentVersion) -> Self {
         Self { opening, version }
     }
+
+    /// Whether `other` is a state of the same opening of the file, so that
+    /// a different version means the content changed rather than the file was
+    /// opened again.
+    pub(crate) fn same_opening(self, other: Self) -> bool {
+        self.opening.is_some() && self.opening == other.opening
+    }
 }
 
 /// Whether the tracker still holds the document version a pull was requested at.
@@ -2381,7 +2388,7 @@ impl NotificationCache {
     /// pass for it.
     ///
     /// Returns the files whose view changed, for the caller to announce: those
-    /// with an evicted entry or a newly recorded mark.
+    /// with an evicted entry or a newly recorded mark, each once, in key order.
     ///
     /// A publication whose canonical path is only the published spelling (the
     /// filesystem could not be asked) names the file of the entry cached under
@@ -2392,7 +2399,7 @@ impl NotificationCache {
         owner: &ServerId,
         published: &[PublishedDiagnosticsUri],
     ) -> Vec<DiagnosticsKey> {
-        let mut changed = Vec::new();
+        let mut changed = BTreeSet::new();
         for publication in published {
             let file = self.lost_file(publication);
             let stale: Vec<SlotKey> = self
@@ -2417,11 +2424,11 @@ impl NotificationCache {
                 && self
                     .eviction_marks
                     .record(file.clone(), owner.clone(), EvictedContent::Lost);
-            if (evicted || marked) && !changed.contains(&file) {
-                changed.push(file);
+            if evicted || marked {
+                changed.insert(file);
             }
         }
-        changed
+        changed.into_iter().collect()
     }
 
     /// The file a lost publication stands for.
@@ -4342,6 +4349,31 @@ mod tests {
             DiagnosticsAvailability::Published
         );
         cache.assert_consistent();
+    }
+
+    /// #779: a batch naming files repeatedly announces each changed file once.
+    #[test]
+    fn test_lost_publish_batch_reports_each_changed_file_once_in_key_order() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let lost = |name: &str| {
+            let uri = file_uri(name);
+            PublishedDiagnosticsUri::for_test(uri.clone(), uri)
+        };
+        let batch: Vec<_> = (0..1000)
+            .rev()
+            .flat_map(|n| {
+                let name = format!("f{n:04}.rs");
+                [lost(&name), lost(&name)]
+            })
+            .collect();
+
+        let changed = cache.record_lost_files(&server, &batch);
+
+        let expected: Vec<_> = (0..1000)
+            .map(|n| DiagnosticsKey::of(&file_uri(&format!("f{n:04}.rs"))))
+            .collect();
+        assert_eq!(changed, expected);
     }
 
     /// #742: a file that already carries a lost mark, or that still shows

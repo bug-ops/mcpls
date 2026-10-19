@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
+use super::{WorkspacePath, WorkspaceRoots};
 use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
@@ -781,6 +782,15 @@ impl DocumentTracker {
         documents.get(path)?.text.line(line).map(str::to_string)
     }
 
+    /// The content of `path` as last sent to a server, or `None` if the
+    /// document is not open.
+    #[must_use]
+    pub(crate) fn text(&self, path: &Path) -> Option<String> {
+        lock_std(&self.documents)
+            .get(path)
+            .map(|state| state.text.as_str().to_owned())
+    }
+
     /// Whether `path`'s tracked content has a 0-based `line`'th line.
     ///
     /// Checked under the documents lock without copying any text.
@@ -994,6 +1004,17 @@ impl DocumentTracker {
     /// Snapshot of the filesystem paths of all currently open documents.
     pub fn open_paths(&self) -> Vec<PathBuf> {
         lock_std(&self.documents).keys().cloned().collect()
+    }
+
+    /// The filesystem paths of all currently open documents, the most
+    /// recently used first (a document is used by an [`Access::Use`] resync).
+    pub(crate) fn open_paths_by_recency(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<(PathBuf, Instant)> = lock_std(&self.documents)
+            .iter()
+            .map(|(path, state)| (path.clone(), state.last_accessed))
+            .collect();
+        paths.sort_unstable_by(|(_, a), (_, b)| b.cmp(a));
+        paths.into_iter().map(|(path, _)| path).collect()
     }
 
     /// Forget `server`'s last-synced version for every currently open
@@ -1248,18 +1269,18 @@ impl DocumentTracker {
     ///
     /// Returns an error if:
     /// - The file cannot be stat'd or read from disk
+    /// - The opened file does not lie under the request's roots
+    ///   ([`Error::PathOutsideWorkspace`])
+    /// - The request is an [`Access::Probe`] for a path the tracker does not
+    ///   hold ([`Error::DocumentNotFound`])
     /// - The `didOpen`/`didChange` notification fails to send
     /// - Resource limits are exceeded
-    pub async fn ensure_open(
-        &self,
-        path: &Path,
-        server: &ServerId,
-        lsp_client: &LspClient,
-    ) -> Result<Uri> {
+    pub async fn ensure_open(&self, request: OpenRequest<'_>) -> Result<Uri> {
+        let path = request.path.as_path();
         let _path_guard = self.lock_path(path).await;
-        let generation = self.generation(server);
-        let decision = self.disk_phase(path).await?;
-        self.sync_phase(path, server, lsp_client, decision, generation)
+        let generation = self.generation(request.server);
+        let decision = self.disk_phase(request.gate(), request.access).await?;
+        self.sync_phase(path, request.server, request.client, decision, generation)
             .await
     }
 
@@ -1267,9 +1288,13 @@ impl DocumentTracker {
     /// should be at, reading from disk only when necessary. Never sends any
     /// LSP notification and never returns early in a way that would skip the
     /// per-server sync phase -- see `ensure_open`'s docs.
-    async fn disk_phase(&self, path: &Path) -> Result<Decision> {
+    async fn disk_phase(&self, gate: OpenGate<'_>, access: Access) -> Result<Decision> {
+        let path = gate.path();
         if !lock_std(&self.documents).contains_key(path) {
-            return self.disk_phase_new(path).await;
+            if access == Access::Probe {
+                return Err(Error::DocumentNotFound(path.to_path_buf()));
+            }
+            return self.disk_phase_new(gate).await;
         }
 
         let read_at = SystemTime::now();
@@ -1289,7 +1314,9 @@ impl DocumentTracker {
         // path below.
         let Some((uri, current_version, fast_path)) =
             lock_std(&self.documents).get_mut(path).map(|st| {
-                st.touch();
+                if access == Access::Use {
+                    st.touch();
+                }
                 let stat_matches = st
                     .disk()
                     .is_some_and(|d| d.mtime == mtime && d.size == size);
@@ -1311,7 +1338,7 @@ impl DocumentTracker {
             return Ok(Decision::unchanged(uri, current_version));
         }
 
-        let (fresh, ..) = self.read_to_string_checked(path).await?;
+        let (fresh, ..) = self.read_to_string_checked(gate).await?;
         let snap = DiskSync {
             mtime,
             size,
@@ -1342,9 +1369,10 @@ impl DocumentTracker {
     /// Reads a not-yet-tracked file from disk and opens it in the tracker at
     /// version 1. No server has synced it yet, so the sync phase always
     /// sends `didOpen` regardless of which server calls next.
-    async fn disk_phase_new(&self, path: &Path) -> Result<Decision> {
+    async fn disk_phase_new(&self, gate: OpenGate<'_>) -> Result<Decision> {
+        let path = gate.path();
         let read_at = SystemTime::now();
-        let (content, mtime, size) = self.read_to_string_checked(path).await?;
+        let (content, mtime, size) = self.read_to_string_checked(gate).await?;
 
         let uri = self.open_text(path.to_path_buf(), DocumentText::build(content).await?)?;
         self.set_disk(
@@ -1368,24 +1396,34 @@ impl DocumentTracker {
     ///
     /// The open runs on the blocking pool through [`RegularFile::open`], which
     /// owns the non-blocking FIFO and Windows device-name protections (see
-    /// #418 and #442) shared with the config loader.
-    async fn open_checked(&self, path: &Path) -> Result<(fs::File, std::fs::Metadata)> {
-        let owned = path.to_path_buf();
-        let opened = tokio::task::spawn_blocking(move || RegularFile::open(&owned))
-            .await
-            .map_err(|source| Error::TaskFailed {
-                task: BackgroundTask::FileOpen,
-                source,
-            })?;
-        let (file, meta) = opened
-            .map_err(|e| match e {
-                OpenRegularFileError::Io(source) => Error::FileIo {
-                    path: path.to_path_buf(),
-                    source,
-                },
-                OpenRegularFileError::NotRegular => Error::NotARegularFile(path.to_path_buf()),
-            })?
-            .into_parts();
+    /// #418 and #442) shared with the config loader. A [`OpenGate::Contained`]
+    /// open goes through [`WorkspaceRoots::open_contained`] instead, which also
+    /// verifies the opened file against the roots (#783).
+    async fn open_checked(&self, gate: OpenGate<'_>) -> Result<(fs::File, std::fs::Metadata)> {
+        let opened = match gate {
+            OpenGate::Contained { roots, path } => {
+                let (roots, path) = (roots.clone(), path.clone());
+                tokio::task::spawn_blocking(move || roots.open_contained(&path))
+            }
+            OpenGate::Ungated(path) => {
+                let owned = path.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    RegularFile::open(&owned).map_err(|e| match e {
+                        OpenRegularFileError::Io(source) => Error::FileIo {
+                            path: owned,
+                            source,
+                        },
+                        OpenRegularFileError::NotRegular => Error::NotARegularFile(owned),
+                    })
+                })
+            }
+        }
+        .await
+        .map_err(|source| Error::TaskFailed {
+            task: BackgroundTask::FileOpen,
+            source,
+        })?;
+        let (file, meta) = opened?.into_parts();
         self.check_file_size(meta.len())?;
         Ok((fs::File::from_std(file), meta))
     }
@@ -1438,9 +1476,10 @@ impl DocumentTracker {
     /// actually read.
     async fn read_to_string_checked(
         &self,
-        path: &Path,
+        gate: OpenGate<'_>,
     ) -> Result<(String, Option<SystemTime>, u64)> {
-        let (file, meta) = self.open_checked(path).await?;
+        let path = gate.path();
+        let (file, meta) = self.open_checked(gate).await?;
         let mtime = meta.modified().ok();
         let size = meta.len();
         let content = self.read_string_bounded(path, file, size).await?;
@@ -1514,7 +1553,7 @@ impl DocumentTracker {
         line: u32,
         budget: u64,
     ) -> Result<LineRead> {
-        let Ok((file, _meta)) = self.open_checked(path).await else {
+        let Ok((file, _meta)) = self.open_checked(OpenGate::Ungated(path)).await else {
             return Ok(LineRead {
                 text: None,
                 bytes_read: OPEN_FAILURE_CHARGE_BYTES,
@@ -1868,6 +1907,111 @@ impl Drop for PathLockGuard<'_> {
     }
 }
 
+#[cfg(test)]
+impl DocumentTracker {
+    /// Opens `path` as a tool call would, with the parent directory as the
+    /// only workspace root.
+    pub(crate) async fn ensure_open_for_test(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        client: &LspClient,
+    ) -> Result<Uri> {
+        self.ensure_open_as_for_test(path, server, client, Access::Use)
+            .await
+    }
+
+    /// As [`Self::ensure_open_for_test`], with the given `access`.
+    pub(crate) async fn ensure_open_as_for_test(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        client: &LspClient,
+        access: Access,
+    ) -> Result<Uri> {
+        let parent = path.parent().unwrap_or(path);
+        let mut roots = vec![parent.to_path_buf()];
+        // Both spellings: a temp dir may be a symlink or an 8.3 short name, and
+        // the verification compares the opened file's real path or the pinned
+        // ancestors with the roots.
+        if let Ok(canonical) = dunce::canonicalize(parent)
+            && canonical != parent
+        {
+            roots.push(canonical);
+        }
+        self.ensure_open(OpenRequest {
+            path: &WorkspacePath::for_test(path.to_path_buf()),
+            roots: &WorkspaceRoots::for_test(roots, Vec::new()),
+            server,
+            client,
+            access,
+        })
+        .await
+    }
+}
+
+/// Whether a resync counts as the document's use for LRU eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// A tool call or a subscribed file's sweep: the document is touched, so
+    /// it becomes the most recently used.
+    Use,
+    /// A background resync of a file nobody asked for: the LRU order is left
+    /// as tool calls made it, and an untracked path is never opened.
+    Probe,
+}
+
+/// What [`DocumentTracker::ensure_open`] needs to bring one document to the
+/// server's side.
+///
+/// `path` was validated by `roots`; the file is opened and the opened handle
+/// is verified against `roots` again, so a symlink swapped in after the
+/// validation is refused (#783).
+#[derive(Debug, Clone, Copy)]
+pub struct OpenRequest<'a> {
+    /// The validated, canonical path of the document.
+    pub path: &'a WorkspacePath,
+    /// The roots `path` was validated against and the opened file must lie in.
+    pub roots: &'a WorkspaceRoots,
+    /// The server to sync the document to.
+    pub server: &'a ServerId,
+    /// The connection to `server`.
+    pub client: &'a LspClient,
+    /// Whether the call touches the document's LRU position.
+    pub access: Access,
+}
+
+impl<'a> OpenRequest<'a> {
+    const fn gate(&self) -> OpenGate<'a> {
+        OpenGate::Contained {
+            roots: self.roots,
+            path: self.path,
+        }
+    }
+}
+
+/// How a document file is opened.
+#[derive(Clone, Copy)]
+enum OpenGate<'a> {
+    /// Opened and verified against the workspace roots.
+    Contained {
+        roots: &'a WorkspaceRoots,
+        path: &'a WorkspacePath,
+    },
+    /// Opened as named: a path a server reported may legitimately lie outside
+    /// the roots.
+    Ungated(&'a Path),
+}
+
+impl<'a> OpenGate<'a> {
+    fn path(self) -> &'a Path {
+        match self {
+            Self::Contained { path, .. } => path.as_path(),
+            Self::Ungated(path) => path,
+        }
+    }
+}
+
 /// Outcome of `DocumentTracker::disk_phase`: the version `ensure_open`'s
 /// caller should end up synced to, and -- only when this call detected an
 /// as-yet-uncommitted content change -- the content and disk snapshot to
@@ -2106,7 +2250,10 @@ mod tests {
         tracker.forget_server(&server);
 
         let (stale_client, _guard) = fake_lsp_client();
-        let decision = tracker.disk_phase(&path).await.unwrap();
+        let decision = tracker
+            .disk_phase(OpenGate::Ungated(&path), Access::Use)
+            .await
+            .unwrap();
         tracker
             .sync_phase(
                 &path,
@@ -2141,7 +2288,10 @@ mod tests {
         let server = ServerId::from_static("rust");
         let (client, _guard) = fake_lsp_client();
 
-        tracker.ensure_open(&path, &server, &client).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &server, &client)
+            .await
+            .unwrap();
 
         let state = tracker.get(&path).unwrap();
         assert_eq!(
@@ -2256,10 +2406,103 @@ mod tests {
         set_mtime(&path, settled_past());
         let (client, _server) = fake_lsp_client();
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         path
+    }
+
+    /// #783: a path validated against the roots whose parent directory became
+    /// a symlink out of them is refused when it is opened, and the file behind
+    /// the symlink is never read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ensure_open_refuses_a_path_swapped_out_of_the_roots_after_validation() {
+        let dir = TempDir::new().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let root = base.join("ws");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(base.join("out")).unwrap();
+        let roots = WorkspaceRoots::from_paths(&[&root]).unwrap();
+        let file = root.join("sub/a.rs");
+        std::fs::write(&file, "inside").unwrap();
+        let validated = roots
+            .validate_blocking(&crate::bridge::ClientPath::try_from(file).unwrap())
+            .unwrap();
+        std::fs::write(base.join("out/a.rs"), "secret").unwrap();
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("out"), root.join("sub")).unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from_static("rust");
+        let (client, _guard) = fake_lsp_client();
+
+        let result = tracker
+            .ensure_open(OpenRequest {
+                path: &validated,
+                roots: &roots,
+                server: &server,
+                client: &client,
+                access: Access::Use,
+            })
+            .await;
+
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
+        assert!(tracker.open_paths().is_empty());
+    }
+
+    /// #781: a probe never opens a file the tracker does not hold, so a
+    /// document evicted between selection and visit stays evicted.
+    #[tokio::test]
+    async fn test_probe_of_an_untracked_path_opens_nothing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}").unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let (client, _guard) = fake_lsp_client();
+
+        let result = tracker
+            .ensure_open_as_for_test(
+                &path,
+                &ServerId::from_static("rust"),
+                &client,
+                Access::Probe,
+            )
+            .await;
+
+        assert_matches!(result, Err(Error::DocumentNotFound(_)));
+        assert!(tracker.open_paths().is_empty());
+    }
+
+    /// #781: a probe resyncs a tracked document but leaves the LRU order as
+    /// tool calls made it; a use moves it to the front.
+    #[tokio::test]
+    async fn test_probe_leaves_the_recency_order_and_use_changes_it() {
+        let dir = TempDir::new().unwrap();
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from_static("rust");
+        let (client, _guard) = fake_lsp_client();
+        let (a, b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+        for path in [&a, &b] {
+            std::fs::write(path, "fn f() {}").unwrap();
+            tracker
+                .ensure_open_for_test(path, &server, &client)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(tracker.open_paths_by_recency(), [b.clone(), a.clone()]);
+
+        tracker
+            .ensure_open_as_for_test(&a, &server, &client, Access::Probe)
+            .await
+            .unwrap();
+        assert_eq!(tracker.open_paths_by_recency(), [b.clone(), a.clone()]);
+
+        tracker
+            .ensure_open_for_test(&a, &server, &client)
+            .await
+            .unwrap();
+        assert_eq!(tracker.open_paths_by_recency(), [a, b]);
     }
 
     /// #503: a document held by an `InFlightGuard` is never evicted -- `open`
@@ -2391,18 +2634,18 @@ mod tests {
         let server_id = ServerId::from_static("rust");
 
         tracker
-            .ensure_open(&path_a, &server_id, &client)
+            .ensure_open_for_test(&path_a, &server_id, &client)
             .await
             .unwrap();
         tracker
-            .ensure_open(&path_b, &server_id, &client)
+            .ensure_open_for_test(&path_b, &server_id, &client)
             .await
             .unwrap();
 
         // Re-access `a` so it becomes the more-recently-used of the two,
         // leaving `b` as the LRU entry despite having been opened second.
         tracker
-            .ensure_open(&path_a, &server_id, &client)
+            .ensure_open_for_test(&path_a, &server_id, &client)
             .await
             .unwrap();
 
@@ -2410,7 +2653,7 @@ mod tests {
         std::fs::write(&path_c, "CCCC").unwrap();
         set_mtime(&path_c, settled_past());
         tracker
-            .ensure_open(&path_c, &server_id, &client)
+            .ensure_open_for_test(&path_c, &server_id, &client)
             .await
             .unwrap();
 
@@ -3351,13 +3594,13 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         let uri1 = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
 
         let uri2 = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(uri1, uri2);
@@ -3375,7 +3618,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3383,7 +3626,7 @@ mod tests {
         set_mtime(&path, settled_past());
 
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3401,7 +3644,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3414,7 +3657,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3436,7 +3679,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3450,7 +3693,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3472,7 +3715,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3480,7 +3723,7 @@ mod tests {
         // immediately, proving the debounce never gates the stat itself.
         std::fs::write(&path, "BBBBBBBB").unwrap();
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3499,7 +3742,7 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -3509,14 +3752,14 @@ mod tests {
 
         // Inside the debounce window: the re-read is gated, cache wins.
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.get(&path).unwrap().version().get(), 1);
 
         tokio::time::advance(Duration::from_millis(300)).await;
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         let state = tracker.get(&path).unwrap();
@@ -3534,14 +3777,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
         std::fs::remove_file(&path).unwrap();
 
         let result = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert_matches!(result, Err(Error::FileIo { .. }));
         assert!(tracker.is_open(&path));
@@ -3563,14 +3806,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
         std::fs::write(&path, "x".repeat(100)).unwrap();
 
         let result = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert_matches!(result, Err(Error::FileSizeLimitExceeded { .. }));
         assert_eq!(tracker.get(&path).unwrap().content(), "small");
@@ -3591,14 +3834,14 @@ mod tests {
         let (client, _server) = fake_lsp_client();
         let tracker = DocumentTracker::new(limits, HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
         assert_eq!(tracker.len(), 1);
 
         std::fs::write(&path, "BBBBBBBB").unwrap();
         let result = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await;
         assert!(
             result.is_ok(),
@@ -3625,7 +3868,7 @@ mod tests {
 
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let result = tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &notify_will_fail)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &notify_will_fail)
             .await;
 
         assert!(result.is_err(), "notify failure must propagate as an error");
@@ -3646,7 +3889,7 @@ mod tests {
         let (client, mut server) = fake_lsp_client();
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3657,7 +3900,7 @@ mod tests {
         std::fs::write(&path, "fn main() { println!(\"hi\"); }").unwrap();
         set_mtime(&path, settled_past());
         tracker
-            .ensure_open(&path, &ServerId::from_static("rust"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("rust"), &client)
             .await
             .unwrap();
 
@@ -3695,7 +3938,10 @@ mod tests {
         let id_a = ServerId::from_static("server-a");
         let id_b = ServerId::from_static("server-b");
 
-        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_a, &client_a)
+            .await
+            .unwrap();
         let mut wire_a = BufReader::new(&mut server_a.write_stdout);
         let opened_a = read_framed_message(&mut wire_a).await;
         assert_eq!(opened_a["method"], "textDocument/didOpen");
@@ -3703,7 +3949,10 @@ mod tests {
         // No disk change between calls: server B's ensure_open must still
         // take the disk-phase fast path (settled mtime) but still send B its
         // own didOpen.
-        tracker.ensure_open(&path, &id_b, &client_b).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_b, &client_b)
+            .await
+            .unwrap();
         let mut wire_b = BufReader::new(&mut server_b.write_stdout);
         let opened_b = read_framed_message(&mut wire_b).await;
         assert_eq!(opened_b["method"], "textDocument/didOpen");
@@ -3726,7 +3975,7 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
 
         tracker
-            .ensure_open(&path, &ServerId::from_static("server-a"), &client_a)
+            .ensure_open_for_test(&path, &ServerId::from_static("server-a"), &client_a)
             .await
             .unwrap();
 
@@ -3735,7 +3984,7 @@ mod tests {
         tokio::time::advance(DISK_CHECK_DEBOUNCE + Duration::from_millis(1)).await;
 
         tracker
-            .ensure_open(&path, &ServerId::from_static("server-b"), &client_b)
+            .ensure_open_for_test(&path, &ServerId::from_static("server-b"), &client_b)
             .await
             .unwrap();
         let mut wire_b = BufReader::new(&mut server_b.write_stdout);
@@ -3760,8 +4009,14 @@ mod tests {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let id = ServerId::from_static("rust");
 
-        tracker.ensure_open(&path, &id, &client).await.unwrap();
-        tracker.ensure_open(&path, &id, &client).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id, &client)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id, &client)
+            .await
+            .unwrap();
 
         let mut wire = BufReader::new(&mut server.write_stdout);
         let opened = read_framed_message(&mut wire).await;
@@ -3793,8 +4048,14 @@ mod tests {
         let id_a = ServerId::from_static("server-a");
         let id_b = ServerId::from_static("server-b");
 
-        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
-        tracker.ensure_open(&path, &id_b, &client_b).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_a, &client_a)
+            .await
+            .unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_b, &client_b)
+            .await
+            .unwrap();
 
         // Shut down B's client so its next notify fails, then change the file
         // so both servers have version 2 to catch up to.
@@ -3804,7 +4065,9 @@ mod tests {
         std::fs::write(&path, "fn main() { updated(); }").unwrap();
         set_mtime(&path, settled_past());
 
-        let result = tracker.ensure_open(&path, &id_b, &client_b_will_fail).await;
+        let result = tracker
+            .ensure_open_for_test(&path, &id_b, &client_b_will_fail)
+            .await;
         assert!(result.is_err(), "B's didChange must fail and propagate");
 
         // No commit happens before a successful notify: content, version and
@@ -3835,7 +4098,10 @@ mod tests {
         // A's next call must independently detect the disk change (B's
         // failure did not consume it) and successfully advance both the
         // shared content/version and its own synced entry.
-        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_a, &client_a)
+            .await
+            .unwrap();
         assert_eq!(
             tracker.get(&path).unwrap().content(),
             "fn main() { updated(); }"
@@ -3907,7 +4173,7 @@ mod tests {
         let path_a_for_task = path_a.clone();
         let handle_a = tokio::spawn(async move {
             tracker_for_a
-                .ensure_open(
+                .ensure_open_for_test(
                     &path_a_for_task,
                     &ServerId::from_static("server-a"),
                     &client_a,
@@ -3923,7 +4189,7 @@ mod tests {
         // ensure_open -- the exact regression #227 fixes.
         tokio::time::timeout(
             Duration::from_secs(5),
-            tracker.ensure_open(&path_b, &ServerId::from_static("server-b"), &client_b),
+            tracker.ensure_open_for_test(&path_b, &ServerId::from_static("server-b"), &client_b),
         )
         .await
         .unwrap()
@@ -3961,7 +4227,7 @@ mod tests {
             let path = path.clone();
             let id = id.clone();
             handles.push(tokio::spawn(async move {
-                tracker.ensure_open(&path, &id, &client).await
+                tracker.ensure_open_for_test(&path, &id, &client).await
             }));
         }
         for handle in handles {
@@ -4024,7 +4290,7 @@ mod tests {
             servers.push(server);
             let id = id.clone();
             handles.push(tokio::spawn(async move {
-                tracker.ensure_open(&path, &id, &client).await
+                tracker.ensure_open_for_test(&path, &id, &client).await
             }));
         }
         for handle in handles {
@@ -4063,7 +4329,7 @@ mod tests {
         // indefinitely on the FIFO -- the exact regression #418 fixes.
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            tracker.read_to_string_checked(&path),
+            tracker.read_to_string_checked(OpenGate::Ungated(&path)),
         )
         .await
         .unwrap();
@@ -4086,7 +4352,7 @@ mod tests {
         let path = PathBuf::from("NUL");
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            tracker.read_to_string_checked(&path),
+            tracker.read_to_string_checked(OpenGate::Ungated(&path)),
         )
         .await
         .unwrap();
@@ -4112,11 +4378,16 @@ mod tests {
         );
 
         std::fs::write(&path, "a".repeat(10)).unwrap();
-        let (content, ..) = tracker.read_to_string_checked(&path).await.unwrap();
+        let (content, ..) = tracker
+            .read_to_string_checked(OpenGate::Ungated(&path))
+            .await
+            .unwrap();
         assert_eq!(content.len(), 10);
 
         std::fs::write(&path, "a".repeat(11)).unwrap();
-        let result = tracker.read_to_string_checked(&path).await;
+        let result = tracker
+            .read_to_string_checked(OpenGate::Ungated(&path))
+            .await;
         assert_matches!(
             result,
             Err(Error::FileSizeLimitExceeded(SizeExceeded { size: 11, max })) if max.get() == 10
@@ -4689,7 +4960,10 @@ mod tests {
         for server in servers {
             let (client, fake) = fake_lsp_client();
             let id = ServerId::new(*server).unwrap();
-            tracker.ensure_open(&path, &id, &client).await.unwrap();
+            tracker
+                .ensure_open_for_test(&path, &id, &client)
+                .await
+                .unwrap();
             out.push((id, client, fake));
         }
         (path, out)
@@ -4702,7 +4976,7 @@ mod tests {
         set_mtime(&path, settled_past());
         let (client, _fake) = fake_lsp_client();
         tracker
-            .ensure_open(&path, &ServerId::from_static("other"), &client)
+            .ensure_open_for_test(&path, &ServerId::from_static("other"), &client)
             .await
             .unwrap();
     }
@@ -4731,7 +5005,10 @@ mod tests {
         );
 
         let (id_a, client_a, mut fake_a) = servers.remove(0);
-        tracker.ensure_open(&path, &id_a, &client_a).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_a, &client_a)
+            .await
+            .unwrap();
 
         let mut wire = BufReader::new(&mut fake_a.write_stdout);
         assert_eq!(
@@ -4820,7 +5097,7 @@ mod tests {
             let path = path.clone();
             tokio::spawn(async move {
                 tracker
-                    .ensure_open(&path, &ServerId::from_static("b"), &client)
+                    .ensure_open_for_test(&path, &ServerId::from_static("b"), &client)
                     .await
             })
         };
@@ -4890,7 +5167,10 @@ mod tests {
             .unwrap();
 
         let generation = tracker.generation(&server);
-        let decision = tracker.disk_phase(&path).await.unwrap();
+        let decision = tracker
+            .disk_phase(OpenGate::Ungated(&path), Access::Use)
+            .await
+            .unwrap();
         {
             let sync = tracker.sync_phase(&path, &server, &client, decision, generation);
             let mut sync = std::pin::pin!(sync);
@@ -4918,7 +5198,10 @@ mod tests {
         );
 
         let generation = tracker.generation(&server);
-        let decision = tracker.disk_phase(&path).await.unwrap();
+        let decision = tracker
+            .disk_phase(OpenGate::Ungated(&path), Access::Use)
+            .await
+            .unwrap();
         tracker
             .sync_phase(&path, &server, &client, decision, generation)
             .await
@@ -4948,7 +5231,10 @@ mod tests {
         evict_by_opening(&tracker, &dir, "q.rs").await;
 
         let (id_d, client_d, _fake_d) = servers.remove(1);
-        tracker.ensure_open(&path, &id_d, &client_d).await.unwrap();
+        tracker
+            .ensure_open_for_test(&path, &id_d, &client_d)
+            .await
+            .unwrap();
         evict_by_opening(&tracker, &dir, "r.rs").await;
 
         assert_eq!(
@@ -5008,7 +5294,12 @@ mod tests {
         let (id_a, client_a, _fake_a) = servers.remove(0);
         let will_fail = client_a.clone();
         client_a.shutdown().await.unwrap();
-        assert!(tracker.ensure_open(&path, &id_a, &will_fail).await.is_err());
+        assert!(
+            tracker
+                .ensure_open_for_test(&path, &id_a, &will_fail)
+                .await
+                .is_err()
+        );
         assert_eq!(
             pending_servers(&tracker, &path),
             HashSet::from([ServerId::from_static("a")])

@@ -13,10 +13,11 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Json;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CustomRequest, CustomResult, ErrorCode,
-    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
-    ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerConfig as RmcpServerConfig, SubscribeRequestParams,
-    SubscriptionFilter, ToolAnnotations, UnsubscribeRequestParams,
+    Implementation, InitializeRequestParams, InitializeResult, ListResourcesResult,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerConfig as RmcpServerConfig, SubscribeRequestParams, SubscriptionFilter, ToolAnnotations,
+    UnsubscribeRequestParams,
 };
 use rmcp::service::SubscriptionContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -29,7 +30,9 @@ use super::custom_request;
 use super::handlers::BridgeContext;
 use super::parameters::Parameters;
 use super::schema_shape::shape_tool_schemas;
-use super::session::{ListenPermit, ListenRegistration, ListenUris, SubscriptionRegistry, Target};
+use super::session::{
+    HandshakeClaim, ListenPermit, ListenRegistration, ListenUris, SubscriptionRegistry, Target,
+};
 use super::tool_support::{McpTool, ToolSupportReport, prefixed_tool_name};
 use super::tools::{
     CachedDiagnosticsParams, CallHierarchyCallsParams, CodeActionsParams, CompletionsParams,
@@ -1659,6 +1662,33 @@ const fn listen_join_error(source: tokio::task::JoinError) -> crate::error::Erro
 )]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McplsServer {
+    /// Answers the session's one `initialize`; a repeat is `-32600` (#776),
+    /// where the SDK default would renegotiate.
+    ///
+    /// Negotiation runs first so a failed attempt leaves the session
+    /// unclaimed and retryable; only the claim winner records the peer info,
+    /// with the negotiated version so `context.protocol_version()` matches the
+    /// reply.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        let result = self.negotiate_initialize(&request)?;
+        match self.context.session.state().claim_handshake() {
+            HandshakeClaim::Repeat => Err(McpError::invalid_request(
+                "the session is already initialized",
+                None,
+            )),
+            HandshakeClaim::First => {
+                let mut request = request;
+                request.protocol_version = result.protocol_version.clone();
+                context.peer.set_peer_info(request);
+                Ok(result)
+            }
+        }
+    }
+
     /// The SDK default answers every undecodable request with "method not
     /// found" and the method name; see `custom_request::answer`.
     ///
@@ -1668,7 +1698,6 @@ impl ServerHandler for McplsServer {
     /// opened by `server/discover`, which is not public; a session opened
     /// without `initialize` whose request declares a pre-2026-07-28 version in
     /// `_meta` is therefore read as legacy here.
-    // TODO(#776): reject a well-formed repeated `initialize` with -32600
     async fn on_custom_request(
         &self,
         request: CustomRequest,
@@ -2034,6 +2063,7 @@ mod tests {
     };
     #[cfg(unix)]
     use crate::config::{PositionEncodings, TimeoutSecs};
+    use crate::lsp::JsonRpcError;
     use crate::mcp::tool_support::ToolBackend;
     use crate::test_lsp::client_path;
 
@@ -2357,11 +2387,11 @@ mod tests {
     fn test_render_error_hides_configured_secrets_in_message_and_data() {
         let redactions = two_server_redactions("bravo-secret-222");
         let rendered = render_error(
-            crate::error::Error::LspServerError {
+            crate::error::Error::LspServerError(JsonRpcError {
                 code: -32602,
                 message: "Invalid offset LineCol { line: 9 } for bravo-secret-222".to_owned(),
                 data: None,
-            },
+            }),
             &redactions,
         );
         let data = rendered.data.as_ref().map(ToString::to_string).unwrap();
@@ -2944,11 +2974,11 @@ mod tests {
     /// still exposes the server's raw error as `data`.
     #[test]
     fn test_map_bridge_error_invalid_position_carries_raw_error_as_data() {
-        let mcp_err = map_bridge_error(crate::error::Error::LspServerError {
+        let mcp_err = map_bridge_error(crate::error::Error::LspServerError(JsonRpcError {
             code: -32603,
             message: "Invalid offset LineCol { line: 9, col: 0 }".to_string(),
             data: None,
-        });
+        }));
 
         assert_eq!(mcp_err.code, ErrorCode::INVALID_PARAMS);
         assert!(mcp_err.message.contains("position out of range"));
@@ -5729,6 +5759,56 @@ sleep 0.3
         .unwrap_or_else(|_| panic!("no response to {method}"));
         serving.abort();
         response
+    }
+
+    /// Sends one `initialize` per entry of `versions` over a fresh in-memory
+    /// session, returning the responses in order.
+    async fn initialize_sequence_over_the_wire(versions: &[&str]) -> Vec<serde_json::Value> {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let server = server_over(workspace.path());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(async move {
+            if let Ok(running) = server.serve(tokio::io::split(server_io)).await {
+                running.waiting().await.ok();
+            }
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(client_read).lines();
+
+        let mut responses = Vec::new();
+        for (id, version) in versions.iter().enumerate() {
+            let mut line = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            })
+            .to_string();
+            line.push('\n');
+            client_write.write_all(line.as_bytes()).await.unwrap();
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("no response to initialize")
+                .unwrap()
+                .unwrap();
+            responses.push(serde_json::from_str(&line).unwrap());
+        }
+        serving.abort();
+        responses
+    }
+
+    /// #776: a second well-formed `initialize` is `-32600`.
+    #[tokio::test]
+    async fn test_repeated_initialize_is_invalid_request_over_the_wire() {
+        let responses = initialize_sequence_over_the_wire(&["2025-06-18", "2025-06-18"]).await;
+
+        assert!(responses[0]["result"].is_object(), "{}", responses[0]);
+        assert_eq!(responses[1]["error"]["code"], -32600, "{}", responses[1]);
     }
 
     /// #750: a served method whose params do not decode is `-32602`, a method
