@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s without a tool call, through a subscription-driven sweep (#648) (#PR).
-- Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#PR).
+- Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s without a tool call, through a subscription-driven sweep (#648) (#784).
+- Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#784).
 
 ### Fixed
 
-- The untrusted launcher refuses further code-running spellings: pwsh dash lookalikes, padded flags, Windows PowerShell 5.1 unknown or valued parameters and bare commands, elvish `--c`, fish flag prefixes, cabal and stack run, eval and repl aliases, `cargo r`/`t`, and `data:` URLs with tab or newline (#734) (#PR).
-- The untrusted launcher refuses distribution names of listed shells and interpreters (`bash-static`, `pwsh-preview`, `pythonw3`, `py`, `lksh`) and the php `-R`/`-B`/`-E`/`-F` and long code flags (#740) (#PR).
-- The untrusted argument backstop runs again before every spawn, and a restart it refuses keeps the running server; `restart_server` reports `spawn_failed` instead of `initialize_failed` for a failed start (#736) (#PR).
-- A cancelled call can no longer leave a half-done `restart_server`, an unannounced respawn, an unsent `didClose` or a lost diagnostics notification, and a late reply to a timed-out request no longer logs a warning (#687) (#PR).
+- The untrusted launcher refuses further code-running spellings: pwsh dash lookalikes, padded flags, Windows PowerShell 5.1 unknown or valued parameters and bare commands, elvish `--c`, fish flag prefixes, cabal and stack run, eval and repl aliases, `cargo r`/`t`, and `data:` URLs with tab or newline (#734) (#784).
+- The untrusted launcher refuses distribution names of listed shells and interpreters (`bash-static`, `pwsh-preview`, `pythonw3`, `py`, `lksh`) and the php `-R`/`-B`/`-E`/`-F` and long code flags (#740) (#784).
+- The untrusted argument backstop runs again before every spawn, and a restart it refuses keeps the running server; `restart_server` reports `spawn_failed` instead of `initialize_failed` for a failed start (#736) (#784).
+- A cancelled call can no longer leave a half-done `restart_server`, an unannounced respawn, an unsent `didClose` or a lost diagnostics notification, and a late reply to a timed-out request no longer logs a warning (#687) (#784).
 - `get_completions` rejects an empty `trigger` while parsing (#745) (#778).
 - A known MCP method with undecodable params answers `-32602` instead of `-32601` (#750) (#778).
 - Client-supplied paths, resource URIs, pagination cursors and method names are escaped and bounded in error messages (#749) (#778).
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `InlineFlag` is `Short(char)` or `Long(LongInlineFlag)`, `ShellFlag::PlusC` reports `+c` as written, wrapped programs name their wrapper, and `cmd` is refused as a runner (`CmdSwitch` and `ShellFlag::SlashC` are removed) (#747) (#PR).
+- **Breaking:** `InlineFlag` is `Short(char)` or `Long(LongInlineFlag)`, `ShellFlag::PlusC` reports `+c` as written, wrapped programs name their wrapper, and `cmd` is refused as a runner (`CmdSwitch` and `ShellFlag::SlashC` are removed) (#747) (#784).
 - Error variants no longer repeat their source in `Display`, and `ErrorChain` renders every cause once (#735) (#778).
 - A diagnostics list is serialized once per publish; its size is recorded when it is bounded (#743) (#778).
 - Whole-document requests and the name-addressed tools share one request path each (`FromDocument`, `addressed`) (#746) (#778).
