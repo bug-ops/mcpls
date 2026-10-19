@@ -283,6 +283,13 @@ const EPOCH_PULL_WINDOW: Duration = SWEEP_INTERVAL;
 /// subscribed files over several ticks instead of sending them together.
 const MAX_EPOCH_PULLS_PER_WINDOW: u8 = 8;
 
+/// Whether a server's window had an epoch-driven pull left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EpochBudget {
+    Granted,
+    Exhausted,
+}
+
 /// The epoch-driven pulls a server spent in its current window.
 #[derive(Debug, Clone, Copy)]
 struct PullBudget {
@@ -648,8 +655,8 @@ impl SweepMemo {
     }
 
     /// Takes one epoch-driven pull of `server` out of its budget for the
-    /// window `now` falls in; `false` when the window has none left.
-    pub(super) fn take_epoch_pull(&self, server: &ServerId, now: Instant) -> bool {
+    /// window `now` falls in.
+    pub(super) fn take_epoch_pull(&self, server: &ServerId, now: Instant) -> EpochBudget {
         let mut state = lock_std(&self.0);
         let budget = state.budgets.entry(server.clone()).or_insert(PullBudget {
             window_start: now,
@@ -661,12 +668,16 @@ impl SweepMemo {
                 spent: 0,
             };
         }
-        let available = budget.spent < MAX_EPOCH_PULLS_PER_WINDOW;
-        if available {
+        let granted = budget.spent < MAX_EPOCH_PULLS_PER_WINDOW;
+        if granted {
             budget.spent = budget.spent.saturating_add(1);
         }
         drop(state);
-        available
+        if granted {
+            EpochBudget::Granted
+        } else {
+            EpochBudget::Exhausted
+        }
     }
 
     #[cfg(test)]
@@ -735,20 +746,30 @@ pub(super) struct PullCandidate {
 }
 
 /// What one pull pass has met so far.
-#[derive(Debug, Default)]
-struct PassState {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PassState {
+    /// No pull ran out of patience yet.
+    #[default]
+    Patient,
     /// A pull ran out of patience, so the pulls after it get only a grace.
-    paid_patience: bool,
+    Impatient,
     /// A pull ran out of patience with the server's background slots full.
-    at_cap: bool,
+    AtCap,
 }
 
 impl PassState {
-    const fn patience(&self) -> Duration {
-        if self.paid_patience {
-            PULL_GRACE
-        } else {
-            PULL_PATIENCE
+    const fn patience(self) -> Duration {
+        match self {
+            Self::Patient => PULL_PATIENCE,
+            Self::Impatient | Self::AtCap => PULL_GRACE,
+        }
+    }
+
+    /// The state after a pull ran out of patience; a full cap stays noted.
+    const fn after_expiry(self) -> Self {
+        match self {
+            Self::Patient | Self::Impatient => Self::Impatient,
+            Self::AtCap => Self::AtCap,
         }
     }
 }
@@ -903,12 +924,12 @@ impl SweepContext {
             })
             .collect();
         due.sort_by_key(|(why, ..)| *why);
-        let mut pass = PassState::default();
+        let mut pass = PassState::Patient;
         for (why, epoch, index, candidate) in due {
             if self.stop.is_cancelled() {
                 return;
             }
-            if pass.at_cap && why == Due::Retry {
+            if pass == PassState::AtCap && why == Due::Retry {
                 set_step(steps, index, SweepStep::Deferred);
                 continue;
             }
@@ -923,7 +944,8 @@ impl SweepContext {
     /// Pulls one file that is `why` due. A pull that does not answer within
     /// the pass's patience ([`PULL_PATIENCE`] until one pull ran out of it,
     /// [`PULL_GRACE`] after) moves to the background if its server has a slot;
-    /// otherwise it is cancelled, counted as a timeout, and `at_cap` set.
+    /// otherwise it is cancelled without counting as a failure and the pass
+    /// is [`PassState::AtCap`].
     async fn pull_one(
         &self,
         why: Due,
@@ -965,7 +987,9 @@ impl SweepContext {
         {
             return SweepStep::Synced;
         }
-        if why == Due::Epoch && !self.memo.take_epoch_pull(&resynced.server, Instant::now()) {
+        if why == Due::Epoch
+            && self.memo.take_epoch_pull(&resynced.server, Instant::now()) == EpochBudget::Exhausted
+        {
             return SweepStep::Synced;
         }
         let mut pull: BoxedPull = Box::pin(run_pull(
@@ -976,7 +1000,7 @@ impl SweepContext {
         ));
         let waited = timeout(pass.patience(), &mut pull).await;
         if waited.is_err() {
-            pass.paid_patience = true;
+            *pass = pass.after_expiry();
         }
         match waited {
             Ok(outcome) => {
@@ -990,7 +1014,7 @@ impl SweepContext {
                 }
                 Err(claim) => {
                     drop((pull, claim));
-                    pass.at_cap = true;
+                    *pass = PassState::AtCap;
                     SweepStep::GaveUp
                 }
             },

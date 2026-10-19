@@ -48,9 +48,7 @@ impl ServerArgs {
     ) -> Result<Self, InvalidServerArgs> {
         Self::try_from(args.into_iter().map(Into::into).collect::<Vec<String>>())
     }
-}
 
-impl ServerArgs {
     /// Arguments written as literals in the source.
     ///
     /// # Panics

@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::pull_tests::{Fixture, answer, error_item, full_report, next_pull_request};
-use super::sweep::{Interest, SweepContext, SweepMemo, SweepStep};
+use super::sweep::{EpochBudget, Interest, SweepContext, SweepMemo, SweepStep};
 use super::*;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::translator::testing::*;
@@ -930,13 +930,19 @@ fn test_epoch_driven_pulls_are_budgeted_per_window() {
     let start = tokio::time::Instant::now();
 
     let granted = (0..20)
-        .filter(|_| memo.take_epoch_pull(&rust, start))
+        .filter(|_| memo.take_epoch_pull(&rust, start) == EpochBudget::Granted)
         .count();
 
     assert_eq!(granted, 8);
-    assert!(memo.take_epoch_pull(&other, start));
-    assert!(!memo.take_epoch_pull(&rust, start + Duration::from_millis(1999)));
-    assert!(memo.take_epoch_pull(&rust, start + Duration::from_secs(2)));
+    assert_eq!(memo.take_epoch_pull(&other, start), EpochBudget::Granted);
+    assert_eq!(
+        memo.take_epoch_pull(&rust, start + Duration::from_millis(1999)),
+        EpochBudget::Exhausted
+    );
+    assert_eq!(
+        memo.take_epoch_pull(&rust, start + Duration::from_secs(2)),
+        EpochBudget::Granted
+    );
 }
 
 /// An epoch-driven pull that is not sent leaves the window's budget alone.
@@ -969,7 +975,10 @@ async fn test_an_epoch_pull_that_finds_the_file_moved_spends_no_budget() {
     context.pull_due(candidates, &mut steps).await;
 
     let granted = (0..20)
-        .filter(|_| memo.take_epoch_pull(&Fixture::rust(), tokio::time::Instant::now()))
+        .filter(|_| {
+            memo.take_epoch_pull(&Fixture::rust(), tokio::time::Instant::now())
+                == EpochBudget::Granted
+        })
         .count();
     assert_eq!(granted, 8);
 }
