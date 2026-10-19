@@ -55,6 +55,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
 | 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730 |
+| 019 | [[mcp/019-mcp-registry-listing/spec\|mcp-registry-listing]] | research (competitor-gap) | P4 | draft | #813 |
 
 ## bridge
 
