@@ -5,8 +5,8 @@
 //! it derives `description` text from rustdoc, including `# Examples` code.
 //! [`shape_tool_schemas`] runs once on the assembled router and shortens that
 //! text: rustdoc sections and code fences are cut, a description keeps its
-//! first paragraph up to a byte cap, and a definition that several tools carry
-//! keeps only a one-line form. It changes `description` annotations only, so
+//! first paragraph up to a byte cap (whole sentences, or nothing), and a
+//! definition that several tools carry keeps only a one-line form. It changes `description` annotations only, so
 //! property names, types, `required` lists and `$ref`s are untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,10 +29,13 @@ const SHARED_NESTED_DESCRIPTION_CAP: DescriptionCap = DescriptionCap::dropping(2
 
 const DEFINITIONS_KEY: &str = "$defs";
 
+/// Spellings whose trailing full stop does not end a sentence.
+const ABBREVIATIONS: [&str; 5] = ["e.g.", "i.e.", "etc.", "vs.", "cf."];
+
 /// What happens to a first paragraph longer than the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Overflow {
-    /// Cut at the last sentence end, else the last word boundary.
+    /// Keep the longest run of whole sentences within the cap, else nothing.
     Truncate,
     /// Remove the description; a cut one-liner would mislead more than none.
     Drop,
@@ -61,29 +64,53 @@ impl DescriptionCap {
     }
 
     /// The first paragraph of `text` without rustdoc sections, cut to the cap
-    /// at the last sentence end, else the last word boundary, never inside a
-    /// backtick span; or nothing, for a cap that drops.
-    fn shorten(self, text: &str) -> String {
+    /// after the last whole sentence that fits; `None` when nothing fits, for
+    /// a cap that drops, or when there is no text.
+    fn shorten(self, text: &str) -> Option<String> {
         let paragraph = first_paragraph(without_rustdoc_sections(text));
         if paragraph.len() <= self.bytes {
-            return paragraph.to_owned();
+            return (!paragraph.is_empty()).then(|| paragraph.to_owned());
         }
-        if self.overflow == Overflow::Drop {
-            return String::new();
+        match self.overflow {
+            Overflow::Drop => None,
+            Overflow::Truncate => {
+                whole_sentences(paragraph, self.bytes).map(std::borrow::ToOwned::to_owned)
+            }
         }
-        let window = &paragraph[..paragraph.floor_char_boundary(self.bytes)];
-        let cut = window
-            .rmatch_indices(['.', '!', '?'])
-            .map(|(index, mark)| index.saturating_add(mark.len()))
-            .find(|end| paragraph[*end..].starts_with(char::is_whitespace))
-            .or_else(|| window.rfind(char::is_whitespace))
-            .unwrap_or(window.len());
-        let mut shortened = paragraph[..cut].trim_end();
-        while shortened.matches('`').count() % 2 == 1 {
-            shortened = shortened[..shortened.rfind('`').unwrap_or(0)].trim_end();
-        }
-        shortened.to_owned()
     }
+}
+
+/// Whether `text` ends a sentence: a `.`, `!` or `?` (optionally closed by
+/// `)`) that is no abbreviation, with every backtick span and parenthesis
+/// closed.
+///
+/// A description whose only sentence within the cap ends in an abbreviation
+/// is therefore removed rather than cut mid-sentence; the golden-surface tests
+/// catch it, so such a first sentence is rewritten at its source.
+fn ends_sentence(text: &str) -> bool {
+    let text = text.trim_end();
+    let stop = text.strip_suffix(')').unwrap_or(text);
+    stop.ends_with(['.', '!', '?'])
+        && !ABBREVIATIONS.iter().any(|abbreviation| {
+            stop.strip_suffix(abbreviation)
+                .is_some_and(|rest| !rest.ends_with(char::is_alphanumeric))
+        })
+        && text.matches('`').count().is_multiple_of(2)
+        && text.matches('(').count() == text.matches(')').count()
+}
+
+/// The longest prefix of `paragraph` within `cap` bytes that ends a sentence
+/// followed by whitespace.
+fn whole_sentences(paragraph: &str, cap: usize) -> Option<&str> {
+    let window = &paragraph[..paragraph.floor_char_boundary(cap)];
+    window
+        .rmatch_indices(['.', '!', '?'])
+        .map(|(index, mark)| index.saturating_add(mark.len()))
+        .map(|end| end.saturating_add(usize::from(window[end..].starts_with(')'))))
+        .find(|end| {
+            paragraph[*end..].starts_with(char::is_whitespace) && ends_sentence(&paragraph[..*end])
+        })
+        .map(|end| &paragraph[..end])
 }
 
 /// `text` up to the first line that opens a rustdoc section (`# Examples`,
@@ -115,12 +142,10 @@ impl Transform for ShortenDescriptions {
         let Some(Value::String(description)) = object.get("description") else {
             return;
         };
-        let shortened = self.0.shorten(description);
-        if shortened.is_empty() {
-            object.remove("description");
-        } else {
-            object.insert("description".to_owned(), Value::String(shortened));
-        }
+        match self.0.shorten(description) {
+            Some(shortened) => object.insert("description".to_owned(), Value::String(shortened)),
+            None => object.remove("description"),
+        };
     }
 }
 
@@ -202,8 +227,7 @@ fn shape_shared_definition(definition: &mut Schema) {
     let own = definition
         .as_object()
         .and_then(|object| object.get("description")?.as_str())
-        .map(|text| SHARED_DEFINITION_DESCRIPTION_CAP.shorten(text))
-        .filter(|text| !text.is_empty());
+        .and_then(|text| SHARED_DEFINITION_DESCRIPTION_CAP.shorten(text));
     RecursiveTransform(ShortenDescriptions(SHARED_NESTED_DESCRIPTION_CAP)).transform(definition);
     if let Some(object) = definition.as_object_mut() {
         match own {
@@ -228,41 +252,84 @@ mod tests {
     #[test]
     fn test_shorten_keeps_first_paragraph() {
         let cap = DescriptionCap::truncating(100);
-        assert_eq!(cap.shorten("First.\n\nSecond paragraph."), "First.");
-        assert_eq!(cap.shorten("Short"), "Short");
+        assert_eq!(
+            cap.shorten("First.\n\nSecond paragraph.").unwrap(),
+            "First."
+        );
+        assert_eq!(cap.shorten("Short").unwrap(), "Short");
+        assert_eq!(cap.shorten(""), None);
     }
 
     #[test]
     fn test_shorten_cuts_at_a_sentence_end_within_the_cap() {
         let cap = DescriptionCap::truncating(40);
         let text = "One sentence here. Another sentence that runs well past the cap.";
-        assert_eq!(cap.shorten(text), "One sentence here.");
+        assert_eq!(cap.shorten(text).unwrap(), "One sentence here.");
     }
 
     #[test]
-    fn test_shorten_cuts_at_a_word_boundary_without_a_sentence_end() {
+    fn test_shorten_keeps_the_longest_run_of_whole_sentences() {
+        let cap = DescriptionCap::truncating(30);
+        let text = "One. Two. Three is a long one. Four.";
+        assert_eq!(cap.shorten(text).unwrap(), "One. Two. Three is a long one.");
+    }
+
+    #[test]
+    fn test_shorten_drops_a_paragraph_without_a_sentence_end_within_the_cap() {
         let cap = DescriptionCap::truncating(12);
-        assert_eq!(cap.shorten("alpha beta gamma delta"), "alpha beta");
+        assert_eq!(cap.shorten("alpha beta gamma delta"), None);
+        assert_eq!(
+            DescriptionCap::truncating(20).shorten("A long first sentence that overflows. Next."),
+            None
+        );
     }
 
     #[test]
-    fn test_shorten_never_leaves_an_open_backtick_span() {
-        let cap = DescriptionCap::truncating(20);
-        let shortened = cap.shorten("Use the `positions_degraded` field when present");
-        assert_eq!(shortened.matches('`').count() % 2, 0, "{shortened}");
+    fn test_shorten_never_cuts_after_an_abbreviation() {
+        let cap = DescriptionCap::truncating(40);
+        assert_eq!(
+            cap.shorten("A name (function, class, etc.) or a number that runs long."),
+            None
+        );
+        assert_eq!(
+            cap.shorten("Outside every root (e.g. the stdlib) and more text."),
+            None
+        );
+        assert_eq!(
+            cap.shorten("Takes a kind, vs. a name. Second sentence is long.")
+                .unwrap(),
+            "Takes a kind, vs. a name."
+        );
+    }
+
+    #[test]
+    fn test_ends_sentence_requires_closed_spans_and_a_real_stop() {
+        assert!(ends_sentence("A whole sentence."));
+        assert!(ends_sentence("A sentence (with an aside.)"));
+        assert!(ends_sentence("Says `x`!"));
+        assert!(!ends_sentence("Ends with a comma,"));
+        assert!(!ends_sentence("Ends with a colon:"));
+        assert!(!ends_sentence("Open `span."));
+        assert!(!ends_sentence("Open (paren."));
+        assert!(!ends_sentence("Lists kinds (function, class, etc.)"));
+        assert!(!ends_sentence("Outside a root (e.g."));
+        assert!(ends_sentence("Ends here, i.e. whole."));
     }
 
     #[test]
     fn test_shorten_never_splits_a_multibyte_character() {
         let cap = DescriptionCap::truncating(5);
-        assert_eq!(cap.shorten("ééééé ééééé"), "éé");
+        assert_eq!(cap.shorten("ééééé ééééé"), None);
+        assert_eq!(cap.shorten("éé. ééééé").unwrap(), "éé.");
     }
 
     #[test]
     fn test_shorten_is_idempotent() {
         let cap = DescriptionCap::truncating(30);
-        let once = cap.shorten("A fairly long description. With a second sentence in it.");
-        assert_eq!(cap.shorten(&once), once);
+        let once = cap
+            .shorten("A fairly long description. With a second sentence in it.")
+            .unwrap();
+        assert_eq!(cap.shorten(&once).unwrap(), once);
     }
 
     #[test]
@@ -617,5 +684,108 @@ mod tests {
                 before.name
             );
         }
+    }
+
+    #[test]
+    fn test_every_published_description_is_a_whole_sentence() {
+        let mut broken = Vec::new();
+        for tool in shaped_tools() {
+            for schema in schemas_of(&tool) {
+                for_each_description(&Value::Object(schema.clone()), "", &mut |path, text| {
+                    if !ends_sentence(text) {
+                        broken.push(format!("{}{path}: {text:?}", tool.name));
+                    }
+                });
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "descriptions that are not whole sentences:\n{}",
+            broken.join("\n")
+        );
+    }
+
+    /// Spec mcp/014 FR-010: shaping may drop a description only through a
+    /// drop cap on a shared definition, never because a first sentence is too
+    /// long for the truncating cap.
+    #[test]
+    fn test_the_truncating_cap_removes_no_description() {
+        let unshaped = McplsServer::unshaped_tool_router().list_all();
+        let shaped = shaped_tools();
+        let refs: Vec<&Tool> = unshaped.iter().collect();
+        let usage = {
+            let mut tools: Vec<Tool> = refs.iter().map(|tool| (*tool).clone()).collect();
+            DefinitionUsage::count(&tools.iter_mut().collect::<Vec<_>>())
+        };
+        let mut lost = Vec::new();
+        for (before, after) in unshaped.iter().zip(&shaped) {
+            for (old, new) in schemas_of(before).zip(schemas_of(after)) {
+                let mut kept = BTreeSet::new();
+                for_each_description(&Value::Object(new.clone()), "", &mut |path, _| {
+                    kept.insert(path.to_owned());
+                });
+                for_each_description(&Value::Object(old.clone()), "", &mut |path, text| {
+                    let in_shared = path
+                        .strip_prefix("/$defs/")
+                        .and_then(|rest| rest.split('/').next())
+                        .is_some_and(|name| usage.is_shared(name));
+                    let has_text = !first_paragraph(without_rustdoc_sections(text)).is_empty();
+                    if has_text && !in_shared && !kept.contains(path) {
+                        lost.push(format!("{}{path}", before.name));
+                    }
+                });
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "descriptions removed by the truncating cap:\n{}",
+            lost.join("\n")
+        );
+    }
+
+    /// Facts a client needs that only the first sentence can publish (shaping
+    /// keeps nothing after it): every description containing the marker must
+    /// also contain the fact, and at least one must exist.
+    #[test]
+    fn test_published_descriptions_keep_their_key_facts() {
+        const FACTS: [(&str, &str); 9] = [
+            (
+                "keep only symbols inside a container",
+                "type, impl, class, module",
+            ),
+            ("Extra context:", "one request per file"),
+            ("symbol kind filter", "function, class"),
+            ("`pending` or `evicted`", "not a clean file"),
+            ("workspace root (stdlib", "not provably inside"),
+            ("`character` offsets are inexact", "non-UTF-16"),
+            ("capped below", "response"),
+            ("Refused before", "keeps serving"),
+            ("Another restart of this server", "none was repeated"),
+        ];
+        let tools = shaped_tools();
+        let mut published = Vec::new();
+        for tool in &tools {
+            for schema in schemas_of(tool) {
+                for_each_description(&Value::Object(schema.clone()), "", &mut |_, text| {
+                    published.push(text.to_owned());
+                });
+            }
+        }
+        for (marker, fact) in FACTS {
+            let carrying: Vec<&String> = published.iter().filter(|t| t.contains(marker)).collect();
+            assert!(!carrying.is_empty(), "no description carries {marker:?}");
+            for text in carrying {
+                assert!(text.contains(fact), "{marker:?} lost {fact:?}: {text:?}");
+            }
+        }
+        let restart = tools
+            .iter()
+            .find(|tool| tool.name == "restart_server")
+            .unwrap();
+        let text = restart.description.as_deref().unwrap();
+        assert!(
+            text.contains("`refused` means nothing was stopped"),
+            "{text}"
+        );
     }
 }

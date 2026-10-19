@@ -28,9 +28,10 @@ use crate::lsp::{LspClient, UnclassifiedError};
 
 /// The timeout applied to a request carrying these params.
 ///
-/// Every request sent through [`PositionedCall`] or [`DisclosedDocument`]
-/// reads its timeout here, so a request kind with its own budget (completion)
-/// cannot lose it on one of the two paths.
+/// Every request sent through [`PositionedCall`], [`DisclosedDocument`] or
+/// [`budgeted`] (the workspace symbol search in `symbols.rs` and the code action
+/// resolve in `edits.rs`) reads its timeout here, so a request kind with its
+/// own budget (completion) cannot lose it on one of the paths.
 pub(super) trait RequestTimeout {
     /// The timeout for this request on `client`.
     fn timeout(client: &LspClient) -> Duration {

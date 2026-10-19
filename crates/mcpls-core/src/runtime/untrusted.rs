@@ -24,10 +24,10 @@ use crate::error::{
 };
 use crate::lsp::command_path::ResolvedCommand;
 use crate::lsp::launcher::WrapperKind;
-use crate::lsp::vetting::{UntrustedVetting, refuse_workspace_executable_arguments};
+use crate::lsp::vetting::UntrustedVetting;
 use crate::lsp::{
-    self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, launcher, process_env,
-    tsserver_pin,
+    self, ChildWorkingDir, ManagedEnvVar, ParentEnv, ServerInitConfig, SpawnTrust, launcher,
+    process_env, tsserver_pin,
 };
 use crate::redaction::Redactions;
 
@@ -452,8 +452,12 @@ fn admit(
     }
 
     let selected = tsserver_pin::with_selected_typescript_server(lsp_config, roots, process_env);
-    let (effective, working_dir, vetting) = match mode {
-        PlanMode::Trusted => (selected.into_owned(), ChildWorkingDir::Inherit, None),
+    let (effective, working_dir, trust) = match mode {
+        PlanMode::Trusted => (
+            selected.into_owned(),
+            ChildWorkingDir::Inherit,
+            SpawnTrust::Trusted,
+        ),
         PlanMode::Untrusted {
             boundary,
             login_home,
@@ -462,20 +466,17 @@ fn admit(
             let hardened = harden_for_untrusted(selected, boundary, login_home, &process_env)
                 .map_err(configured)?;
             let working_dir = untrusted_working_dir(boundary, login_home).map_err(configured)?;
-            refuse_workspace_executable_arguments(
-                &lsp_config.args,
-                boundary,
-                &working_dir,
-                lsp_config.env.host(),
-            )
-            .map_err(configured)?;
             let vetting = UntrustedVetting::new(boundary.clone(), configured_command.clone());
-            (hardened, working_dir, Some(vetting))
+            vetting
+                .boundary()
+                .refuse_arguments(&lsp_config.args, &working_dir, lsp_config.env.host())
+                .map_err(configured)?;
+            (hardened, working_dir, SpawnTrust::Untrusted(vetting))
         }
     };
     let command = effective.command.server_command().clone();
     let plan = tsserver_pin::plan_typescript(effective, process_env);
-    if let Some(vetting) = &vetting {
+    if let Some(vetting) = trust.vetting() {
         plan.vet_untrusted(vetting)
             .map_err(|refusal| (command, refusal))?;
     }
@@ -489,11 +490,8 @@ fn admit(
         config.workspace.position_encodings.clone(),
         Arc::clone(redactions),
     )
-    .with_child_working_dir(working_dir);
-    let init = match vetting {
-        Some(vetting) => init.with_untrusted(vetting),
-        None => init,
-    };
+    .with_child_working_dir(working_dir)
+    .with_trust(trust);
     Ok(match pinned {
         Some(tsserver) => init.with_auto_pin(tsserver),
         None => init,
@@ -743,9 +741,8 @@ mod plan_tests {
         let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&workspace)).unwrap();
         let cwd = ChildWorkingDir::Fixed(outside);
         let refuse = |arg: &Path, host| {
-            refuse_workspace_executable_arguments(
+            crate::lsp::vetting::UntrustedBoundary::new(roots.clone()).refuse_arguments(
                 &[arg.to_string_lossy().into_owned()],
-                &roots,
                 &cwd,
                 host,
             )
@@ -2008,12 +2005,8 @@ mod plan_tests {
             executable(&srv);
             let args = vec!["../ws/bin/srv".to_owned()];
 
-            let refusal = refuse_workspace_executable_arguments(
-                &args,
-                &fx.roots,
-                &ChildWorkingDir::Fixed(fx.outside.clone()),
-                HostOs::Other,
-            );
+            let refusal = crate::lsp::vetting::UntrustedBoundary::new(fx.roots.clone())
+                .refuse_arguments(&args, &ChildWorkingDir::Fixed(fx.outside), HostOs::Other);
 
             assert_eq!(
                 refusal,

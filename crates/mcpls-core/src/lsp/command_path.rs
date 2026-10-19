@@ -89,15 +89,20 @@ pub fn or_system_path(host: HostOs, path_var: OsString, parent_env: impl ParentE
     if !path_var.is_empty() {
         return path_var;
     }
-    let dirs = match host {
-        HostOs::Windows => vec![
-            PathBuf::from(parent_env("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
-                .join("System32"),
-        ],
-        HostOs::Other => vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-    };
-    std::env::join_paths(dirs).unwrap_or_default()
+    match host {
+        HostOs::Windows => {
+            let system =
+                PathBuf::from(parent_env("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+                    .join("System32");
+            // `join_paths` refuses a `SystemRoot` holding the separator or a quote.
+            std::env::join_paths([system])
+                .unwrap_or_else(|_| OsString::from(WINDOWS_SYSTEM_PATH_FALLBACK))
+        }
+        HostOs::Other => OsString::from("/usr/bin:/bin"),
+    }
 }
+
+const WINDOWS_SYSTEM_PATH_FALLBACK: &str = "C:\\Windows\\System32";
 
 #[cfg(test)]
 mod tests {
@@ -121,6 +126,14 @@ mod tests {
             PathBuf::from("/win").join("System32").into_os_string()
         );
         assert!(other.to_string_lossy().contains("/usr/bin"));
+    }
+
+    #[test]
+    fn test_or_system_path_falls_back_when_system_root_cannot_be_joined() {
+        let rejected = or_system_path(HostOs::Windows, OsString::new(), |key| {
+            (key == "SystemRoot").then(|| OsString::from("C:\\a\"b"))
+        });
+        assert_eq!(rejected, OsString::from(WINDOWS_SYSTEM_PATH_FALLBACK));
     }
 
     #[test]

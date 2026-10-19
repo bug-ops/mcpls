@@ -46,7 +46,9 @@ related:
 > - **Pump re-wiring (FR-009):** the diagnostics pump is re-wired on restart and the push-degraded
 >   flag is cleared. Automatic crash respawn keeps discarding notifications (a follow-up).
 > - **Cooldown and backoff (FR-008):** a manual restart bypasses the crash-loop backoff; the same
->   server is throttled for 5 s (`throttled { retry_in_ms }`).
+>   server is throttled for 5 s (`throttled { retry_in_ms }`). A restart refused before the old
+>   process was stopped (`failed` with reason `refused`) does not start the cooldown, so a retry
+>   after the cause is fixed is evaluated afresh (#815).
 > - **Annotations (FR-010):** `read_only_hint = false`, `destructive_hint = true`,
 >   `idempotent_hint = false` (each repeat tears down and respawns a process). Destructive
 >   because the group kill also kills shared daemons (Gradle, Bloop) that other clients may be

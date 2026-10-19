@@ -3,12 +3,14 @@
 //!
 //! The schedule (interval, subscribed files, companions, per-server jobs)
 //! belongs to `runtime::disk_sweep`; this module is the unit it runs per
-//! server: [`SweepContext::run`].
+//! server: [`SweepContext::run_job`].
 //!
 //! A job resyncs every file it was given first, which is all the schedule
 //! waits for, then hands the subscribed files that are due to a pull pass
-//! that runs in the background, one pass per server at a time. A pull that has
-//! not answered after [`PULL_PATIENCE`] moves out of the pass, to wait in the
+//! that runs in the background, one pass per server at a time. A job that finds
+//! its server's pass still running queues the files that are due for that pass
+//! to pull next, at most [`MAX_QUEUED_PULLS_PER_SERVER`] of them (#809). A pull
+//! that has not answered after [`PULL_PATIENCE`] moves out of the pass, to wait in the
 //! background where at most [`MAX_DETACHED_PULLS_PER_SERVER`] may wait per
 //! server, so one unanswered pull delays only its own file. Once a pull ran
 //! out of patience, the pass waits only [`PULL_GRACE`] for each pull after it,
@@ -17,7 +19,7 @@
 //! failure, and the retries wait for a later tick. A pass never delays the
 //! resync of the next tick.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -31,18 +33,18 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{PullSupport, Translator};
 use crate::bridge::notifications::DocumentStamp;
-use crate::bridge::state::{ContentDigest, SweepState};
+use crate::bridge::state::SweepState;
 use crate::bridge::translator::routing::PreparedDocument;
 use crate::bridge::translator::save_support::SaveSupport;
 use crate::bridge::{Access, ClientPath, NotificationCache, WorkspacePath};
 use crate::config::{ServerId, ToolKind, WorkspaceTrust};
 use crate::error::{Error, ErrorChain};
 use crate::lsp::LspClient;
-use crate::util::lock_std;
+use crate::util::{catch_panic, lock_std};
 
 /// Time between two sweeps.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
@@ -74,6 +76,10 @@ pub const MAX_FAILED_PULLS_PER_STATE: u8 = 3;
 /// Memo entries kept for files the sweep no longer visits, so a later visit
 /// still compares with what the sweep last saw of them.
 const MAX_MEMO_TOMBSTONES: usize = MAX_COMPANION_FILES;
+
+/// Most due files per server that wait for the running pull pass to pull
+/// them: one tick's worth, so a drained queue is never larger than one pass.
+const MAX_QUEUED_PULLS_PER_SERVER: usize = MAX_SWEPT_FILES_PER_TICK;
 
 /// A counter of the content changes the sweep observed on one server's files.
 ///
@@ -200,6 +206,17 @@ impl Attempt {
     }
 }
 
+/// Counts the sweep's ticks, so the memo can tell the files visited most
+/// recently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+struct SweepTick(u64);
+
+impl SweepTick {
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
 /// Whether a content change moved a file's text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Content {
@@ -228,8 +245,14 @@ impl Change {
 
 /// Identifies one claim on a file's pull, so a claim that outlived its memo
 /// entry cannot touch the entry of a later one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ClaimId(u64);
+
+impl ClaimId {
+    const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
 
 /// Where an outstanding pull waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,15 +278,13 @@ enum FilePull {
 #[derive(Debug, Clone)]
 struct FileMemo {
     server: ServerId,
-    seen: DocumentStamp,
-    /// The digest of the text the server was told when `seen` was recorded;
-    /// `None` when the sweep could not read it, which compares as different.
-    digest: Option<ContentDigest>,
+    /// What the server was told of the file when the sweep last visited it.
+    seen: SweepState,
     pull: FilePull,
     /// Whether a `didSave` for the last change is still to be sent.
     save: SaveDebt,
     /// The tick of the last visit.
-    last_tick: u64,
+    last_tick: SweepTick,
 }
 
 /// Whether the server still has to be told that a changed file was saved.
@@ -302,10 +323,41 @@ struct MemoState {
     files: HashMap<PathBuf, FileMemo>,
     epochs: HashMap<ServerId, SweepEpoch>,
     budgets: HashMap<ServerId, PullBudget>,
-    next_claim: u64,
-    tick: u64,
+    next_claim: ClaimId,
+    tick: SweepTick,
     /// Servers with a pull pass running.
     pulling: HashSet<ServerId>,
+    /// The files a job found due while its server's pass ran, for that pass to
+    /// pull next; keyed by path, so the newest resync of a file wins.
+    queued: HashMap<ServerId, BTreeMap<PathBuf, Resynced>>,
+}
+
+impl MemoState {
+    /// The memo entry whose pull `ticket` holds, with the attempt it restores,
+    /// while that claim is the one outstanding.
+    fn held_mut(&mut self, ticket: &ClaimTicket) -> Option<(&mut FileMemo, Attempt)> {
+        let memo = self.files.get_mut(&ticket.path)?;
+        match memo.pull {
+            FilePull::Outstanding {
+                previous, claim, ..
+            } if claim == ticket.id => Some((memo, previous)),
+            FilePull::Outstanding { .. } | FilePull::Idle(_) => None,
+        }
+    }
+
+    /// Why `path` is due for a pull at `current` and `epoch`, if it is and no
+    /// pull of it is outstanding.
+    fn due(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> Option<Due> {
+        match self.files.get(path)?.pull {
+            FilePull::Idle(attempt) => attempt.due(current, epoch),
+            FilePull::Outstanding { .. } => None,
+        }
+    }
+
+    /// The epoch of `server`'s files.
+    fn epoch(&self, server: &ServerId) -> SweepEpoch {
+        self.epochs.get(server).copied().unwrap_or_default()
+    }
 }
 
 /// The document state each file was last seen at by the sweep, and the pull
@@ -365,17 +417,78 @@ impl Drop for PullClaim {
 }
 
 /// The right to run the pull pass of one server; there is one at a time.
+///
+/// The pass keeps the right until [`Self::next_batch`] finds nothing queued,
+/// which releases it under the lock that found the queue empty, so a file
+/// queued meanwhile is never left without a pass. Dropping the pass earlier
+/// releases it too and leaves the queue to the next pass.
 #[derive(Debug)]
 #[must_use = "dropping the pass lets the next one start"]
-struct PullPass {
+pub(super) struct PullPass {
     memo: SweepMemo,
-    server: ServerId,
+    /// `None` once the pass released its right.
+    server: Option<ServerId>,
+}
+
+impl PullPass {
+    /// Puts back the files this pass took from the queue and did not pull, so
+    /// the next pass pulls them instead of leaving them to their next visit.
+    fn requeue(&self, candidates: Vec<PullCandidate>) {
+        if let Some(server) = &self.server {
+            self.memo.requeue(server, candidates);
+        }
+    }
+
+    /// The files queued since the pass last looked, or `None` after releasing
+    /// the right to run a pass when there are none.
+    fn next_batch(&mut self) -> Option<Vec<PullCandidate>> {
+        let server = self.server.as_ref()?;
+        let mut state = lock_std(&self.memo.0);
+        let queued = state
+            .queued
+            .remove(server)
+            .filter(|queue| !queue.is_empty());
+        if queued.is_none() {
+            state.pulling.remove(server);
+        }
+        drop(state);
+        let Some(queue) = queued else {
+            self.server = None;
+            return None;
+        };
+        Some(queue.into_iter().map(PullCandidate::from).collect())
+    }
 }
 
 impl Drop for PullPass {
     fn drop(&mut self) {
-        lock_std(&self.memo.0).pulling.remove(&self.server);
+        if let Some(server) = self.server.take() {
+            lock_std(&self.memo.0).pulling.remove(&server);
+        }
     }
+}
+
+/// What a job found when it offered its pull candidates to a server.
+#[derive(Debug)]
+pub(super) enum PassStart {
+    /// No pass ran: the job runs one, over its own candidates first, then the
+    /// `leftovers` an earlier pass that ended early left queued.
+    Started {
+        pass: PullPass,
+        leftovers: Vec<PullCandidate>,
+    },
+    /// A pass runs: the candidates that are due went to its queue, or were
+    /// refused because it is full; the others need no pull.
+    Queued(Vec<(usize, Deferral)>),
+}
+
+/// Why a failed `detach` handed the claim back.
+#[derive(Debug)]
+enum DetachRefused {
+    /// The server has no background slot left.
+    CapFull(PullClaim),
+    /// The claim no longer holds the file's pull.
+    NotHeld(PullClaim),
 }
 
 /// What claiming a file's pull found.
@@ -389,21 +502,72 @@ enum ClaimResult {
 }
 
 impl SweepMemo {
-    /// Takes the right to run a pull pass for `server`, when none runs.
-    fn begin_pull_pass(&self, server: &ServerId) -> Option<PullPass> {
-        lock_std(&self.0)
-            .pulling
-            .insert(server.clone())
-            .then(|| PullPass {
-                memo: self.clone(),
-                server: server.clone(),
-            })
+    /// Takes the right to run a pull pass for `server` when none runs, with
+    /// the files an earlier pass left queued, minus those `candidates` replace.
+    /// Otherwise queues the `candidates` that are due for the running pass.
+    ///
+    /// Only files that are due are queued, so idle files cannot crowd out an
+    /// edited one; a due file that does not fit stays due for its next visit.
+    pub(super) fn begin_or_queue(
+        &self,
+        server: &ServerId,
+        candidates: &[(usize, PullCandidate)],
+    ) -> PassStart {
+        let mut state = lock_std(&self.0);
+        if state.pulling.insert(server.clone()) {
+            let mut leftovers = state.queued.remove(server).unwrap_or_default();
+            drop(state);
+            for (_, candidate) in candidates {
+                leftovers.remove(&candidate.path);
+            }
+            return PassStart::Started {
+                pass: PullPass {
+                    memo: self.clone(),
+                    server: Some(server.clone()),
+                },
+                leftovers: leftovers.into_iter().map(PullCandidate::from).collect(),
+            };
+        }
+        let mut deferrals = Vec::new();
+        for (index, candidate) in candidates {
+            let PullCandidate { path, resynced } = candidate;
+            let epoch = state.epoch(server);
+            if state.due(path, resynced.current, epoch).is_none() {
+                continue;
+            }
+            let queue = state.queued.entry(server.clone()).or_default();
+            if queue.contains_key(path) || queue.len() < MAX_QUEUED_PULLS_PER_SERVER {
+                queue.insert(path.clone(), resynced.clone());
+                deferrals.push((*index, Deferral::Queued));
+            } else {
+                deferrals.push((*index, Deferral::QueueFull));
+            }
+        }
+        drop(state);
+        PassStart::Queued(deferrals)
+    }
+
+    /// Queues the `candidates` a pass took and did not pull, with the rules
+    /// of [`Self::begin_or_queue`]; a newer entry of the same path stays.
+    fn requeue(&self, server: &ServerId, candidates: Vec<PullCandidate>) {
+        let mut state = lock_std(&self.0);
+        for PullCandidate { path, resynced } in candidates {
+            let epoch = state.epoch(server);
+            if state.due(&path, resynced.current, epoch).is_none() {
+                continue;
+            }
+            let queue = state.queued.entry(server.clone()).or_default();
+            if queue.len() < MAX_QUEUED_PULLS_PER_SERVER {
+                queue.entry(path).or_insert(resynced);
+            }
+        }
+        drop(state);
     }
 
     /// Starts a new tick, which the visits that follow are stamped with.
     pub(crate) fn begin_tick(&self) {
         let mut state = lock_std(&self.0);
-        state.tick = state.tick.saturating_add(1);
+        state.tick = state.tick.next();
     }
 
     /// Records that `path` of `server` is at `after`, reached from `before`
@@ -418,34 +582,26 @@ impl SweepMemo {
     ) -> Change {
         let mut state = lock_std(&self.0);
         let tick = state.tick;
-        let (previous, previous_digest) = if let Some(memo) = state.files.get_mut(path) {
-            let previous = (Some(memo.seen), memo.digest);
-            memo.seen = after.stamp();
-            memo.digest = after.digest();
+        let previous = if let Some(memo) = state.files.get_mut(path) {
             memo.server = server.clone();
             memo.last_tick = tick;
-            previous
+            Some(std::mem::replace(&mut memo.seen, after))
         } else {
             state.files.insert(
                 path.to_path_buf(),
                 FileMemo {
                     server: server.clone(),
-                    seen: after.stamp(),
-                    digest: after.digest(),
+                    seen: after,
                     pull: FilePull::Idle(Attempt::NotPulled),
                     save: SaveDebt::Settled,
                     last_tick: tick,
                 },
             );
-            (
-                before.map(SweepState::stamp),
-                before.and_then(SweepState::digest),
-            )
+            before
         };
         let change = match previous {
-            Some(previous) if previous != after.stamp() => {
-                let same = previous_digest.is_some() && previous_digest == after.digest();
-                Change::Moved(if same {
+            Some(previous) if previous.stamp() != after.stamp() => {
+                Change::Moved(if previous.same_text(after) {
                     Content::Same
                 } else {
                     Content::Different
@@ -479,21 +635,13 @@ impl SweepMemo {
     }
 
     fn epoch(&self, server: &ServerId) -> SweepEpoch {
-        lock_std(&self.0)
-            .epochs
-            .get(server)
-            .copied()
-            .unwrap_or_default()
+        lock_std(&self.0).epoch(server)
     }
 
     /// Why `path` is due for a pull at `current` and `epoch`, if it is and no
     /// pull of it is outstanding.
     fn due(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> Option<Due> {
-        let pull = lock_std(&self.0).files.get(path)?.pull;
-        match pull {
-            FilePull::Idle(attempt) => attempt.due(current, epoch),
-            FilePull::Outstanding { .. } => None,
-        }
+        lock_std(&self.0).due(path, current, epoch)
     }
 
     /// Records that a pull of `current` would add nothing: the cache holds
@@ -512,7 +660,7 @@ impl SweepMemo {
     /// Takes the right to pull `path` at `current` and `epoch`.
     fn claim_pull(&self, path: &Path, current: DocumentStamp, epoch: SweepEpoch) -> ClaimResult {
         let mut state = lock_std(&self.0);
-        let id = ClaimId(state.next_claim);
+        let id = state.next_claim;
         let Some(memo) = state.files.get_mut(path) else {
             return ClaimResult::Settled;
         };
@@ -528,7 +676,7 @@ impl SweepMemo {
             claim: id,
             placement: Placement::Inline,
         };
-        state.next_claim = state.next_claim.saturating_add(1);
+        state.next_claim = id.next();
         drop(state);
         ClaimResult::Claimed(PullClaim {
             memo: self.clone(),
@@ -566,28 +714,19 @@ impl SweepMemo {
 
     /// Moves the pull `claim` holds into the background when its server has a
     /// slot for it; otherwise hands the claim back unchanged.
-    fn detach(&self, claim: PullClaim) -> Result<PullClaim, PullClaim> {
+    fn detach(&self, claim: PullClaim) -> Result<PullClaim, DetachRefused> {
         let mut state = lock_std(&self.0);
         let Some(ticket) = &claim.ticket else {
-            return Err(claim);
+            return Err(DetachRefused::NotHeld(claim));
         };
-        let Some(server) = state
-            .files
-            .get(&ticket.path)
-            .map(|memo| memo.server.clone())
-        else {
-            return Err(claim);
+        let Some(server) = state.held_mut(ticket).map(|(memo, _)| memo.server.clone()) else {
+            return Err(DetachRefused::NotHeld(claim));
         };
         if Self::detached_count(&state, &server) >= MAX_DETACHED_PULLS_PER_SERVER {
-            return Err(claim);
+            return Err(DetachRefused::CapFull(claim));
         }
-        if let Some(memo) = state.files.get_mut(&ticket.path)
-            && let FilePull::Outstanding {
-                claim: held,
-                placement,
-                ..
-            } = &mut memo.pull
-            && *held == ticket.id
+        if let Some((memo, _)) = state.held_mut(ticket)
+            && let FilePull::Outstanding { placement, .. } = &mut memo.pull
         {
             *placement = Placement::Detached;
         }
@@ -596,23 +735,13 @@ impl SweepMemo {
     }
 
     fn complete(&self, ticket: &ClaimTicket, outcome: PullOutcome) {
-        if let Some(memo) = lock_std(&self.0).files.get_mut(&ticket.path)
-            && let FilePull::Outstanding {
-                previous, claim, ..
-            } = memo.pull
-            && claim == ticket.id
-        {
+        if let Some((memo, previous)) = lock_std(&self.0).held_mut(ticket) {
             memo.pull = FilePull::Idle(previous.after(ticket.state, ticket.epoch, outcome));
         }
     }
 
     fn abort(&self, ticket: &ClaimTicket) {
-        if let Some(memo) = lock_std(&self.0).files.get_mut(&ticket.path)
-            && let FilePull::Outstanding {
-                previous, claim, ..
-            } = memo.pull
-            && claim == ticket.id
-        {
+        if let Some((memo, previous)) = lock_std(&self.0).held_mut(ticket) {
             memo.pull = FilePull::Idle(previous);
         }
     }
@@ -638,9 +767,10 @@ impl SweepMemo {
             files,
             epochs,
             budgets,
+            queued,
             ..
         } = &mut *state;
-        let mut tombstones: Vec<(u64, PathBuf)> = files
+        let mut tombstones: Vec<(SweepTick, PathBuf)> = files
             .iter()
             .filter(|(path, memo)| !keep(path) && matches!(memo.pull, FilePull::Idle(_)))
             .map(|(path, memo)| (memo.last_tick, path.clone()))
@@ -651,6 +781,12 @@ impl SweepMemo {
         }
         epochs.retain(|server, _| files.values().any(|memo| memo.server == *server));
         budgets.retain(|server, _| files.values().any(|memo| memo.server == *server));
+        queued.retain(|server, queue| {
+            queue.retain(|path, _| {
+                keep(path) && files.get(path).is_some_and(|memo| memo.server == *server)
+            });
+            !queue.is_empty()
+        });
         drop(state);
     }
 
@@ -678,6 +814,14 @@ impl SweepMemo {
         } else {
             EpochBudget::Exhausted
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_files(&self, server: &ServerId) -> usize {
+        lock_std(&self.0)
+            .queued
+            .get(server)
+            .map_or(0, BTreeMap::len)
     }
 
     #[cfg(test)]
@@ -714,15 +858,37 @@ pub enum SweepStep {
     /// in the background, so it was cancelled; it is not counted as a failure
     /// and the file stays due.
     GaveUp,
-    /// The pull is left for a later tick: the job already paid for an
-    /// unanswered pull at full cap.
-    Deferred,
+    /// The pull is left for a later tick, for the reason given.
+    Deferred(Deferral),
     /// The resync did not finish in time, so the server's queue is wedged;
     /// the job ended and its remaining files wait for a later tick.
     TimedOut,
 }
 
+/// Why a pull that is due waits for a later pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deferral {
+    /// The job already paid for an unanswered pull at full cap, so retries
+    /// wait.
+    AtCap,
+    /// Another pull of the file is outstanding.
+    Busy,
+    /// The file changed since the job resynced it; the next visit pulls it.
+    Moved,
+    /// The server spent the epoch-driven pulls of its window.
+    Throttled,
+    /// The server's pull pass runs; it pulls the file when it is done.
+    Queued,
+    /// The server's pull pass runs and its queue is full; the file stays due
+    /// for its next visit.
+    QueueFull,
+    /// The running pass already pulled this state of the file; a retry waits
+    /// for a later pass.
+    Tried,
+}
+
 /// A tracked file brought up to date with the disk, as the sweep left it.
+#[derive(Debug, Clone)]
 struct Resynced {
     server: ServerId,
     uri: Uri,
@@ -740,14 +906,72 @@ enum Bounded<T> {
 }
 
 /// A subscribed file that may be pulled after the resyncs of its job.
+#[derive(Debug)]
 pub(super) struct PullCandidate {
     path: PathBuf,
     resynced: Resynced,
 }
 
+impl From<(PathBuf, Resynced)> for PullCandidate {
+    fn from((path, resynced): (PathBuf, Resynced)) -> Self {
+        Self { path, resynced }
+    }
+}
+
+/// How a run of pulls ended.
+#[derive(Debug)]
+pub(super) enum Drained {
+    /// Every candidate that was due was reached.
+    All,
+    /// The server's queue is wedged or the sweep stopped. The candidates not
+    /// pulled are handed back, so a pass that took them from the queue can
+    /// put them back for the next pass.
+    Wedged(Vec<PullCandidate>),
+}
+
+impl Drained {
+    /// A run that stopped at `candidate`, with the candidates still behind it.
+    fn wedged(
+        candidate: PullCandidate,
+        rest: impl Iterator<Item = (Due, SweepEpoch, usize, PullCandidate)>,
+    ) -> Self {
+        Self::Wedged(
+            std::iter::once(candidate)
+                .chain(rest.map(|(.., candidate)| candidate))
+                .collect(),
+        )
+    }
+
+    /// The candidates the run left unpulled.
+    fn into_unpulled(self) -> Vec<PullCandidate> {
+        match self {
+            Self::All => Vec::new(),
+            Self::Wedged(rest) => rest,
+        }
+    }
+}
+
+/// What a task the sweep spawns does, for the log when it panics.
+#[derive(Debug, Clone, Copy)]
+enum SweepTask {
+    /// The pull pass of a server.
+    PullPass,
+    /// A pull that ran out of patience and finishes in the background.
+    DetachedPull,
+}
+
+/// The state of each file a pull pass sent a pull for, across all its
+/// batches, so a later batch does not ask again what the pass already asked: a
+/// pull is repeated by a later pass at the earliest.
+///
+/// Only pulls that were sent count; a file the pass declined (throttled,
+/// busy, moved) may still be pulled by a later batch of the same pass.
+#[derive(Debug, Default)]
+pub(super) struct PulledStates(HashMap<PathBuf, DocumentStamp>);
+
 /// What one pull pass has met so far.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum PassState {
+pub(super) enum PassState {
     /// No pull ran out of patience yet.
     #[default]
     Patient,
@@ -832,33 +1056,100 @@ impl SweepContext {
     #[cfg(test)]
     pub(crate) async fn run(&self, visits: Vec<(PathBuf, Interest)>) -> Vec<SweepStep> {
         let (mut steps, candidates) = self.resync_pass(&visits).await;
-        self.pull_due(candidates, &mut steps).await;
+        self.pull_due(candidates, &mut steps, &mut PulledStates::default())
+            .await;
         log_steps(&visits, &steps);
         steps
     }
 
-    /// As [`Self::run`], but returns once the files are resynced: the pulls
-    /// run in the background, unless the server's previous pull pass is still
-    /// running, in which case the files due stay due for a later tick.
+    /// Sweeps `visits` like a test's single-shot run, but returns once the
+    /// files are resynced: the pulls run in the background, in the server's
+    /// pull pass.
+    ///
+    /// When the server's previous pass is still running, the files that are
+    /// due are queued for it instead, so a pull waits for that pass and not
+    /// for the window to come round again (#809).
     pub(crate) async fn run_job(&self, visits: Vec<(PathBuf, Interest)>) {
         let (mut steps, candidates) = self.resync_pass(&visits).await;
-        // TODO(#809): a skipped pass drops its candidates, which wait a window cycle.
-        let pass = candidates
+        let Some(server) = candidates
             .first()
-            .and_then(|(_, candidate)| self.memo.begin_pull_pass(&candidate.resynced.server));
-        let Some(pass) = pass else {
+            .map(|(_, candidate)| candidate.resynced.server.clone())
+        else {
             log_steps(&visits, &steps);
             return;
         };
-        let context = self.clone();
-        self.pulls.spawn(async move {
-            let _pass = pass;
-            tokio::select! {
-                biased;
-                () = context.stop.cancelled() => {}
-                () = context.pull_due(candidates, &mut steps) => {}
+        match self.memo.begin_or_queue(&server, &candidates) {
+            PassStart::Queued(deferrals) => {
+                for (index, deferral) in deferrals {
+                    set_step(&mut steps, index, SweepStep::Deferred(deferral));
+                }
+                log_steps(&visits, &steps);
             }
-            log_steps(&visits, &steps);
+            PassStart::Started { pass, leftovers } => {
+                let context = self.clone();
+                self.spawn_contained(SweepTask::PullPass, async move {
+                    tokio::select! {
+                        biased;
+                        () = context.stop.cancelled() => {}
+                        () = context.run_pass(pass, candidates, leftovers, visits, steps) => {}
+                    }
+                });
+            }
+        }
+    }
+
+    /// Runs a server's pull pass: the job's own candidates, then the files an
+    /// earlier pass left queued, then whatever jobs queue while the pass runs,
+    /// until nothing is queued or the server is wedged.
+    pub(super) async fn run_pass(
+        &self,
+        mut pass: PullPass,
+        candidates: Vec<(usize, PullCandidate)>,
+        leftovers: Vec<PullCandidate>,
+        visits: Vec<(PathBuf, Interest)>,
+        mut steps: Vec<SweepStep>,
+    ) {
+        let mut pulled = PulledStates::default();
+        let mut unpulled = self
+            .pull_due(candidates, &mut steps, &mut pulled)
+            .await
+            .into_unpulled();
+        log_steps(&visits, &steps);
+        let mut next = Some(leftovers);
+        while unpulled.is_empty() {
+            let Some(batch) = next
+                .take()
+                .filter(|batch| !batch.is_empty())
+                .or_else(|| pass.next_batch())
+            else {
+                break;
+            };
+            unpulled = self.pull_batch(batch, &mut pulled).await.into_unpulled();
+        }
+        unpulled.extend(next.into_iter().flatten());
+        pass.requeue(unpulled);
+    }
+
+    /// Pulls files that were queued for the pass, which no job visits now.
+    async fn pull_batch(&self, batch: Vec<PullCandidate>, pulled: &mut PulledStates) -> Drained {
+        let visits: Vec<(PathBuf, Interest)> = batch
+            .iter()
+            .map(|candidate| (candidate.path.clone(), Interest::Subscribed))
+            .collect();
+        let mut steps = vec![SweepStep::Synced; batch.len()];
+        let candidates = batch.into_iter().enumerate().collect();
+        let drained = self.pull_due(candidates, &mut steps, pulled).await;
+        log_steps(&visits, &steps);
+        drained
+    }
+
+    /// Spawns `work` onto the tracker, logging a panic in it instead of
+    /// dropping the task's handle on the floor.
+    fn spawn_contained(&self, task: SweepTask, work: impl Future<Output = ()> + Send + 'static) {
+        self.pulls.spawn(async move {
+            if let Err(panicked) = catch_panic(work).await {
+                warn!(?task, "disk sweep task panicked: {}", panicked.message());
+            }
         });
     }
 
@@ -907,12 +1198,16 @@ impl SweepContext {
     }
 
     /// Pulls the candidates that are due: new states first, then files
-    /// another file's change made stale, then failed pulls to retry.
+    /// another file's change made stale, then failed pulls to retry. `pulled`
+    /// is what the whole pull pass has asked so far, which carries over from
+    /// one batch of the pass to the next; what the pass met of its server's
+    /// patience starts afresh with every batch.
     pub(super) async fn pull_due(
         &self,
         candidates: Vec<(usize, PullCandidate)>,
         steps: &mut [SweepStep],
-    ) {
+        pulled: &mut PulledStates,
+    ) -> Drained {
         let mut due: Vec<(Due, SweepEpoch, usize, PullCandidate)> = candidates
             .into_iter()
             .filter_map(|(index, candidate)| {
@@ -924,21 +1219,32 @@ impl SweepContext {
             })
             .collect();
         due.sort_by_key(|(why, ..)| *why);
-        let mut pass = PassState::Patient;
-        for (why, epoch, index, candidate) in due {
+        let mut due = due.into_iter();
+        let mut state = PassState::Patient;
+        while let Some((why, epoch, index, candidate)) = due.next() {
+            let current = candidate.resynced.current;
             if self.stop.is_cancelled() {
-                return;
+                return Drained::wedged(candidate, due);
             }
-            if pass == PassState::AtCap && why == Due::Retry {
-                set_step(steps, index, SweepStep::Deferred);
+            if pulled.0.get(&candidate.path) == Some(&current) {
+                set_step(steps, index, SweepStep::Deferred(Deferral::Tried));
                 continue;
             }
-            let step = self.pull_one(why, epoch, &candidate, &mut pass).await;
+            if state == PassState::AtCap && why == Due::Retry {
+                set_step(steps, index, SweepStep::Deferred(Deferral::AtCap));
+                continue;
+            }
+            let step = self.pull_one(why, epoch, &candidate, &mut state).await;
             set_step(steps, index, step);
-            if step == SweepStep::TimedOut {
-                return;
+            match step {
+                SweepStep::TimedOut => return Drained::wedged(candidate, due),
+                SweepStep::Pulled | SweepStep::Detached | SweepStep::GaveUp => {
+                    pulled.0.insert(candidate.path, current);
+                }
+                SweepStep::Skipped | SweepStep::Synced | SweepStep::Deferred(_) => {}
             }
         }
+        Drained::All
     }
 
     /// Pulls one file that is `why` due. A pull that does not answer within
@@ -965,9 +1271,10 @@ impl SweepContext {
                 return SweepStep::Synced;
             }
         }
-        let ClaimResult::Claimed(claim) = self.memo.claim_pull(path, resynced.current, epoch)
-        else {
-            return SweepStep::Synced;
+        let claim = match self.memo.claim_pull(path, resynced.current, epoch) {
+            ClaimResult::Claimed(claim) => claim,
+            ClaimResult::Outstanding => return SweepStep::Deferred(Deferral::Busy),
+            ClaimResult::Settled => return SweepStep::Synced,
         };
         let doc = match self
             .translator
@@ -985,12 +1292,12 @@ impl SweepContext {
             .stamp(doc.path(), doc.server_id())
             != Some(resynced.current)
         {
-            return SweepStep::Synced;
+            return SweepStep::Deferred(Deferral::Moved);
         }
         if why == Due::Epoch
             && self.memo.take_epoch_pull(&resynced.server, Instant::now()) == EpochBudget::Exhausted
         {
-            return SweepStep::Synced;
+            return SweepStep::Deferred(Deferral::Throttled);
         }
         let mut pull: BoxedPull = Box::pin(run_pull(
             Arc::clone(&self.translator),
@@ -1012,9 +1319,13 @@ impl SweepContext {
                     self.spawn_detached(pull, claim);
                     SweepStep::Detached
                 }
-                Err(claim) => {
+                Err(DetachRefused::CapFull(claim)) => {
                     drop((pull, claim));
                     *pass = PassState::AtCap;
+                    SweepStep::GaveUp
+                }
+                Err(DetachRefused::NotHeld(claim)) => {
+                    drop((pull, claim));
                     SweepStep::GaveUp
                 }
             },
@@ -1024,7 +1335,7 @@ impl SweepContext {
     /// Lets `pull` finish in the background, until the sweep stops.
     fn spawn_detached(&self, pull: BoxedPull, claim: PullClaim) {
         let stop = self.stop.clone();
-        self.pulls.spawn(async move {
+        self.spawn_contained(SweepTask::DetachedPull, async move {
             tokio::select! {
                 biased;
                 () = stop.cancelled() => {}
@@ -1215,6 +1526,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::DocumentVersion;
+    use crate::bridge::state::ContentDigest;
 
     fn stamp(version: i32) -> DocumentStamp {
         DocumentStamp::new(None, DocumentVersion::new(version))
@@ -1440,16 +1752,224 @@ mod tests {
         assert_eq!(memo.take_save_debt(path), SaveDebt::Settled);
     }
 
+    fn candidate(index: usize, path: &str, version: i32) -> (usize, PullCandidate) {
+        let candidate = PullCandidate::from((
+            PathBuf::from(path),
+            Resynced {
+                server: rust(),
+                uri: Uri::from(format!("file://{path}")),
+                current: stamp(version),
+            },
+        ));
+        (index, candidate)
+    }
+
+    fn started(start: PassStart) -> (PullPass, Vec<PullCandidate>) {
+        match start {
+            PassStart::Started { pass, leftovers } => (pass, leftovers),
+            PassStart::Queued(deferrals) => panic!("a pass ran: {deferrals:?}"),
+        }
+    }
+
+    fn queued(start: PassStart) -> Vec<(usize, Deferral)> {
+        match start {
+            PassStart::Queued(deferrals) => deferrals,
+            PassStart::Started { .. } => panic!("no pass ran"),
+        }
+    }
+
+    fn queued_paths(batch: Vec<PullCandidate>) -> Vec<PathBuf> {
+        batch.into_iter().map(|candidate| candidate.path).collect()
+    }
+
     #[test]
     fn one_pull_pass_runs_per_server() {
         let memo = SweepMemo::default();
-        let first = memo.begin_pull_pass(&rust()).expect("no pass runs");
-        assert!(memo.begin_pull_pass(&rust()).is_none());
-        assert!(
-            memo.begin_pull_pass(&ServerId::from_static("other"))
-                .is_some()
-        );
+        let (first, _) = started(memo.begin_or_queue(&rust(), &[]));
+        assert_matches!(queued(memo.begin_or_queue(&rust(), &[])).as_slice(), []);
+        let _other = started(memo.begin_or_queue(&ServerId::from_static("other"), &[]));
         drop(first);
-        assert!(memo.begin_pull_pass(&rust()).is_some());
+        let _again = started(memo.begin_or_queue(&rust(), &[]));
+    }
+
+    #[test]
+    fn a_due_file_is_queued_while_the_pass_runs_and_the_newest_resync_wins() {
+        let memo = memo_with(&["/w/a.rs", "/w/b.rs"]);
+        let (mut pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+
+        let first = queued(memo.begin_or_queue(&rust(), &[candidate(3, "/w/a.rs", 1)]));
+        let second = queued(memo.begin_or_queue(
+            &rust(),
+            &[candidate(0, "/w/a.rs", 1), candidate(1, "/w/b.rs", 1)],
+        ));
+
+        assert_eq!(first, [(3, Deferral::Queued)]);
+        assert_eq!(second, [(0, Deferral::Queued), (1, Deferral::Queued)]);
+        let batch = pass.next_batch().expect("two files are queued");
+        assert_eq!(
+            queued_paths(batch),
+            [PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")]
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_due_is_not_queued() {
+        let memo = memo_with(&["/w/a.rs"]);
+        memo.record_answered(Path::new("/w/a.rs"), stamp(1), epoch(0));
+        let (mut pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+
+        let deferrals = queued(memo.begin_or_queue(&rust(), &[candidate(0, "/w/a.rs", 1)]));
+
+        assert_matches!(deferrals.as_slice(), []);
+        assert!(pass.next_batch().is_none());
+    }
+
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|n| format!("/w/f{n:03}.rs")).collect()
+    }
+
+    fn offered(names: &[String]) -> Vec<(usize, PullCandidate)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, path)| candidate(index, path, 1))
+            .collect()
+    }
+
+    #[test]
+    fn idle_files_never_crowd_a_due_file_out_of_the_queue() {
+        let names = names(MAX_QUEUED_PULLS_PER_SERVER + 1);
+        let memo = memo_with(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        for path in &names[..MAX_QUEUED_PULLS_PER_SERVER] {
+            memo.record_answered(Path::new(path), stamp(1), epoch(0));
+        }
+        let (_pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+
+        let deferrals = queued(memo.begin_or_queue(&rust(), &offered(&names)));
+
+        assert_eq!(deferrals, [(MAX_QUEUED_PULLS_PER_SERVER, Deferral::Queued)]);
+    }
+
+    #[test]
+    fn a_full_queue_refuses_one_more_due_file() {
+        let names = names(MAX_QUEUED_PULLS_PER_SERVER + 1);
+        let memo = memo_with(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let (_pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+
+        let deferrals = queued(memo.begin_or_queue(&rust(), &offered(&names)));
+
+        assert_eq!(deferrals.len(), names.len());
+        assert_eq!(
+            deferrals.last(),
+            Some(&(MAX_QUEUED_PULLS_PER_SERVER, Deferral::QueueFull))
+        );
+    }
+
+    #[test]
+    fn the_pass_drains_the_queue_and_releases_its_right_with_the_last_look() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let (mut pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+        queued(memo.begin_or_queue(&rust(), &[candidate(0, "/w/a.rs", 1)]));
+
+        assert_eq!(
+            pass.next_batch().map(queued_paths),
+            Some(vec![PathBuf::from("/w/a.rs")])
+        );
+        assert!(pass.next_batch().is_none());
+
+        let (_next, leftovers) = started(memo.begin_or_queue(&rust(), &[]));
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn a_pass_dropped_early_leaves_its_queue_to_the_next_one_minus_the_newer_files() {
+        let memo = memo_with(&["/w/a.rs", "/w/b.rs"]);
+        let (pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+        queued(memo.begin_or_queue(
+            &rust(),
+            &[candidate(0, "/w/a.rs", 1), candidate(1, "/w/b.rs", 1)],
+        ));
+        drop(pass);
+
+        let (_next, leftovers) =
+            started(memo.begin_or_queue(&rust(), &[candidate(0, "/w/a.rs", 1)]));
+
+        assert_eq!(queued_paths(leftovers), [PathBuf::from("/w/b.rs")]);
+    }
+
+    #[test]
+    fn trimming_prunes_queued_files_that_are_gone_or_belong_to_another_server() {
+        let memo = memo_with(&["/w/a.rs", "/w/b.rs", "/w/c.rs"]);
+        let (_pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+        queued(memo.begin_or_queue(
+            &rust(),
+            &[
+                candidate(0, "/w/a.rs", 1),
+                candidate(1, "/w/b.rs", 1),
+                candidate(2, "/w/c.rs", 1),
+            ],
+        ));
+        memo.observe(
+            &ServerId::from_static("other"),
+            Path::new("/w/b.rs"),
+            None,
+            state(1, "b"),
+        );
+
+        memo.retain(|path| path != Path::new("/w/c.rs"));
+
+        let kept: Vec<_> = lock_std(&memo.0).queued[&rust()].keys().cloned().collect();
+        assert_eq!(kept, [PathBuf::from("/w/a.rs")]);
+    }
+
+    #[test]
+    fn files_a_pass_took_and_did_not_pull_go_back_for_the_next_pass() {
+        let memo = memo_with(&["/w/a.rs", "/w/b.rs", "/w/c.rs"]);
+        let (mut pass, _) = started(memo.begin_or_queue(&rust(), &[]));
+        queued(memo.begin_or_queue(
+            &rust(),
+            &[
+                candidate(0, "/w/a.rs", 1),
+                candidate(1, "/w/b.rs", 1),
+                candidate(2, "/w/c.rs", 1),
+            ],
+        ));
+        let taken = pass.next_batch().expect("three files are queued");
+        memo.record_answered(Path::new("/w/c.rs"), stamp(1), epoch(0));
+        queued(memo.begin_or_queue(&rust(), &[candidate(0, "/w/a.rs", 2)]));
+
+        pass.requeue(taken);
+        drop(pass);
+
+        let (_next, leftovers) = started(memo.begin_or_queue(&rust(), &[]));
+        let kept: Vec<_> = leftovers
+            .iter()
+            .map(|candidate| (candidate.path.clone(), candidate.resynced.current))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (PathBuf::from("/w/a.rs"), stamp(2)),
+                (PathBuf::from("/w/b.rs"), stamp(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_claim_that_no_longer_holds_its_file_is_not_detached() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let claim = claim_of(&memo, "/w/a.rs");
+        lock_std(&memo.0).files.remove(Path::new("/w/a.rs"));
+
+        assert_matches!(memo.detach(claim), Err(DetachRefused::NotHeld(_)));
+    }
+
+    #[test]
+    fn only_two_current_states_with_equal_digests_hold_the_same_text() {
+        let lagging = SweepState::Lagging { stamp: stamp(1) };
+        assert!(state(1, "a").same_text(state(2, "a")));
+        assert!(!state(1, "a").same_text(state(1, "b")));
+        assert!(!lagging.same_text(lagging));
+        assert!(!state(1, "a").same_text(lagging));
     }
 }

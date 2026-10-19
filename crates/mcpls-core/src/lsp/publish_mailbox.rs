@@ -10,6 +10,7 @@
 //! over so the cache can say so ([`PublishDelivery::Lost`],
 //! [`PublishDelivery::LostUnnamed`]).
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -246,13 +247,15 @@ impl State {
             return Some(PublishDelivery::Lost(lost));
         }
         while let Some((key, seq)) = self.order.pop_front() {
-            if !is_current(&self.pending, &key, seq) {
+            let Entry::Occupied(entry) = self.pending.entry(key) else {
+                continue;
+            };
+            if entry.get().seq != seq {
                 continue;
             }
-            if let Some(pending) = self.pending.remove(&key) {
-                self.bytes = self.bytes.saturating_sub(pending.bytes);
-                return Some(PublishDelivery::Publish(pending.publish));
-            }
+            let pending = entry.remove();
+            self.bytes = self.bytes.saturating_sub(pending.bytes);
+            return Some(PublishDelivery::Publish(pending.publish));
         }
         std::mem::take(&mut self.lost_overflowed).then_some(PublishDelivery::LostUnnamed)
     }

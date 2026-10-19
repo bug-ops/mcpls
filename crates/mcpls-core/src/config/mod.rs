@@ -271,6 +271,7 @@ impl_text_newtype!(ToolPrefix, InvalidToolPrefix);
 /// characters, so a TOML value smuggling a raw ANSI escape byte cannot be
 /// echoed verbatim into a terminal through a log line.
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidToolPrefix {
     /// The prefix was empty or whitespace only.
     #[error(
@@ -1093,7 +1094,10 @@ impl ServerConfig {
             .read_bounded(MAX_CONFIG_FILE_BYTES)
             .map_err(|e| match e {
                 ReadBoundedError::TooLarge(exceeded) => ConfigError::FileTooLarge(exceeded).into(),
-                ReadBoundedError::Io(e) => Error::Io(e),
+                ReadBoundedError::Io(source) => Error::FileIo {
+                    path: path.to_path_buf(),
+                    source,
+                },
             })?;
         let content = String::from_utf8(buf).map_err(ConfigError::NotUtf8)?;
 
@@ -1192,10 +1196,14 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// [`Error::ConfigInsideWorkspace`] when `source` is inside; [`Error::Io`]
-    /// when `source` or the working directory cannot be resolved.
+    /// [`Error::ConfigInsideWorkspace`] when `source` is inside;
+    /// [`Error::FileIo`] when `source` cannot be canonicalized; [`Error::Io`]
+    /// when the working directory cannot be resolved.
     pub fn ensure_outside_workspace(&self, source: &Path, origin: ConfigOrigin) -> Result<()> {
-        let canonical = dunce::canonicalize(source).map_err(Error::Io)?;
+        let canonical = dunce::canonicalize(source).map_err(|io| Error::FileIo {
+            path: source.to_path_buf(),
+            source: io,
+        })?;
         let roots = WorkspaceRoots::from_configured(&self.workspace.roots)?;
         let home = trust::login_home_dir();
         let roots = roots.untrusted_boundary(&self.workspace.roots, home.as_deref());
@@ -1258,7 +1266,7 @@ mod tests {
             .iter()
             .map(|s| s.command.as_str())
             .collect();
-        let builtins: HashSet<&str> = BuiltinServer::ALL.iter().map(|b| b.command()).collect();
+        let builtins: HashSet<&str> = BuiltinServer::ALL.iter().map(|b| b.as_str()).collect();
         assert_eq!(defaults, builtins);
     }
 
@@ -1280,7 +1288,7 @@ mod tests {
     #[test]
     fn test_builtin_server_roundtrip_and_hint() {
         for b in BuiltinServer::ALL {
-            assert_eq!(BuiltinServer::from_command(b.command()), Some(b));
+            assert_eq!(BuiltinServer::from_command(b.as_str()), Some(b));
             assert_ne!(b.install_hint(), "");
         }
     }
@@ -3570,6 +3578,16 @@ mod tests {
                 .ensure_outside_workspace(&file, ConfigOrigin::Argument)
                 .unwrap_err();
             assert_matches!(err, Error::ConfigInsideWorkspace { .. });
+        }
+
+        #[test]
+        fn test_ensure_outside_workspace_names_the_path_it_cannot_canonicalize() {
+            let dir = TempDir::new().unwrap();
+            let missing = dir.path().join("missing.toml");
+            let err = ServerConfig::default()
+                .ensure_outside_workspace(&missing, ConfigOrigin::Argument)
+                .unwrap_err();
+            assert_matches!(err, Error::FileIo { path, .. } if path == missing);
         }
 
         #[test]

@@ -38,8 +38,9 @@ pub enum RouteSupport {
         /// The server the call would be dispatched to.
         server: ServerId,
     },
-    /// The routed server is registered and publishes diagnostics but advertises
-    /// no pull provider, so `get_diagnostics` answers from the push cache.
+    /// Registered and publishing diagnostics, but with no pull provider: answers come from the push cache.
+    ///
+    /// `get_diagnostics` answers from the push cache.
     PushOnly {
         /// The server the call would be dispatched to.
         server: ServerId,

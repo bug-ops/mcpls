@@ -87,6 +87,44 @@ pub enum ExitGrace {
     IfAnswered(Duration),
 }
 
+/// Whether the LSP `exit` notification reached the server on shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitNotice {
+    /// The `shutdown` handshake completed and `exit` was sent.
+    Sent,
+    /// The handshake failed or was cut short, or `exit` was withheld because
+    /// escaping descendants could not be marked.
+    NotSent,
+}
+
+impl ExitNotice {
+    /// Judged from the handshake's own result, before it is merged with the
+    /// message loop's stop.
+    const fn of(handshake: &Result<MarkOutcome>) -> Self {
+        match handshake {
+            Ok(MarkOutcome::Confirmed) => Self::Sent,
+            _ => Self::NotSent,
+        }
+    }
+}
+
+/// How long the leader process is given to exit on its own after the
+/// handshake, with `remaining` of the shutdown budget left. `answered` is the
+/// merged result of the handshake and the message loop's stop.
+fn child_exit_wait(
+    grace: ExitGrace,
+    mark: MarkOutcome,
+    answered: &Result<()>,
+    remaining: Duration,
+) -> Duration {
+    match grace {
+        _ if mark != MarkOutcome::Confirmed => Duration::ZERO,
+        ExitGrace::WithinBudget => remaining.min(CHILD_EXIT_GRACE),
+        ExitGrace::IfAnswered(grace) if answered.is_ok() => grace,
+        ExitGrace::IfAnswered(_) => Duration::ZERO,
+    }
+}
+
 /// How long a failed `initialize` waits for the child to be reaped before
 /// concluding it is still running and keeping the original error.
 const EARLY_EXIT_PROBE: Duration = Duration::from_millis(500);
@@ -199,12 +237,6 @@ impl ServerState {
     pub const fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
     }
-
-    /// Check if the server can accept new requests.
-    #[must_use]
-    pub const fn can_accept_requests(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
 }
 
 /// Where a spawned server's working directory is.
@@ -234,17 +266,29 @@ pub enum ChildWorkingDir {
 
 /// Whether a server belongs to an untrusted workspace, and if so what it was
 /// vetted against.
-#[derive(Debug, Clone, Default)]
-enum SpawnTrust {
-    #[default]
+#[derive(Debug, Clone)]
+pub enum SpawnTrust {
+    /// The server runs as configured.
     Trusted,
     /// The boundary the argument backstop and the tsserver pin are evaluated
     /// against again before every spawn, and the command as configured.
     Untrusted(UntrustedVetting),
 }
 
+impl SpawnTrust {
+    /// What an untrusted server is vetted against; `None` for a trusted one.
+    pub const fn vetting(&self) -> Option<&UntrustedVetting> {
+        match self {
+            Self::Trusted => None,
+            Self::Untrusted(vetting) => Some(vetting),
+        }
+    }
+}
+
 /// A [`ServerInitConfig`] that [`ServerInitConfig::for_respawn`] vetted, so a
-/// respawn spawns exactly what was checked and does not check it again.
+/// respawn spawns exactly what was checked. The spawn still re-runs the
+/// argument backstop on purpose (#736): a workspace file can become
+/// executable between vetting and spawn.
 #[derive(Debug, Clone)]
 pub struct VettedInitConfig(ServerInitConfig);
 
@@ -334,12 +378,11 @@ impl ServerInitConfig {
         }
     }
 
-    /// This config marked as an untrusted-workspace server whose arguments
-    /// must keep clear of the boundary `vetting` holds (see
-    /// [`Self::vet_arguments`]).
+    /// This config with the given trust; an untrusted server's arguments must
+    /// keep clear of the boundary its vetting holds (see [`Self::vet_arguments`]).
     #[must_use]
-    pub(crate) fn with_untrusted(mut self, vetting: UntrustedVetting) -> Self {
-        self.trust = SpawnTrust::Untrusted(vetting);
+    pub(crate) fn with_trust(mut self, trust: SpawnTrust) -> Self {
+        self.trust = trust;
         self
     }
 
@@ -356,7 +399,7 @@ impl ServerInitConfig {
     /// [`Error::ServerFailedToStart`] with the untrusted-mode refusal when an
     /// argument now names an executable inside the workspace.
     pub(crate) fn vet_arguments(&self) -> Result<()> {
-        let SpawnTrust::Untrusted(vetting) = &self.trust else {
+        let Some(vetting) = self.trust.vetting() else {
             return Ok(());
         };
         vetting
@@ -372,7 +415,7 @@ impl ServerInitConfig {
     /// [`Self::vet_arguments`] on the blocking pool, skipped for a trusted
     /// config.
     pub(crate) async fn vet_arguments_off_runtime(&self) -> Result<()> {
-        if matches!(self.trust, SpawnTrust::Trusted) {
+        if self.trust.vetting().is_none() {
             return Ok(());
         }
         self.on_planning_pool(Self::vet_arguments).await
@@ -458,7 +501,7 @@ impl ServerInitConfig {
     }
 
     /// Mutable access to the server config, for tests that adjust a fixture.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) const fn server_config_mut(&mut self) -> &mut LspServerConfig {
         &mut self.server_config
     }
@@ -474,7 +517,8 @@ impl ServerInitConfig {
     /// Called by a restart before it stops the running server and by every
     /// other respawn right before it spawns; the filesystem work runs on the
     /// blocking pool and only for an auto-pinned or untrusted server. The
-    /// result is what the respawn spawns, so it is vetted once.
+    /// result is what the respawn spawns; the spawn re-runs the argument
+    /// backstop on purpose (#736).
     ///
     /// In untrusted mode the argument backstop runs again
     /// ([`Self::vet_arguments`]). A tsserver pin mcpls chose whose canonical
@@ -491,7 +535,7 @@ impl ServerInitConfig {
     /// startup makes), or an argument now names an executable inside the
     /// workspace.
     pub(crate) async fn for_respawn(&self) -> Result<VettedInitConfig> {
-        if self.auto_pin.is_none() && matches!(self.trust, SpawnTrust::Trusted) {
+        if self.auto_pin.is_none() && self.trust.vetting().is_none() {
             return Ok(VettedInitConfig(self.clone()));
         }
         self.on_planning_pool(Self::plan_respawn).await
@@ -511,7 +555,7 @@ impl ServerInitConfig {
         let mut unpinned = self.server_config.clone();
         unpinned.initialization_options = None;
         let plan = tsserver_pin::plan_typescript(unpinned, process_env);
-        if let SpawnTrust::Untrusted(vetting) = &self.trust {
+        if let Some(vetting) = self.trust.vetting() {
             plan.vet_untrusted(vetting)
                 .map_err(|refusal| self.refusal(refusal))?;
         }
@@ -631,7 +675,6 @@ impl LspServer {
 
     /// Replace the config a respawn of this server would use.
     #[cfg(test)]
-    #[cfg(unix)]
     pub(crate) fn set_init_config(&mut self, config: ServerInitConfig) {
         self.init_config = config;
     }
@@ -1298,6 +1341,7 @@ impl LspServer {
         let mark = handshake
             .as_ref()
             .map_or(MarkOutcome::Confirmed, |mark| *mark);
+        let notice = ExitNotice::of(&handshake);
         let handshake = handshake.map(drop);
         let handshake = match client.shutdown_until(deadline).await {
             Ok(()) => handshake,
@@ -1305,25 +1349,41 @@ impl LspServer {
         };
 
         if let Some(child) = &mut self.child {
-            let child_deadline = match grace {
-                _ if mark != MarkOutcome::Confirmed => Instant::now(),
-                ExitGrace::WithinBudget => deadline.min(Instant::now() + CHILD_EXIT_GRACE),
-                ExitGrace::IfAnswered(grace) if handshake.is_ok() => Instant::now() + grace,
-                ExitGrace::IfAnswered(_) => Instant::now(),
-            };
-            match timeout_at(child_deadline, child.wait()).await {
-                Ok(Ok(status)) => {
-                    debug!(
-                        ?status,
-                        "LSP server process exited after `exit` notification"
-                    );
-                }
+            let wait = child_exit_wait(
+                grace,
+                mark,
+                &handshake,
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            match timeout(wait, child.wait()).await {
+                Ok(Ok(status)) => match notice {
+                    ExitNotice::Sent => {
+                        debug!(
+                            ?status,
+                            "LSP server process exited after `exit` notification"
+                        );
+                    }
+                    ExitNotice::NotSent => {
+                        debug!(
+                            ?status,
+                            "LSP server process exited without an `exit` notification"
+                        );
+                    }
+                },
                 Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
-                Err(_) => warn!(
-                    timeout = ?CHILD_EXIT_GRACE,
-                    "LSP server process did not exit within grace period after `exit` \
-                     notification, killing it"
-                ),
+                Err(_) => match notice {
+                    ExitNotice::Sent => warn!(
+                        waited = ?wait,
+                        exit = ?notice,
+                        "LSP server process did not exit within the wait after `exit` \
+                         notification, killing it"
+                    ),
+                    ExitNotice::NotSent => warn!(
+                        waited = ?wait,
+                        exit = ?notice,
+                        "LSP server process killed without an `exit` notification"
+                    ),
+                },
             }
             let sweep_budget = deadline
                 .saturating_duration_since(Instant::now())
@@ -1607,6 +1667,67 @@ mod tests {
     use crate::lsp::JsonRpcError;
 
     #[test]
+    fn test_child_exit_wait_follows_the_grace_policy() {
+        let remaining = Duration::from_secs(10);
+        let grace = Duration::from_secs(7);
+        let answered = Ok(());
+        let unanswered = Err(Error::ShutdownTimeout);
+        let wait = |policy, mark, answered: &Result<()>| {
+            child_exit_wait(policy, mark, answered, remaining)
+        };
+
+        assert_eq!(
+            wait(ExitGrace::WithinBudget, MarkOutcome::Confirmed, &answered),
+            CHILD_EXIT_GRACE
+        );
+        assert_eq!(
+            child_exit_wait(
+                ExitGrace::WithinBudget,
+                MarkOutcome::Confirmed,
+                &answered,
+                Duration::from_secs(1)
+            ),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            wait(
+                ExitGrace::IfAnswered(grace),
+                MarkOutcome::Confirmed,
+                &answered
+            ),
+            grace
+        );
+        assert_eq!(
+            wait(
+                ExitGrace::IfAnswered(grace),
+                MarkOutcome::Confirmed,
+                &unanswered
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn test_exit_notice_is_sent_only_after_a_confirmed_handshake() {
+        assert_eq!(
+            ExitNotice::of(&Ok(MarkOutcome::Confirmed)),
+            ExitNotice::Sent
+        );
+        assert_eq!(
+            ExitNotice::of(&Err(Error::ShutdownTimeout)),
+            ExitNotice::NotSent
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            ExitNotice::of(&Ok(MarkOutcome::Failed(
+                crate::lsp::process::MarkFailure::NoConfirmation
+            ))),
+            ExitNotice::NotSent,
+            "a withheld `exit` is not a sent one"
+        );
+    }
+
+    #[test]
     fn test_client_capabilities_offer_configured_encodings_in_order() {
         let encodings =
             PositionEncodings::new(vec![PositionEncoding::Utf32, PositionEncoding::Utf8]).unwrap();
@@ -1725,19 +1846,16 @@ mod tests {
     #[test]
     fn test_server_state_ready() {
         assert!(ServerState::Ready.is_ready());
-        assert!(ServerState::Ready.can_accept_requests());
     }
 
     #[test]
     fn test_server_state_uninitialized() {
         assert!(!ServerState::Uninitialized.is_ready());
-        assert!(!ServerState::Uninitialized.can_accept_requests());
     }
 
     #[test]
     fn test_server_state_initializing() {
         assert!(!ServerState::Initializing.is_ready());
-        assert!(!ServerState::Initializing.can_accept_requests());
     }
 
     #[test]
@@ -1789,13 +1907,11 @@ mod tests {
     #[test]
     fn test_server_state_shutting_down() {
         assert!(!ServerState::ShuttingDown.is_ready());
-        assert!(!ServerState::ShuttingDown.can_accept_requests());
     }
 
     #[test]
     fn test_server_state_shutdown() {
         assert!(!ServerState::Shutdown.is_ready());
-        assert!(!ServerState::Shutdown.can_accept_requests());
     }
 
     #[test]
@@ -3080,7 +3196,7 @@ sleep 5
             PositionEncodings::DEFAULT,
             std::sync::Arc::default(),
         )
-        .with_untrusted(UntrustedVetting::new(roots, command));
+        .with_trust(SpawnTrust::Untrusted(UntrustedVetting::new(roots, command)));
         (dir, tool, init)
     }
 

@@ -18,12 +18,12 @@ use super::limits::DEFAULT_HEURISTICS_MAX_DEPTH;
 use super::limits::SearchDepth;
 use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
-use super::server_args::{InvalidServerArgs, ServerArgs};
+use super::server_args::ServerArgs;
 use super::server_env::{EnvKey, EnvValue, InvalidServerEnv, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::{contains_nul, impl_text_newtype};
 use crate::bridge::IndexingPolicy;
-use crate::error::{ChainedError, ConfigError};
+use crate::error::{ChainedError, ConfigError, spelled_enum};
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -244,9 +244,10 @@ pub enum InvalidServerCommand {
     ContainsNul,
 }
 
-/// The non-blank executable name or path of an LSP server.
+/// The non-blank executable name or path of an LSP server, without a NUL.
 ///
-/// Deserializes from a TOML string and rejects a blank one at load time.
+/// Deserializes from a TOML string and rejects a blank one, or one holding a
+/// NUL, at load time.
 ///
 /// # Examples
 ///
@@ -397,7 +398,7 @@ impl LaunchCommand {
     /// The default entry's command: typescript-language-server, auto-selected.
     const fn typescript() -> Self {
         Self {
-            command: ServerCommand::from_static(BuiltinServer::TypescriptLanguageServer.command()),
+            command: ServerCommand::from_static(BuiltinServer::TypescriptLanguageServer.as_str()),
             selection: ServerSelection::Auto,
         }
     }
@@ -481,8 +482,9 @@ impl PartialEq<&str> for LaunchCommand {
 /// Configuration for a single LSP server.
 ///
 /// Serialization goes through a raw mirror of this struct, which reports an
-/// invalid `file_patterns` entry with the id of the server that holds it and
-/// builds the [`LaunchCommand`] from the `command` and `selection` keys.
+/// invalid `file_patterns`, `env` or `args` entry with the id of the server
+/// that holds it and builds the [`LaunchCommand`] from the `command` and
+/// `selection` keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawLspServerConfig", into = "RawLspServerConfig")]
 pub struct LspServerConfig {
@@ -689,11 +691,9 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
                 error,
             },
         })?;
-        let args = ServerArgs::try_from(args).map_err(|InvalidServerArgs { index }| {
-            ConfigError::ArgContainsNul {
-                server: entry.clone(),
-                index,
-            }
+        let args = ServerArgs::try_from(args).map_err(|error| ConfigError::ArgContainsNul {
+            server: entry.clone(),
+            error,
         })?;
         let file_patterns = file_patterns
             .iter()
@@ -722,50 +722,29 @@ impl TryFrom<RawLspServerConfig> for LspServerConfig {
     }
 }
 
-/// Language servers mcpls ships a default configuration for.
-///
-/// Single source of truth for each builtin's executable name and its install
-/// hint, so spawn-failure guidance cannot drift from the defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinServer {
-    /// rust-analyzer for Rust.
-    RustAnalyzer,
-    /// pyright for Python.
-    Pyright,
-    /// typescript-language-server for TypeScript.
-    TypescriptLanguageServer,
-    /// gopls for Go.
-    Gopls,
-    /// clangd for C and C++.
-    Clangd,
-    /// zls for Zig.
-    Zls,
+spelled_enum! {
+    /// Language servers mcpls ships a default configuration for.
+    ///
+    /// Single source of truth for each builtin's executable name
+    /// ([`Self::as_str`]) and its install hint, so spawn-failure guidance
+    /// cannot drift from the defaults.
+    BuiltinServer {
+        /// rust-analyzer for Rust.
+        RustAnalyzer => "rust-analyzer",
+        /// pyright for Python.
+        Pyright => "pyright-langserver",
+        /// typescript-language-server for TypeScript.
+        TypescriptLanguageServer => "typescript-language-server",
+        /// gopls for Go.
+        Gopls => "gopls",
+        /// clangd for C and C++.
+        Clangd => "clangd",
+        /// zls for Zig.
+        Zls => "zls",
+    }
 }
 
 impl BuiltinServer {
-    /// Every builtin server.
-    pub const ALL: [Self; 6] = [
-        Self::RustAnalyzer,
-        Self::Pyright,
-        Self::TypescriptLanguageServer,
-        Self::Gopls,
-        Self::Clangd,
-        Self::Zls,
-    ];
-
-    /// Executable name looked up on `PATH`.
-    #[must_use]
-    pub const fn command(self) -> &'static str {
-        match self {
-            Self::RustAnalyzer => "rust-analyzer",
-            Self::Pyright => "pyright-langserver",
-            Self::TypescriptLanguageServer => "typescript-language-server",
-            Self::Gopls => "gopls",
-            Self::Clangd => "clangd",
-            Self::Zls => "zls",
-        }
-    }
-
     /// The workspace-supplied code this server can run, for the message that
     /// explains why untrusted mode refused it.
     #[must_use]
@@ -847,7 +826,7 @@ impl BuiltinServer {
     /// ```
     #[must_use]
     pub fn matches_command(self, command: &str) -> bool {
-        CommandStem::of(command).is(self.command())
+        CommandStem::of(command).is(self.as_str())
     }
 
     /// Look up a builtin by its exact executable name.
@@ -862,7 +841,7 @@ impl BuiltinServer {
     /// ```
     #[must_use]
     pub fn from_command(command: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|b| b.command() == command)
+        Self::ALL.into_iter().find(|b| b.as_str() == command)
     }
 }
 
@@ -888,7 +867,7 @@ impl LspServerConfig {
     ) -> Self {
         Self {
             language_id,
-            command: ServerCommand::from_static(server.command()).into(),
+            command: ServerCommand::from_static(server.as_str()).into(),
             args: ServerArgs::from_static(args),
             env: crate::config::ServerEnv::default(),
             file_patterns: file_patterns

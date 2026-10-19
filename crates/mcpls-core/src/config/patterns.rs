@@ -11,6 +11,7 @@ use super::text_newtype::impl_text_newtype;
 
 /// Why a string is not a valid [`ProjectMarker`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidProjectMarker {
     /// The marker was empty.
     #[error("project marker cannot be empty")]
@@ -72,6 +73,7 @@ impl_text_newtype!(
 
 /// Why a string is not a valid [`FileExtension`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidFileExtension {
     /// The extension was empty.
     #[error("file extension cannot be empty")]
@@ -170,6 +172,7 @@ impl_text_newtype!(
 
 /// Why a string is not a valid [`FileName`].
 #[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InvalidFileName {
     /// The name was empty.
     #[error("file name cannot be empty")]

@@ -10,7 +10,8 @@
 //! Covered installs: symlinked executables (npm, nvm, bun, Homebrew with a
 //! global `typescript` peer), npm `.cmd`/`.ps1`/extensionless shims next to
 //! `node_modules/typescript-language-server`, pnpm global installs, and
-//! `node` or `bun` running the server's absolute `cli.mjs`. Shims are never
+//! `node`, `nodejs` or `bun` (also with a version suffix, such as `node22`)
+//! running the server's absolute `cli.mjs`. Shims are never
 //! executed or parsed. Package runners (`npx`, `bunx`, `pnpm dlx`,
 //! `deno npm:`) and version-manager shims (Volta, asdf, mise) stay
 //! unresolved and are reported with a warning, never with a startup
@@ -38,7 +39,7 @@ use crate::config::{
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::resolve_named;
-use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX};
+use crate::lsp::launcher::{NPM_PACKAGE_RUNNERS, NPM_SPECIFIER_PREFIX, is_script_interpreter};
 use crate::lsp::vetting::UntrustedVetting;
 use crate::lsp::{LspNotification, ParentEnv};
 use crate::util::read_regular_file_bounded;
@@ -54,7 +55,6 @@ const NODE_NAME: &str = "node";
 const TYPESCRIPT_STEM: &str = "typescript";
 const NATIVE_BIN_DIR: &str = "bin";
 const NATIVE_TSC_ARGS: &[&str] = &["--lsp", "--stdio"];
-const SCRIPT_INTERPRETERS: [&str; 2] = ["node", "bun"];
 const PNPM_GLOBAL_DIR: &str = "global";
 /// Most `global/<store version>` entries a pnpm install is searched through;
 /// more is treated as ambiguous.
@@ -176,7 +176,7 @@ fn mentions_server(arg: &str) -> bool {
 enum Launch<'a> {
     /// The server executable itself: a symlink, an npm shim or a pnpm shim.
     Server(&'a Path),
-    /// `node` or `bun` running the server's absolute script.
+    /// `node`, `nodejs` or `bun` running the server's absolute script.
     Script(&'a Path),
     /// A package runner that fetches or resolves the server on its own.
     PackageRunner,
@@ -193,8 +193,7 @@ fn classify(config: &LspServerConfig) -> Option<Launch<'_>> {
     if !config.args.iter().any(|arg| mentions_server(arg)) {
         return None;
     }
-    let script = CommandStem::of(config.command.as_str())
-        .is_any(&SCRIPT_INTERPRETERS)
+    let script = is_script_interpreter(&CommandStem::of(config.command.as_str()))
         .then(|| {
             config
                 .args
@@ -470,7 +469,7 @@ fn inspect(config: &LspServerConfig, parent_env: impl ParentEnv) -> Option<Resol
 ///
 /// A launcher that only names the server in its arguments is
 /// `PackageRunner` (`npx`, `bunx`, `deno npm:`), pinned through its absolute
-/// script (`node`, `bun`), or `UnsupportedLauncher` (wrappers); it is never
+/// script (`node`, `nodejs`, `bun`), or `UnsupportedLauncher` (wrappers); it is never
 /// silently unrelated.
 ///
 /// `PATH` is read as the child sees it: the config's `env` override, else
@@ -1521,7 +1520,7 @@ mod launch_tests {
             .join("node_modules")
             .join(SERVER_STEM)
             .join("lib/cli.mjs");
-        for interpreter in ["node", "bun"] {
+        for interpreter in ["node", "bun", "nodejs", "node22"] {
             let config = config(interpreter, &[cli.to_str().unwrap(), "--stdio"]);
             assert_eq!(
                 resolve(&config, |_| None),

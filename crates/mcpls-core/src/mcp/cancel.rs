@@ -9,8 +9,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use rmcp::RoleServer;
-use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock};
+use rmcp::handler::server::tool::IntoCallToolResult;
+use rmcp::model::{CallToolResponse, CallToolResult, ContentBlock, ErrorData as McpError};
 use rmcp::service::Peer;
+use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
 /// How often a running handler checks whether its connection has closed.
@@ -26,25 +28,68 @@ pub(super) const PEER_CLOSE_POLL: Duration = Duration::from_millis(250);
 /// the placeholder response carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(super) enum CallStop {
-    /// The client sent `notifications/cancelled`, or the serve loop was
-    /// cancelled.
-    #[error("request cancelled (client cancellation or server shutdown)")]
-    ClientCancelled,
+    /// The request token fired while mcpls was not shutting down: the client
+    /// sent `notifications/cancelled`, or its session ended.
+    #[error("request cancelled by the client or its session ended")]
+    Cancelled,
+    /// The request token fired after the server's stop token: mcpls is
+    /// shutting down.
+    #[error("mcpls is shutting down")]
+    ServerShutdown,
     /// The connection ended.
     #[error("connection closed")]
     ConnectionClosed,
 }
 
 impl CallStop {
+    /// The cause of a fired request token: shutdown when `stop` was cancelled
+    /// first, else a cancellation by the client or its session.
+    ///
+    /// Shutdown paths that cancel neither `stop` nor reach a signal branch
+    /// (see `run_stdio` and `serve_http`) read as [`Self::Cancelled`].
+    fn of_request_cancel(stop: &CancellationToken) -> Self {
+        if stop.is_cancelled() {
+            Self::ServerShutdown
+        } else {
+            Self::Cancelled
+        }
+    }
+
     /// The tool-level error result that stands in for the call's response.
     ///
     /// rmcp discards it for a call the client cancelled and the transport is
-    /// gone when the connection closed; only a call still pending when the
-    /// serve loop is cancelled has it delivered, in place of a protocol error
-    /// that would be logged as a failure.
+    /// gone when the connection closed; only a call still pending when mcpls
+    /// shuts down has it delivered, in place of a protocol error that would be
+    /// logged as a failure.
     pub(super) fn into_response(self) -> CallToolResponse {
         CallToolResult::error(vec![ContentBlock::text(self.to_string())]).into()
     }
+}
+
+/// The error side of a tool that must answer shutdown with the same tool-error
+/// result as every other tool, while still failing the call as a protocol
+/// error otherwise.
+#[derive(Debug)]
+pub(super) enum ToolFailure {
+    /// A JSON-RPC error.
+    Protocol(McpError),
+    /// The call was stopped; delivered as a tool-error result.
+    Stopped(CallStop),
+}
+
+impl IntoCallToolResult for ToolFailure {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, McpError> {
+        match self {
+            Self::Protocol(error) => Err(error),
+            Self::Stopped(stop) => Ok(stop.into_response()),
+        }
+    }
+}
+
+/// The outcome of a detached task; a task cancelled by runtime teardown means
+/// mcpls is shutting down.
+pub(super) fn detached_result<T>(joined: Result<T, JoinError>) -> Result<T, ToolFailure> {
+    joined.map_err(|_| ToolFailure::Stopped(CallStop::ServerShutdown))
 }
 
 /// Resolves once `peer`'s transport has closed.
@@ -55,7 +100,8 @@ pub(super) async fn peer_closed(peer: &Peer<RoleServer>) {
 }
 
 /// Runs `handler` until it finishes, the request token fires or `closed`
-/// resolves.
+/// resolves. `stop` is the server's shutdown token; it only decides which
+/// [`CallStop`] a fired request token reports.
 ///
 /// The signals are checked first, in that order, so a call cancelled before
 /// it starts never polls its handler: no LSP request is issued and no document
@@ -63,12 +109,13 @@ pub(super) async fn peer_closed(peer: &Peer<RoleServer>) {
 /// the LSP requests it had outstanding.
 pub(super) async fn run_cancellable<T>(
     request: &CancellationToken,
+    stop: &CancellationToken,
     closed: impl Future<Output = ()>,
     handler: impl Future<Output = T>,
 ) -> Result<T, CallStop> {
     tokio::select! {
         biased;
-        () = request.cancelled() => Err(CallStop::ClientCancelled),
+        () = request.cancelled() => Err(CallStop::of_request_cancel(stop)),
         () = closed => Err(CallStop::ConnectionClosed),
         output = handler => Ok(output),
     }
@@ -98,7 +145,8 @@ mod tests {
     #[tokio::test]
     async fn a_finished_handler_returns_its_output() {
         let token = CancellationToken::new();
-        let outcome = run_cancellable(&token, pending(), async { 7 }).await;
+        let outcome =
+            run_cancellable(&token, &CancellationToken::new(), pending(), async { 7 }).await;
         assert_eq!(outcome, Ok(7));
     }
 
@@ -109,11 +157,12 @@ mod tests {
         let polled = Arc::new(AtomicBool::new(false));
         let outcome = run_cancellable(
             &token,
+            &CancellationToken::new(),
             pending(),
             Polled(Arc::clone(&polled)).never_finishes(),
         )
         .await;
-        assert_matches!(outcome, Err(CallStop::ClientCancelled));
+        assert_matches!(outcome, Err(CallStop::Cancelled));
         assert!(!polled.load(Ordering::SeqCst));
     }
 
@@ -123,6 +172,7 @@ mod tests {
         let polled = Arc::new(AtomicBool::new(false));
         let outcome = run_cancellable(
             &token,
+            &CancellationToken::new(),
             std::future::ready(()),
             Polled(Arc::clone(&polled)).never_finishes(),
         )
@@ -153,8 +203,45 @@ mod tests {
             tokio::task::yield_now().await;
             canceller.cancel();
         });
-        let outcome = run_cancellable(&token, pending(), handler).await;
-        assert_matches!(outcome, Err(CallStop::ClientCancelled));
+        let outcome = run_cancellable(&token, &CancellationToken::new(), pending(), handler).await;
+        assert_matches!(outcome, Err(CallStop::Cancelled));
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_request_token_fired_after_the_stop_token_reports_shutdown() {
+        let (token, stop) = (CancellationToken::new(), CancellationToken::new());
+        stop.cancel();
+        token.cancel();
+        let outcome = run_cancellable(&token, &stop, pending(), pending::<()>()).await;
+        assert_matches!(outcome, Err(CallStop::ServerShutdown));
+    }
+
+    #[tokio::test]
+    async fn a_task_cancelled_by_runtime_teardown_reads_as_shutdown() {
+        let task = tokio::spawn(pending::<()>());
+        task.abort();
+        let joined = task.await;
+        assert_matches!(
+            detached_result(joined),
+            Err(ToolFailure::Stopped(CallStop::ServerShutdown))
+        );
+        assert_matches!(detached_result(Ok::<_, JoinError>(1)), Ok(1));
+    }
+
+    #[test]
+    fn a_stopped_call_is_delivered_as_a_tool_error_result() {
+        let response = ToolFailure::Stopped(CallStop::ServerShutdown)
+            .into_call_tool_result()
+            .unwrap();
+        let CallToolResponse::Complete(result) = response else {
+            panic!("expected a complete result");
+        };
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            ToolFailure::Protocol(McpError::internal_error("x", None))
+                .into_call_tool_result()
+                .is_err()
+        );
     }
 }

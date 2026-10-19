@@ -293,8 +293,9 @@ impl ToolRoutes {
     }
 }
 
-/// One route of a tool in the report: the languages sharing this support
-/// status (absent for workspace-wide tools) and the status itself.
+/// One route of a tool: the languages that share this support status.
+///
+/// The languages are absent for workspace-wide tools.
 #[derive(JsonSchema)]
 #[expect(
     dead_code,

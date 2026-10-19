@@ -70,10 +70,19 @@ fn prefix_eq(a: PrefixComponent<'_>, b: PrefixComponent<'_>) -> bool {
     }
 }
 
-fn is_within(path: &Path, root: &Path, rule: CaseRule) -> bool {
+/// The part of `path` below `root`, matching components with `rule`.
+///
+/// The single notion of "under a root": lookup and remainder come from the
+/// same component walk, so they cannot disagree (`C:` vs `\\?\C:`).
+fn strip_root<'p>(path: &'p Path, root: &Path, rule: CaseRule) -> Option<&'p Path> {
     let mut components = path.components();
     root.components()
         .all(|r| components.next().is_some_and(|c| rule.components_eq(c, r)))
+        .then_some(components.as_path())
+}
+
+fn is_within(path: &Path, root: &Path, rule: CaseRule) -> bool {
+    strip_root(path, root, rule).is_some()
 }
 
 /// Resolves `.` and `..` without touching the filesystem; `..` never rises
@@ -802,10 +811,21 @@ impl WorkspaceRoots {
 
     /// The canonical root the canonical `path` lies under, if any.
     pub(crate) fn canonical_root_of(&self, path: &Path) -> Option<&Path> {
+        self.split_under_root(path).map(|(root, _)| root)
+    }
+
+    /// The canonical root the canonical `path` lies under and the remainder
+    /// below it, from one component walk.
+    pub(crate) fn split_under_root<'r, 'p>(
+        &'r self,
+        path: &'p Path,
+    ) -> Option<(&'r Path, &'p Path)> {
         self.canonical
             .iter()
             .map(PathBuf::as_path)
-            .find(|root| is_within(path, root, CaseRule::Exact))
+            .find_map(|root| {
+                strip_root(path, root, CaseRule::Exact).map(|relative| (root, relative))
+            })
     }
 
     /// Whether the canonical `path` lies under a canonical root.
@@ -973,6 +993,47 @@ mod tests {
     fn test_verbatim_disk_equals_disk() {
         let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"C:\ws")], vec![]);
         assert!(roots.contains_canonical(Path::new(r"\\?\C:\ws\a.rs")));
+    }
+
+    #[test]
+    fn test_split_under_root_returns_root_and_remainder() {
+        let roots = WorkspaceRoots::for_test(vec![abs("/ws")], vec![]);
+        let file = abs("/ws/sub/a.rs");
+
+        let (root, relative) = roots.split_under_root(&file).unwrap();
+
+        assert_eq!(root, abs("/ws"));
+        assert_eq!(relative, Path::new("sub").join("a.rs"));
+        assert_eq!(
+            roots.split_under_root(&abs("/ws")).unwrap().1,
+            Path::new("")
+        );
+        assert!(roots.split_under_root(&abs("/wsx/a.rs")).is_none());
+        assert!(roots.split_under_root(&abs("/other/a.rs")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_split_under_root_strips_a_verbatim_spelling_of_the_root() {
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"C:\ws")], vec![]);
+        let long = format!(r"\\?\C:\ws\{}\a.rs", "d".repeat(300));
+
+        let (root, relative) = roots.split_under_root(Path::new(&long)).unwrap();
+
+        assert_eq!(root, Path::new(r"C:\ws"));
+        assert_eq!(relative, Path::new(&format!(r"{}\a.rs", "d".repeat(300))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_split_under_root_strips_a_verbatim_unc_spelling_of_the_root() {
+        let roots = WorkspaceRoots::for_test(vec![PathBuf::from(r"\\server\share\ws")], vec![]);
+
+        let (_, relative) = roots
+            .split_under_root(Path::new(r"\\?\UNC\server\share\ws\sub\a.rs"))
+            .unwrap();
+
+        assert_eq!(relative, Path::new(r"sub\a.rs"));
     }
 
     #[cfg(windows)]

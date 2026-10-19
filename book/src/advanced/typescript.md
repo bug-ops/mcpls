@@ -18,7 +18,7 @@ By default mcpls passes the `tsserver` bundled next to `typescript-language-serv
 - `npm -g` style symlink installs;
 - npm `.cmd`, `.ps1` and extensionless shims beside a `node_modules` that holds the server;
 - pnpm global installs, found under `<PNPM_HOME>/global`;
-- `node` or `bun` running the server's absolute `cli.mjs`.
+- `node`, `nodejs` or `bun` (also versioned, such as `node22`) running the server's absolute `cli.mjs`.
 
 Shims are located by file existence and are never executed or parsed.
 
@@ -30,7 +30,7 @@ mcpls logs a warning naming the reason, and the server runs unpinned, in these c
 |------|------------|
 | Server not found on `PATH` | Install `typescript-language-server` or fix `command` |
 | Started through a Volta, asdf or mise shim, or another wrapper script | Set `initialization_options.tsserver.path` to a trusted `tsserver.js` |
-| Started through `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`, or `node`/`bun` with a relative script path | Use the `typescript-language-server` executable or an absolute `cli.mjs`, or set `tsserver.path` |
+| Started through `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `deno npm:`, or `node`/`nodejs`/`bun` (also versioned) with a relative script path | Use the `typescript-language-server` executable or an absolute `cli.mjs`, or set `tsserver.path` |
 | A pnpm global install with more than one `global/<version>` entry holding the server, or more than 16 entries | Remove stale entries, or set `tsserver.path` |
 | No valid `typescript` package next to the server | `npm install -g typescript@6` |
 | Only TypeScript 7 or later next to the server, which ships no `tsserver` | Install `typescript@6` next to the server, or use the native server below |

@@ -314,7 +314,7 @@ async fn resolve_code_action(
 
 /// Resolves up to [`MAX_CODE_ACTION_RESOLVES`] deferred actions in `entries`
 /// concurrently -- via [`resolve_code_action`] -- replacing each resolved
-/// entry in place. No-op when `resolve_supported` is `false`.
+/// entry in place.
 ///
 /// Runs the round-trips through a [`JoinSet`] rather than sequentially so
 /// this call's added latency stays close to one resolve's, not proportional
@@ -323,12 +323,7 @@ async fn resolve_deferred_code_actions(
     entries: &mut [lsp_types::CodeActionResponse],
     client: &LspClient,
     server_id: &ServerId,
-    resolve_supported: bool,
 ) {
-    if !resolve_supported {
-        return;
-    }
-
     let mut resolve_tasks = JoinSet::new();
     let mut skipped_due_to_cap = 0usize;
     for (index, entry) in entries.iter().enumerate() {
@@ -735,8 +730,9 @@ impl Translator {
         let response_uri = doc.uri().clone();
         let mut budget = ItemBudget::new();
         let mut entries = budget.admit(response.unwrap_or_default());
-        let resolve_supported = self.code_action_resolve_supported(server_id);
-        resolve_deferred_code_actions(&mut entries, client, server_id, resolve_supported).await;
+        if self.code_action_resolve_supported(server_id) {
+            resolve_deferred_code_actions(&mut entries, client, server_id).await;
+        }
 
         let mut actions = Vec::with_capacity(entries.len());
         for action_or_command in entries {

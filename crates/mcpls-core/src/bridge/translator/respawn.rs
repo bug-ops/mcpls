@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 use tokio::time::Duration;
 
 use super::Translator;
-use super::restart::{NotificationReceivers, NotificationRouting};
+use super::restart::{
+    NotificationReceivers, NotificationRouting, PushDelivery, reset_server_cache,
+};
 use super::servers::Backend;
 use crate::bridge::indexing::IndexingReset;
 use crate::bridge::{DiagnosticsKey, DiagnosticsRole, NotificationCache, on_lifecycle};
@@ -34,14 +36,48 @@ pub(super) struct RespawnBackoff {
     /// (a common real crash-loop shape) would bypass backoff entirely: each
     /// "success" would otherwise look like a fresh, unbacked-off start.
     consecutive_failures: u32,
-    /// When the most recent attempt was made, or (if `last_attempt_succeeded`)
-    /// when that success was last found to have not held up.
-    last_attempt: Instant,
-    /// Whether the most recent attempt completed `initialize` successfully.
-    /// `false` for an outright spawn failure. Also reset to `false` once a
-    /// "successful" respawn is found to have died again within the
-    /// stability window, so that discovery is applied only once.
-    last_attempt_succeeded: bool,
+    /// The most recent attempt and how it ended.
+    last: LastAttempt,
+}
+
+/// How the most recent respawn attempt ended, and when.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum LastAttempt {
+    /// An outright spawn failure, or a "successful" respawn found dead again
+    /// within the stability window (applied once, so the discovery is not
+    /// counted twice).
+    Failed(Instant),
+    /// The attempt completed `initialize`; whether it held up is not known yet.
+    Succeeded(Instant),
+}
+
+impl LastAttempt {
+    const fn at(self) -> Instant {
+        match self {
+            Self::Failed(at) | Self::Succeeded(at) => at,
+        }
+    }
+}
+
+impl RespawnBackoff {
+    /// The state after a failed attempt at `now`, extending any earlier failures.
+    fn after_failure(previous: Option<Self>, now: Instant) -> Self {
+        Self {
+            consecutive_failures: previous
+                .map_or_default(|previous| previous.consecutive_failures)
+                .saturating_add(1),
+            last: LastAttempt::Failed(now),
+        }
+    }
+
+    /// The state after an attempt that completed `initialize` at `now`; earlier
+    /// failures are kept until the server proves itself stable.
+    fn after_success(previous: Option<Self>, now: Instant) -> Self {
+        Self {
+            consecutive_failures: previous.map_or_default(|previous| previous.consecutive_failures),
+            last: LastAttempt::Succeeded(now),
+        }
+    }
 }
 
 /// Base delay before the first backed-off retry after a respawn failure.
@@ -93,7 +129,7 @@ impl Translator {
     fn respawn_backoff_remaining(&self, id: &ServerId) -> Option<Duration> {
         let (consecutive_failures, last_attempt) = {
             let entry = self.backoff_of(id)?;
-            (entry.consecutive_failures, entry.last_attempt)
+            (entry.consecutive_failures, entry.last.at())
         };
         if consecutive_failures == 0 {
             return None;
@@ -110,35 +146,22 @@ impl Translator {
         lock_std(&self.servers).get(id)?.backoff
     }
 
-    /// Applies `update` to the backoff state of `id`, creating it with
-    /// `initial` first; a server without a slot has no backoff to keep.
+    /// Replaces the backoff state of `id` with `transition` applied to the
+    /// previous one; a server without a slot has no backoff to keep.
     fn update_backoff(
         &self,
         id: &ServerId,
-        initial: RespawnBackoff,
-        update: impl FnOnce(&mut RespawnBackoff),
+        transition: impl FnOnce(Option<RespawnBackoff>, Instant) -> RespawnBackoff,
     ) {
+        let now = self.clock.now();
         if let Some(slot) = lock_std(&self.servers).get_mut(id) {
-            update(slot.backoff.get_or_insert(initial));
+            slot.backoff = Some(transition(slot.backoff, now));
         }
     }
 
     /// Records a failed respawn attempt for `id`, extending its backoff.
     fn record_respawn_failure(&self, id: &ServerId) {
-        let now = self.clock.now();
-        self.update_backoff(
-            id,
-            RespawnBackoff {
-                consecutive_failures: 0,
-                last_attempt: now,
-                last_attempt_succeeded: false,
-            },
-            |entry| {
-                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-                entry.last_attempt = now;
-                entry.last_attempt_succeeded = false;
-            },
-        );
+        self.update_backoff(id, RespawnBackoff::after_failure);
     }
 
     /// Records that a respawn attempt for `id` completed `initialize`
@@ -150,19 +173,7 @@ impl Translator {
     /// [`Self::reconcile_respawn_stability`], which is what acts on this
     /// entry.
     fn record_respawn_success(&self, id: &ServerId) {
-        let now = self.clock.now();
-        self.update_backoff(
-            id,
-            RespawnBackoff {
-                consecutive_failures: 0,
-                last_attempt: now,
-                last_attempt_succeeded: true,
-            },
-            |entry| {
-                entry.last_attempt = now;
-                entry.last_attempt_succeeded = true;
-            },
-        );
+        self.update_backoff(id, RespawnBackoff::after_success);
     }
 
     /// Reconciles `id`'s backoff state against a *newly observed* death,
@@ -181,27 +192,18 @@ impl Translator {
     ///   fresh, unbacked-off start, spawning one child process per tool
     ///   call forever.
     fn reconcile_respawn_stability(&self, id: &ServerId) {
-        let Some(entry) = self.backoff_of(id) else {
-            return;
-        };
-        if !entry.last_attempt_succeeded {
-            return;
-        }
-        if self
-            .clock
-            .now()
-            .saturating_duration_since(entry.last_attempt)
-            >= RESPAWN_BACKOFF_BASE
+        let now = self.clock.now();
+        if let Some(slot) = lock_std(&self.servers).get_mut(id)
+            && let Some(RespawnBackoff {
+                last: LastAttempt::Succeeded(at),
+                ..
+            }) = slot.backoff
         {
-            if let Some(slot) = lock_std(&self.servers).get_mut(id) {
-                slot.backoff = None;
-            }
-        } else if let Some(slot) = lock_std(&self.servers).get_mut(id)
-            && let Some(current) = slot.backoff.as_mut()
-        {
-            current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-            current.last_attempt = self.clock.now();
-            current.last_attempt_succeeded = false;
+            slot.backoff = if now.saturating_duration_since(at) >= RESPAWN_BACKOFF_BASE {
+                None
+            } else {
+                Some(RespawnBackoff::after_failure(slot.backoff, now))
+            };
         }
     }
 
@@ -387,12 +389,9 @@ impl Translator {
     ) -> (Option<LspClient>, Vec<DiagnosticsKey>) {
         let id = attempt.disarm();
         self.record_respawn_success(id);
-        let diagnostics_route = self.is_diagnostics_route(language_id, id);
+        let role = DiagnosticsRole::from_route(self.is_diagnostics_route(language_id, id));
 
-        let stale_task = lock_std(&self.servers)
-            .get_mut(id)
-            .and_then(|slot| slot.notification_task.take());
-        if let Some(handle) = stale_task {
+        if let Some(handle) = self.take_notification_task(id) {
             handle.abort();
         }
 
@@ -400,36 +399,33 @@ impl Translator {
         // the cache, and `clear_server_diagnostics` is scoped to one server's
         // own entries (#266), so a crashed rust-analyzer never wipes a
         // healthy pyright's cached diagnostics.
-        let mut cleared = Vec::new();
-        if let Some(mut cache) = cache {
-            cache.reset_indexing_state(
-                id,
-                IndexingReset::AwaitReplacement {
-                    within: self.indexing_ready_timeout,
-                },
-            );
-            if diagnostics_route {
-                cleared = cache.clear_server_diagnostics(id);
-                match routing {
-                    NotificationRouting::Pump(_) => cache.clear_push_degraded(id),
-                    NotificationRouting::Discard => {
+        let cleared = cache.map_or_default(|mut cache| {
+            let push = match routing {
+                NotificationRouting::Pump(_) => PushDelivery::Live,
+                NotificationRouting::Discard => {
+                    if role == DiagnosticsRole::Authoritative {
                         tracing::warn!(
                             "LSP server '{id}' (language '{language_id}') respawned; its diagnostics \
                              push notifications are discarded rather than cached until it is \
                              restarted with `restart_server` or mcpls is restarted"
                         );
-                        cache.mark_push_degraded(id);
                     }
+                    PushDelivery::Degraded
                 }
-            }
-        }
+            };
+            reset_server_cache(
+                &mut cache,
+                id,
+                IndexingReset::AwaitReplacement {
+                    within: self.indexing_ready_timeout,
+                },
+                role,
+                push,
+            )
+        });
 
         let consumer = match routing {
-            NotificationRouting::Pump(wiring) => wiring.spawn_pump(
-                id.clone(),
-                receivers,
-                DiagnosticsRole::from_route(diagnostics_route),
-            ),
+            NotificationRouting::Pump(wiring) => wiring.spawn_pump(id.clone(), receivers, role),
             NotificationRouting::Discard => self.spawn_discard_consumer(id, receivers),
         };
         let old_client = self.swap_in(id, new_server, &consumer);
@@ -549,7 +545,8 @@ pub(super) enum RespawnConfig {
     /// The config of a server that died; vetted right before the spawn.
     Unvetted(ServerInitConfig),
     /// A config a restart vetted before it stopped the old server, so the
-    /// respawn does not vet it again.
+    /// respawn skips the workspace-trust vetting; the spawn itself still
+    /// re-runs the argument backstop on purpose (#736).
     Vetted(VettedInitConfig),
 }
 
@@ -588,6 +585,25 @@ mod tests {
             translator.respawn_backoff_remaining(&id).is_none(),
             "once the fake clock has advanced past the computed delay, \
              the backoff window must be reported as elapsed"
+        );
+    }
+
+    #[test]
+    fn test_backoff_transitions_keep_failures_until_stability_is_proven() {
+        let now = Instant::now();
+        let failed = RespawnBackoff::after_failure(None, now);
+        assert_eq!(failed.consecutive_failures, 1);
+        std::assert_matches!(failed.last, LastAttempt::Failed(_));
+
+        let again = RespawnBackoff::after_failure(Some(failed), now);
+        assert_eq!(again.consecutive_failures, 2);
+
+        let succeeded = RespawnBackoff::after_success(Some(again), now);
+        assert_eq!(succeeded.consecutive_failures, 2);
+        std::assert_matches!(succeeded.last, LastAttempt::Succeeded(_));
+        assert_eq!(
+            RespawnBackoff::after_success(None, now).consecutive_failures,
+            0
         );
     }
 
@@ -1638,7 +1654,7 @@ sleep 1
             assert!(
                 translator
                     .backoff_of(&id)
-                    .is_some_and(|b| !b.last_attempt_succeeded),
+                    .is_some_and(|b| matches!(b.last, LastAttempt::Failed(_))),
                 "an abandoned respawn counts as a failed attempt"
             );
             assert!(translator.dead_server_config(&id).is_some());

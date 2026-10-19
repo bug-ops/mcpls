@@ -218,7 +218,7 @@ No new persistent data. Entities touched:
 |----------|-------------------|
 | A new tool or result type is added and exceeds its per-tool budget | The budget test fails with the offending tool and byte counts; the author trims the schema or raises the constant in a reviewed change |
 | A doc comment on a schema-visible type gains a code fence or `# Examples` | The description lint (FR-013) fails naming the path; the stripping layer (FR-004) normally removes it before it reaches the wire, so the test guards the stripper itself |
-| Description is cut in the middle of a sentence or Markdown construct | Truncation happens only at a paragraph boundary or sentence end; an unterminated code fence or backtick span is never emitted |
+| Description is cut in the middle of a sentence or Markdown construct | Whole sentences or none: a description longer than its cap keeps the longest run of whole sentences that fits, and is removed when none does. A cut is valid only after `.`, `!` or `?` (optionally followed by `)`) that no abbreviation (`e.g.`, `i.e.`, `etc.`, `vs.`, `cf.`) precedes, with balanced backticks and parentheses. A golden test requires every published description to be whole, and a second test requires that the truncating cap removes none, so a first sentence that does not fit is rewritten at its source (#814) |
 | A type is recursive (`Symbol`) | Stays as `$defs` plus `$ref` (FR-007); inlining it would not terminate |
 | A shared definition is inlined (FR-006) and referenced twice in one schema (for example `Range` containing two `Position2D`) | Both copies appear; the measured total, not the intent, decides whether inlining is kept (FR-006) |
 | A type with a hand-flattened schema, such as `min_level` (`#[schemars(inline)]`) | Left as is; shaping must be idempotent over already-shaped schemas |
@@ -281,6 +281,7 @@ Baseline values are those measured at commit `517cb53`.
 > - Phase 3 (dropping `format` or `minimum`, inlining small definitions) is not applied: `format` and `minimum` are kept, because phases 1 and 2 meet the budgets.
 > - The structural check compares the shaped router with the unshaped router of the same tree.
 > - A definition carried by two or more tools keeps its own description only when it fits in 80 B, and its nested descriptions only when they fit in 24 B; the meaning of `positions_degraded`, `truncated`, `out_of_workspace` and the enrichment statuses lives in the tool descriptions (`out_of_workspace` through a shared sentence added to the 15 tools that carry it).
+> - Whole sentences or none (#814): the truncating cap never falls back to a word boundary. The first sentence of every schema-visible field is at most 100 B, so the cap removes nothing; `restart_server` names `refused` in its tool description, paid for inside that description.
 > - Measured after #617 and #618 (typed hierarchy item inputs grew the unshaped surface): 181,350 B unshaped, 121,744 B shaped (6.4% headroom), largest tool 7,564 B, schema description bytes 26,995 B.
 
 ## 10. See Also

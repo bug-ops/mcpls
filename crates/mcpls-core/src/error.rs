@@ -16,8 +16,8 @@ use crate::bridge::{
 };
 use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, EnvKey, EnvTooLarge, FileKey, FilePattern,
-    InvalidAutoSelection, InvalidEnvValue, LanguageId, ServerCommand, ServerId, ToolKind,
-    UnsupportedFilePattern,
+    InvalidAutoSelection, InvalidEnvValue, InvalidServerArgs, LanguageId, ServerCommand, ServerId,
+    ToolKind, UnsupportedFilePattern,
 };
 use crate::lsp::JsonRpcError;
 pub use crate::redaction::RedactedText;
@@ -459,7 +459,7 @@ macro_rules! spelled_enum {
     (
         $(#[$meta:meta])*
         $name:ident {
-            $($(#[$variant_meta:meta])* $variant:ident => $spelling:literal),+ $(,)?
+            $($(#[$variant_meta:meta])* $variant:ident => $spelling:expr),+ $(,)?
         }
     ) => {
         $(#[$meta])*
@@ -1771,12 +1771,13 @@ pub enum ConfigError {
 
     /// An entry of a server's `args` holds a NUL, which the operating system
     /// cannot pass in an argument.
-    #[error("lsp_servers entry '{server}': args[{index}] cannot contain NUL")]
+    #[error("lsp_servers entry '{server}'")]
     ArgContainsNul {
         /// The id of the entry that holds the argument.
         server: ServerId,
-        /// The position of the argument in `args`.
-        index: usize,
+        /// Which argument holds the NUL.
+        #[source]
+        error: InvalidServerArgs,
     },
 
     /// A config path has no directory to resolve relative entries against.
@@ -1869,6 +1870,7 @@ pub enum ConfigError {
 
 /// A step of the LSP initialization handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InitPhase {
     /// The `initialize` request.
     Initialize,
@@ -2784,7 +2786,7 @@ impl TomlParseError {
                 let column = before
                     .rsplit('\n')
                     .next()
-                    .map_or(0, |last| last.chars().count())
+                    .map_or_default(|last| last.chars().count())
                     .saturating_add(1);
                 (line, column)
             });

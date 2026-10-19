@@ -26,8 +26,8 @@ pub use lifecycle::{
     ChildWorkingDir, LspServer, ServerInitConfig, ServerLanes, ServerState, SpawnedServer,
 };
 pub(crate) use lifecycle::{
-    ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, VettedInitConfig, child_env_var,
-    current_environment,
+    ExitGrace, SUPPORTED_SYMBOL_KINDS, ServerStartOutcome, SpawnTrust, VettedInitConfig,
+    child_env_var, current_environment,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{

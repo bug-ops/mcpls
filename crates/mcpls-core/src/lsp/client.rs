@@ -3,7 +3,9 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{ErrorCodes, LspErrorCodes, Notification as _, PublishDiagnosticsParams};
+use lsp_types::{
+    ErrorCodes, LspErrorCodes, LspRequestMethod, Notification as _, PublishDiagnosticsParams,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -100,21 +102,21 @@ const SHUTDOWN_ABORT_SETTLE: Duration = Duration::from_millis(50);
 ///
 /// This list only gates `-32801`. `-32802` (`ServerCancelled`) retry is
 /// unaffected and keeps retrying unconditionally for every method, as before.
-pub const CONTENT_MODIFIED_RETRY_METHODS: &[&str] = &[
-    "textDocument/signatureHelp",
-    "textDocument/inlayHint",
-    "textDocument/completion",
-    "textDocument/prepareCallHierarchy",
-    "callHierarchy/incomingCalls",
-    "callHierarchy/outgoingCalls",
-    "textDocument/diagnostic",
-    "textDocument/hover",
-    "textDocument/definition",
-    "textDocument/references",
-    "textDocument/implementation",
-    "textDocument/typeDefinition",
-    "textDocument/documentSymbol",
-    "workspace/symbol",
+pub const CONTENT_MODIFIED_RETRY_METHODS: &[LspRequestMethod<'static>] = &[
+    LspRequestMethod::TextDocumentSignatureHelp,
+    LspRequestMethod::TextDocumentInlayHint,
+    LspRequestMethod::TextDocumentCompletion,
+    LspRequestMethod::TextDocumentPrepareCallHierarchy,
+    LspRequestMethod::CallHierarchyIncomingCalls,
+    LspRequestMethod::CallHierarchyOutgoingCalls,
+    LspRequestMethod::TextDocumentDiagnostic,
+    LspRequestMethod::TextDocumentHover,
+    LspRequestMethod::TextDocumentDefinition,
+    LspRequestMethod::TextDocumentReferences,
+    LspRequestMethod::TextDocumentImplementation,
+    LspRequestMethod::TextDocumentTypeDefinition,
+    LspRequestMethod::TextDocumentDocumentSymbol,
+    LspRequestMethod::WorkspaceSymbol,
 ];
 
 /// Upper bound on the effective timeout for completion requests, regardless
@@ -766,13 +768,7 @@ impl LspClient {
                         )
                     });
                 }
-                Err(Error::LspServerError(response))
-                    if (LspErrorCodes::from(response.code) == LspErrorCodes::ServerCancelled
-                        || (LspErrorCodes::from(response.code)
-                            == LspErrorCodes::ContentModified
-                            && CONTENT_MODIFIED_RETRY_METHODS.contains(&method)))
-                        && Self::should_retrigger(response.data.as_ref()) =>
-                {
+                Err(Error::LspServerError(response)) if Self::retries(&response, method) => {
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
                         // Same "LSP error response: ..." prefix as the
                         // non-retryable branch below -- a log-grep alert on
@@ -804,6 +800,21 @@ impl LspClient {
         }
 
         Err(UnclassifiedError::logged(Error::ServerTerminated))
+    }
+
+    /// Whether `response` to `method` is one the client sends again: a
+    /// cancelled request always, a modified document only for the methods in
+    /// [`CONTENT_MODIFIED_RETRY_METHODS`], and both only when the server asks
+    /// to retrigger.
+    fn retries(response: &JsonRpcError, method: &str) -> bool {
+        let retryable = match LspErrorCodes::from(response.code) {
+            LspErrorCodes::ServerCancelled => true,
+            LspErrorCodes::ContentModified => {
+                CONTENT_MODIFIED_RETRY_METHODS.contains(&LspRequestMethod::from(method))
+            }
+            _ => false,
+        };
+        retryable && Self::should_retrigger(response.data.as_ref())
     }
 
     /// Like [`Self::request_typed`], but a server error response is returned
@@ -1415,18 +1426,20 @@ impl LspClient {
         params: Option<&Value>,
         settings: Option<&LspSettings>,
     ) -> std::result::Result<Value, JsonRpcError> {
-        match method {
-            "client/registerCapability"
-            | "client/unregisterCapability"
-            | "workspace/workspaceFolders"
-            | "workspace/diagnostic/refresh"
-            | "workspace/semanticTokens/refresh"
-            | "workspace/inlayHint/refresh"
-            | "workspace/codeLens/refresh"
-            | "window/showMessageRequest"
-            | "window/workDoneProgress/create" => Ok(Value::Null),
-            "workspace/configuration" => Self::workspace_configuration_result(params, settings),
-            "workspace/applyEdit" => Ok(serde_json::json!({ "applied": false })),
+        match LspRequestMethod::from(method) {
+            LspRequestMethod::ClientRegisterCapability
+            | LspRequestMethod::ClientUnregisterCapability
+            | LspRequestMethod::WorkspaceWorkspaceFolders
+            | LspRequestMethod::WorkspaceDiagnosticRefresh
+            | LspRequestMethod::WorkspaceSemanticTokensRefresh
+            | LspRequestMethod::WorkspaceInlayHintRefresh
+            | LspRequestMethod::WorkspaceCodeLensRefresh
+            | LspRequestMethod::WindowShowMessageRequest
+            | LspRequestMethod::WindowWorkDoneProgressCreate => Ok(Value::Null),
+            LspRequestMethod::WorkspaceConfiguration => {
+                Self::workspace_configuration_result(params, settings)
+            }
+            LspRequestMethod::WorkspaceApplyEdit => Ok(serde_json::json!({ "applied": false })),
             _ => Err(JsonRpcError::new(
                 ErrorCodes::MethodNotFound,
                 format!("Unhandled server request: {method}"),

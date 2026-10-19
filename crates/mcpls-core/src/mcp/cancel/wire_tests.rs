@@ -36,6 +36,10 @@ struct Wire {
     writer: WriteHalf<DuplexStream>,
     serving: JoinHandle<()>,
     stop: CancellationToken,
+    /// The server's own shutdown token, as a transport cancels it.
+    shutdown: CancellationToken,
+    /// Fires the shutdown signal of a wire served through `serve_until`.
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
     next_id: i64,
 }
 
@@ -74,7 +78,33 @@ impl Wire {
         translator.register_client(server_id, client);
 
         let server = mcp_server(translator, roots, McpConfig::default());
-        Self::serve(server, workspace, &file, Some(lsp)).await
+        Self::serve(server, workspace, &file, Some(lsp), false).await
+    }
+
+    /// [`Self::connect`], served the way `run_stdio` serves: through
+    /// `serve_until`, ended by `signal`.
+    async fn connect_via_stdio_path() -> Self {
+        let workspace = TempDir::new().unwrap();
+        let file = workspace.path().join("lib.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let roots = WorkspaceRoots::from_paths(&[workspace.path().to_path_buf()]).unwrap();
+        let server_id = ServerId::from_static("rust");
+        let mut translator = Translator::new()
+            .with_router(ToolRouter::catch_all([(
+                server_id.clone(),
+                LanguageId::from_static("rust"),
+            )]))
+            .with_extensions(HashMap::from([(
+                FileExtension::from_static("rs"),
+                LanguageId::from_static("rust"),
+            )]));
+        translator.set_workspace_roots(roots.clone());
+        let translator = Arc::new(translator);
+        let (client, lsp) = fake_lsp_client();
+        translator.register_client(server_id, client);
+
+        let server = mcp_server(translator, roots, McpConfig::default());
+        Self::serve(server, workspace, &file, Some(lsp), true).await
     }
 
     async fn serve(
@@ -82,15 +112,28 @@ impl Wire {
         workspace: TempDir,
         file: &std::path::Path,
         lsp: Option<FakeServer>,
+        via_stdio_path: bool,
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let stop = CancellationToken::new();
         let serve_stop = stop.clone();
-        let serving = tokio::spawn(async move {
-            if let Ok(running) = server.serve_with_ct(split(server_io), serve_stop).await {
-                running.waiting().await.ok();
-            }
-        });
+        let shutdown = server.stop_token();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = if via_stdio_path {
+            tokio::spawn(async move {
+                crate::transport::serve_until(server, split(server_io), async move {
+                    signal_rx.await.ok();
+                })
+                .await
+                .ok();
+            })
+        } else {
+            tokio::spawn(async move {
+                if let Ok(running) = server.serve_with_ct(split(server_io), serve_stop).await {
+                    running.waiting().await.ok();
+                }
+            })
+        };
         let (read, writer) = split(client_io);
         let mut wire = Self {
             file: file.display().to_string(),
@@ -100,6 +143,8 @@ impl Wire {
             writer,
             serving,
             stop,
+            shutdown,
+            signal: via_stdio_path.then_some(signal_tx),
             next_id: 0,
         };
         wire.handshake().await;
@@ -246,14 +291,15 @@ async fn a_client_cancel_logs_no_warning() {
     assert!(warnings.is_empty(), "{warnings:?}");
 }
 
-/// #807: a call still pending when the serve loop is cancelled is answered
-/// with a tool error that says why, not a protocol error.
+/// #807, #815: a call still pending when the serve loop is cancelled after
+/// the server's stop token is answered with a tool error that names shutdown.
 #[tokio::test(start_paused = true)]
 async fn a_call_pending_at_shutdown_gets_a_tool_error_result() {
     let mut wire = Wire::connect().await;
     let hover = wire.call_hover().await;
     wire.hover_request().await;
 
+    wire.shutdown.cancel();
     wire.stop.cancel();
     let (_, response) = wire.responses_until_with(hover).await;
 
@@ -261,7 +307,43 @@ async fn a_call_pending_at_shutdown_gets_a_tool_error_result() {
     assert_eq!(response["result"]["isError"], true);
     assert_eq!(
         response["result"]["content"][0]["text"],
-        "request cancelled (client cancellation or server shutdown)"
+        "mcpls is shutting down"
+    );
+}
+
+/// #815: the stdio path cancels the server's stop token on the shutdown signal,
+/// so a call pending then reports shutdown, not a client cancellation.
+#[tokio::test(start_paused = true)]
+async fn a_signal_on_the_stdio_path_reports_shutdown_to_a_pending_call() {
+    let mut wire = Wire::connect_via_stdio_path().await;
+    let hover = wire.call_hover().await;
+    wire.hover_request().await;
+
+    wire.signal.take().unwrap().send(()).unwrap();
+    let (_, response) = wire.responses_until_with(hover).await;
+
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "mcpls is shutting down"
+    );
+}
+
+/// #815: a serve loop cancelled while the server's stop token is not does not
+/// claim a shutdown.
+#[tokio::test(start_paused = true)]
+async fn a_call_pending_when_only_the_serve_loop_ends_reports_a_cancellation() {
+    let mut wire = Wire::connect().await;
+    let hover = wire.call_hover().await;
+    wire.hover_request().await;
+
+    wire.stop.cancel();
+    let (_, response) = wire.responses_until_with(hover).await;
+
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "request cancelled by the client or its session ended"
     );
 }
 
@@ -426,7 +508,7 @@ mod restart {
         let file = workspace.path().join("lib.rs");
         let server = mcp_server(Arc::clone(&translator), roots, mcp);
         (
-            Wire::serve(server, workspace, &file, None).await,
+            Wire::serve(server, workspace, &file, None, false).await,
             translator,
         )
     }

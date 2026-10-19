@@ -293,7 +293,7 @@ impl From<ToolSet> for Vec<ToolKind> {
 /// only ever sees the post-heuristics *applicable* subset for a given
 /// workspace, not the raw `[[lsp_servers]]` array, so a printed index would
 /// usually name the wrong TOML entry (misleading, worse than omitting it).
-/// `command`/`args` distinguish the entries instead; when two entries are
+/// `command` and the argument count distinguish the entries instead; when two entries are
 /// truly identical in every visible field, the description is the same for
 /// both halves, which is an honest reflection of the ambiguity.
 ///
@@ -305,7 +305,7 @@ impl From<ToolSet> for Vec<ToolKind> {
 /// let summary = EntrySummary {
 ///     language: LanguageId::from_static("python"),
 ///     command: LaunchCommand::from(ServerCommand::from_static("pyright")),
-///     args: vec![],
+///     arg_count: 0,
 /// };
 /// assert_eq!(summary.to_string(), "language 'python', command 'pyright'");
 /// ```
@@ -315,8 +315,11 @@ pub struct EntrySummary {
     pub language: LanguageId,
     /// Executable the entry launches.
     pub command: LaunchCommand,
-    /// Arguments passed to the executable.
-    pub args: Vec<String>,
+    /// Number of arguments passed to the executable.
+    ///
+    /// Only the count is kept: arguments can carry secrets (`--api-key=...`)
+    /// that must not reach `Display` or the derived `Debug` of an error.
+    pub arg_count: usize,
 }
 
 impl EntrySummary {
@@ -324,7 +327,7 @@ impl EntrySummary {
         Self {
             language: cfg.language_id.clone(),
             command: cfg.command.clone(),
-            args: cfg.args.to_vec(),
+            arg_count: cfg.args.len(),
         }
     }
 }
@@ -336,8 +339,9 @@ impl fmt::Display for EntrySummary {
             "language '{}', command '{}'",
             self.language, self.command
         )?;
-        if !self.args.is_empty() {
-            write!(f, ", args {:?}", self.args)?;
+        if self.arg_count > 0 {
+            let noun = if self.arg_count == 1 { "arg" } else { "args" };
+            write!(f, ", {} {noun}", self.arg_count)?;
         }
         Ok(())
     }
@@ -907,10 +911,54 @@ mod tests {
         // usually name the wrong `[[lsp_servers]]` array position.
         assert!(!msg.contains("entry #"), "message was: {msg}");
         assert!(msg.contains("rust-analyzer"), "message was: {msg}");
+        assert!(msg.contains(", 1 arg"), "message was: {msg}");
+        assert!(!msg.contains("1 args"), "message was: {msg}");
         assert!(
-            msg.contains("--dummy-second-instance"),
+            !msg.contains("--dummy-second-instance"),
             "message was: {msg}"
         );
+    }
+
+    #[test]
+    fn test_entry_summary_pluralises_the_argument_count() {
+        let summary = |arg_count| EntrySummary {
+            language: LanguageId::from_static("rust"),
+            command: ServerCommand::from_static("ra").into(),
+            arg_count,
+        };
+        assert_eq!(summary(0).to_string(), "language 'rust', command 'ra'");
+        assert_eq!(
+            summary(1).to_string(),
+            "language 'rust', command 'ra', 1 arg"
+        );
+        assert_eq!(
+            summary(2).to_string(),
+            "language 'rust', command 'ra', 2 args"
+        );
+    }
+
+    #[test]
+    fn test_from_configs_duplicate_server_id_error_never_prints_arguments() {
+        let secret_args = |args: &[&str]| {
+            crate::config::ServerArgs::try_from(
+                args.iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let mut first = cfg("rust", None, None);
+        first.args = secret_args(&["--stdio"]);
+        let mut second = cfg("rust", None, None);
+        second.args = secret_args(&["--api-key=SECRET"]);
+        let err = ToolRouter::from_configs(&[first, second]).unwrap_err();
+        for rendered in [
+            format!("{err}"),
+            format!("{err:?}"),
+            crate::error::ErrorChain(&err).to_string(),
+        ] {
+            assert!(!rendered.contains("SECRET"), "leaked: {rendered}");
+        }
     }
 
     #[test]

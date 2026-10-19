@@ -1,10 +1,10 @@
 //! The per-file sweep step (#648): when a tracked file is resynced and pulled,
 //! and what the pull publishes.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::{assert_matches, fs};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::pull_tests::{Fixture, answer, error_item, full_report, next_pull_request};
-use super::sweep::{EpochBudget, Interest, SweepContext, SweepMemo, SweepStep};
+use super::sweep::{
+    Deferral, Drained, EpochBudget, Interest, PassStart, PulledStates, SweepContext, SweepMemo,
+    SweepStep,
+};
 use super::*;
 use crate::bridge::state::ResourceLimits;
 use crate::bridge::translator::testing::*;
@@ -972,7 +975,9 @@ async fn test_an_epoch_pull_that_finds_the_file_moved_spends_no_budget() {
         .await;
     fx.edit("fn main() { let moved = 1; }");
 
-    context.pull_due(candidates, &mut steps).await;
+    context
+        .pull_due(candidates, &mut steps, &mut PulledStates::default())
+        .await;
 
     let granted = (0..20)
         .filter(|_| {
@@ -981,4 +986,173 @@ async fn test_an_epoch_pull_that_finds_the_file_moved_spends_no_budget() {
         })
         .count();
     assert_eq!(granted, 8);
+}
+
+/// A pass that stops hands back the candidates it did not pull, so the pass
+/// that took them from the queue can put them back (#809).
+#[tokio::test]
+async fn test_a_stopped_run_hands_back_the_candidates_it_did_not_pull() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    fx.edit("fn main() { let x: i32 = \"s\"; }");
+    let stop = CancellationToken::new();
+    let context = SweepContext::new(
+        Arc::clone(&fx.translator),
+        Arc::clone(&fx.cache),
+        SweepMemo::default(),
+        TaskTracker::new(),
+        stop.clone(),
+    );
+    let (mut steps, candidates) = context
+        .resync_pass(&[(fx.path.clone(), Interest::Subscribed)])
+        .await;
+    stop.cancel();
+
+    let drained = context
+        .pull_due(candidates, &mut steps, &mut PulledStates::default())
+        .await;
+
+    let Drained::Wedged(rest) = drained else {
+        panic!("a stopped run reached every candidate");
+    };
+    assert_eq!(rest.len(), 1);
+}
+
+/// A file the pass declined is not recorded as pulled: once the epoch budget
+/// refills, a later batch of the same pass pulls it.
+#[tokio::test(start_paused = true)]
+async fn test_a_throttled_file_is_pulled_by_the_same_pass_once_the_budget_refills() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    let companion = fx.track_companion().await;
+    let memo = SweepMemo::default();
+    let context = sweep_context(&fx.translator, &fx.cache, &memo);
+    sweep_file(
+        &fx.translator,
+        &fx.path,
+        Interest::Subscribed,
+        &memo,
+        &fx.cache,
+    )
+    .await;
+    fs::write(&companion, "fn other() { let y = 2; }").unwrap();
+    let (mut steps, candidates) = context
+        .resync_pass(&[
+            (companion, Interest::Companion),
+            (fx.path.clone(), Interest::Subscribed),
+        ])
+        .await;
+    for _ in 0..8 {
+        memo.take_epoch_pull(&Fixture::rust(), tokio::time::Instant::now());
+    }
+    let mut pulled = PulledStates::default();
+
+    context.pull_due(candidates, &mut steps, &mut pulled).await;
+
+    assert_eq!(steps[1], SweepStep::Deferred(Deferral::Throttled));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let (mut steps, candidates) = context
+        .resync_pass(&[(fx.path.clone(), Interest::Subscribed)])
+        .await;
+    let mut wire = BufReader::new(&mut server.write_stdout);
+
+    tokio::join!(
+        context.pull_due(candidates, &mut steps, &mut pulled),
+        answer(
+            &mut wire,
+            &mut server.read_half_stdin,
+            full_report(json!([error_item(0, "again")])),
+        ),
+    );
+
+    assert_eq!(steps[0], SweepStep::Pulled);
+}
+
+/// What a pass met of its server's patience does not outlive a batch: a file
+/// of a later batch that answers within the patience is not cut short by an
+/// unanswered pull of an earlier one.
+#[tokio::test(start_paused = true)]
+async fn test_a_later_batch_of_a_pass_gets_the_full_patience() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    let other = fx.track_companion().await;
+    fx.edit("fn main() { let x: i32 = \"s\"; }");
+    let context = sweep_context(&fx.translator, &fx.cache, &SweepMemo::default());
+    let (mut steps, mut candidates) = context
+        .resync_pass(&[
+            (fx.path.clone(), Interest::Subscribed),
+            (other, Interest::Subscribed),
+        ])
+        .await;
+    let second = candidates.pop().expect("two candidates");
+    let mut pulled = PulledStates::default();
+
+    context.pull_due(candidates, &mut steps, &mut pulled).await;
+
+    assert_eq!(steps[0], SweepStep::Detached);
+    let mut wire = BufReader::new(&mut server.write_stdout);
+    tokio::join!(
+        context.pull_due(vec![second], &mut steps, &mut pulled),
+        async {
+            next_pull_request(&mut wire).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            answer(
+                &mut wire,
+                &mut server.read_half_stdin,
+                full_report(json!([error_item(0, "slow")])),
+            )
+            .await;
+        },
+    );
+    assert_eq!(steps[1], SweepStep::Pulled);
+}
+
+/// A pass that ends early puts the files it took from the queue and did not
+/// pull back, so the next pass pulls them instead of leaving them to a later
+/// visit (#809).
+#[tokio::test]
+async fn test_a_pass_that_ends_early_requeues_the_files_it_took() {
+    let (fx, mut server) = Fixture::new(crate::redaction::Redactions::default());
+    fx.attach_tracker().await;
+    fx.pull_answered(&mut server, full_report(json!([error_item(0, "first")])))
+        .await;
+    fx.edit("fn main() { let x: i32 = \"s\"; }");
+    let memo = SweepMemo::default();
+    let stop = CancellationToken::new();
+    let context = SweepContext::new(
+        Arc::clone(&fx.translator),
+        Arc::clone(&fx.cache),
+        memo.clone(),
+        TaskTracker::new(),
+        stop.clone(),
+    );
+    let (_steps, candidates) = context
+        .resync_pass(&[(fx.path.clone(), Interest::Subscribed)])
+        .await;
+    let rust = Fixture::rust();
+    let PassStart::Started { pass, .. } = memo.begin_or_queue(&rust, &[]) else {
+        panic!("no pass ran");
+    };
+    assert_matches!(
+        memo.begin_or_queue(&rust, &candidates),
+        PassStart::Queued(_)
+    );
+    assert_eq!(memo.queued_files(&rust), 1);
+    stop.cancel();
+
+    context
+        .run_pass(pass, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        .await;
+
+    assert_eq!(memo.queued_files(&rust), 1);
+    assert_matches!(
+        memo.begin_or_queue(&rust, &[]),
+        PassStart::Started { leftovers, .. } if leftovers.len() == 1
+    );
 }
