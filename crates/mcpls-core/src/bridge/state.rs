@@ -1158,6 +1158,19 @@ impl DocumentTracker {
         });
     }
 
+    /// How many tracked documents `server`'s current process has been sent.
+    pub(crate) fn synced_document_count(&self, server: &ServerId) -> usize {
+        lock_std(&self.documents)
+            .values()
+            .filter(|state| state.synced_version(server).is_some())
+            .count()
+    }
+
+    /// Whether `server`'s sync history was ever forgotten (restart or respawn).
+    pub(crate) fn sync_history_forgotten(&self, server: &ServerId) -> bool {
+        self.generation(server) != SyncGeneration::default()
+    }
+
     /// Current sync generation for `server` (see [`Self::forget_server`]).
     fn generation(&self, server: &ServerId) -> SyncGeneration {
         lock_std(&self.generations)
@@ -2454,6 +2467,36 @@ mod tests {
             state.synced_version(&server).map(DocumentVersion::get),
             Some(1)
         );
+    }
+
+    /// #796: the coverage accessors count documents sent to the current
+    /// server process and flag a forgotten sync history.
+    #[tokio::test]
+    async fn test_synced_document_count_and_forgotten_history() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cover.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+        set_mtime(&path, settled_past());
+
+        let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
+        let server = ServerId::from_static("rust");
+        let other = ServerId::from_static("other");
+        let (client, _guard) = fake_lsp_client();
+
+        assert_eq!(tracker.synced_document_count(&server), 0);
+        assert!(!tracker.sync_history_forgotten(&server));
+
+        tracker
+            .ensure_open_for_test(&path, &server, &client)
+            .await
+            .unwrap();
+        assert_eq!(tracker.synced_document_count(&server), 1);
+        assert_eq!(tracker.synced_document_count(&other), 0);
+
+        tracker.forget_server(&server);
+        assert_eq!(tracker.synced_document_count(&server), 0);
+        assert!(tracker.sync_history_forgotten(&server));
+        assert!(!tracker.sync_history_forgotten(&other));
     }
 
     /// Marks `path`'s tracked document as disk-verified, for a test that

@@ -77,7 +77,7 @@ pub(super) fn open_beneath(root: &Path, relative: &Path) -> io::Result<Beneath> 
 /// # Errors
 ///
 /// The underlying I/O error, including when the root cannot be opened.
-#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+#[cfg(unix)]
 pub(super) fn open_walking(root: &Path, relative: &Path) -> io::Result<Beneath> {
     use std::path::Component;
 
@@ -107,7 +107,7 @@ pub(super) fn open_walking(root: &Path, relative: &Path) -> io::Result<Beneath> 
 /// symlink: `ELOOP`, `EMLINK` (FreeBSD), `EFTYPE` (NetBSD) or `ENOTDIR`
 /// (macOS). `ENOTDIR` also covers a regular file in place of a directory, which
 /// is treated the same: the tree no longer matches the validated path.
-#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+#[cfg(unix)]
 const fn is_symlink_refusal(errno: Errno) -> bool {
     #[cfg(target_os = "netbsd")]
     if matches!(errno, Errno::FTYPE) {

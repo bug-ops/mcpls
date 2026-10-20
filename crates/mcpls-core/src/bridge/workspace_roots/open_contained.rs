@@ -9,7 +9,8 @@
 //!   is never opened; without `openat2` they walk the components with
 //!   `O_NOFOLLOW`. The opened handle's own path from `/proc/self/fd` is then
 //!   checked against the roots as well.
-//! - macOS opens first, then asks the handle for its path with
+//! - macOS walks the components with `O_NOFOLLOW` like other Unix systems, so
+//!   an outside target is never opened, then asks the handle for its path with
 //!   `fcntl(F_GETPATH)` and checks it against the roots.
 //! - Windows has no safe handle-to-path API in the dependencies, so every
 //!   ancestor directory is pinned (opened without `FILE_SHARE_DELETE`, so it
@@ -18,12 +19,12 @@
 //! - Other Unix systems walk the components with `O_NOFOLLOW` from the root
 //!   directory, so no symlink is followed and no outside target is opened.
 
-#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+#[cfg(unix)]
 mod beneath;
 
 use std::io;
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use self::beneath::Beneath;
 use super::{WorkspacePath, WorkspaceRoots};
 use crate::error::Error;
@@ -49,7 +50,7 @@ impl WorkspaceRoots {
     }
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(windows, all(test, any(target_os = "linux", target_os = "android"))))]
 fn open_regular(path: &WorkspacePath) -> Result<RegularFile, Error> {
     RegularFile::open(path.as_path()).map_err(|error| error.into_error(path.as_path()))
 }
@@ -65,7 +66,7 @@ fn outside(path: &WorkspacePath) -> Error {
     Error::PathOutsideWorkspace(path.as_path().to_path_buf())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 impl WorkspaceRoots {
     /// Runs `open` on the root containing `path` and the path relative to it.
     fn open_under_root(
@@ -83,7 +84,7 @@ impl WorkspaceRoots {
 }
 
 /// Turns the outcome of a containment-aware open into a verified regular file.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn regular_from(path: &WorkspacePath, beneath: Beneath) -> Result<RegularFile, Error> {
     match beneath {
         Beneath::Opened(file) => {
@@ -172,7 +173,8 @@ mod platform {
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Path;
 
-    use super::{WorkspacePath, WorkspaceRoots, file_io, open_regular, outside, require_linked};
+    use super::beneath::open_walking;
+    use super::{WorkspacePath, WorkspaceRoots, file_io, outside, regular_from, require_linked};
     use crate::error::Error;
     use crate::util::RegularFile;
 
@@ -182,7 +184,8 @@ mod platform {
             path: &WorkspacePath,
             after_open: impl FnOnce(),
         ) -> Result<RegularFile, Error> {
-            let file = open_regular(path)?;
+            let beneath = self.open_under_root(path, open_walking)?;
+            let file = regular_from(path, beneath)?;
             after_open();
             let raw =
                 rustix::fs::getpath(file.file()).map_err(|errno| file_io(path, errno.into()))?;
@@ -396,7 +399,7 @@ mod tests {
         path
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     #[test]
     fn test_open_contained_refuses_symlink_to_outside_fifo() {
         let (_guard, base, roots) = workspace();

@@ -33,9 +33,18 @@ pub struct InvalidServerArgs {
 /// assert_eq!(ServerArgs::new(["ok", "a\0b"]).unwrap_err().index, 1);
 /// # Ok::<(), mcpls_core::config::InvalidServerArgs>(())
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
 pub struct ServerArgs(Vec<String>);
+
+/// Prints the argument count only: arguments may carry credentials such as `--api-key=...`.
+impl std::fmt::Debug for ServerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerArgs")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 impl ServerArgs {
     /// Validates `args`.
@@ -146,6 +155,17 @@ mod tests {
             Err(InvalidServerArgs { index: 1 })
         );
         assert_eq!(ServerArgs::new(["a", ""]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn debug_output_never_holds_an_argument() {
+        let args = ServerArgs::new(["--api-key=SECRETVALUE", "--stdio"]).unwrap();
+        let other = ServerArgs::new(["--api-key=OTHERVALUE", "--stdio"]).unwrap();
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("SECRETVALUE"));
+        assert!(!rendered.contains("stdio"));
+        assert_eq!(rendered, format!("{other:?}"));
+        assert_eq!(rendered, "ServerArgs { len: 2 }");
     }
 
     #[test]

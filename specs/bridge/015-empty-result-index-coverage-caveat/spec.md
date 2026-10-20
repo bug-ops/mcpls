@@ -11,7 +11,7 @@ tags:
   - reliability
   - competitor-gap
 created: 2026-10-19
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[bridge/006-lsp-indexing-readiness-gate/spec|bridge/006-lsp-indexing-readiness-gate]]"
@@ -84,9 +84,7 @@ restart; earlier it had replaced an unconditional "may be dead code" hint with a
 the same reason. One competitor and one niche server class is thin evidence, hence P4. The mcpls
 side was confirmed by source inspection at HEAD `d2a9533`: no coverage hint exists anywhere in
 `crates/mcpls-core/src` for the empty-references case. A live reproduction against a real
-open-document-only server has not been run `[NEEDS CLARIFICATION: which language server in the
-default 30-language mapping, if any, exhibits open-document-only indexing for references, so that
-the reproduction in SC-001 can be run live rather than against a test double]`.
+open-document-only server has not been run (none is known in the default mapping, so SC-001 runs against a test double; see section 11).
 
 ### Goal
 
@@ -114,15 +112,13 @@ caller, (b) removes one cause, (c) tells the human.
 change.** (a) is the only option that removes the hazard for both causes without changing document
 lifecycle behavior, and it is the established mcpls shape for "the answer may be incomplete". (b)
 addresses a narrower cause at a real behavioral cost and should be evaluated only if (a) proves
-insufficient `[NEEDS CLARIFICATION: is a bounded re-sync after restart wanted as a separate
-follow-up, or rejected outright because it conflicts with lazy open?]`.
+insufficient (rejected; see section 11).
 
-**Close-as-non-goal fallback.** If section 11's gate fails (the field cannot fit the
-`tools/list` budget without trimming unrelated schema text, or no trigger rule below can avoid
-flagging every empty result), the item closes as option (c) alone: a README and tool-description
-statement that an empty result reflects only what the routed server has indexed, with a pointer to
-`get_definition` and to touching the files of interest. P4 and one-competitor evidence make this a
-legitimate outcome, not a failure.
+**Close-as-non-goal fallback (not taken).** Had the field not fit the `tools/list` budget without
+trimming unrelated schema text, or had no trigger rule avoided flagging every empty result, the item
+would have closed as option (c) alone: a README and tool-description statement that an empty result
+reflects only what the routed server has indexed. The maintainer approved rule (i) and a minimal
+budget raise instead, so (a) plus (c) was implemented; see section 11.
 
 ### Out of Scope
 
@@ -131,15 +127,13 @@ legitimate outcome, not a failure.
   of this change (see the open question above).
 - Disclosing coverage on tools other than `get_references` and `workspace_symbol_search`
   (`go_to_implementation`, call hierarchy incoming calls, type hierarchy). They are candidates for
-  a follow-up once the field shape is proven `[NEEDS CLARIFICATION: should the shared type be
-  designed now so those tools can adopt it without a shape change?]`.
+  a follow-up once the field shape is proven (the shared `IndexCoverage` type can be adopted without a shape change).
 - The indexing-in-progress cause (already covered by bridge/006, bridge/012 and bridge/013) and any
   change to the 30 s bounded wait or the gating of `workspace_symbol_search`.
 - A config key or environment variable that declares a server as open-document-only. Per-server
   behavior is not configured here.
 - Detecting a server's indexing model from its capabilities or name. LSP defines no capability for
-  it `[NEEDS CLARIFICATION: is any initialize-time signal usable to classify a server as
-  open-document-only, or must the note apply to every server on an empty result?]`.
+  it (none exists, so the note applies to every empty result).
 - Technical design: recorded in a plan after this spec is approved.
 
 ## 2. User Stories
@@ -221,11 +215,11 @@ THEN the chosen option, the measured payload delta and the rejected options with
 |----|-------------|----------|
 | FR-001 | WHEN `get_references` or `workspace_symbol_search` returns an empty result AND the trigger rule (FR-003) holds THE SYSTEM SHALL attach a typed coverage note to the response | must |
 | FR-002 | WHEN the result contains at least one item THE SYSTEM SHALL NOT attach the coverage note and SHALL serialize the response exactly as before | must |
-| FR-003 | THE trigger rule SHALL be decided from state mcpls already holds (the document tracker's synced set for the routed server and its sync generation) and SHALL NOT require an additional LSP request `[NEEDS CLARIFICATION: exact rule. Candidates: (i) every empty result; (ii) an empty result when the routed server has been sent no document other than the queried one; (iii) an empty result when the number of synced documents is below a threshold. Rule (i) is the simplest and never under-warns but flags servers that index the whole workspace on every genuine empty]` | must |
-| FR-004 | THE coverage note SHALL be a typed field on the typed response, defined once and shared by both tools, with a closed set of values and bounded size; it SHALL NOT be a free-form string | must |
-| FR-005 | THE coverage note SHALL state the routed server's synced-document scope in machine-readable terms (at minimum: that the answer is limited to the server's own index, and the number of documents mcpls has sent to the current server process) `[NEEDS CLARIFICATION: exact members. Candidates: a closed enum scope value; a document count; a flag set when the sync generation changed since the session's first sync (restart or respawn seen)]` | must |
-| FR-006 | WHEN the routed server's sync generation has changed since documents were last synced to it (restart or respawn) THE note SHALL say so, using the generation already tracked by `DocumentTracker`, without recording a new per-server history | should |
-| FR-007 | THE note SHALL describe the routed server only; WHEN the request spans several servers (workspace symbol search routed to more than one) THE note SHALL be derived per routed server and merged by a rule stated in the plan `[NEEDS CLARIFICATION: merge rule for multi-server workspace_symbol_search: any-server-partial, or per-server entries bounded by a cap]` | must |
+| FR-003 | THE trigger rule SHALL be decided from state mcpls already holds (the document tracker's synced set for the routed server and its sync generation) and SHALL NOT require an additional LSP request (decided: rule (i), every empty result where the server itself answered empty; see section 11) | must |
+| FR-004 | THE coverage note SHALL be a typed field on the typed response, defined once and shared by both tools, with bounded size; it SHALL NOT be a free-form string | must |
+| FR-005 | THE coverage note SHALL state the routed server's synced-document scope in machine-readable terms (at minimum: that the answer is limited to the server's own index, and the number of documents currently synced to the current server process (LRU eviction lowers it)) (decided: a count and a restart flag; see section 11) | must |
+| FR-006 | WHEN the routed server's sync generation has changed since documents were last synced to it (restart or respawn) THE note SHALL say so, using the generation already tracked by `DocumentTracker`, without recording a new per-server history; the indicator is sticky: once a restart or respawn was observed it stays set for the rest of the process lifetime | should |
+| FR-007 | THE note SHALL describe the routed server only; WHEN the request spans several servers (workspace symbol search routed to more than one) THE note SHALL be derived per routed server and merged by a rule stated in the plan (moot: the search routes to exactly one server) | must |
 | FR-008 | WHEN the indexing state is `Loading` THE SYSTEM SHALL keep reporting indexing through the existing channel (`Error::WorkspaceIndexing` or `indexing_in_progress`) and SHALL NOT fold it into the coverage note | must |
 | FR-009 | THE `tools/list` descriptions of the two tools SHALL state, in one canonical wording, that an empty result with the note reflects only what the routed server has indexed and is not proof of absence, and SHALL NOT state or imply that an empty result without the note is proof of absence | must |
 | FR-010 | THE output schemas of the two tools SHALL document the field | must |
@@ -240,8 +234,8 @@ THEN the chosen option, the measured payload delta and the rejected options with
 |----|----------|-------------|
 | NFR-001 | Output compatibility | Default output for non-empty results is byte-identical to the pre-change output; the field is omitted, not `null`, when absent. This deliberately differs from `indexing_in_progress`, which is always present, because the note applies only to empty results |
 | NFR-002 | Latency | No extra LSP round-trip on the non-empty path and none on the empty path: the note is computed from tracker state held in memory ([[constitution]] section VI) |
-| NFR-003 | Payload budget | The golden `tools/list` payload SHALL stay within the enforced budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (total 135,500 B, per tool 9,000 B, schema descriptions 35,000 B as enforced in `mcp/schema_shape.rs` at HEAD). The field type SHALL be shared and its description kept to one canonical sentence per tool. `get_references` is the largest published tool in mcp/014's baseline (12,458 B before shaping), so its per-tool headroom SHALL be measured before design `[NEEDS CLARIFICATION: current measured headroom of the total and of get_references; mcp/014 recorded only 357 B of total headroom at the time of mcp/016, so the change may need an offsetting trim or a reviewed budget raise]` |
-| NFR-004 | Type safety | The scope is a closed enum and the count a bounded integer on a typed response; no stringly-typed state and no untyped map, per [[constitution]] and the project's type-safety rule |
+| NFR-003 | Payload budget | The golden `tools/list` payload SHALL stay within the enforced budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (total 136,000 B, per tool 9,000 B, schema descriptions 35,000 B as enforced in `mcp/schema_shape.rs` at HEAD). The field type SHALL be shared and its description kept to one canonical sentence per tool. `get_references` is the largest published tool in mcp/014's baseline (12,458 B before shaping), so its per-tool headroom SHALL be measured before design (measured in section 11) |
+| NFR-004 | Type safety | The count is a bounded integer and the restart indicator a boolean on a typed response; no stringly-typed state and no untyped map, per [[constitution]] and the project's type-safety rule |
 | NFR-005 | Consistency | The note is produced by one function shared by both tools, and its wording in descriptions is one canonical sentence; a third tool adopting it requires no new definition |
 | NFR-006 | Concurrency | Reading tracker state for the note SHALL follow the existing lock-ordering discipline and SHALL NOT hold a tracker lock across an await |
 | NFR-007 | Pre-1.0 | The response shape change is additive and is recorded in `CHANGELOG.md` with the PR link |
@@ -253,7 +247,7 @@ THEN the chosen option, the measured payload delta and the rejected options with
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| Index coverage note (new) | Optional, typed statement attached to an empty references or workspace-symbol result | closed-enum scope; count of documents sent to the current server process; whether a restart or respawn was observed `[NEEDS CLARIFICATION: final members, see FR-005]` |
+| Index coverage note (new) | Optional, typed statement attached to an empty references or workspace-symbol result | count of documents currently synced to the current server process; whether a restart or respawn was observed (sticky for the process lifetime) |
 | Synced document set (existing) | Per-server set of documents mcpls has sent with `didOpen` | server id, paths, sync generation (`DocumentTracker`) |
 | Sync generation (existing) | Per-server counter bumped by `forget_server` | integer, compared to detect a restart or respawn |
 | Locations result / workspace symbol result (existing) | The tool outputs that gain the optional field | items, existing degradation fields |
@@ -264,7 +258,7 @@ THEN the chosen option, the measured payload delta and the rejected options with
 |----------|-------------------|
 | Non-empty result | No note; response unchanged (FR-002, NFR-001) |
 | Empty result, server indexes the whole workspace | With rule (i) the note appears although the empty is genuine: acceptable cost of never under-warning; with rules (ii) or (iii) the note may be suppressed (FR-003). The wording must not claim the server is open-document-only |
-| Empty result, server `Loading` | `get_references` returns `Error::WorkspaceIndexing` as today; for `workspace_symbol_search` (ungated by bridge/006 and left so by bridge/013) the existing indexing disclosure is unchanged and the coverage note is independent of it (FR-008) `[NEEDS CLARIFICATION: workspace_symbol_search has no indexing flag today; does disclosing coverage here pull in the deferred question of gating or flagging it (#422)?]` |
+| Empty result, server `Loading` | `get_references` returns `Error::WorkspaceIndexing` as today; for `workspace_symbol_search` (ungated by bridge/006 and left so by bridge/013) the existing indexing disclosure is unchanged and the coverage note is independent of it (FR-008) (gating or flagging it, #422, stays out of scope) |
 | Empty result straight after `restart_server` or respawn | Note reports a changed sync generation (FR-006) |
 | Server returns `null` instead of `[]` | Treated as empty, same as today (`unwrap_or_default`) |
 | Server returns an error | Error path unchanged; no note |
@@ -312,16 +306,8 @@ THEN the chosen option, the measured payload delta and the rejected options with
 
 ## 9. Open Questions
 
-> [!question] To resolve before the plan
-> - [NEEDS CLARIFICATION: trigger rule, FR-003 (i), (ii) or (iii)]
-> - [NEEDS CLARIFICATION: exact members of the note, FR-005]
-> - [NEEDS CLARIFICATION: multi-server merge rule for `workspace_symbol_search`, FR-007]
-> - [NEEDS CLARIFICATION: a live reproduction server for the open-document-only behavior, section 1]
-> - [NEEDS CLARIFICATION: an initialize-time signal to classify servers, if any, Out of Scope]
-> - [NEEDS CLARIFICATION: measured `tools/list` headroom, NFR-003]
-> - [NEEDS CLARIFICATION: whether option (b) is a wanted follow-up or rejected]
-> - [NEEDS CLARIFICATION: whether the shared type should be designed now for adoption by `go_to_implementation` and the hierarchy tools]
-> - [NEEDS CLARIFICATION: interaction with the deferred gating or flagging of `workspace_symbol_search` (#422)]
+> [!success] All resolved
+> The nine questions raised in the draft are answered in section 11.
 
 ## 10. See Also
 
@@ -334,3 +320,21 @@ THEN the chosen option, the measured payload delta and the rejected options with
 - [[bridge/005-expose-document-tracker-limits/spec|bridge/005]] — tracker limits that bound option (b)
 - [[mcp/014-tools-list-payload-size/spec|mcp/014]] — `tools/list` size budget
 - Code: `crates/mcpls-core/src/bridge/translator/navigation.rs` (`handle_references`), `crates/mcpls-core/src/bridge/state.rs` (`DocumentTracker`, `forget_server`), `crates/mcpls-core/src/bridge/translator/restart.rs`, `crates/mcpls-core/src/bridge/translator/respawn.rs`, `crates/mcpls-core/src/mcp/schema_shape.rs` (budget constants), `crates/mcpls-core/src/mcp/tool_surface.json`
+
+## 11. Resolution
+
+Decided by the maintainer on 2026-10-19 and implemented for #796.
+
+- **Option chosen**: (a) plus the (c) documentation. Option (b), eager re-sync, is rejected: it conflicts with lazy open ([[bridge/002-document-tracker-synchronization/spec|bridge/002]]).
+- **Trigger rule**: (i), every empty result. Rules (ii) and (iii) are rejected: they can under-warn, and a server's indexing model is not observable.
+- **Note members** (FR-005): `index_coverage { synced_documents: u32, server_restarted: bool }`. The field itself is the scope statement, so no scope enum is carried (a single-valued enum would encode nothing). `synced_documents` counts tracked documents synced to the current server process; `server_restarted` is true once the tracker's sync generation for the server moved (restart or respawn) and is omitted when false. Derived from tracker state by one function; no LSP request is added.
+- **Types** (FR-004, NFR-005): `IndexCoverage` is one shared type. `get_references` returns `ReferencesResult` (a flattened `LocationsResult` plus the note) so the shared `LocationsResult` of five tools is not widened; `WorkspaceSymbolResult` carries the field directly. The field is omitted, not `null`, on non-empty results.
+- **Multi-server merge** (FR-007): moot. `workspace_symbol_search` routes to exactly one server (`resolve_any`).
+- **Emptied by mcpls**: the workspace-symbol note is attached only when the server itself returned no symbols, so `limit` and `kind_filter` that empty a non-empty server answer carry no note. For `get_references` nothing is removed after the server answers, so every empty result carries it.
+- **Sticky restart flag**: `server_restarted` stays set for the process lifetime (the tracker never resets its generation); FR-006 is amended accordingly. `synced_documents` counts currently tracked documents, so eviction lowers it.
+- **Loading state** (FR-008): unchanged; `workspace_symbol_search` stays ungated and the note is independent of indexing.
+- **Initialize-time server classification**: none exists in LSP; not attempted.
+- **Adoption by other tools**: out of scope; `IndexCoverage` is reusable without a shape change.
+- **Documentation**: tool descriptions of both tools carry one canonical sentence (FR-009); `book/src/tools/code-intelligence.md` states the limitation (FR-011). The repository has no `docs/user-guide/`.
+- **Measured `tools/list` delta** (NFR-003, SC-005): total 134,770 B to 135,990 B (+1,220 B, of which 412 B are the two description sentences); `get_references` 7,876 B to 8,483 B (limit 9,000 B); schema description bytes 29,111 B to 29,385 B (limit 35,000 B). The total no longer fit under 135,500 B, so [[mcp/014-tools-list-payload-size/spec|mcp/014]]'s total budget was raised to 136,000 B (minimal raise, approved by the maintainer); the per-tool and description budgets are unchanged.
+- **Live reproduction**: no server in the default mapping is known to index only opened documents; SC-001 and SC-002 are covered by a test double and the `.local/testing` playbook.

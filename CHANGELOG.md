@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#784).
 - The diagnostics sweep re-pulls subscribed files when any tracked file of their server changes, walks the 256 most recent unsubscribed files of such servers, and sends `didSave` to servers that advertise `textDocumentSync.save` (#781) (#790).
 - `McplsServer::with_stop` attaches a stop token so a call stopped by shutdown reports `ServerShutdown` instead of `Cancelled` (#815) (#823).
+- Empty `get_references` and `workspace_symbol_search` results carry a typed `index_coverage` note (synced documents, restart seen) (#796).
 
 ### Fixed
 
@@ -47,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A duplicate server id error no longer prints server arguments (#816) (#823).
 - On Windows a file whose canonical path exceeds `MAX_PATH` is opened inside the workspace instead of being refused as outside it (#817) (#823).
 - Config read errors name the path, sweep task panics are logged, and the child-exit warning reports the grace actually applied (#820) (#823).
+- Secrets in server arguments and environment values no longer appear in `Debug` output (#824).
+- On macOS, workspace file opens walk the components with `O_NOFOLLOW`, so an outside FIFO or device behind a symlink is never opened (#792).
 
 ### Changed
 

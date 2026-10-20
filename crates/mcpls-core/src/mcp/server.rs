@@ -54,9 +54,9 @@ use crate::bridge::{
     FormatDocumentResult, HierarchyItem, HoverResult, IncomingCallsResult, Indexed,
     InlayHintsResult, KindFilter, KindFilterField, KindFilterInput, LocationsResult,
     NotificationCache, OutgoingCallsResult, Position, PositionEncoding, PositionRange,
-    PrepareRenameResult, RenameResult, RestartServerResult, RouteSignals, SelectionRangesResult,
-    ServerLogsResult, ServerMessagesResult, SignatureHelpResult, SymbolTarget, Translator,
-    TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, RouteSignals,
+    SelectionRangesResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
+    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -159,6 +159,13 @@ macro_rules! availability_note {
 macro_rules! out_of_workspace_note {
     () => {
         "`out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory)."
+    };
+}
+
+/// Tool-description sentence for the tools whose empty results carry `index_coverage`.
+macro_rules! index_coverage_note {
+    () => {
+        "On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence."
     };
 }
 
@@ -781,7 +788,7 @@ impl McplsServer {
 
     /// Find all references to a symbol.
     #[tool(
-        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!()),
+        description = concat!("References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. ", name_addressing_note!(), " ", positions_note_request!(), " ", enclosing_symbol_note!(), " ", out_of_workspace_note!(), " ", index_coverage_note!()),
         title = "Find References"
     )]
     async fn get_references(
@@ -791,7 +798,7 @@ impl McplsServer {
             include_declaration,
             context,
         }): Parameters<ReferencesParams>,
-    ) -> Result<Json<Addressed<LocationsResult>>, McpError> {
+    ) -> Result<Json<Addressed<ReferencesResult>>, McpError> {
         let translator = &self.context.translator;
         self.addressed(
             target,
@@ -951,7 +958,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!(), " ", out_of_workspace_note!()),
+        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!(), " ", out_of_workspace_note!(), " ", index_coverage_note!()),
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(

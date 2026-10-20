@@ -262,6 +262,7 @@ impl Translator {
         // each one -- bounds the *normalization* loop's cost to `limit`;
         // this collection loop itself still scans the full response (#474).
         let mut raw_symbols = raw_workspace_symbols(response, &ctx);
+        let server_answered_empty = raw_symbols.is_empty();
 
         if let Some(target) = kind_filter {
             raw_symbols.retain(|s| s.kind == target);
@@ -287,10 +288,12 @@ impl Translator {
             });
         }
 
+        let index_coverage = server_answered_empty.then(|| self.index_coverage(&server_id));
         Ok(WorkspaceSymbolResult {
             symbols,
             truncated,
             positions_degraded: ctx.positions_degraded(),
+            index_coverage,
         })
     }
 
@@ -437,7 +440,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::PositionDegradation;
+    use crate::bridge::translator::dto::{IndexCoverage, PositionDegradation};
     use crate::bridge::translator::testing::*;
     use crate::config::{LanguageId, ServerCommand, ServerId, TimeoutSecs, ToolRouter, ToolSet};
     use crate::test_lsp::client_path;
@@ -931,6 +934,98 @@ mod tests {
             "the range-less LocationUriOnly symbol must be dropped, not fabricated"
         );
         assert_eq!(result.symbols[0].name, "with_range");
+        assert!(
+            result.index_coverage.is_none(),
+            "a non-empty result carries no coverage note"
+        );
+    }
+
+    /// #796: an empty answer carries the coverage note.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_empty_result_carries_index_coverage() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from_static("rust");
+        let caps = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::Value::Null,
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.symbols.is_empty());
+        assert_eq!(
+            result.index_coverage,
+            Some(IndexCoverage {
+                synced_documents: 0,
+                server_restarted: false,
+            })
+        );
+    }
+
+    /// #796: an answer emptied by `limit` is not an index-coverage question.
+    #[tokio::test]
+    async fn test_handle_workspace_symbol_limit_zero_carries_no_index_coverage() {
+        let dir = TempDir::new().unwrap();
+        let server_id = ServerId::from_static("rust");
+        let caps = lsp_types::ServerCapabilities {
+            workspace_symbol_provider: Some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        };
+        let (translator, mut server) = translator_with_capabilities(&dir, &server_id, caps);
+        let uri = Url::from_file_path(dir.path().join("a.rs"))
+            .unwrap()
+            .to_string();
+        let translator = Arc::new(translator);
+        let handle = {
+            let translator = Arc::clone(&translator);
+            tokio::spawn(async move {
+                translator
+                    .handle_workspace_symbol("foo".to_string(), None, 0)
+                    .await
+            })
+        };
+
+        let mut wire = BufReader::new(&mut server.write_stdout);
+        let request = read_framed_message(&mut wire).await;
+        write_response(
+            &mut server.read_half_stdin,
+            &request["id"],
+            serde_json::json!([{
+                "name": "foo",
+                "kind": 12,
+                "location": {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    }
+                }
+            }]),
+        )
+        .await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.symbols.is_empty());
+        assert!(result.truncated);
+        assert!(result.index_coverage.is_none());
     }
 
     /// #415 (revised: `search_workspace_symbols` is read-only navigation,

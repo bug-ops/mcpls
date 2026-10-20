@@ -7,7 +7,10 @@ use lsp_types::ReferenceContext;
 use tokio::time::Instant;
 
 use super::Translator;
-use super::dto::{HoverResult, Location, LocationsResult, Position, PositionDegradation};
+use super::dto::{
+    HoverResult, IndexCoverage, Location, LocationsResult, Position, PositionDegradation,
+    ReferencesResult,
+};
 use super::enclosing::{Contextualized, ResultContext};
 use super::encoding_ctx::EncodingCtx;
 use super::positioned::{FromPosition, GotoRequest, Positioned};
@@ -573,11 +576,11 @@ impl Translator {
         position: Position,
         include_declaration: bool,
         context: ResultContext,
-    ) -> Result<LocationsResult> {
+    ) -> Result<ReferencesResult> {
         let Positioned {
             result: response,
             ctx,
-            doc: _doc,
+            doc,
         } = self
             .position_request::<lsp_types::ReferencesRequest>(
                 &file_path,
@@ -590,7 +593,25 @@ impl Translator {
             .await?;
 
         let normalized = lsp_locations_to_mcp(response.unwrap_or_default(), &ctx).await;
-        Ok(self.contextualize_into(normalized, context).await)
+        let result = self.contextualize_into(normalized, context).await;
+        let index_coverage = result
+            .locations
+            .is_empty()
+            .then(|| self.index_coverage(doc.server_id()));
+        Ok(ReferencesResult {
+            result,
+            index_coverage,
+        })
+    }
+
+    /// What an empty answer from `server` covers, from tracker state alone.
+    pub(super) fn index_coverage(&self, server: &ServerId) -> IndexCoverage {
+        let tracker = &self.document_tracker;
+        IndexCoverage {
+            synced_documents: u32::try_from(tracker.synced_document_count(server))
+                .unwrap_or(u32::MAX),
+            server_restarted: tracker.sync_history_forgotten(server),
+        }
     }
 
     /// Handle go-to-implementation request (`textDocument/implementation`).
@@ -1144,7 +1165,28 @@ mod tests {
         .await;
 
         let result = handle.await.unwrap().unwrap();
-        assert!(result.locations.is_empty());
+        assert!(result.result.locations.is_empty());
+        assert_eq!(
+            result.index_coverage,
+            Some(IndexCoverage {
+                synced_documents: 1,
+                server_restarted: false,
+            })
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["index_coverage"],
+            serde_json::json!({"synced_documents": 1})
+        );
+
+        translator.document_tracker.forget_server(&server_id);
+        assert_eq!(
+            translator.index_coverage(&server_id),
+            IndexCoverage {
+                synced_documents: 0,
+                server_restarted: true,
+            }
+        );
     }
 
     /// S3 fix: `handle_implementation` shares `handle_goto` with
@@ -1551,6 +1593,14 @@ mod tests {
             .expect("handle_references should not hang")
             .unwrap()
             .unwrap();
+        assert!(result.index_coverage.is_none());
+        assert!(
+            serde_json::to_value(&result)
+                .unwrap()
+                .get("index_coverage")
+                .is_none()
+        );
+        let result = result.result;
 
         assert_eq!(
             result.locations.len(),
@@ -1637,7 +1687,8 @@ mod tests {
             .await
             .expect("handle_references should not hang")
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .result;
 
         assert_eq!(result.locations.len(), MAX_NORMALIZED_LOCATIONS);
         assert!(

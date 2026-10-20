@@ -168,7 +168,7 @@ Priorities: `must` / `should` / `may`. Byte counts are UTF-8 bytes of the compac
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 135,500 B (baseline 171,465 B; stretch target 110,000 B) (135,500 B is the enforced figure, raised from 135,000 B for the `additionalProperties: false` keyword on 43 input schema objects of [[mcp/016-reject-unknown-tool-arguments/spec\|mcp/016]] (measured 135,143 B, leaving 357 B of headroom under the 135,500 B constant; a change that adds schema bytes must trim elsewhere or raise the constant in a reviewed change), and earlier from 130,000 B for the diagnostics `availability`/`origin` fields, the `indexing_in_progress` flag on four more tools, the `push_only` route status and the inlined kind-filter enums of batch 27; the stretch target is not tracked) | must |
+| FR-001 | THE serialized `tools` array SHALL NOT exceed the total budget: 136,000 B (baseline 171,465 B; stretch target 110,000 B) (136,000 B is the enforced figure, raised from 135,500 B for the `index_coverage` field and description sentence of `get_references` and `workspace_symbol_search` of [[bridge/015-empty-result-index-coverage-caveat/spec\|bridge/015]] (measured 135,990 B, leaving 10 B of headroom), earlier from 135,000 B for the `additionalProperties: false` keyword on 43 input schema objects of [[mcp/016-reject-unknown-tool-arguments/spec\|mcp/016]] (measured 135,143 B, leaving 357 B of headroom under the 135,500 B constant; a change that adds schema bytes must trim elsewhere or raise the constant in a reviewed change), and earlier from 130,000 B for the diagnostics `availability`/`origin` fields, the `indexing_in_progress` flag on four more tools, the `push_only` route status and the inlined kind-filter enums of batch 27; the stretch target is not tracked) | must |
 | FR-002 | EACH serialized `Tool` SHALL NOT exceed the per-tool budget: 9,000 B (baseline maximum 12,458 B, `get_references`) (9,000 B enforced for every tool; no per-tool override) | must |
 | FR-003 | THE sum of all `description` string bytes inside every `inputSchema` and `outputSchema` SHALL NOT exceed 35,000 B (baseline 73,444 B) | should |
 | FR-004 | THE system SHALL NOT emit, in any `inputSchema` or `outputSchema` `description`, a Markdown code fence (a line starting with three backticks), a Markdown heading line (a line starting with `#`), or a rustdoc section such as `# Examples`, `# Errors` or `# Panics` | must |
@@ -232,7 +232,7 @@ Baseline values are those measured at commit `517cb53`.
 
 | ID | Metric | Baseline | Target |
 |----|--------|----------|--------|
-| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 135,500 B (stretch 110,000 B) |
+| SC-001 | Total serialized `tools` array (compact) | 171,465 B | at most 136,000 B (stretch 110,000 B) |
 | SC-002 | Largest single `Tool` | 12,458 B (`get_references`) | at most 9,000 B |
 | SC-003 | Sum of schema `description` bytes | 73,444 B | at most 35,000 B |
 | SC-004 | Schema descriptions containing a code fence or rustdoc section heading | 10 (about 5.9 KB) | 0 |
@@ -282,6 +282,7 @@ Baseline values are those measured at commit `517cb53`.
 > - The structural check compares the shaped router with the unshaped router of the same tree.
 > - A definition carried by two or more tools keeps its own description only when it fits in 80 B, and its nested descriptions only when they fit in 24 B; the meaning of `positions_degraded`, `truncated`, `out_of_workspace` and the enrichment statuses lives in the tool descriptions (`out_of_workspace` through a shared sentence added to the 15 tools that carry it).
 > - Whole sentences or none (#814): the truncating cap never falls back to a word boundary. The first sentence of every schema-visible field is at most 100 B, so the cap removes nothing; `restart_server` names `refused` in its tool description, paid for inside that description.
+> - Total budget raised to 136,000 B for the #796 `index_coverage` note (135,990 B measured; `get_references` 8,483 B; schema description bytes 29,385 B).
 > - Measured after #617 and #618 (typed hierarchy item inputs grew the unshaped surface): 181,350 B unshaped, 121,744 B shaped (6.4% headroom), largest tool 7,564 B, schema description bytes 26,995 B.
 
 ## 10. See Also

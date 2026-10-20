@@ -518,7 +518,7 @@ async fn test_references_create_repo_function() {
 
     // Should find at least the definition itself
     assert!(
-        !refs_json.locations.is_empty(),
+        !refs_json.result.locations.is_empty(),
         "Should find at least one reference (the definition)"
     );
 }
@@ -555,9 +555,9 @@ async fn test_references_user_struct() {
 
     // User is referenced in types.rs and functions.rs, plus the definition
     assert!(
-        refs_json.locations.len() >= 2,
+        refs_json.result.locations.len() >= 2,
         "Should find multiple references to User struct, got: {}",
-        refs_json.locations.len()
+        refs_json.result.locations.len()
     );
 }
 
