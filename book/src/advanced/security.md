@@ -42,7 +42,7 @@ Pointing mcpls at an untrusted checkout, such as a cloned third-party repository
 ## What mcpls does to narrow the exposure
 
 - **Cleared environment.** A server starts with an empty environment plus an allowlist (`PATH`, `HOME`, `USERPROFILE`, `TMPDIR`, `TEMP`, `TMP`, and the Windows system variables), and then the entry's `env`. Variables such as `NODE_OPTIONS` or `LD_PRELOAD` are not passed on unless you set them.
-- **Workspace boundary.** Tool calls reject paths outside every workspace root, and results flag locations outside the roots. Rename and code-action edits that target files outside the roots are withheld and counted in `dropped`.
+- **Workspace boundary.** Tool calls reject paths outside every workspace root, and results flag locations outside the roots. Rename and code-action edits that target files outside the roots are withheld and counted in `dropped`. When mcpls opens a file for a tool call it checks the opened file against the roots, so a symlink inside the workspace that points at a FIFO, a device or any file outside the roots is never read.
 - **Secret redaction.** Secret-looking values are removed from text that reaches logs and clients ([Diagnostics and Resources](diagnostics.md#redaction)).
 - **tsserver pin.** The TypeScript server is pointed at its own bundled `tsserver` instead of the workspace's ([TypeScript](typescript.md)).
 - **No authentication by design.** mcpls itself authenticates no one on any transport; see [Transports](transports.md#there-is-no-authentication).

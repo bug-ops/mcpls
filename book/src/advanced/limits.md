@@ -33,6 +33,8 @@ In this chapter you find every boundary mcpls enforces or cannot cross, in one p
 | Diagnostics cache | 1000 files |
 | Server log buffer, server message buffer | 100 and 50 entries |
 | Subscriptions per session | 1000 |
+| Diagnostics sweep | every 2 s; 64 subscribed files per tick; 256 unsubscribed companion files per server |
+| Server `env` table | 128 KiB in total; 128 KiB per entry (32767 characters on Windows) |
 | Concurrent `subscriptions/listen` streams | 100 |
 | Enclosing-symbol enrichment | 16 files (or `max_documents / 4` when `max_documents` is below 64), 30 s |
 | Per-response disk read for position conversion | 4 times `max_file_size`, at most 256 MiB |

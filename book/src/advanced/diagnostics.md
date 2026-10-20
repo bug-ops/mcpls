@@ -75,7 +75,14 @@ mcpls supports `resources/subscribe`. A subscribed session receives `resources/u
 - when a write evicts the file from the cache, so a re-read returns its new `availability`;
 - within about two seconds of an on-disk edit to a file the session subscribes to, even when no tool call touches it (see below).
 
-While a tracked file has a subscriber, mcpls checks it against the disk every two seconds. When the file changed it resynchronizes the server and pulls the file's diagnostics once per document version, which notifies the subscriber if they changed. Nothing is sent while nothing changes, a server whose pull support is not yet known (it advertises no diagnostic provider and has not answered a pull) is only resynchronized until one `get_diagnostics` call settles it, after which the sweep notifies from then on, a failed pull is retried on later ticks up to three times per version, and a server that is dead, starting or restarting is left alone. Only files mcpls already tracks (opened by an earlier tool call) are checked, at most 64 per tick. Diagnostics that only change after a save (flycheck-only), or because another file was edited, are not refreshed by the sweep.
+While a tracked file has a subscriber, mcpls checks it against the disk every two seconds. When the file changed it resynchronizes the server and pulls the file's diagnostics once per document version, which notifies the subscriber if they changed. Nothing is sent while nothing changes, a server whose pull support is not yet known (it advertises no diagnostic provider and has not answered a pull) is only resynchronized until one `get_diagnostics` call settles it, after which the sweep notifies from then on, a failed pull is retried on later ticks up to three times per version, and a server that is dead, starting or restarting is left alone. Only files mcpls already tracks (opened by an earlier tool call) are checked, at most 64 subscribed files per tick; the rest follow on later ticks.
+
+Two things extend the sweep beyond the subscribed file itself:
+
+- **Saves.** When a changed file's server advertises `textDocument/didSave` support (`textDocumentSync.save`), mcpls sends it one `didSave` after the resynchronization, so servers that analyze on save, such as rust-analyzer's flycheck, produce fresh diagnostics. The notification is sent once per change, and a file reopened after eviction gets one too.
+- **Other files.** An edit to any tracked file of the same server can change the diagnostics of a subscribed file. The sweep therefore watches up to the 256 most recently used tracked files that nobody subscribes to, and re-pulls the subscribed files when one of them changed.
+
+A pull that does not answer in time does not hold up the other files: it moves to the background and the sweep keeps going. In an [untrusted workspace](untrusted-mode.md) mcpls sends no `didSave`, because it makes servers run build scripts; the resynchronization and the pulls still happen.
 
 If the file's server is still starting, subscribing succeeds, and the subscriber receives one `resources/updated` if startup then fails. A session may hold at most 1000 subscriptions.
 

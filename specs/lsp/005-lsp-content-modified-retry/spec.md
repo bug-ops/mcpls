@@ -148,6 +148,7 @@ AND the doc's worst-case latency formula reflects that both -32801 and
 | FR-005 | THE SYSTEM SHALL correct the doc comment at `config/server.rs:185` to name `-32802` as `` `ServerCancelled` `` rather than "content modified" | must |
 | FR-006 | WHEN a `-32801` response is received THE SYSTEM SHALL retry it [NEEDS CLARIFICATION: should the retry be gated by a `data.retriggerRequest`-style flag as `-32802` is, or retried unconditionally? The LSP 3.17 spec does not define a `retriggerRequest` data field for `ContentModified`, only for `ServerCancelled`] | must |
 | FR-007 | THE SYSTEM SHALL log a retry attempt for `-32801` at the same log level and with equivalent detail (method name, attempt number, backoff delay) as the existing `-32802` retry log at client.rs:338-341 and :388-391 | should |
+| FR-008 | WHEN a JSON-RPC response carries both `result` and `error` THE SYSTEM SHALL treat it as the error, keeping its code, so a `-32801` or `-32802` in such a response still retries (#737) | must |
 
 ## 4. Non-Functional Requirements
 

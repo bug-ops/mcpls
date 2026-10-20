@@ -14,14 +14,14 @@ User documentation: <https://bug-ops.github.io/mcpls/>. API documentation: <http
 
 ```toml
 [dependencies]
-mcpls-core = "0.7"
+mcpls-core = "0.8"
 ```
 
 Enable the `transport-http` feature to serve over Streamable HTTP:
 
 ```toml
 [dependencies]
-mcpls-core = { version = "0.7", features = ["transport-http"] }
+mcpls-core = { version = "0.8", features = ["transport-http"] }
 ```
 
 ## Usage
@@ -44,8 +44,9 @@ async fn main() {
 - Protocol translation between MCP tools and LSP requests, with 1-based to 0-based position and encoding conversion
 - Language server lifecycle management: spawn, initialize, restart, shutdown
 - Non-blocking startup: the MCP server accepts connections while language servers initialize
-- Lazy document tracking and a diagnostics cache for push-based notifications
-- TOML configuration, server discovery by project markers, and trust controls
+- Lazy document tracking and a diagnostics cache for push-based notifications, refreshed from disk edits for subscribed resources
+- TOML configuration, server discovery by project markers, and trust controls (untrusted launcher, open-then-verify file access)
+- Cancellation of in-flight tool calls, forwarded to the language server as `$/cancelRequest`
 - stdio and optional HTTP transports
 
 ## Learn more

@@ -49,6 +49,13 @@ related:
 >   server is throttled for 5 s (`throttled { retry_in_ms }`). A restart refused before the old
 >   process was stopped (`failed` with reason `refused`) does not start the cooldown, so a retry
 >   after the cause is fixed is evaluated afresh (#815).
+> - **Failure reasons (FR-011):** `failed` carries a closed `kind`: `refused` (rejected before the old
+>   process was stopped, which keeps serving: an untrusted-workspace refusal of the replacement's
+>   config, or the pre-stop vetting itself failing), `spawn_failed` (the replacement could not be
+>   started), `initialize_failed` (it started but did not complete `initialize`) and `shutting_down`.
+>   Every reason except `refused` means the old process is gone; the server stays registered as dead
+>   and the next tool call retries under the normal backoff (#797, #736). A call that meets shutdown
+>   answers with a tool error, not a JSON-RPC error (#815).
 > - **Annotations (FR-010):** `read_only_hint = false`, `destructive_hint = true`,
 >   `idempotent_hint = false` (each repeat tears down and respawns a process). Destructive
 >   because the group kill also kills shared daemons (Gradle, Bloop) that other clients may be

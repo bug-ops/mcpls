@@ -129,13 +129,13 @@ One table per language server.
 |-----|------|---------|-------------|
 | `language_id` | string | required | Language identifier sent to the server |
 | `command` | string | required | Executable, on `PATH` or absolute |
-| `args` | array of strings | `[]` | Command-line arguments |
+| `args` | array of strings | `[]` | Command-line arguments; must not contain a NUL byte |
 | `file_patterns` | array of strings | `[]` | Files this server serves ([forms](#file_patterns)) |
 | `timeout_seconds` | integer, 1 to 900 | `30` | The `initialize` handshake |
 | `request_timeout_seconds` | integer, 1 to 900 | `30` | Each LSP request behind a tool call |
 | `initialization_options` | table | none | Sent in `initialize` |
 | `settings` | table | none | Pushed after `initialized` |
-| `env` | table of strings | `{}` | Environment variables for the server |
+| `env` | table of strings | `{}` | Environment variables for the server, size-limited ([`env`](#env)) |
 | `heuristics` | table | none | Project markers |
 | `name` | string | the `language_id` | Routing identity |
 | `handles` | array of strings | unset (catch-all) | Routing values this server serves |
@@ -176,6 +176,15 @@ For `typescript-language-server`, mcpls adds `tsserver.path` automatically unles
 ### `env`
 
 The server does not inherit mcpls's environment. It is cleared, then `PATH`, `HOME`, `USERPROFILE`, `TMPDIR`, `TEMP`, `TMP` and the Windows system variables are passed on, and then `env` is applied and can override any of them. Setting `PATH` replaces the passthrough value. On Unix, your `PATH` is searched first, so a bare `command` becomes unresolvable unless your `PATH` contains it; Windows falls back to the parent's `PATH`. To add a directory, give an absolute `command` instead.
+
+The table is checked when the configuration loads, and a violation names the server and the variable:
+
+- A name or value must not contain a NUL byte, and a name must not contain `=`.
+- One entry (`NAME=value` plus a terminator) is at most 128 KiB, or 32767 characters on Windows.
+- The whole table is at most 128 KiB, which leaves room for the inherited environment and the arguments.
+- On Windows, names that differ only in case, such as `Path` and `PATH`, are one variable and count as a duplicate.
+
+Values are never printed in logs or debug output.
 
 ### `heuristics`
 

@@ -98,13 +98,13 @@ related:
 - **Launchers (#652).** In untrusted mode an allowed server whose launch lets the workspace choose the
   program is refused: `UntrustedRefusal::ProjectLauncher` for package runners (`npm`, `npx`, `bunx`,
   `pnpm`, `pnpx`, `yarn`, `uvx`, `corepack`, any `npm:` argument), task runners (`make`, `just`, `task`,
-  `rake`, `mvn`, `sbt`) and the run subcommands of `bun`, `deno`, `cargo`, `go`, `uv`, `pipx`, `poetry`,
+  `rake`, `mvn`, `sbt`) and the run subcommands of `bun`, `deno`, `cargo` (`run`, `r`, `test`, `t`, `bench`), `go`, `uv`, `pipx`, `poetry`,
   `pdm`, `hatch`, `bundle`, `dotnet`, `stack` and `cabal` including their `runghc`, `script` and `v1-`/`v2-`/`new-` aliases (`lsp/launcher.rs`, a `LaunchRule` per command stem); `env` is
   unwrapped, `env -S` is refused as unanalyzable, and so is a command string: `-c`, `+c`, `--command`,
   `--commands` for `sh`, `bash`, `zsh`, `dash`, `ash`, `hush`, `ksh`, `mksh`, `lksh`, `oksh`, `yash`,
   `posh`, `fish`, `csh`, `tcsh`, `elvish`, `nu`, `xonsh`, `powershell`, `pwsh` (also as a `busybox`
-  applet; a version and the distribution suffixes `-preview`, `-static`, `-intel64`, `-dbg`, `w` and `t` do not hide the name) and an inline program for `node`, `bun`, `python`, `py`, `perl`, `ruby`, `php` (`-r`, `-R`, `-B`, `-E`, `-F`), `lua`, `rscript`,
-  `julia`, `osascript` and `deno eval`. Arguments are read with the whitespace around them removed; PowerShell
+  applet; a version and the distribution suffixes `-preview`, `-static`, `-intel64`, `-dbg`, `_d`, `w` and `t` do not hide the name, so `bash-static`, `pwsh-preview` and `pythonw3` are matched) and an inline program for `node`, `bun`, `python`, `py`, `perl`, `ruby`, `php` (`-r`, `-R`, `-B`, `-E`, `-F`), `lua`, `rscript`,
+  `julia`, `osascript` and `deno eval`; a `data:` URL given to a module-loading long flag (`--import`, `--loader`) counts as an inline program, however the scheme is cased and wherever tabs or newlines stand in it (#734). Arguments are read with the whitespace around them removed; PowerShell
   also reads the en dash, em dash and horizontal bar as `-`, Windows PowerShell 5.1 (`powershell`) reads a
   bare argument as `-Command` (`LaunchTrigger::ImplicitCommandString`; `-File` ends the check), fish matches long flags by prefix and elvish
   reads `-c`, `--c` and `-c=true` alike. `cmd` is a runner refused on every use (`LaunchRule::Always`):
