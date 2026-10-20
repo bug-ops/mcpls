@@ -256,6 +256,7 @@ async fn run_references(
         .expect("handler should not hang")
         .unwrap()
         .unwrap()
+        .result
 }
 
 fn outcome(result: &crate::bridge::LocationsResult, index: usize) -> EnclosingSymbolOutcome {
@@ -814,7 +815,7 @@ async fn test_enrichment_deadline_skips_remaining_files() {
         expect_request(&mut wire, "textDocument/didOpen").await;
         expect_request(&mut wire, "textDocument/documentSymbol").await;
     }
-    let result = handle.await.unwrap().unwrap();
+    let result = handle.await.unwrap().unwrap().result;
 
     assert_matches!(
         outcome(&result, 0),

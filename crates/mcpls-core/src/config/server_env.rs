@@ -95,8 +95,15 @@ impl_text_newtype!(
 /// assert!(EnvValue::new("").is_ok());
 /// assert!(EnvValue::new("a\0b").is_err());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnvValue(Cow<'static, str>);
+
+/// Hides the value: environment values commonly carry credentials.
+impl std::fmt::Debug for EnvValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvValue(<redacted>)")
+    }
+}
 
 impl AsRef<std::ffi::OsStr> for EnvValue {
     fn as_ref(&self) -> &std::ffi::OsStr {
@@ -453,6 +460,20 @@ mod tests {
         assert_eq!(EnvValue::new("a\0b"), Err(InvalidEnvValue::ContainsNul));
         assert!(EnvValue::new("").is_ok());
         assert_eq!(EnvValue::from_static("1"), "1");
+    }
+
+    #[test]
+    fn debug_output_never_holds_a_value() {
+        assert_eq!(
+            format!("{:?}", value("SECRETVALUE")),
+            "EnvValue(<redacted>)"
+        );
+
+        let env =
+            ServerEnv::from_entries(entries(&[("TOKEN", "SECRETVALUE")]), HostOs::Other).unwrap();
+        let rendered = format!("{env:?}");
+        assert!(!rendered.contains("SECRETVALUE"));
+        assert!(rendered.contains("TOKEN"));
     }
 
     #[test]

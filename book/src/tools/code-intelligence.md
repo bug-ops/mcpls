@@ -70,6 +70,8 @@ Arguments: addressing as above, plus `include_declaration` (default `false`) and
 
 Each location has `uri`, `range`, `out_of_workspace` and, with `context`, the `enclosing_symbol`. Searching a very common symbol can be slow, and the list is capped (`truncated: true`).
 
+An empty result carries `index_coverage`: `synced_documents` is how many documents are currently synced to the server process (eviction of old documents lowers it), and `server_restarted` is `true` after a restart or respawn and stays `true` for the rest of the session. Some servers index only documents opened in the session, so the empty answer covers only what the server has indexed and is not proof that the symbol is unused. `get_definition` can still resolve such a symbol; touching the files of interest widens the answer.
+
 ## get_document_symbols
 
 Returns the outline of one file as a hierarchy of symbols (types, functions, fields) with their ranges.
@@ -91,6 +93,8 @@ Arguments: `query` (required), `limit` (default 100, capped by the server) and `
 ```
 
 This tool has no document to route on. mcpls sends it to the first server that explicitly claims `workspace_symbols` in `handles`, otherwise to the first catch-all server.
+
+When the server itself answers with no symbols, the result carries the same `index_coverage` note as `get_references`. It is not added when `limit` or `kind_filter` emptied a non-empty server answer.
 
 ## get_document_highlights
 

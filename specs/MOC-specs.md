@@ -50,7 +50,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
 | 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
 | 013 | [[mcp/013-http-allowed-host-default-port-rejection/spec\|http-allowed-host-default-port-rejection]] | enhancement | P3 | implemented | #629 |
-| 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (135,500 B tools/list budget, #654 kind filter schemas, #705 closed input schemas) | #630; #654 |
+| 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (136,000 B tools/list budget, #654 kind filter schemas, #705 closed input schemas) | #630; #654 |
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | implemented | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
@@ -75,7 +75,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | implemented (#667) | #667 |
 | 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | implemented (#668) | #668 |
 | 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | implemented (coverage-based exclusion, learned pull sources) | #703 |
-| 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | draft | #796 |
+| 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | implemented (rule (i), typed `index_coverage` note) | #796 |
 | 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
 
 ## runtime

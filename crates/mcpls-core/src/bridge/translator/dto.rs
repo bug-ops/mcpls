@@ -774,6 +774,12 @@ pub struct WorkspaceSymbolResult {
     /// Tells whether the queried position or only the returned offsets are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions_degraded: Option<PositionDegradation>,
+    /// Set only when the server itself answered with no symbols: what its answer covers.
+    ///
+    /// Omitted for a non-empty result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "IndexCoverage")]
+    pub index_coverage: Option<IndexCoverage>,
 }
 
 /// A single code action.
@@ -990,6 +996,35 @@ pub struct LocationsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "EnrichmentSummary")]
     pub enrichment: Option<EnrichmentSummary>,
+}
+
+/// What an empty references or workspace-symbol answer covers.
+///
+/// A language server that indexes only documents sent with `didOpen` answers an empty list for
+/// symbols in files this session never opened, so an empty answer is not proof of absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct IndexCoverage {
+    /// Documents currently tracked as synced to the server process; LRU eviction lowers it.
+    pub synced_documents: u32,
+    /// Set only when the server was restarted or respawned; stays set for the rest of the session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_restarted: bool,
+}
+
+/// Result of a references request: the locations plus an optional index-coverage note.
+///
+/// A separate type from [`LocationsResult`] so the note's schema is paid for by one tool only.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReferencesResult {
+    /// The locations found.
+    #[serde(flatten)]
+    pub result: LocationsResult,
+    /// Set only when `locations` is empty: what the routed server's answer covers.
+    ///
+    /// Omitted for a non-empty result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "IndexCoverage")]
+    pub index_coverage: Option<IndexCoverage>,
 }
 
 /// A single inlay hint entry.
@@ -1484,6 +1519,16 @@ impl ServerText for LocationsResult {
     }
 }
 
+impl ServerText for ReferencesResult {
+    fn redact_server_text(&mut self, redactions: &Redactions) {
+        let Self {
+            result,
+            index_coverage: _,
+        } = self;
+        result.redact_server_text(redactions);
+    }
+}
+
 impl ServerText for Diagnostic {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
@@ -1628,6 +1673,7 @@ impl ServerText for WorkspaceSymbolResult {
             symbols,
             truncated: _,
             positions_degraded: _,
+            index_coverage: _,
         } = self;
         symbols.redact_server_text(redactions);
     }

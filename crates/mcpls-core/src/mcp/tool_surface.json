@@ -3239,7 +3239,7 @@
   {
     "name": "get_references",
     "title": "Find References",
-    "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory). On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence.",
     "inputSchema": {
       "$defs": {
         "ResultContext": {
@@ -3505,6 +3505,23 @@
           ],
           "type": "object"
         },
+        "IndexCoverage": {
+          "description": "What an empty references or workspace-symbol answer covers.",
+          "properties": {
+            "server_restarted": {
+              "type": "boolean"
+            },
+            "synced_documents": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "synced_documents"
+          ],
+          "type": "object"
+        },
         "NotComputedReason": {
           "description": "Why an item's enclosing symbol was not looked up.",
           "oneOf": [
@@ -3658,6 +3675,10 @@
         "enrichment": {
           "$ref": "#/$defs/EnrichmentSummary",
           "description": "Set only with `context: \"enclosing_symbol\"`: how many files were enriched or skipped."
+        },
+        "index_coverage": {
+          "$ref": "#/$defs/IndexCoverage",
+          "description": "Set only when `locations` is empty: what the routed server's answer covers."
         },
         "locations": {
           "description": "Locations found.",
@@ -7325,7 +7346,7 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory). On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -7395,6 +7416,23 @@
     },
     "outputSchema": {
       "$defs": {
+        "IndexCoverage": {
+          "description": "What an empty references or workspace-symbol answer covers.",
+          "properties": {
+            "server_restarted": {
+              "type": "boolean"
+            },
+            "synced_documents": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "synced_documents"
+          ],
+          "type": "object"
+        },
         "Location": {
           "description": "Location in a document.",
           "properties": {
@@ -7504,6 +7542,10 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "index_coverage": {
+          "$ref": "#/$defs/IndexCoverage",
+          "description": "Set only when the server itself answered with no symbols: what its answer covers."
+        },
         "positions_degraded": {
           "anyOf": [
             {

@@ -126,10 +126,15 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   any component. On Linux and macOS a swap of the roots themselves or of the
   directories above a root is caught by the handle-path check; on Windows and
   other Unix systems it is not covered (on other Unix a directory moved out of
-  the roots after the walk entered it is not detected). macOS still opens a
-  symlink target outside the roots (non-blocking) before refusing it, so an
-  outside FIFO or device is opened. On Windows a directory below a root that is
-  a junction or a volume mounted in a folder is a reparse point and is refused.
+  the roots after the walk entered it is not detected). macOS uses the same
+  walk, so an outside FIFO or device behind a symlink is never opened. The
+  handle-path check then runs on the opened file. A directory on the path
+  with search-only permission cannot be opened for the walk, and the open
+  fails.
+  On Windows the last entry is opened before it is checked, so a file symlink
+  there that points outside the roots is opened (not read) before it is
+  refused. On Windows a directory below a root that is a junction or a volume
+  mounted in a folder is a reparse point and is refused.
 
 - **Save notifications.** While a file of a server is subscribed, mcpls sends
   `textDocument/didSave` to that server, from the diagnostics sweep only, for
@@ -140,7 +145,9 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   their on-save checks, such as rust-analyzer's build scripts and procedural
   macros, after each edit. The risk class (workspace code the server runs)
   already existed; the frequency is new. Dynamic `didSave` registration is not
-  tracked.
+  tracked. In untrusted-workspace mode the sweep never sends `didSave`. A
+  `didSave` follows a content digest, so only a file whose text changed sends
+  one.
 
 - **Explicitly configured workspace binaries.** A server `command` you configure,
   for example a TypeScript 7 `tsc` for the native server (`tsc --lsp --stdio`),
