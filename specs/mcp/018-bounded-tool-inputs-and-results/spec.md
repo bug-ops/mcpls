@@ -80,7 +80,7 @@ SO THAT one call cannot flood my context or the mcpls process
 | FR-002 | WHEN a positioned tool receives a `line` greater than the last line of the tracked document THE SYSTEM SHALL fail with `PositionBeyondDocument`, naming the requested line and the document's last line, classified as invalid params, and SHALL NOT forward the request to the server | must |
 | FR-003 | THE SYSTEM SHALL NOT reject a `character` past the end of its line; it is forwarded and the server clamps it (LSP 3.17 `Position`) | must |
 | FR-004 | THE rename `new_name` parameter SHALL be a `NewName`: a blank or whitespace-only value and a value longer than `MAX_NEW_NAME_LENGTH` (1,000 bytes) SHALL fail deserialization, and surrounding whitespace of an accepted value SHALL be kept | must |
-| FR-005 | THE completion trigger and symbol-addressing targets SHALL be parsed by serde into typed values at the MCP boundary, with typed errors in place of strings | must |
+| FR-005 | THE completion trigger and symbol-addressing targets SHALL be parsed by serde into typed values at the MCP boundary, with typed errors in place of strings: `NewName`, `CompletionTrigger` and `SymbolName` are built with `new` and report `InvalidTextField`/`TextField`, and an empty completion `trigger` is rejected while parsing, as invalid params (#745) | must |
 | FR-006 | THE code action kind filters SHALL be closed enums shared with the kinds advertised to servers, and SHALL include `source.fixAll` and `refactor.move` | should |
 
 ### Results

@@ -42,6 +42,7 @@ Rust projects work with no configuration. For other languages, see [Minimal Conf
 - Several language servers at once, started concurrently and stopped with mcpls, with graceful degradation
 - stdio transport by default; optional HTTP transport behind the `transport-http` feature
 - Untrusted-workspace mode (`--workspace-trust untrusted`) for code you do not trust
+- Diagnostics resources (`lsp-diagnostics://`) update on disk edits for subscribed clients, and cancelled calls cancel the language server request
 
 ## Learn more
 

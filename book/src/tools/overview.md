@@ -130,6 +130,8 @@ Failures are returned as MCP errors with a code and a message, except malformed 
 | Server restarted while a request was in flight (`-32054`, retryable) | Retry the request |
 | `capability_not_advertised` | The server lacks the feature; see `get_tool_support` |
 
+A path, resource URI or method name that you send and that appears in an error message is escaped and shortened, so control characters and very long input never reach the log or your terminal unchanged.
+
 See [Troubleshooting](../guide/troubleshooting.md) for the fixes.
 
 ## What's Next

@@ -61,10 +61,31 @@ Per server, `status` is:
 | `status` | Meaning |
 |----------|---------|
 | `restarted` | A new process runs; `indexing_state` is `unknown`, `loading` or `ready` |
-| `failed` | The restart failed with a typed `reason`; the server stays registered and the next tool call retries |
+| `failed` | The restart failed with a typed `reason` (see below) |
 | `throttled` | Restarted too recently; retry after `retry_in_ms` |
 | `initializing` | The server is still starting |
 | `not_running` | The server never started; fix the cause and restart mcpls |
+
+### Why a restart fails
+
+A `failed` entry carries `reason`, an object with a `kind` and, for most kinds, a `message`:
+
+```json
+{ "status": "failed", "reason": { "kind": "refused", "message": "..." } }
+```
+
+| `reason.kind` | Meaning | Old process |
+|---------------|---------|-------------|
+| `refused` | A check made before the old process was stopped rejected the restart, for example an [untrusted-workspace](../advanced/untrusted-mode.md) refusal of the launcher | Still running and serving |
+| `spawn_failed` | The replacement could not be started, for example the executable is gone | Stopped; the server stays registered and the next tool call retries the spawn |
+| `initialize_failed` | The replacement started but did not complete the handshake | Stopped; same retry |
+| `shutting_down` | mcpls is shutting down, so no replacement was started | Stopped |
+
+A `refused` restart does not start the 5 second per-server cooldown, so you can fix the cause and call again at once. Every other outcome that stopped the old process starts it, and a repeat call within 5 seconds answers `throttled`.
+
+## Cancelling a call
+
+If the client cancels a `restart_server` call, the restarts it already began still finish, so no server is left half restarted.
 
 This tool is destructive: it kills processes the server started, including daemons other clients may share. It is neither read-only nor idempotent. Requests in flight on the old process fail with the retryable `-32054` error, and the first whole-workspace query afterwards may wait while the new server indexes.
 

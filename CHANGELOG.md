@@ -7,75 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-20
+
 ### Added
 
-- Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s without a tool call, through a subscription-driven sweep (#648) (#784).
-- Client-cancelled tool calls and calls on a closed connection stop and send `$/cancelRequest` for their outstanding LSP requests; a timed-out LSP request is cancelled on the server (#687) (#784).
-- The diagnostics sweep re-pulls subscribed files when any tracked file of their server changes, walks the 256 most recent unsubscribed files of such servers, and sends `didSave` to servers that advertise `textDocumentSync.save` (#781) (#790).
+- Subscribers of `lsp-diagnostics://` resources are notified of on-disk edits within about 2 s through a subscription-driven sweep that re-pulls subscribed files when their server's tracked files change, walks the 256 most recent unsubscribed files, and sends `didSave` to servers that advertise `textDocumentSync.save` (#648, #781) (#784, #790).
+- Client-cancelled tool calls, calls on a closed connection and timed-out LSP requests send `$/cancelRequest` for their outstanding LSP requests (#687) (#784).
 - `McplsServer::with_stop` attaches a stop token so a call stopped by shutdown reports `ServerShutdown` instead of `Cancelled` (#815) (#823).
 - Empty `get_references` and `workspace_symbol_search` results carry a typed `index_coverage` note (synced documents, restart seen) (#826).
 
-### Fixed
-
-- The untrusted launcher refuses a script operand that resolves to a device, FIFO or socket in the server's working directory, closing device aliases such as `/Volumes/Macintosh HD/dev/stdin` (#787) (#794).
-- A NUL byte in a server's `args` is rejected at config load, naming the server and argument index (#786) (#794).
-- A server `env` table over the host's size limits is rejected at config load (#785) (#794).
-- The diagnostics sweep sends no `didSave` in untrusted workspaces and sends it for reopened files (#789) (#794).
-- The untrusted launcher refuses shells and interpreters that read their program from stdin (`bash -s`, `python -`, `pwsh -File -`, bare `deno`, `/dev/stdin` operands) (#782) (#790).
-- Tool calls and the diagnostics sweep open a file first and verify the opened handle's path against the workspace roots (#783) (#790).
-- Workspace file opens on Linux use `openat2(RESOLVE_BENEATH)` and on other Unix an `O_NOFOLLOW` component walk, so an outside symlink target (FIFO, device) is never opened (#788) (#794).
-- `DocumentNotFound` and `PathToUri` render the client path through `EchoedPath` (#780) (#790).
-- Recording lost files under the diagnostics cache lock is no longer quadratic (#779) (#790).
-- A repeated well-formed `initialize` on an established session answers `-32600` instead of renegotiating (#776) (#790).
-- A NUL byte in a server `env` value is rejected when the config is loaded (#751) (#790).
-- The untrusted launcher refuses further code-running spellings: pwsh dash lookalikes, padded flags, Windows PowerShell 5.1 unknown or valued parameters and bare commands, elvish `--c`, fish flag prefixes, cabal and stack run, eval and repl aliases, `cargo r`/`t`, and `data:` URLs with tab or newline (#734) (#784).
-- The untrusted launcher refuses distribution names of listed shells and interpreters (`bash-static`, `pwsh-preview`, `pythonw3`, `py`, `lksh`) and the php `-R`/`-B`/`-E`/`-F` and long code flags (#740) (#784).
-- The untrusted argument backstop runs again before every spawn, and a restart it refuses keeps the running server; `restart_server` reports `spawn_failed` instead of `initialize_failed` for a failed start (#736) (#784).
-- A cancelled call can no longer leave a half-done `restart_server`, an unannounced respawn, an unsent `didClose` or a lost diagnostics notification, and a late reply to a timed-out request no longer logs a warning (#687) (#784).
-- `get_completions` rejects an empty `trigger` while parsing (#745) (#778).
-- A known MCP method with undecodable params answers `-32602` instead of `-32601` (#750) (#778).
-- Client-supplied paths, resource URIs, pagination cursors and method names are escaped and bounded in error messages (#749) (#778).
-- A JSON-RPC response carrying both `result` and `error` keeps the error code, so a `-32801` still retries (#737) (#778).
-- A lost-publish batch re-checks the diagnostics role after resolving, announces only files whose view changed, and republished files are delivered in arrival order (#742) (#778).
-- A lost mark under a lexical fallback path marks the symlinked file's entry, the mailbox byte budget counts URI bytes, the dropped-frame log escapes the method, and Windows environment variable names fold case over the Basic Multilingual Plane only (#738) (#778).
-- `restart_server` reports a refusal before the old process is stopped as `refused` instead of `spawn_failed` and vets the config once (#797) (#811).
-- An unanswered diagnostics pull no longer stalls the disk sweep for the other files of its server (#806) (#811).
-- Sweep shutdown waits for its jobs and pulls, a resync and `didSave` are bounded by the request timeout, and `didSave` follows a content digest instead of document versions (#798, #791) (#811).
-- A tool call cancelled by the client or by shutdown returns an error result and logs no warning (#807) (#811).
-- A skipped diagnostics pull pass hands its candidates to the running pass instead of dropping them (#809) (#823).
-- `tools/list` descriptions are whole sentences instead of fragments cut mid-sentence, and `restart_server` names the `refused` reason (#814) (#823).
-- A refused restart no longer starts the restart cooldown, and `restart_server` answers shutdown with a tool error instead of a JSON-RPC error (#815) (#823).
-- A duplicate server id error no longer prints server arguments (#816) (#823).
-- On Windows a file whose canonical path exceeds `MAX_PATH` is opened inside the workspace instead of being refused as outside it (#817) (#823).
-- Config read errors name the path, sweep task panics are logged, and the child-exit warning reports the grace actually applied (#820) (#823).
-- Secrets in server arguments and environment values no longer appear in `Debug` output (#826).
-- On macOS, workspace file opens walk the components with `O_NOFOLLOW`, so an outside FIFO or device behind a symlink is never opened (#826).
-
 ### Changed
 
-- **Breaking:** `Error::LspServerError` carries a `JsonRpcError` and `ServerErrorResponse` is removed (#777) (#790).
-- **Breaking:** `ServerEnv::insert`, `from_entries` and `iter` use the new `EnvValue`, and `ConfigError::InvalidEnvValue` is added (#751) (#790).
-- **Breaking:** `DocumentTracker::ensure_open` takes an `OpenRequest` with `Access::{Use, Probe}` (#783) (#790).
-- **Breaking:** `Error::TomlDe` wraps the new `TomlParseError` instead of `toml::de::Error` and shows the message with line and column, never the source line (#751) (#790).
-- **Breaking:** the untrusted launcher refuses a shell or interpreter without a script (`node --version`, `deno`, REPLs), adding `LaunchTrigger::ProgramFromStdin` and `UnanalyzableLaunch::RelativeOperandAfterChdir` (#782) (#790).
-- `JsonRpcError` is re-exported from `lsp`, and the `initialize` claim type `HandshakeClaim` is public (#777, #776) (#790).
-- **Breaking:** `InlineFlag` is `Short(char)` or `Long(LongInlineFlag)`, `ShellFlag::PlusC` reports `+c` as written, wrapped programs name their wrapper, and `cmd` is refused as a runner (`CmdSwitch` and `ShellFlag::SlashC` are removed) (#747) (#784).
-- Error variants no longer repeat their source in `Display`, and `ErrorChain` renders every cause once (#735) (#778).
-- A diagnostics list is serialized once per publish; its size is recorded when it is bounded (#743) (#778).
-- Whole-document requests and the name-addressed tools share one request path each (`FromDocument`, `addressed`) (#746) (#778).
-- **Breaking:** `LspServer::spawn` returns `SpawnedServer { server, lanes }`, `ServerStartOutcome::Started` holds a `SpawnedServer`, and the `take_*` receivers are gone (#744) (#778).
-- **Breaking:** `NewName`, `CompletionTrigger` and `SymbolName` use `new` instead of `try_new` and report `InvalidTextField`/`TextField`; `InvalidNewName`, `InvalidCompletionTrigger` and `SymbolNameError` are removed, and an empty `trigger` is invalid (#745) (#778).
-- **Breaking:** `Error::ServerNotFound` renames `source` to `io`, and the `Display` of `McpServerStart`, `TaskFailed`, `HttpBind`, `Json`, `ServerSpawnFailed` and `ConfigError::UnsupportedFilePattern` no longer includes the cause; use `ErrorChain` (#735) (#778).
-- **Breaking:** the `DefinitionResult`, `ReferencesResult` and `DiagnosticSeverity` aliases, `Translator::is_document_open` (now `open_state`), the `lsp::HostOs` re-export and `Serialize` on `JsonRpcResponse` are removed, and the launcher detail enums are `#[non_exhaustive]` (#748) (#778).
-- **Breaking:** `RestartFailure` is `#[non_exhaustive]` with the new `Refused` variant (wire kind `refused`), and `TextField` is `#[non_exhaustive]` (#797, #800) (#811).
-- **Breaking:** `LspServerConfig::args` is `ServerArgs`, `ServerEnv::insert` returns `Result`, `InvalidServerCommand` is an enum, and `MAX_ENV_ENTRY_BYTES` and `ServerEnv::check_size` are removed (#793, #799) (#811).
-- **Breaking:** `DocumentTracker::is_open` is removed, `OpenRequest` fields are private (`OpenRequest::new`), and `spawn_disk_sweep` returns `DiskSweepHandle` (#802, #798) (#811).
-- **Breaking:** `From<toml::de::Error> for Error` is removed and config read failures other than not-found are `Error::FileIo` with the path (#804) (#811).
-- Notification sends share one typed path, `CodeAction` and `WorkspaceSymbol` requests use `RequestTimeout`, and launcher trust, working directory and wrapper grammar are typed (#801, #799, #803, #800, #805) (#811).
-- **Breaking:** `EntrySummary.args` is replaced by `arg_count`; `BuiltinServer::command` is replaced by `as_str` and the type gains `Display` and `#[non_exhaustive]`; `ConfigError::ArgContainsNul` carries a source `InvalidServerArgs`; config read and canonicalize failures return `Error::FileIo` (#816, #819, #820) (#823).
-- **Breaking:** `RestartOutcome`, `InitPhase`, `InvalidEnvKey`, `InvalidToolPrefix`, `InvalidBoundedText`, `InvalidProjectMarker`, `InvalidFileExtension` and `InvalidFileName` are `#[non_exhaustive]`, and `ServerState::can_accept_requests` is removed (#819, #821) (#823).
+- **Breaking:** errors: `Error::LspServerError` carries a `JsonRpcError` and `ServerErrorResponse` is removed; `Error::TomlDe` wraps `TomlParseError` and omits the source line; `Error::ServerNotFound` renames `source` to `io`; `From<toml::de::Error> for Error` is removed and config read failures are `Error::FileIo` with the path; variant `Display` no longer repeats the cause, use `ErrorChain` (#735, #751, #777, #804) (#778, #790, #811, #823).
+- **Breaking:** config and env types: `ServerEnv` uses `EnvValue` and `insert` returns `Result`; `LspServerConfig::args` is `ServerArgs`; `InvalidServerCommand` is an enum; `MAX_ENV_ENTRY_BYTES` and `ServerEnv::check_size` are removed; `EntrySummary.args` becomes `arg_count`; `BuiltinServer::command` becomes `as_str`; `ConfigError::ArgContainsNul` carries `InvalidServerArgs`; `ConfigError::InvalidEnvValue` is added (#751, #793, #799, #816, #819, #820) (#790, #811, #823).
+- **Breaking:** `NewName`, `CompletionTrigger` and `SymbolName` use `new` instead of `try_new` and report `InvalidTextField`/`TextField`; their error types are removed and an empty `trigger` is invalid (#745) (#778).
+- **Breaking:** document tracking: `DocumentTracker::ensure_open` takes an `OpenRequest` (`Access::{Use, Probe}`, private fields, `OpenRequest::new`); `DocumentTracker::is_open` is removed; `spawn_disk_sweep` returns `DiskSweepHandle` (#783, #798, #802) (#790, #811).
+- **Breaking:** `LspServer::spawn` returns `SpawnedServer { server, lanes }`, `ServerStartOutcome::Started` holds it, and the `take_*` receivers are gone (#744) (#778).
+- **Breaking:** untrusted launcher: it refuses a shell or interpreter without a script, adding `LaunchTrigger::ProgramFromStdin` and `UnanalyzableLaunch::RelativeOperandAfterChdir`; `InlineFlag` is `Short(char)` or `Long(LongInlineFlag)`, `ShellFlag::PlusC` reports `+c` as written, `cmd` is refused as a runner and `CmdSwitch` and `ShellFlag::SlashC` are removed (#747, #782) (#784, #790).
+- **Breaking:** `RestartFailure` gains `Refused` (wire kind `refused`); `RestartFailure`, `TextField`, `RestartOutcome`, `InitPhase`, `BuiltinServer`, the `Invalid*` config errors and the launcher detail enums are `#[non_exhaustive]`; `ServerState::can_accept_requests` is removed (#748, #797, #800, #819, #821) (#778, #811, #823).
+- **Breaking:** the `DefinitionResult`, `ReferencesResult` and `DiagnosticSeverity` aliases, `Translator::is_document_open` (now `open_state`), the `lsp::HostOs` re-export and `Serialize` on `JsonRpcResponse` are removed (#748) (#778).
+- `JsonRpcError` is re-exported from `lsp`, and `HandshakeClaim` is public (#776, #777) (#790).
 - The TypeScript server pin applies to `nodejs`, versioned `node22`-style and `bun` launches, so untrusted mode admits them (#818) (#823).
-- Restart, respawn, sweep, launcher and env code share typed states and single implementations instead of bools, paired fields and duplicated tables (#818, #819) (#823).
+- Internal: a diagnostics list is serialized once per publish, whole-document and name-addressed tools share one request path each, notification sends and launcher grammar are typed, and restart, respawn, sweep and env code share typed states and single implementations (#743, #746, #801, #803, #805, #818, #819) (#778, #811, #823).
+- Dependencies: tokio 1.53.3, schemars 1.2.3, serde_json 1.0.154, tokio-util 0.7.20, toml 1.1.8, proptest 1.12.0, hyper 1.12.0; CI actions bumped (#759-#775).
+
+### Fixed
+
+- Untrusted launcher: refuses a script operand resolving to a device, FIFO or socket (including `/Volumes/Macintosh HD/dev/stdin`), shells and interpreters reading their program from stdin (`bash -s`, `python -`, bare `deno`), distribution names of listed shells and interpreters (`bash-static`, `pwsh-preview`, `py`) with the php `-R`/`-B`/`-E`/`-F` flags, and further code-running spellings (pwsh dash lookalikes, elvish `--c`, fish flag prefixes, cabal and stack run, `cargo r`/`t`, `data:` URLs with tab or newline); the argument backstop runs before every spawn (#734, #736, #740, #782, #787) (#784, #790, #794).
+- Config load rejects a NUL byte in server `args` or `env` values and a server `env` table over the host's size limits; read errors name the path (#751, #785, #786, #820) (#790, #794, #823).
+- Workspace file opens verify the opened handle against the workspace roots and never open an outside symlink target (FIFO, device): `openat2(RESOLVE_BENEATH)` on Linux, an `O_NOFOLLOW` component walk on other Unix including macOS; on Windows a canonical path over `MAX_PATH` opens inside the workspace (#783, #788, #817) (#790, #794, #823, #826).
+- Diagnostics sweep: no `didSave` in untrusted workspaces, sent for reopened files and keyed on a content digest; an unanswered pull no longer stalls other files; shutdown waits for jobs and pulls; resync and `didSave` are bounded by the request timeout; a skipped pass hands its candidates to the running pass; task panics are logged (#789, #791, #798, #806, #809, #820) (#794, #811, #823).
+- Lost-publish batches re-check the diagnostics role, announce only changed files and deliver in arrival order; a lost mark under a lexical fallback path marks the symlinked file's entry; recording lost files is no longer quadratic; the mailbox byte budget counts URI bytes (#738, #742, #779) (#778, #790).
+- `restart_server`: a refusal before the old process stops reports `refused` and keeps the server running without starting the cooldown; a failed start reports `spawn_failed`; shutdown answers with a tool error; a cancelled call leaves no half-done restart, unannounced respawn, unsent `didClose` or lost notification (#687, #736, #797, #807, #815) (#784, #811, #823).
+- Protocol: a repeated `initialize` answers `-32600`; undecodable params of a known method answer `-32602`; a response with both `result` and `error` keeps the error code so `-32801` retries; `get_completions` rejects an empty `trigger` while parsing (#745, #750, #737, #776) (#778, #790).
+- Client-supplied paths, resource URIs, cursors and method names are escaped and bounded in error messages, including `DocumentNotFound` and `PathToUri` through `EchoedPath`; the dropped-frame log escapes the method; a duplicate server id error prints no arguments, and secrets in server arguments and environment values stay out of `Debug` output (#749, #780, #816) (#778, #790, #823, #826).
+- `tools/list` descriptions are whole sentences, a cancelled tool call logs no warning and the late reply to a timed-out request logs none, the child-exit warning reports the grace applied, and Windows environment variable names fold case over the Basic Multilingual Plane only (#738, #807, #814, #820) (#778, #811, #823).
 
 ## [0.7.0] - 2026-10-07
 
@@ -927,7 +893,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/bug-ops/mcpls/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/bug-ops/mcpls/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bug-ops/mcpls/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bug-ops/mcpls/compare/v0.4.0...v0.5.0
