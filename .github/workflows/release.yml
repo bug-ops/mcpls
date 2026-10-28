@@ -90,7 +90,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@8a2045612414e945291083f820cd50b4d8fc2218 # cargo-bins/cargo-binstall main
+        uses: cargo-bins/cargo-binstall@81df5c23b0dc775b009efdfc9895c5965b7a4e40 # cargo-bins/cargo-binstall main
 
       - name: Install Rust target stdlib
         run: rustup target add ${{ matrix.target }}
