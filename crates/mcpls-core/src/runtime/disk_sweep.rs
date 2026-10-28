@@ -1221,7 +1221,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_files_beyond_the_background_slots_are_pulled_once_slots_free() {
         let names = ["a.rs", "b.rs", "c.rs", "d.rs"];
-        let mut fleet = Fleet::new(&names, &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&names, &[])).await;
         fleet.sweep.tick_and_settle().await;
         *fleet.wedge.delay.lock().unwrap() = Duration::from_secs(10);
         for name in names {
@@ -1244,7 +1244,7 @@ mod tests {
     /// An unanswered pull delays only its own file (spec 016 SC-001).
     #[tokio::test(start_paused = true)]
     async fn test_a_hung_pull_delays_only_its_own_file() {
-        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&["a.rs", "b.rs", "c.rs"], &[])).await;
         fleet.sweep.tick_and_settle().await;
         fleet.wedge.hang("a.rs");
         fleet.edit("a.rs");
@@ -1275,7 +1275,7 @@ mod tests {
     /// (#809).
     #[tokio::test(start_paused = true)]
     async fn test_a_file_edited_while_the_pass_runs_is_handed_to_it() {
-        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&["a.rs", "b.rs", "c.rs"], &[])).await;
         fleet.sweep.tick_and_settle().await;
         for name in ["a.rs", "c.rs"] {
             fleet.wedge.hang(name);
@@ -1302,7 +1302,7 @@ mod tests {
     /// state, one at a time and a request timeout apart (spec 016 SC-006).
     #[tokio::test(start_paused = true)]
     async fn test_a_hung_file_gets_the_capped_number_of_pulls_for_its_state() {
-        let mut fleet = Fleet::new(&["a.rs"], &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&["a.rs"], &[])).await;
         fleet.sweep.tick_and_settle().await;
         fleet.wedge.hang("a.rs");
         let before = fleet.wedge.count(PULL, "a.rs");
@@ -1332,7 +1332,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_a_full_cap_costs_a_pass_little_and_never_delays_a_resync() {
         let hung = ["h1.rs", "h2.rs", "h3.rs", "h4.rs", "h5.rs", "h6.rs"];
-        let mut fleet = Fleet::new(&hung, &["d.rs"]).await;
+        let mut fleet = Box::pin(Fleet::new(&hung, &["d.rs"])).await;
         fleet.sweep.tick_and_settle().await;
         for name in hung {
             fleet.wedge.hang(name);
@@ -1364,7 +1364,7 @@ mod tests {
     async fn test_a_hung_file_is_pulled_at_most_once_per_pass_over_many_ticks() {
         const TICKS: usize = 10;
         let hung = ["h1.rs", "h2.rs", "h3.rs", "h4.rs", "h5.rs", "h6.rs"];
-        let mut fleet = Fleet::new(&hung, &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&hung, &[])).await;
         fleet.sweep.tick_and_settle().await;
         for name in hung {
             fleet.wedge.hang(name);
@@ -1397,7 +1397,7 @@ mod tests {
     async fn answering_file_pulled_after(hung: &[&str]) -> Duration {
         let mut names: Vec<&str> = hung.to_vec();
         names.push("z.rs");
-        let mut fleet = Fleet::new(&names, &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&names, &[])).await;
         fleet.sweep.tick_and_settle().await;
         for name in hung {
             fleet.wedge.hang(name);
@@ -1435,7 +1435,7 @@ mod tests {
     /// change made stale, whatever their path order.
     #[tokio::test(start_paused = true)]
     async fn test_a_pass_pulls_new_states_before_stale_ones() {
-        let mut fleet = Fleet::new(&["a.rs", "b.rs", "c.rs"], &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&["a.rs", "b.rs", "c.rs"], &[])).await;
         fleet.sweep.tick_and_settle().await;
         let seen_before = fleet.wedge.seen.lock().unwrap().len();
         fleet.edit("a.rs");
@@ -1470,7 +1470,7 @@ mod tests {
     /// returns.
     #[tokio::test(start_paused = true)]
     async fn test_stopping_the_sweep_ends_its_background_pulls() {
-        let mut fleet = Fleet::new(&["a.rs"], &[]).await;
+        let mut fleet = Box::pin(Fleet::new(&["a.rs"], &[])).await;
         fleet.sweep.tick_and_settle().await;
         fleet.wedge.hang("a.rs");
         fleet.edit("a.rs");
