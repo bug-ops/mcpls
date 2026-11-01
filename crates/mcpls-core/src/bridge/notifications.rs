@@ -513,7 +513,7 @@ const MAX_SERVER_MESSAGES: usize = 50;
 /// (e.g. a server restart) loses no replayable clear.
 const MAX_RECENT_EVICTIONS: usize = MAX_DIAGNOSTIC_ENTRIES;
 
-/// Most evicted files remembered for `NotificationCache::availability`.
+/// Most evicted files remembered per server for `NotificationCache::availability`.
 const MAX_EVICTION_MARKS: usize = MAX_DIAGNOSTIC_ENTRIES;
 
 /// How long an empty-entry removal stays replayable.
@@ -624,17 +624,19 @@ struct EvictionMark {
 /// Files whose entries capacity eviction removed, so a read can tell a clean
 /// file or lost diagnostics from a file nothing was ever published for.
 ///
-/// Bounded to `MAX_EVICTION_MARKS`; once the oldest mark of a server is
-/// forgotten the server is `overflowed`, and a file without entry or mark is
-/// then reported as possibly evicted rather than as pending. A server's marks
-/// and overflow are dropped with its diagnostics (respawn), and a file's mark
-/// with its next entry. The overflow also ends with the server's next accepted
-/// write, so a file forgotten before it reads as pending again instead of
-/// possibly evicted for as long as the process runs.
+/// Bounded to `MAX_EVICTION_MARKS` per server, so one server cannot displace
+/// another's marks. A file's mark belongs to the server that recorded it last.
+/// Once a server forgets its own oldest mark the server is `overflowed`, and a
+/// file without entry or mark is then reported as possibly evicted rather than
+/// as pending. A server's marks and overflow are dropped with its diagnostics
+/// (respawn), and a file's mark with its next entry. The overflow also ends
+/// with the server's next accepted write, so a file forgotten before it reads
+/// as pending again instead of possibly evicted for as long as the process
+/// runs.
 #[derive(Debug, Default)]
 struct EvictionMarks {
     by_file: HashMap<DiagnosticsKey, EvictionMark>,
-    order: BTreeMap<u64, DiagnosticsKey>,
+    order: HashMap<ServerId, BTreeMap<u64, DiagnosticsKey>>,
     next_seq: u64,
     overflowed: HashSet<ServerId>,
 }
@@ -642,7 +644,6 @@ struct EvictionMarks {
 impl EvictionMarks {
     /// Marks `file`; returns whether that changed what a read of it says (it
     /// had no mark, or one with other content).
-    // TODO(#867): forgetting another owner's mark on overflow marks that server overflowed (FR-010 of lsp/014)
     fn record(&mut self, file: DiagnosticsKey, owner: ServerId, content: EvictedContent) -> bool {
         let previous = self.by_file.get(&file).map(|previous| previous.content);
         let content = match previous {
@@ -653,7 +654,19 @@ impl EvictionMarks {
         self.forget_file(&file);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        self.order.insert(seq, file.clone());
+        let ordered = self.order.entry(owner.clone()).or_default();
+        ordered.insert(seq, file.clone());
+        let mut overflow = false;
+        while ordered.len() > MAX_EVICTION_MARKS {
+            let Some((_, oldest)) = ordered.pop_first() else {
+                break;
+            };
+            self.by_file.remove(&oldest);
+            overflow = true;
+        }
+        if overflow {
+            self.overflowed.insert(owner.clone());
+        }
         self.by_file.insert(
             file,
             EvictionMark {
@@ -662,26 +675,27 @@ impl EvictionMarks {
                 seq,
             },
         );
-        while self.by_file.len() > MAX_EVICTION_MARKS {
-            let Some((_, oldest)) = self.order.pop_first() else {
-                break;
-            };
-            if let Some(mark) = self.by_file.remove(&oldest) {
-                self.overflowed.insert(mark.owner);
-            }
-        }
         changed
     }
 
     fn forget_file(&mut self, file: &DiagnosticsKey) {
         if let Some(mark) = self.by_file.remove(file) {
-            self.order.remove(&mark.seq);
+            self.unorder(&mark.owner, mark.seq);
+        }
+    }
+
+    fn unorder(&mut self, owner: &ServerId, seq: u64) {
+        if let Some(owned) = self.order.get_mut(owner) {
+            owned.remove(&seq);
+            if owned.is_empty() {
+                self.order.remove(owner);
+            }
         }
     }
 
     fn forget_server(&mut self, server: &ServerId) {
         self.by_file.retain(|_, mark| &mark.owner != server);
-        self.order.retain(|_, file| self.by_file.contains_key(file));
+        self.order.remove(server);
         self.overflowed.remove(server);
     }
 
@@ -2042,9 +2056,14 @@ impl NotificationCache {
         assert_eq!(empty, self.empty_diagnostics_count);
 
         let marks = &self.eviction_marks;
-        assert_eq!(marks.by_file.len(), marks.order.len(), "marks diverge");
-        for (seq, file) in &marks.order {
-            assert_eq!(marks.by_file.get(file).map(|mark| mark.seq), Some(*seq));
+        let ordered: usize = marks.order.values().map(BTreeMap::len).sum();
+        assert_eq!(marks.by_file.len(), ordered, "marks diverge");
+        for (owner, owned) in &marks.order {
+            assert!(owned.len() <= MAX_EVICTION_MARKS);
+            for (seq, file) in owned {
+                let mark = marks.by_file.get(file).expect("ordered file has a mark");
+                assert_eq!((&mark.owner, mark.seq), (owner, *seq));
+            }
         }
     }
 
@@ -4981,6 +5000,142 @@ mod tests {
         assert_eq!(marks.content(&file), Some(EvictedContent::Lost));
     }
 
+    fn mark_files(marks: &mut EvictionMarks, owner: &ServerId, prefix: &str, count: usize) {
+        for i in 0..count {
+            let file = DiagnosticsKey::of(&Uri::from(format!("file:///{prefix}{i}.rs").as_str()));
+            marks.record(file, owner.clone(), EvictedContent::Clean);
+        }
+    }
+
+    /// #867: a server filling its cap, then another recording, loses nothing.
+    #[test]
+    fn test_marks_of_another_server_do_not_displace_a_full_owner() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut marks = EvictionMarks::default();
+        mark_files(&mut marks, &a, "a", MAX_EVICTION_MARKS);
+        mark_files(&mut marks, &b, "b", 1);
+        assert_eq!(marks.by_file.len(), MAX_EVICTION_MARKS + 1);
+        assert!(!marks.has_overflowed(&a));
+        assert!(!marks.has_overflowed(&b));
+        assert!(
+            marks
+                .content(&DiagnosticsKey::of(&Uri::from("file:///a0.rs")))
+                .is_some()
+        );
+    }
+
+    /// #867: exceeding its own cap drops the owner's oldest and flags only it.
+    #[test]
+    fn test_owner_exceeding_its_cap_drops_its_own_oldest_and_flags_only_itself() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut marks = EvictionMarks::default();
+        mark_files(&mut marks, &b, "b", 1);
+        mark_files(&mut marks, &a, "a", MAX_EVICTION_MARKS + 1);
+        assert!(marks.has_overflowed(&a));
+        assert!(!marks.has_overflowed(&b));
+        assert!(
+            marks
+                .content(&DiagnosticsKey::of(&Uri::from("file:///a0.rs")))
+                .is_none()
+        );
+        assert!(
+            marks
+                .content(&DiagnosticsKey::of(&Uri::from("file:///a1.rs")))
+                .is_some()
+        );
+        assert!(
+            marks
+                .content(&DiagnosticsKey::of(&Uri::from("file:///b0.rs")))
+                .is_some()
+        );
+        assert_eq!(
+            marks.order.get(&a).map(BTreeMap::len),
+            Some(MAX_EVICTION_MARKS)
+        );
+    }
+
+    /// #867: forgetting a server or a file keeps the per-owner order exact.
+    #[test]
+    fn test_forgetting_marks_keeps_per_owner_order_consistent() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut marks = EvictionMarks::default();
+        mark_files(&mut marks, &a, "a", 2);
+        mark_files(&mut marks, &b, "b", 1);
+        marks.forget_file(&DiagnosticsKey::of(&Uri::from("file:///b0.rs")));
+        assert!(!marks.order.contains_key(&b));
+        marks.forget_server(&a);
+        assert!(marks.by_file.is_empty() && marks.order.is_empty());
+    }
+
+    fn newest_mark_of(marks: &EvictionMarks, owner: &ServerId) -> Option<DiagnosticsKey> {
+        marks
+            .order
+            .get(owner)?
+            .last_key_value()
+            .map(|(_, file)| file.clone())
+    }
+
+    /// #867: re-recording a file at the cap neither overflows nor grows.
+    #[test]
+    fn test_rerecording_a_file_at_the_cap_does_not_overflow() {
+        let a = route();
+        let mut marks = EvictionMarks::default();
+        mark_files(&mut marks, &a, "a", MAX_EVICTION_MARKS);
+        let first = DiagnosticsKey::of(&Uri::from("file:///a0.rs"));
+        marks.record(first.clone(), a.clone(), EvictedContent::Clean);
+        assert!(!marks.has_overflowed(&a));
+        assert_eq!(marks.by_file.len(), MAX_EVICTION_MARKS);
+        assert_eq!(newest_mark_of(&marks, &a), Some(first));
+    }
+
+    /// #867: the server that records a file last owns its mark.
+    #[test]
+    fn test_recording_a_file_again_moves_its_mark_to_the_new_owner() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut marks = EvictionMarks::default();
+        let file = DiagnosticsKey::of(&first_uri());
+        marks.record(file.clone(), a.clone(), EvictedContent::Lost);
+        marks.record(file.clone(), b.clone(), EvictedContent::Clean);
+        assert!(!marks.order.contains_key(&a));
+        assert_eq!(newest_mark_of(&marks, &b), Some(file.clone()));
+        assert_eq!(marks.by_file.get(&file).map(|mark| &mark.owner), Some(&b));
+        assert_eq!(marks.content(&file), Some(EvictedContent::Lost));
+    }
+
+    /// #867: forgetting one server keeps the other's marks and overflow.
+    #[test]
+    fn test_forgetting_a_server_keeps_the_overflow_and_marks_of_another() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut marks = EvictionMarks::default();
+        mark_files(&mut marks, &a, "a", MAX_EVICTION_MARKS + 1);
+        mark_files(&mut marks, &b, "b", MAX_EVICTION_MARKS + 1);
+        marks.forget_server(&a);
+        assert!(!marks.has_overflowed(&a));
+        assert!(marks.has_overflowed(&b));
+        assert_eq!(marks.by_file.len(), MAX_EVICTION_MARKS);
+        assert_eq!(
+            marks.order.get(&b).map(BTreeMap::len),
+            Some(MAX_EVICTION_MARKS)
+        );
+    }
+
+    /// #867: one server's overflow does not change how another's files read.
+    #[test]
+    fn test_overflow_of_one_server_leaves_another_servers_files_pending() {
+        let (a, b) = (route(), ServerId::from_static("other-server"));
+        let mut cache = NotificationCache::new();
+        mark_files(&mut cache.eviction_marks, &a, "a", MAX_EVICTION_MARKS + 1);
+        let unseen = Uri::from("file:///never-published.rs");
+        assert_eq!(
+            cache.availability(&unseen, Some(&a)),
+            DiagnosticsAvailability::Evicted
+        );
+        assert_eq!(
+            cache.availability(&unseen, Some(&b)),
+            DiagnosticsAvailability::Pending
+        );
+    }
+
     fn overflowed_after_churn() -> NotificationCache {
         let mut cache = full_cache(false);
         for i in 0..=MAX_EVICTION_MARKS {
@@ -5050,7 +5205,6 @@ mod tests {
         }
         assert!(cache.eviction_marks.has_overflowed(&route()));
         assert!(cache.eviction_marks.by_file.len() <= MAX_EVICTION_MARKS);
-        assert!(cache.eviction_marks.order.len() <= MAX_EVICTION_MARKS);
         cache.assert_consistent();
 
         assert_eq!(

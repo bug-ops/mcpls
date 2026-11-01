@@ -183,7 +183,7 @@ THEN each source of the loss logs at most one WARN per rate-limit interval, with
 | FR-007 | WHEN a loss is recorded and the merged view of a subscribed file changed THE SYSTEM SHALL send `resources/updated` for it | must |
 | FR-008 | THE dropped-frame log lines SHALL stay rate limited through the existing mechanism, with one WARN per source per interval carrying a dropped count (the transport's skipped-frame line, the undecodable-run line and the lost-publish line), and SHALL NOT include server-controlled frame content | must |
 | FR-009 | WHEN a dropped notification is not a `publishDiagnostics` frame THE SYSTEM SHALL NOT record a diagnostics loss | must |
-| FR-010 | WHEN a loss is recorded for one server THE SYSTEM SHALL NOT mark another server's diagnostics | must |
+| FR-010 | WHEN a loss is recorded for one server THE SYSTEM SHALL NOT mark another server's diagnostics, and the bound on capacity-eviction marks and their overflow mark SHALL apply per server, so one server's marks never displace another's (a file's mark belongs to the server that recorded it last) | must |
 | FR-011 | A later valid `publishDiagnostics` for an affected file SHALL replace the entry normally and clear the file-level loss | must |
 | FR-012 | THE identification of a dropped frame as a diagnostics publish SHALL NOT require buffering the full oversized frame, and memory per frame SHALL stay within the existing limits | must |
 | FR-013 | Regression tests SHALL cover an oversized and a small malformed publish after an accepted publish, asserting the loss signal on all three surfaces and the subscriber notification | must |
