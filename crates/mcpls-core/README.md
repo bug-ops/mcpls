@@ -44,11 +44,11 @@ async fn main() {
 - Protocol translation between MCP tools and LSP requests, with 1-based to 0-based position and encoding conversion
 - Language server lifecycle management: spawn, initialize, restart, shutdown
 - Non-blocking startup: the MCP server accepts connections while language servers initialize
-- Lazy document tracking and a diagnostics cache for push-based notifications, refreshed from disk edits for subscribed resources
+- Lazy document tracking and a diagnostics cache for push-based notifications, refreshed from disk edits for subscribed resources; files of dropped or undecodable publishes are marked `evicted`, with per-server bounds
 - TOML configuration, server discovery by project markers, and trust controls (untrusted launcher, open-then-verify file access)
 - Cancellation of in-flight tool calls, forwarded to the language server as `$/cancelRequest`
-- Fan-out workspace symbol search across all eligible servers, with per-server outcomes
-- stdio and optional HTTP transports; stdio requests over 4 MiB are rejected with `-32600`
+- Fan-out workspace symbol search across all eligible servers, with per-server outcomes and indexing status
+- stdio and optional HTTP transports; stdio requests over 4 MiB or undecodable are answered with `-32600` or `-32700`; an oversized LSP frame (10-256 MiB) fails only its own request
 
 ## Learn more
 

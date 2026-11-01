@@ -30,6 +30,7 @@ flowchart LR
 - Every push is stored per file, keyed by the file's canonical path. A server may publish one file under several spellings (a symlink and its target); mcpls returns the union with exact duplicates removed.
 - A full pull report from `get_diagnostics` is stored next to the pushed entries in a separate slot. Partial and `unchanged` reports, failed pulls, and reports that raced a later pull or an edit are returned to the caller but not stored.
 - The cache holds at most 1000 file entries. When a write evicts another file, that file becomes `evicted`, which is reported honestly instead of as clean.
+- Each server remembers at most 1000 evicted files of its own. A server that loses more forgets its oldest mark, and files it never reported on then read as possibly `evicted` until its next accepted publish. One server's marks and overflow never displace or flag another server's files.
 - Server log messages (100 entries) and `showMessage` messages (50 entries) are kept in separate bounded buffers for `get_server_logs` and `get_server_messages`.
 
 `get_diagnostics` merges the pull answer with the cached pushes, deduplicating by severity, code and proximity. `get_cached_diagnostics` returns the cache alone and never triggers analysis. A file that is edited on disk keeps its last known diagnostics until the server publishes new ones or a pull replaces them (the next call, or, for a subscribed file, the next sweep); there is no window where they appear empty.
@@ -42,7 +43,7 @@ Every diagnostics answer carries `availability`, because an empty list is ambigu
 |-------|---------|
 | `published` | The server reported on the file; an empty list means clean |
 | `pending` | Nothing has been published since the server started; unknown |
-| `evicted` | A publish was lost: dropped to bound the cache or the delivery buffer (a burst of more than 1000 files, or 64 MiB, from one server), or unreadable (oversized, malformed or failing the typed decode); what the server said is unknown |
+| `evicted` | A publish was lost: dropped to bound the cache or the delivery buffer (a burst of more than 1000 files, or 64 MiB, from one server), or unreadable (oversized, malformed, failing the typed decode, or carrying a `uri` longer than 16 KiB, which is never cached or listed); what the server said is unknown |
 
 A server restart returns every file to `pending`.
 
