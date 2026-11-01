@@ -18,8 +18,9 @@ use serde::Serialize;
 use super::Translator;
 use super::pull_support::PullSupport;
 use super::routing::{
-    Capability, LanguageCandidates, MemberPresence, RouteLookup, WorkspaceRouteLookup,
-    is_untrusted_refusal, lookup_route, lookup_workspace_route, workspace_fan_out_members,
+    Capability, FanOutMembers, LanguageCandidates, MemberPresence, RouteLookup,
+    WorkspaceRouteLookup, is_untrusted_refusal, lookup_route, lookup_workspace_route,
+    workspace_fan_out_members,
 };
 use crate::bridge::ClientPath;
 use crate::config::{LanguageId, LanguageMap, ServerId, ToolKind, ToolRouter};
@@ -35,26 +36,35 @@ use crate::util::lock_std;
 pub enum RouteSupport {
     /// The routed server is registered and advertises the tool's capability.
     Supported {
-        /// The server the call would be dispatched to.
+        /// The routed server.
         server: ServerId,
     },
-    /// Registered and publishing diagnostics, but with no pull provider: answers come from the push cache.
+    /// Registered and publishing diagnostics without a pull provider: answers come from the push cache.
     ///
     /// `get_diagnostics` answers from the push cache.
     PushOnly {
-        /// The server the call would be dispatched to.
+        /// The routed server.
         server: ServerId,
     },
-    /// The routed server is registered but does not advertise the capability.
+    /// Registered but does not advertise the capability.
     CapabilityNotAdvertised {
-        /// The server the call would be dispatched to.
+        /// The routed server.
         server: ServerId,
         /// The capability the server does not advertise.
         capability: Capability,
     },
-    /// The routed server has not finished initializing, or its capabilities
-    /// are not known yet.
-    Initializing,
+    /// The routed server is still initializing, or its capabilities are unknown.
+    Initializing {
+        /// Set for fan-out members only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "ServerId")]
+        server: Option<ServerId>,
+    },
+    /// Failed to start or died; this check does not restart it.
+    Unavailable {
+        /// The server.
+        server: ServerId,
+    },
     /// No server is routed for this tool.
     NoServer,
 }
@@ -95,6 +105,7 @@ pub struct ToolSupportSnapshot {
     configured_router: Arc<ToolRouter>,
     refused: HashSet<ServerId>,
     expected: HashSet<ServerId>,
+    dead: HashSet<ServerId>,
     running: HashMap<ServerId, RunningSupport>,
     registered: HashSet<ServerId>,
 }
@@ -170,7 +181,9 @@ impl ToolSupportSnapshot {
                     (_, support) => support,
                 }
             }
-            RouteLookup::Initializing(_) => RouteSupport::Initializing,
+            // ASSUMPTION: naming the server here would split the per-language
+            // groups of `get_tool_support`, so document routes stay anonymous.
+            RouteLookup::Initializing(_) => RouteSupport::Initializing { server: None },
             RouteLookup::Failed(_) | RouteLookup::Dangling { .. } | RouteLookup::Unrouted => {
                 RouteSupport::NoServer
             }
@@ -180,17 +193,11 @@ impl ToolSupportSnapshot {
     /// Support for a workspace-wide `tool` (no document, hence no language).
     ///
     /// With two or more eligible servers (the set the handler fans out over)
-    /// the answer aggregates them; see [`Self::fan_out_support`].
+    /// the answer aggregates them; see [`Self::workspace_members`] for the
+    /// per-server view.
     pub(crate) fn workspace_support(&self, tool: ToolKind) -> RouteSupport {
-        let members = workspace_fan_out_members(
-            &self.configured_router,
-            tool,
-            |id| self.refused.contains(id),
-            |id| self.registered.contains(id),
-            |id| self.expected.contains(id),
-        );
-        if let Some(members) = members {
-            return self.fan_out_support(tool, members);
+        if let Some(members) = self.fan_out_members(tool) {
+            return Self::aggregate(&self.member_supports(tool, &members));
         }
         let lookup = lookup_workspace_route(
             || self.router.resolve_any(tool).cloned(),
@@ -203,7 +210,7 @@ impl ToolSupportSnapshot {
                 self.registered_support(server, Capability::for_tool(tool))
             }
             WorkspaceRouteLookup::Initializing(_) | WorkspaceRouteLookup::AllInitializing => {
-                RouteSupport::Initializing
+                RouteSupport::Initializing { server: None }
             }
             WorkspaceRouteLookup::Dangling(_)
             | WorkspaceRouteLookup::NothingConfigured
@@ -211,29 +218,67 @@ impl ToolSupportSnapshot {
         }
     }
 
-    /// The best support among fan-out `members`: the first server in config
+    /// Support of each server a fanned-out workspace `tool` asks, in config
+    /// order, each naming its server; empty when the tool is not fanned out.
+    pub(crate) fn workspace_members(&self, tool: ToolKind) -> Vec<RouteSupport> {
+        self.fan_out_members(tool)
+            .map(|members| self.member_supports(tool, &members))
+            .unwrap_or_default()
+    }
+
+    fn fan_out_members(&self, tool: ToolKind) -> Option<FanOutMembers> {
+        workspace_fan_out_members(
+            &self.configured_router,
+            tool,
+            |id| self.refused.contains(id),
+            |id| self.registered.contains(id),
+            |id| self.expected.contains(id),
+        )
+    }
+
+    fn member_supports(&self, tool: ToolKind, members: &FanOutMembers) -> Vec<RouteSupport> {
+        let capability = Capability::for_tool(tool);
+        members
+            .iter()
+            .map(|(server, presence)| match presence {
+                MemberPresence::Registered if self.dead.contains(server) => {
+                    RouteSupport::Unavailable {
+                        server: server.clone(),
+                    }
+                }
+                MemberPresence::Registered => {
+                    match self.registered_support(server.clone(), capability) {
+                        RouteSupport::Initializing { .. } => RouteSupport::Initializing {
+                            server: Some(server.clone()),
+                        },
+                        support => support,
+                    }
+                }
+                MemberPresence::Initializing => RouteSupport::Initializing {
+                    server: Some(server.clone()),
+                },
+                MemberPresence::Absent => RouteSupport::Unavailable {
+                    server: server.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// The best support among fan-out members: the first server in config
     /// order that would be asked and advertises the capability, else
     /// initializing when any member is, else the first capability gap, else no
-    /// server.
-    fn fan_out_support(
-        &self,
-        tool: ToolKind,
-        members: Vec<(ServerId, MemberPresence)>,
-    ) -> RouteSupport {
-        let capability = Capability::for_tool(tool);
-        let supports: Vec<RouteSupport> = members
-            .into_iter()
-            .map(|(server, presence)| match presence {
-                MemberPresence::Registered => self.registered_support(server, capability),
-                MemberPresence::Initializing => RouteSupport::Initializing,
-                MemberPresence::Absent => RouteSupport::NoServer,
-            })
-            .collect();
+    /// server. An unavailable member counts as no server.
+    fn aggregate(supports: &[RouteSupport]) -> RouteSupport {
         let first = |wanted: fn(&RouteSupport) -> bool| {
             supports.iter().find(|support| wanted(support)).cloned()
         };
         first(|support| matches!(support, RouteSupport::Supported { .. }))
-            .or_else(|| first(|support| matches!(support, RouteSupport::Initializing)))
+            .or_else(|| {
+                supports
+                    .iter()
+                    .any(|support| matches!(support, RouteSupport::Initializing { .. }))
+                    .then_some(RouteSupport::Initializing { server: None })
+            })
             .or_else(|| {
                 first(|support| matches!(support, RouteSupport::CapabilityNotAdvertised { .. }))
             })
@@ -251,7 +296,7 @@ impl ToolSupportSnapshot {
 
     fn registered_support(&self, server: ServerId, capability: Option<Capability>) -> RouteSupport {
         let Some(RunningSupport { caps, .. }) = self.running.get(&server) else {
-            return RouteSupport::Initializing;
+            return RouteSupport::Initializing { server: None };
         };
         match capability {
             Some(capability) if !caps.contains(capability) => {
@@ -269,9 +314,9 @@ impl Translator {
     /// misreported as `no_server`), whatever registration or restart is
     /// doing at the same moment.
     pub(crate) fn tool_support_snapshot(&self) -> ToolSupportSnapshot {
-        let servers = lock_std(&self.servers);
+        let mut servers = lock_std(&self.servers);
         let expected = servers.expected();
-        let running = servers
+        let running: HashMap<ServerId, RunningSupport> = servers
             .running_servers()
             .map(|(id, server)| {
                 (
@@ -286,6 +331,15 @@ impl Translator {
         let registered = servers
             .ids()
             .filter(|id| servers.client(id).is_some())
+            .cloned()
+            .collect();
+        let dead = running
+            .keys()
+            .filter(|id| {
+                servers
+                    .server_mut(id)
+                    .is_some_and(|server| matches!(server.is_dead(), Ok(true)))
+            })
             .cloned()
             .collect();
         let refused = servers
@@ -305,6 +359,7 @@ impl Translator {
             configured_router: Arc::clone(&self.configured_router),
             refused,
             expected,
+            dead,
             running,
             registered,
         }
@@ -363,6 +418,7 @@ mod tests {
             router,
             refused: HashSet::new(),
             expected: ids(expected),
+            dead: HashSet::new(),
             running: caps
                 .iter()
                 .map(|(id, caps)| {
@@ -547,7 +603,7 @@ mod tests {
         let snap = snapshot(&["rust"], &[], &[]);
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-            RouteSupport::Initializing
+            RouteSupport::Initializing { server: None }
         );
     }
 
@@ -556,11 +612,11 @@ mod tests {
         let snap = snapshot(&[], &["rust"], &[]);
         assert_eq!(
             snap.document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-            RouteSupport::Initializing
+            RouteSupport::Initializing { server: None }
         );
         assert_eq!(
             snap.workspace_support(ToolKind::WorkspaceSymbols),
-            RouteSupport::Initializing
+            RouteSupport::Initializing { server: None }
         );
     }
 
@@ -638,6 +694,7 @@ mod tests {
             configured_router: Arc::new(ToolRouter::default()),
             refused: HashSet::new(),
             expected: HashSet::new(),
+            dead: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
         };
@@ -687,6 +744,7 @@ mod tests {
             configured_router: Arc::new(ToolRouter::default()),
             refused: HashSet::new(),
             expected: HashSet::new(),
+            dead: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
         };
@@ -701,6 +759,7 @@ mod tests {
             configured_router: Arc::new(ToolRouter::default()),
             refused: HashSet::new(),
             expected: HashSet::new(),
+            dead: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
         };
@@ -793,6 +852,7 @@ mod tests {
             router: Arc::new(live),
             refused,
             expected: ids(expected),
+            dead: HashSet::new(),
             running: registered
                 .iter()
                 .map(|(id, advertised)| {
@@ -832,7 +892,7 @@ mod tests {
         let snap = polyglot_snapshot(&[("a", false)], &["b"], &[]);
         assert_eq!(
             snap.workspace_support(ToolKind::WorkspaceSymbols),
-            RouteSupport::Initializing
+            RouteSupport::Initializing { server: None }
         );
     }
 
@@ -867,6 +927,80 @@ mod tests {
             RouteSupport::Supported {
                 server: ServerId::from_static("b")
             }
+        );
+    }
+
+    #[test]
+    fn workspace_members_name_each_server_in_config_order() {
+        let snap = polyglot_snapshot(&[("a", true)], &["b"], &[]);
+        assert_eq!(
+            snap.workspace_members(ToolKind::WorkspaceSymbols),
+            [
+                RouteSupport::Supported {
+                    server: ServerId::from_static("a")
+                },
+                RouteSupport::Initializing {
+                    server: Some(ServerId::from_static("b"))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_members_report_an_absent_or_dead_member_as_unavailable() {
+        let absent = polyglot_snapshot(&[("a", true)], &[], &[]);
+        assert_eq!(
+            absent.workspace_members(ToolKind::WorkspaceSymbols),
+            [
+                RouteSupport::Supported {
+                    server: ServerId::from_static("a")
+                },
+                RouteSupport::Unavailable {
+                    server: ServerId::from_static("b")
+                },
+            ]
+        );
+        let mut dead = polyglot_snapshot(&[("a", true), ("b", true)], &[], &[]);
+        dead.dead.insert(ServerId::from_static("a"));
+        assert_eq!(
+            dead.workspace_members(ToolKind::WorkspaceSymbols),
+            [
+                RouteSupport::Unavailable {
+                    server: ServerId::from_static("a")
+                },
+                RouteSupport::Supported {
+                    server: ServerId::from_static("b")
+                },
+            ]
+        );
+        assert_eq!(
+            dead.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Supported {
+                server: ServerId::from_static("b")
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_members_are_empty_without_a_fan_out() {
+        let single = polyglot_snapshot(&[("a", true), ("b", true)], &[], &["b"]);
+        assert_eq!(
+            single.workspace_members(ToolKind::WorkspaceSymbols),
+            Vec::<RouteSupport>::new()
+        );
+    }
+
+    #[test]
+    fn the_fan_out_aggregate_stays_anonymous_and_counts_unavailable_as_no_server() {
+        let initializing = polyglot_snapshot(&[("a", false)], &["b"], &[]);
+        assert_eq!(
+            initializing.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Initializing { server: None }
+        );
+        let nothing = polyglot_snapshot(&[], &[], &[]);
+        assert_eq!(
+            nothing.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::NoServer
         );
     }
 }

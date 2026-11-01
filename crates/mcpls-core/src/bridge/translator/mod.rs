@@ -1035,7 +1035,7 @@ mod tests {
                 translator
                     .tool_support_snapshot()
                     .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-                RouteSupport::Initializing
+                RouteSupport::Initializing { server: None }
             );
             assert!(
                 logs.entries()
@@ -1083,7 +1083,7 @@ mod tests {
             translator
                 .tool_support_snapshot()
                 .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-            RouteSupport::Initializing
+            RouteSupport::Initializing { server: None }
         );
 
         translator.settle_failed(&spawn_failure(&configs[0]));

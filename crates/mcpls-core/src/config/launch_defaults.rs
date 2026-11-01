@@ -21,12 +21,17 @@ use crate::spelling::spelled_enum;
 /// (deficit at most 1), so the margin is that deficit plus 2.
 const REFERENCES_MARGIN: usize = 3;
 
-const fn nonzero(count: usize) -> NonZeroUsize {
-    match NonZeroUsize::new(count) {
-        Some(count) => count,
-        None => panic!("a launch limit must be non-zero"),
-    }
-}
+const REFERENCES_LIMIT: NonZeroUsize =
+    NonZeroUsize::new(MAX_NORMALIZED_LOCATIONS + REFERENCES_MARGIN)
+        .expect("a launch limit must be non-zero");
+
+const RESULTS_LIMIT: NonZeroUsize =
+    NonZeroUsize::new(MAX_NORMALIZED_LOCATIONS + 1).expect("a launch limit must be non-zero");
+
+/// Measured with clangd 21: a limit of N admits exactly N files, so one
+/// beyond the edit cap lets mcpls cut and flag the rename itself.
+const RENAME_FILE_LIMIT: NonZeroUsize =
+    NonZeroUsize::new(MAX_NORMALIZED_LOCATIONS + 1).expect("a launch limit must be non-zero");
 
 spelled_enum! {
     /// A clangd command-line option mcpls may append, without its dashes.
@@ -35,6 +40,8 @@ spelled_enum! {
         LimitReferences => "limit-references",
         /// Caps workspace symbols and completion items.
         LimitResults => "limit-results",
+        /// Files a rename may touch before clangd refuses it.
+        RenameFileLimit => "rename-file-limit",
         /// Verbosity of clangd's stderr log.
         Log => "log",
     }
@@ -61,10 +68,9 @@ impl LaunchOption {
     /// The value mcpls appends when the user wrote none.
     const fn default_value(self) -> LaunchValue {
         match self {
-            Self::LimitReferences => {
-                LaunchValue::Count(nonzero(MAX_NORMALIZED_LOCATIONS + REFERENCES_MARGIN))
-            }
-            Self::LimitResults => LaunchValue::Count(nonzero(MAX_NORMALIZED_LOCATIONS + 1)),
+            Self::LimitReferences => LaunchValue::Count(REFERENCES_LIMIT),
+            Self::LimitResults => LaunchValue::Count(RESULTS_LIMIT),
+            Self::RenameFileLimit => LaunchValue::Count(RENAME_FILE_LIMIT),
             Self::Log => LaunchValue::LogError,
         }
     }
@@ -157,12 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_clangd_launch_appends_all_three_options() {
+    fn test_default_clangd_launch_appends_all_four_options() {
         assert_eq!(
             rendered(&LspServerConfig::clangd()),
             [
                 format!("--limit-references={}", MAX_NORMALIZED_LOCATIONS + 3),
                 format!("--limit-results={}", MAX_NORMALIZED_LOCATIONS + 1),
+                format!("--rename-file-limit={}", MAX_NORMALIZED_LOCATIONS + 1),
                 "--log=error".to_owned(),
             ]
         );
@@ -181,6 +188,7 @@ mod tests {
         };
         assert!(references.get() - 1 > MAX_NORMALIZED_LOCATIONS);
         assert!(results.get() > MAX_NORMALIZED_LOCATIONS);
+        assert!(RENAME_FILE_LIMIT.get() > MAX_NORMALIZED_LOCATIONS);
     }
 
     #[test]
@@ -218,7 +226,27 @@ mod tests {
             ],
         );
         let names: Vec<_> = appended(&config).iter().map(AppendedOption::name).collect();
-        assert_eq!(names, [LaunchOption::LimitReferences, LaunchOption::Log]);
+        assert_eq!(
+            names,
+            [
+                LaunchOption::LimitReferences,
+                LaunchOption::RenameFileLimit,
+                LaunchOption::Log
+            ]
+        );
+    }
+
+    #[test]
+    fn test_user_rename_file_limit_replaces_the_default() {
+        let config = clangd_with("clangd", &["--rename-file-limit=7"]);
+        let options = rendered(&config);
+        assert!(
+            options
+                .iter()
+                .all(|option| !option.starts_with("--rename-file-limit")),
+            "{options:?}"
+        );
+        assert_eq!(options.len(), LaunchOption::ALL.len() - 1);
     }
 
     #[test]
@@ -232,7 +260,11 @@ mod tests {
             assert!(appended(&clangd_with(command, &[])).is_empty(), "{command}");
         }
         for command in ["/usr/bin/clangd", "clangd.exe", "CLANGD"] {
-            assert_eq!(appended(&clangd_with(command, &[])).len(), 3, "{command}");
+            assert_eq!(
+                appended(&clangd_with(command, &[])).len(),
+                LaunchOption::ALL.len(),
+                "{command}"
+            );
         }
     }
 }

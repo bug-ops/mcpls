@@ -26,7 +26,7 @@ use rmcp::model::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::spelling::spelled_enum;
+use crate::spelling::{Spelled, spelled_enum};
 use crate::util::{MAX_ECHOED_NAME_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
 
 spelled_enum! {
@@ -66,12 +66,6 @@ enum Lifecycle {
 }
 
 impl Served {
-    fn of(method: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|served| served.as_str() == method)
-    }
-
     const fn lifecycle(self) -> Lifecycle {
         match self {
             Self::Ping | Self::ResourcesSubscribe | Self::ResourcesUnsubscribe => {
@@ -142,7 +136,7 @@ fn method_not_found(method: &str) -> McpError {
 ///   request does not (a duplicate field is the case that gets here), is
 ///   "invalid params" with a fixed text.
 pub(super) fn answer(request: &CustomRequest, kind: SessionKind) -> McpError {
-    let Some(served) = Served::of(&request.method) else {
+    let Some(served) = Served::from_spelling(&request.method) else {
         return method_not_found(&request.method);
     };
     if !served.available(kind) {

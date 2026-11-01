@@ -1295,6 +1295,7 @@ mod plan_tests {
                             .server_config()
                             .initialization_options
                             .as_ref()
+                            .map(crate::config::InitializationOptions::as_value)
                     ),
                     Some(tsserver)
                 );
@@ -2244,7 +2245,7 @@ mod plan_tests {
             typescript_workspace(&fx);
             let mut with_user_pin = typescript_shim(&fx, ".volta/bin");
             with_user_pin.initialization_options =
-                Some(serde_json::json!({"tsserver": {"path": "/opt/ts/tsserver.js"}}));
+                Some(serde_json::json!({"tsserver": {"path": "/opt/ts/tsserver.js"}}).into());
             for config in [typescript_shim(&fx, ".volta/bin"), with_user_pin] {
                 let command = config.command.server_command().clone();
 
@@ -2393,7 +2394,7 @@ mod plan_tests {
             let mut config = typescript_with_path(&install);
             let missing = fx.outside.join("gone/tsserver.js");
             config.initialization_options =
-                Some(serde_json::json!({"tsserver": {"path": missing}}));
+                Some(serde_json::json!({"tsserver": {"path": missing}}).into());
             let init = plan(
                 &config_with(vec![config], WorkspaceTrust::Trusted),
                 &fx.roots,

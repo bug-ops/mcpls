@@ -4674,7 +4674,7 @@
   {
     "name": "get_tool_support",
     "title": "Tool Support",
-    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `push_only` (no pull provider: `get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+    "description": "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) sharing a `status`: `supported`, `push_only` (`get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing`, `unavailable` (failed to start or died) or `no_server`; a multi-server `workspace_symbol_search` lists one route per server, without `languages`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a capable server, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4703,7 +4703,7 @@
               "properties": {
                 "server": {
                   "$ref": "#/$defs/ServerId",
-                  "description": "The server the call would be dispatched to."
+                  "description": "The routed server."
                 },
                 "status": {
                   "const": "supported",
@@ -4717,11 +4717,11 @@
               "type": "object"
             },
             {
-              "description": "Registered and publishing diagnostics, but with no pull provider: answers come from the push cache.",
+              "description": "Registered and publishing diagnostics without a pull provider: answers come from the push cache.",
               "properties": {
                 "server": {
                   "$ref": "#/$defs/ServerId",
-                  "description": "The server the call would be dispatched to."
+                  "description": "The routed server."
                 },
                 "status": {
                   "const": "push_only",
@@ -4735,7 +4735,7 @@
               "type": "object"
             },
             {
-              "description": "The routed server is registered but does not advertise the capability.",
+              "description": "Registered but does not advertise the capability.",
               "properties": {
                 "capability": {
                   "$ref": "#/$defs/Capability",
@@ -4743,7 +4743,7 @@
                 },
                 "server": {
                   "$ref": "#/$defs/ServerId",
-                  "description": "The server the call would be dispatched to."
+                  "description": "The routed server."
                 },
                 "status": {
                   "const": "capability_not_advertised",
@@ -4758,8 +4758,12 @@
               "type": "object"
             },
             {
-              "description": "The routed server has not finished initializing, or its capabilities\nare not known yet.",
+              "description": "The routed server is still initializing, or its capabilities are unknown.",
               "properties": {
+                "server": {
+                  "$ref": "#/$defs/ServerId",
+                  "description": "Set for fan-out members only."
+                },
                 "status": {
                   "const": "initializing",
                   "type": "string"
@@ -4767,6 +4771,24 @@
               },
               "required": [
                 "status"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Failed to start or died; this check does not restart it.",
+              "properties": {
+                "server": {
+                  "$ref": "#/$defs/ServerId",
+                  "description": "The server."
+                },
+                "status": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "server"
               ],
               "type": "object"
             },
@@ -7524,6 +7546,10 @@
                 "index_coverage": {
                   "$ref": "#/$defs/IndexCoverage",
                   "description": "Set only when the server answered with no symbols: what its answer covers."
+                },
+                "indexing_in_progress": {
+                  "description": "Set only while the server was indexing.",
+                  "type": "boolean"
                 },
                 "outcome": {
                   "const": "answered",

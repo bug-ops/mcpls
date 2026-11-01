@@ -80,6 +80,7 @@ When the command is `clangd` (by file name, so `/usr/bin/clangd` counts; wrapper
 |--------|-------|-----|
 | `--limit-references` | 10003 | clangd's default of 1000 would cut `get_references` silently; now only mcpls's own flagged cap of 10,000 applies |
 | `--limit-results` | 10001 | clangd's default of 100 would cut `workspace_symbol_search` silently; the default `limit` of 100 now reports `truncated: true` when more match |
+| `--rename-file-limit` | 10001 | clangd's default of 50 would refuse `rename_symbol` over more files; now a rename past mcpls's own edit cap of 10,000 is cut and flagged by mcpls instead |
 | `--log` | `error` | no stderr line per request |
 
 An option counts as written in any of `--name=value`, `-name=value`, `--name value` and `-name value`; an `@file` argument suppresses all three. A limit you write yourself is respected and is not reported as `truncated` when clangd applies it. These options need a clangd that accepts them (`--limit-references` appears in the clangd 14 manual); an older one fails to start and the error shows its stderr. Because `--limit-results` also bounds completion, `get_completions` caps its own answer at 100 items for every server and sets `truncated` when it drops any.

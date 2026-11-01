@@ -100,8 +100,9 @@ SO THAT one call cannot flood my context or the mcpls process
 | ID | Requirement | Priority |
 |----|-------------|----------|
 | FR-014 | THE stdio transport SHALL bound one incoming JSON-RPC line at `StdioMessageLimit` (4 MiB by default, the bound the HTTP transport applies to a body; not configurable; zero is unrepresentable). The count excludes the terminating `\n`; a line of exactly the limit is accepted | must |
-| FR-015 | WHEN a stdio line exceeds the limit and is a request THE SYSTEM SHALL discard it and answer with JSON-RPC error `-32600` carrying the request `id` recovered by a streaming scan of the top-level members (a missing or unusable `id` is answered with a null id); WHEN it is a notification THE SYSTEM SHALL discard it without a reply; either way the session stays open and later lines are served | must |
-| FR-016 | Lines within the limit SHALL be decoded by the MCP SDK's own codec, so every other framing rule is unchanged | must |
+| FR-015 | WHEN a stdio line exceeds the limit and is a request THE SYSTEM SHALL discard it and answer with JSON-RPC error `-32600` carrying the request `id` recovered by a streaming scan of the top-level members (a missing or unusable `id` is answered without an `id` member); WHEN it is a notification THE SYSTEM SHALL discard it without a reply; either way the session stays open and later lines are served | must |
+| FR-016 | Lines within the limit SHALL be decoded by the MCP SDK's own codec; a line the codec rejects is handled per FR-017, and every other framing rule is unchanged | must |
+| FR-017 | WHEN a stdio line within the limit fails to decode THE SYSTEM SHALL classify it by a streaming scan of its top-level members, as for FR-015. A request (`method` and a fully read `id`, also in a truncated line) that is not JSON or nests too deeply SHALL be answered `-32700` carrying that `id`; one that is JSON but not a JSON-RPC message SHALL be answered `-32600` carrying that `id`. A notification, a response (`result` or `error` without `method`), an `id`-only object and a non-object SHALL keep today's handling: no reply for undecodable JSON, `-32600` without `id` for a non-message. Such lines SHALL be logged at warn at most once a minute. The session stays open | must |
 
 ## 4. Non-Functional Requirements
 
@@ -125,6 +126,14 @@ SO THAT one call cannot flood my context or the mcpls process
 | `get_completions` answer of 101 items | Best 100 by prefix match kept, `truncated: true` |
 | Stdio request line of 4 MiB plus one byte | Discarded, `-32600` with the request id, session continues |
 | Stdio notification line over 4 MiB | Discarded, no reply, warning logged |
+| Stdio request nested 125 levels deep or more (within the limit) | `-32700` with the request id, session continues |
+| Stdio request line cut off after its `id` and `method` | `-32700` with the request id |
+| Stdio request line that breaks after its `method` and full `id` (cut off, missing comma, unquoted key) | `-32700` with the request id; a line end ends a number id, for LF and CRLF alike |
+| Stdio request cut off inside a string `id`, or an oversized line cut inside its `id` | No reply (the id cannot be trusted) |
+| Stdio request the SDK skips for compatibility (for example method `notifications/x` with an `id`) | `-32600` with the request id |
+| Stdio notification, or a response with `result`/`error`, nested too deeply | No reply |
+| Stdio `{"jsonrpc":"2.0","id":1}` (an `id` and nothing else) | `-32600` without an id |
+| Stdio request whose `id` key is written with escapes (`"\u0069d"`) | No reply: an escaped key is never matched (known limit) |
 
 ## 6. Success Criteria
 
@@ -133,7 +142,7 @@ SO THAT one call cannot flood my context or the mcpls process
 | SC-001 | A tool call with a line beyond the document sends no LSP request |
 | SC-002 | A 100,000-item server answer yields at most 10,000 items and `truncated: true` |
 | SC-003 | Eviction never closes a document with an in-flight request |
-| SC-004 | An oversized stdio request is answered with `-32600` and its id instead of being dropped |
+| SC-004 | An oversized stdio request is answered with `-32600` and its id, and an in-limit request that does not decode with `-32700` and its id, instead of being dropped |
 
 ## 7. Agent Boundaries
 

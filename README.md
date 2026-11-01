@@ -51,6 +51,10 @@ Or with Cargo:
 cargo install mcpls
 ```
 
+Prebuilt archives for Linux, macOS and Windows (x86_64 and aarch64) with SHA256 checksums and build-provenance attestations are on [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest).
+
+mcpls is also listed in the official [MCP Registry](https://registry.modelcontextprotocol.io/?q=mcpls) as `io.github.bug-ops/mcpls` (cargo package, stdio transport), so registry-aware clients can discover it there. The listing installs the same crate as `cargo install mcpls`.
+
 You also need at least one language server, for example `rustup component add rust-analyzer`. See [Installation](https://bug-ops.github.io/mcpls/getting-started/installation.html) for other methods and servers.
 
 ## Quick start

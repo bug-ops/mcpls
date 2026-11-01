@@ -37,10 +37,9 @@ const LINE_READ_BUDGET_FILE_MULTIPLE: u64 = 4;
 const LINE_READ_BUDGET_CEILING: u64 = 256 * 1024 * 1024;
 
 /// [`SizeLimit::DEFAULT`] as a bound, checked at compile time to be finite.
-const DEFAULT_FILE_SIZE: NonZeroU64 = match SizeLimit::DEFAULT.get() {
-    Some(default) => default,
-    None => panic!("SizeLimit::DEFAULT must be bounded"),
-};
+const DEFAULT_FILE_SIZE: NonZeroU64 = SizeLimit::DEFAULT
+    .get()
+    .expect("SizeLimit::DEFAULT must be bounded");
 
 /// Per-response disk-read budget derived from the tracker's configured
 /// limits (#489): [`LINE_READ_BUDGET_FILE_MULTIPLE`] times
@@ -339,7 +338,7 @@ impl EncodingCtx {
             tracing::warn!(
                 uri = uri.as_ref(),
                 line = position.line().get(),
-                encoding = self.encoding.to_lsp(),
+                encoding = self.encoding.as_str(),
                 "could not convert MCP column exactly; passing it through unconverted, which \
                  is wrong for a non-UTF-16 server (logged once per response)"
             );
@@ -372,7 +371,7 @@ impl EncodingCtx {
             tracing::warn!(
                 uri = uri.as_ref(),
                 line = pos.line,
-                encoding = self.encoding.to_lsp(),
+                encoding = self.encoding.as_str(),
                 "could not convert server column exactly; passing it through unconverted, \
                  which is wrong for a non-UTF-16 server (logged once per response)"
             );

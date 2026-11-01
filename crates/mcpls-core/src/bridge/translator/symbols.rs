@@ -18,12 +18,12 @@ use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::positioned::{budgeted, document_request};
 use super::routing::{
-    Capability, FileLocalCapability, IndexingGate, MemberPresence, PreparedDocument,
+    Capability, FanOutMembers, FileLocalCapability, IndexingGate, MemberPresence, PreparedDocument,
     WorkspaceRouteLookup, is_untrusted_refusal, lookup_workspace_route, workspace_fan_out_members,
 };
-use crate::bridge::ClientPath;
+use crate::bridge::{ClientPath, Indexed};
 use crate::config::{ServerId, ToolKind};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::util::lock_std;
 
 /// Validate `query`'s length for `handle_workspace_symbol`.
@@ -38,6 +38,21 @@ fn validate_query_length(query: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `workspace/symbol` request for `query`.
+fn workspace_symbol_params(query: String) -> LspWorkspaceSymbolParams {
+    LspWorkspaceSymbolParams {
+        query,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
+/// `limit` clamped to `MAX_NORMALIZED_LOCATIONS`, else `u32::MAX` would reopen
+/// the unbounded normalization loop (#474).
+fn effective_limit(limit: u32) -> usize {
+    (limit as usize).min(MAX_NORMALIZED_LOCATIONS)
 }
 
 /// A `textDocument/documentSymbol` answer together with what is needed to
@@ -238,7 +253,6 @@ impl Translator {
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
         validate_query_length(&query)?;
-        let kind_filter = kind_filter.map(|filter| u32::from(filter.kind()));
 
         if let Some(members) = self.fan_out_members() {
             return self
@@ -263,13 +277,9 @@ impl Translator {
         })?;
         self.require_capability(&server_id, Capability::WorkspaceSymbols)?;
 
-        let params = LspWorkspaceSymbolParams {
-            query,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-
-        let response = budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params).await?;
+        let response =
+            budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, workspace_symbol_params(query))
+                .await?;
 
         let ctx = self.encoding_ctx(&server_id);
 
@@ -281,29 +291,14 @@ impl Translator {
         let mut raw_symbols = raw_workspace_symbols(response, &ctx);
         let server_answered_empty = raw_symbols.is_empty();
 
-        if let Some(target) = kind_filter {
-            raw_symbols.retain(|s| s.kind == target);
-        }
-        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (else u32::MAX
-        // would reopen the unbounded normalization loop, see #474).
-        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
+        raw_symbols.retain(|symbol| symbol.kind_matches(kind_filter));
+        let effective_limit = effective_limit(limit);
         let truncated = raw_symbols.len() > effective_limit;
         raw_symbols.truncate(effective_limit);
 
         let mut symbols = Vec::with_capacity(raw_symbols.len());
         for raw in raw_symbols {
-            let range = ctx.normalize_range(&raw.uri, raw.range).await;
-            symbols.push(WorkspaceSymbol {
-                name: raw.name,
-                kind: raw.kind,
-                location: Location {
-                    uri: raw.uri.to_string(),
-                    range,
-                    out_of_workspace: raw.out_of_workspace,
-                },
-                container_name: raw.container_name,
-                server: None,
-            });
+            symbols.push(raw.normalize(&ctx, None).await);
         }
 
         let index_coverage = server_answered_empty.then(|| self.index_coverage(&server_id));
@@ -318,7 +313,7 @@ impl Translator {
 
     /// The servers a workspace symbol search fans out over, or `None` when
     /// fewer than two are eligible. One `servers` guard serves every closure.
-    fn fan_out_members(&self) -> Option<Vec<(ServerId, MemberPresence)>> {
+    fn fan_out_members(&self) -> Option<FanOutMembers> {
         let servers = lock_std(&self.servers);
         workspace_fan_out_members(
             &self.configured_router,
@@ -338,86 +333,84 @@ impl Translator {
     async fn workspace_symbol_fan_out(
         &self,
         query: String,
-        kind_filter: Option<u32>,
+        kind_filter: Option<SymbolKindFilter>,
         limit: u32,
-        members: Vec<(ServerId, MemberPresence)>,
+        members: FanOutMembers,
     ) -> Result<WorkspaceSymbolResult> {
-        let params = LspWorkspaceSymbolParams {
-            query,
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-        };
-        // Bounded by the configured server count, as `members` is.
-        let answers = futures::future::join_all(members.into_iter().map(|(id, presence)| {
+        let params = workspace_symbol_params(query);
+        let ask = |(id, presence): (ServerId, MemberPresence)| {
             let params = params.clone();
             async move {
-                let result = self.ask_workspace_member(&id, presence, params).await;
-                (id, result)
+                let answer = self.ask_workspace_member(&id, presence, params).await;
+                (id, answer)
             }
-        }))
-        .await;
+        };
+        let (first, rest) = members.into_parts();
+        // Bounded by the configured server count, as `members` is.
+        let (first, rest) = futures::join!(
+            ask(first),
+            futures::future::join_all(rest.into_iter().map(&ask))
+        );
 
-        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (see #474); one
-        // extra unique symbol is enough to know the result was cut.
-        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
+        // One extra unique symbol is enough to know the result was cut.
+        let effective_limit = effective_limit(limit);
         let mut merged = MergedSymbols::new(effective_limit.saturating_add(1));
-        let mut producers = Vec::new();
-        let mut failures = Vec::new();
-        let mut outcomes = Vec::with_capacity(answers.len());
-        for (id, answer) in answers {
-            let status = match answer {
-                Ok(response) => {
-                    let producer = Arc::new(Producer {
-                        ctx: self.encoding_ctx(&id),
-                        id: id.clone(),
-                    });
-                    let raw = raw_workspace_symbols(response, &producer.ctx);
-                    let returned = raw.len();
-                    merged.extend(
-                        &producer,
-                        raw.into_iter()
-                            .filter(|symbol| kind_filter.is_none_or(|kind| symbol.kind == kind)),
-                    );
-                    producers.push(producer);
-                    ServerStatus::Answered {
+        let mut outcomes = Vec::with_capacity(rest.len().saturating_add(1));
+        let mut record = |(id, answer): (ServerId, Answer)| match answer {
+            Ok(Indexed {
+                result: response,
+                indexing,
+            }) => {
+                let producer = Arc::new(Producer {
+                    ctx: self.encoding_ctx(&id),
+                    id: id.clone(),
+                });
+                let raw = raw_workspace_symbols(response, &producer.ctx);
+                let returned = raw.len();
+                merged.extend(
+                    &producer,
+                    raw.into_iter()
+                        .filter(|symbol| symbol.kind_matches(kind_filter)),
+                );
+                outcomes.push(ServerOutcome {
+                    server: id.clone(),
+                    status: ServerStatus::Answered {
                         symbols: u32::try_from(returned).unwrap_or(u32::MAX),
                         index_coverage: (returned == 0).then(|| self.index_coverage(&id)),
-                    }
-                }
-                Err(failure) => {
-                    tracing::debug!(
-                        server = %id,
-                        outcome = ?failure.kind,
-                        error = %failure.error,
-                        "workspace symbol search: server did not answer"
-                    );
-                    let status = failure.kind.into();
-                    failures.push(failure);
-                    status
-                }
-            };
-            outcomes.push(ServerOutcome { server: id, status });
+                        indexing_in_progress: indexing.indexing_in_progress,
+                    },
+                });
+                Recorded::Producer(producer)
+            }
+            Err(failure) => {
+                let status = failure.status();
+                tracing::debug!(
+                    server = %id,
+                    outcome = ?status,
+                    error = %failure,
+                    "workspace symbol search: server did not answer"
+                );
+                outcomes.push(ServerOutcome { server: id, status });
+                Recorded::Failure(failure)
+            }
+        };
+        let mut tally = Tally::start(record(first));
+        for answer in rest {
+            tally = tally.absorb(record(answer));
         }
 
-        if producers.is_empty() {
-            return Err(aggregate_failure(failures));
-        }
+        let producers = match tally {
+            Tally::NoneAnswered(failures) => return Err(aggregate_failure(failures)),
+            Tally::Answered(producers) => producers,
+        };
 
         let (accepted, truncated) = merged.finish(effective_limit);
         let mut symbols = Vec::with_capacity(accepted.len());
         for (producer, raw) in accepted {
-            let range = producer.ctx.normalize_range(&raw.uri, raw.range).await;
-            symbols.push(WorkspaceSymbol {
-                name: raw.name,
-                kind: raw.kind,
-                location: Location {
-                    uri: raw.uri.to_string(),
-                    range,
-                    out_of_workspace: raw.out_of_workspace,
-                },
-                container_name: raw.container_name,
-                server: Some(producer.id.clone()),
-            });
+            symbols.push(
+                raw.normalize(&producer.ctx, Some(producer.id.clone()))
+                    .await,
+            );
         }
 
         Ok(WorkspaceSymbolResult {
@@ -433,53 +426,45 @@ impl Translator {
     }
 
     /// Asks one fan-out member for its workspace symbols, never respawning it.
+    ///
+    /// The indexing state is sampled around the request, so an answer that
+    /// overlapped indexing is flagged.
     async fn ask_workspace_member(
         &self,
         id: &ServerId,
         presence: MemberPresence,
         params: LspWorkspaceSymbolParams,
-    ) -> std::result::Result<Option<lsp_types::WorkspaceSymbolResponse>, MemberFailure> {
+    ) -> Answer {
         match presence {
             MemberPresence::Registered => {}
             MemberPresence::Initializing => {
-                return Err(MemberFailure::new(
-                    Unanswered::Initializing,
-                    Error::ServerInitializing {
-                        server_id: id.clone(),
-                    },
-                ));
+                return Err(MemberFailure::Initializing {
+                    server_id: id.clone(),
+                });
             }
             MemberPresence::Absent => {
-                let error = self
-                    .startup_failure(id)
-                    .map_or(Error::NoServerConfigured, |failure| {
-                        Error::ServerFailedToStart(Box::new(failure))
-                    });
-                return Err(MemberFailure::new(Unanswered::Unavailable, error));
+                return Err(self.startup_failure(id).map_or(
+                    MemberFailure::Unavailable(Error::NoServerConfigured),
+                    |failure| MemberFailure::FailedToStart(Box::new(failure)),
+                ));
             }
         }
         if self.dead_server_config(id).is_some() {
-            return Err(MemberFailure::new(
-                Unanswered::Unavailable,
-                Error::ServerTerminated,
-            ));
+            return Err(MemberFailure::Unavailable(Error::ServerTerminated));
         }
         let client = lock_std(&self.servers).client(id);
         let Some(client) = client else {
-            return Err(MemberFailure::new(
-                Unanswered::Unavailable,
-                Error::NoServerConfigured,
-            ));
+            return Err(MemberFailure::Unavailable(Error::NoServerConfigured));
         };
         if let Err(error) = self.require_capability(id, Capability::WorkspaceSymbols) {
-            return Err(MemberFailure::new(
-                Unanswered::CapabilityNotAdvertised,
-                error,
-            ));
+            return Err(MemberFailure::CapabilityNotAdvertised(error));
         }
-        budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params)
+        let before = self.sample_indexing(id).await;
+        let response = budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params)
             .await
-            .map_err(MemberFailure::from_request_error)
+            .map_err(MemberFailure::from_request_error)?;
+        let after = self.sample_indexing(id).await;
+        Ok(Indexed::new(response, before.union(after)))
     }
 
     /// The server a workspace symbol search goes to.
@@ -536,57 +521,147 @@ impl Translator {
     }
 }
 
-/// Why a fan-out member contributed no answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unanswered {
-    Initializing,
-    Unavailable,
-    TimedOut,
-    Failed,
-    CapabilityNotAdvertised,
+/// The answer of one fan-out member.
+type Answer =
+    std::result::Result<Indexed<Option<lsp_types::WorkspaceSymbolResponse>>, MemberFailure>;
+
+/// Why a fan-out member contributed no answer, with the error the
+/// single-server path would have returned for it.
+#[derive(Debug)]
+enum MemberFailure {
+    Initializing { server_id: ServerId },
+    FailedToStart(Box<ServerSpawnFailure>),
+    Unavailable(Error),
+    TimedOut(Error),
+    Failed(Error),
+    CapabilityNotAdvertised(Error),
 }
 
-impl Unanswered {
-    /// Whether the member broke rather than being merely early or incapable.
-    const fn is_breakage(self) -> bool {
-        matches!(self, Self::Unavailable | Self::TimedOut | Self::Failed)
+impl MemberFailure {
+    /// A process that died mid-request is unavailable, not failed, so the
+    /// outcome does not depend on how soon its command channel closed.
+    fn from_request_error(error: Error) -> Self {
+        match error {
+            Error::Timeout(_) => Self::TimedOut(error),
+            Error::ServerTerminated => Self::Unavailable(error),
+            Error::ServerFailedToStart(failure) => Self::FailedToStart(failure),
+            _ => Self::Failed(error),
+        }
     }
-}
 
-impl From<Unanswered> for ServerStatus {
-    fn from(kind: Unanswered) -> Self {
-        match kind {
-            Unanswered::Initializing => Self::Initializing,
-            Unanswered::Unavailable => Self::Unavailable,
-            Unanswered::TimedOut => Self::TimedOut,
-            Unanswered::Failed => Self::Failed,
-            Unanswered::CapabilityNotAdvertised => Self::CapabilityNotAdvertised,
+    const fn status(&self) -> ServerStatus {
+        match self {
+            Self::Initializing { .. } => ServerStatus::Initializing,
+            Self::FailedToStart(_) | Self::Unavailable(_) => ServerStatus::Unavailable,
+            Self::TimedOut(_) => ServerStatus::TimedOut,
+            Self::Failed(_) => ServerStatus::Failed,
+            Self::CapabilityNotAdvertised(_) => ServerStatus::CapabilityNotAdvertised,
+        }
+    }
+
+    /// Whether the member broke rather than being merely early or incapable.
+    const fn is_breakage(&self) -> bool {
+        matches!(
+            self,
+            Self::FailedToStart(_) | Self::Unavailable(_) | Self::TimedOut(_) | Self::Failed(_)
+        )
+    }
+
+    const fn is_initializing(&self) -> bool {
+        matches!(self, Self::Initializing { .. })
+    }
+
+    fn spawn_failure(&self) -> Option<&ServerSpawnFailure> {
+        match self {
+            Self::FailedToStart(failure) => Some(failure),
+            _ => None,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::Initializing { server_id } => Error::ServerInitializing { server_id },
+            Self::FailedToStart(failure) => Error::ServerFailedToStart(failure),
+            Self::Unavailable(error)
+            | Self::TimedOut(error)
+            | Self::Failed(error)
+            | Self::CapabilityNotAdvertised(error) => error,
         }
     }
 }
 
-/// A fan-out member that did not answer, with the error the single-server
-/// path would have returned for it.
-#[derive(Debug)]
-struct MemberFailure {
-    kind: Unanswered,
-    error: Error,
+impl std::fmt::Display for MemberFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initializing { server_id } => write!(f, "server {server_id} is initializing"),
+            Self::FailedToStart(failure) => write!(f, "{}", failure.failed_to_start()),
+            Self::Unavailable(error)
+            | Self::TimedOut(error)
+            | Self::Failed(error)
+            | Self::CapabilityNotAdvertised(error) => write!(f, "{error}"),
+        }
+    }
 }
 
-impl MemberFailure {
-    const fn new(kind: Unanswered, error: Error) -> Self {
-        Self { kind, error }
+/// The members of a fan-out that did not answer: at least one, in config order.
+struct MemberFailures {
+    first: MemberFailure,
+    rest: Vec<MemberFailure>,
+}
+
+impl MemberFailures {
+    fn iter(&self) -> impl Iterator<Item = &MemberFailure> {
+        std::iter::once(&self.first).chain(&self.rest)
     }
 
-    /// A process that died mid-request is unavailable, not failed, so the
-    /// outcome does not depend on how soon its command channel closed.
-    const fn from_request_error(error: Error) -> Self {
-        let kind = match error {
-            Error::Timeout(_) => Unanswered::TimedOut,
-            Error::ServerTerminated => Unanswered::Unavailable,
-            _ => Unanswered::Failed,
-        };
-        Self::new(kind, error)
+    /// The first member satisfying `wanted`, else the first member.
+    fn into_first_or_head(self, wanted: impl Fn(&MemberFailure) -> bool) -> MemberFailure {
+        let Self { first, rest } = self;
+        if wanted(&first) {
+            return first;
+        }
+        rest.into_iter()
+            .find(|failure| wanted(failure))
+            .unwrap_or(first)
+    }
+}
+
+/// What a member's answer turned into once recorded.
+enum Recorded {
+    Producer(Arc<Producer>),
+    Failure(MemberFailure),
+}
+
+/// How the fan-out stands: nobody has answered yet, or somebody has.
+enum Tally {
+    NoneAnswered(MemberFailures),
+    Answered(Vec<Arc<Producer>>),
+}
+
+impl Tally {
+    fn start(recorded: Recorded) -> Self {
+        match recorded {
+            Recorded::Producer(producer) => Self::Answered(vec![producer]),
+            Recorded::Failure(first) => Self::NoneAnswered(MemberFailures {
+                first,
+                rest: Vec::new(),
+            }),
+        }
+    }
+
+    fn absorb(self, recorded: Recorded) -> Self {
+        match (self, recorded) {
+            (Self::NoneAnswered(_), Recorded::Producer(producer)) => Self::Answered(vec![producer]),
+            (Self::NoneAnswered(mut failures), Recorded::Failure(failure)) => {
+                failures.rest.push(failure);
+                Self::NoneAnswered(failures)
+            }
+            (Self::Answered(mut producers), Recorded::Producer(producer)) => {
+                producers.push(producer);
+                Self::Answered(producers)
+            }
+            (Self::Answered(producers), Recorded::Failure(_)) => Self::Answered(producers),
+        }
     }
 }
 
@@ -596,44 +671,28 @@ impl MemberFailure {
 /// all of them give the aggregate, a mix gives the first one's error. Failing
 /// that, members that all failed to start give the all-failed aggregate (#527),
 /// then the first breakage stands, else the first member's own error.
-fn aggregate_failure(failures: Vec<MemberFailure>) -> Error {
-    if let Some(first) = failures
-        .iter()
-        .position(|failure| failure.kind == Unanswered::Initializing)
-    {
-        if failures
-            .iter()
-            .all(|failure| failure.kind == Unanswered::Initializing)
-        {
-            return Error::WorkspaceServersInitializing;
-        }
-        return failures
-            .into_iter()
-            .nth(first)
-            .map_or(Error::NoServerConfigured, |failure| failure.error);
-    }
-    if failures
-        .iter()
-        .all(|failure| matches!(failure.error, Error::ServerFailedToStart(_)))
-    {
-        return Error::AllServersFailedToInit {
-            failures: failures
-                .into_iter()
-                .filter_map(|failure| match failure.error {
-                    Error::ServerFailedToStart(spawn) => Some(*spawn),
-                    _ => None,
-                })
-                .collect(),
+fn aggregate_failure(failures: MemberFailures) -> Error {
+    if failures.iter().any(MemberFailure::is_initializing) {
+        return if failures.iter().all(MemberFailure::is_initializing) {
+            Error::WorkspaceServersInitializing
+        } else {
+            failures
+                .into_first_or_head(MemberFailure::is_initializing)
+                .into_error()
         };
     }
-    let chosen = failures
+    let spawn_failures: Option<Vec<ServerSpawnFailure>> = failures
         .iter()
-        .position(|failure| failure.kind.is_breakage())
-        .unwrap_or(0);
-    failures
-        .into_iter()
-        .nth(chosen)
-        .map_or(Error::NoServerConfigured, |failure| failure.error)
+        .map(|failure| failure.spawn_failure().cloned())
+        .collect();
+    spawn_failures.map_or_else(
+        || {
+            failures
+                .into_first_or_head(MemberFailure::is_breakage)
+                .into_error()
+        },
+        |failures| Error::AllServersFailedToInit { failures },
+    )
 }
 
 /// A server that answered a fan-out, with the context its symbols are
@@ -649,10 +708,10 @@ struct Producer {
 #[derive(PartialEq, Eq, Hash)]
 struct SymbolIdentity {
     name: String,
-    kind: u32,
+    kind: lsp_types::SymbolKind,
     container_name: Option<String>,
-    uri: String,
-    range: [u32; 4],
+    uri: lsp_types::Uri,
+    range: lsp_types::Range,
 }
 
 /// The unique symbols of a fan-out, concatenated in config order, collection
@@ -703,7 +762,7 @@ impl MergedSymbols {
 /// #474).
 struct RawWorkspaceSymbol {
     name: String,
-    kind: u32,
+    kind: lsp_types::SymbolKind,
     container_name: Option<String>,
     out_of_workspace: bool,
     uri: lsp_types::Uri,
@@ -712,13 +771,33 @@ struct RawWorkspaceSymbol {
 
 impl RawWorkspaceSymbol {
     fn identity(&self) -> SymbolIdentity {
-        let (start, end) = (self.range.start, self.range.end);
         SymbolIdentity {
             name: self.name.clone(),
             kind: self.kind,
             container_name: self.container_name.clone(),
-            uri: self.uri.to_string(),
-            range: [start.line, start.character, end.line, end.character],
+            uri: self.uri.clone(),
+            range: self.range,
+        }
+    }
+
+    fn kind_matches(&self, filter: Option<SymbolKindFilter>) -> bool {
+        filter.is_none_or(|filter| filter.kind() == self.kind)
+    }
+
+    /// Converts into the MCP symbol, tagged with `server` when several
+    /// servers were asked.
+    async fn normalize(self, ctx: &EncodingCtx, server: Option<ServerId>) -> WorkspaceSymbol {
+        let range = ctx.normalize_range(&self.uri, self.range).await;
+        WorkspaceSymbol {
+            name: self.name,
+            kind: lsp_kind_to_u32(self.kind),
+            location: Location {
+                uri: self.uri.to_string(),
+                range,
+                out_of_workspace: self.out_of_workspace,
+            },
+            container_name: self.container_name,
+            server,
         }
     }
 
@@ -730,7 +809,7 @@ impl RawWorkspaceSymbol {
     ) -> Self {
         Self {
             name: base.name,
-            kind: lsp_kind_to_u32(base.kind),
+            kind: base.kind,
             container_name: base.container_name,
             out_of_workspace: ctx.is_out_of_workspace(&uri),
             uri,
@@ -1819,7 +1898,8 @@ mod fan_out_tests {
             status_of(&result, "a"),
             &ServerStatus::Answered {
                 symbols: 1,
-                index_coverage: None
+                index_coverage: None,
+                indexing_in_progress: false,
             }
         );
     }
@@ -1905,7 +1985,8 @@ mod fan_out_tests {
             status_of(&result, "a"),
             &ServerStatus::Answered {
                 symbols: 3,
-                index_coverage: None
+                index_coverage: None,
+                indexing_in_progress: false,
             },
             "the count is the answer's, before duplicates are dropped"
         );
@@ -1937,7 +2018,8 @@ mod fan_out_tests {
             status_of(&result, "b"),
             &ServerStatus::Answered {
                 symbols: 1,
-                index_coverage: None
+                index_coverage: None,
+                indexing_in_progress: false,
             },
             "a server past the cut still reports its count"
         );
@@ -1970,7 +2052,8 @@ mod fan_out_tests {
             status_of(&result, "a"),
             &ServerStatus::Answered {
                 symbols: 1,
-                index_coverage: None
+                index_coverage: None,
+                indexing_in_progress: false,
             },
             "filtered-out symbols are not an empty answer"
         );
@@ -2103,8 +2186,55 @@ mod fan_out_tests {
                     synced_documents: 0,
                     server_restarted: false,
                 }),
+                indexing_in_progress: false,
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_still_indexing_flags_its_own_answer_only() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let cache = Arc::new(tokio::sync::Mutex::new(
+            crate::bridge::NotificationCache::new(),
+        ));
+        for (id, quiescent) in [("a", false), ("b", true)] {
+            cache.lock().await.observe_indexing_signal(
+                &ServerId::new(id).unwrap(),
+                "experimental/serverStatus",
+                Some(&json!({"quiescent": quiescent})),
+            );
+        }
+        p.translator = Arc::new(
+            Arc::into_inner(p.translator)
+                .expect("no other owner")
+                .with_notification_cache(cache),
+        );
+        let a = answer(p.take("a"), Duration::ZERO, json!([]));
+        let b = answer(p.take("b"), Duration::ZERO, json!([]));
+
+        let result = p.search(None, 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_matches!(
+            status_of(&result, "a"),
+            ServerStatus::Answered {
+                indexing_in_progress: true,
+                ..
+            }
+        );
+        assert_matches!(
+            status_of(&result, "b"),
+            ServerStatus::Answered {
+                indexing_in_progress: false,
+                ..
+            }
+        );
+        let wire = serde_json::to_value(&result.servers).unwrap();
+        assert_eq!(wire[0]["indexing_in_progress"], true);
+        assert!(wire[1].get("indexing_in_progress").is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2402,7 +2532,7 @@ mod fan_out_tests {
     fn raw(name: &str, line: u32) -> RawWorkspaceSymbol {
         RawWorkspaceSymbol {
             name: name.to_owned(),
-            kind: 12,
+            kind: lsp_types::SymbolKind::Function,
             container_name: None,
             out_of_workspace: false,
             uri: lsp_types::Uri::from("file:///w/a.rs"),
@@ -2432,68 +2562,79 @@ mod fan_out_tests {
         assert!(!truncated);
     }
 
-    fn failure(kind: Unanswered, error: Error) -> MemberFailure {
-        MemberFailure::new(kind, error)
+    fn timed_out() -> MemberFailure {
+        MemberFailure::TimedOut(Error::Timeout(Duration::from_secs(1)))
+    }
+
+    fn initializing(id: &'static str) -> MemberFailure {
+        MemberFailure::Initializing {
+            server_id: ServerId::from_static(id),
+        }
+    }
+
+    fn incapable(id: &'static str) -> MemberFailure {
+        MemberFailure::CapabilityNotAdvertised(Error::CapabilityNotSupported {
+            server_id: ServerId::from_static(id),
+            capability: Capability::WorkspaceSymbols,
+        })
+    }
+
+    fn failures(first: MemberFailure, rest: Vec<MemberFailure>) -> MemberFailures {
+        MemberFailures { first, rest }
     }
 
     #[test]
     fn aggregate_failure_prefers_an_initializing_server_over_a_breakage() {
-        let error = aggregate_failure(vec![
-            failure(Unanswered::TimedOut, Error::Timeout(Duration::from_secs(1))),
-            failure(
-                Unanswered::Initializing,
-                Error::ServerInitializing {
-                    server_id: ServerId::from_static("b"),
-                },
-            ),
-        ]);
+        let error = aggregate_failure(failures(timed_out(), vec![initializing("b")]));
         assert_matches!(error, Error::ServerInitializing { server_id } if server_id.as_str() == "b");
     }
 
     #[test]
     fn aggregate_failure_prefers_a_breakage_over_a_capability_gap() {
-        let error = aggregate_failure(vec![
-            failure(
-                Unanswered::CapabilityNotAdvertised,
-                Error::CapabilityNotSupported {
-                    server_id: ServerId::from_static("a"),
-                    capability: Capability::WorkspaceSymbols,
-                },
-            ),
-            failure(Unanswered::TimedOut, Error::Timeout(Duration::from_secs(1))),
-        ]);
+        let error = aggregate_failure(failures(incapable("a"), vec![timed_out()]));
         assert_matches!(error, Error::Timeout(_));
     }
 
     #[test]
     fn aggregate_failure_of_initializing_and_incapable_servers_is_initializing() {
-        let error = aggregate_failure(vec![
-            failure(
-                Unanswered::CapabilityNotAdvertised,
-                Error::CapabilityNotSupported {
-                    server_id: ServerId::from_static("a"),
-                    capability: Capability::WorkspaceSymbols,
-                },
-            ),
-            failure(
-                Unanswered::Initializing,
-                Error::ServerInitializing {
-                    server_id: ServerId::from_static("b"),
-                },
-            ),
-        ]);
+        let error = aggregate_failure(failures(incapable("a"), vec![initializing("b")]));
         assert_matches!(error, Error::ServerInitializing { .. });
+    }
+
+    #[test]
+    fn aggregate_failure_of_only_initializing_servers_is_the_aggregate() {
+        let error = aggregate_failure(failures(initializing("a"), vec![initializing("b")]));
+        assert_matches!(error, Error::WorkspaceServersInitializing);
+    }
+
+    #[test]
+    fn aggregate_failure_of_incapable_servers_is_the_first_one() {
+        let error = aggregate_failure(failures(incapable("a"), vec![incapable("b")]));
+        assert_matches!(error, Error::CapabilityNotSupported { server_id, .. } if server_id.as_str() == "a");
     }
 
     #[test]
     fn a_process_that_died_mid_request_is_unavailable_not_failed() {
         assert_eq!(
-            MemberFailure::from_request_error(Error::ServerTerminated).kind,
-            Unanswered::Unavailable
+            MemberFailure::from_request_error(Error::ServerTerminated).status(),
+            ServerStatus::Unavailable
         );
         assert_eq!(
-            MemberFailure::from_request_error(Error::NoServerConfigured).kind,
-            Unanswered::Failed
+            MemberFailure::from_request_error(Error::NoServerConfigured).status(),
+            ServerStatus::Failed
         );
+    }
+
+    #[test]
+    fn a_failure_to_start_reported_by_a_request_keeps_the_all_failed_aggregate() {
+        let spawn = start_failure("a");
+        let from_request =
+            MemberFailure::from_request_error(Error::ServerFailedToStart(Box::new(spawn)));
+        assert_eq!(from_request.status(), ServerStatus::Unavailable);
+        let error = aggregate_failure(failures(
+            from_request,
+            vec![MemberFailure::FailedToStart(Box::new(start_failure("b")))],
+        ));
+        assert_matches!(error, Error::AllServersFailedToInit { failures } if failures.len() == 2);
     }
 }

@@ -1,13 +1,14 @@
 //! A stdio [`Transport`] with an mcpls-owned message-size limit.
 //!
 //! `rmcp`'s own stdio framing silently drops a line over its internal cap
-//! before parsing it, so the client never learns that its request was lost.
-//! [`StdioTransport`] bounds the line itself and, for an oversized request,
-//! recovers the request `id` with a streaming [`TopLevelScan`] and answers
-//! with a JSON-RPC `-32600` error. Lines within the limit are decoded by
-//! `rmcp`'s own codec, so every other framing rule stays `rmcp`'s.
+//! before parsing it, and drops one its codec cannot parse, so the client never
+//! learns that its request was lost. [`StdioTransport`] bounds the line itself
+//! and, for a rejected request, recovers the request `id` with a streaming
+//! [`EnvelopeScan`] and answers with a JSON-RPC error. Lines within the limit
+//! are decoded by `rmcp`'s own codec, so every other framing rule stays `rmcp`'s.
 
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
 use rmcp::RoleServer;
 use rmcp::model::{ErrorData, RequestId};
@@ -19,9 +20,8 @@ use tokio::task::JoinHandle;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::Decoder as _;
 
-const MAX_ID_BYTES: usize = 128;
-const KEY_BYTES: usize = 6;
-const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+use crate::json_envelope::{Envelope, EnvelopeScan, IdToken, Shape};
+use crate::lsp::DropCounter;
 
 /// Non-zero cap, in bytes, on one incoming stdio JSON-RPC line.
 ///
@@ -33,10 +33,7 @@ pub struct StdioMessageLimit(NonZeroUsize);
 
 impl StdioMessageLimit {
     /// 4 MiB, the same bound the HTTP transport applies to a request body.
-    pub(crate) const DEFAULT: Self = match NonZeroUsize::new(4 * 1024 * 1024) {
-        Some(limit) => Self(limit),
-        None => unreachable!(),
-    };
+    pub(crate) const DEFAULT: Self = Self(super::DEFAULT_MESSAGE_BYTES);
 
     /// The limit in bytes.
     pub(crate) const fn get(self) -> usize {
@@ -45,309 +42,141 @@ impl StdioMessageLimit {
 
     /// A limit of `bytes`, or `None` for zero.
     #[cfg(test)]
-    pub(crate) const fn new(bytes: usize) -> Option<Self> {
-        match NonZeroUsize::new(bytes) {
-            Some(limit) => Some(Self(limit)),
-            None => None,
-        }
+    pub(crate) fn new(bytes: usize) -> Option<Self> {
+        NonZeroUsize::new(bytes).map(Self)
     }
 }
 
-/// Which top-level object member the scanner is positioned on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Slot {
-    Id,
-    Method,
-    Other,
-}
-
-/// A top-level key, kept only as far as it can still equal `id` or `method`.
-#[derive(Debug, Default)]
-struct KeyBuf {
-    bytes: [u8; KEY_BYTES],
-    len: usize,
-    matchable: bool,
-}
-
-impl KeyBuf {
-    fn new() -> Self {
-        Self {
-            matchable: true,
-            ..Self::default()
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        match self.bytes.get_mut(self.len) {
-            Some(cell) => {
-                *cell = byte;
-                self.len = self.len.saturating_add(1);
-            }
-            None => self.matchable = false,
-        }
-    }
-
-    fn slot(&self) -> Slot {
-        let key = self.bytes.get(..self.len).unwrap_or_default();
-        match (self.matchable, key) {
-            (true, b"id") => Slot::Id,
-            (true, b"method") => Slot::Method,
-            _ => Slot::Other,
-        }
-    }
-}
-
-/// The raw token of the top-level `id` member.
-#[derive(Debug)]
-enum IdCapture {
-    Absent,
-    Raw(Vec<u8>),
-    Unusable,
-}
-
-impl IdCapture {
-    fn begin(&mut self) {
-        *self = match self {
-            Self::Absent => Self::Raw(Vec::new()),
-            Self::Raw(_) | Self::Unusable => Self::Unusable,
-        };
-    }
-
-    fn push(&mut self, byte: u8) {
-        if let Self::Raw(raw) = self {
-            if raw.len() < MAX_ID_BYTES {
-                raw.push(byte);
-            } else {
-                *self = Self::Unusable;
-            }
-        }
-    }
-
-    fn mark_unusable(&mut self) {
-        *self = Self::Unusable;
-    }
-
-    fn resolve(&self) -> Option<RequestId> {
-        match self {
-            Self::Raw(raw) => serde_json::from_slice(raw).ok(),
-            Self::Absent | Self::Unusable => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Phase {
-    BeforeRoot,
-    ExpectKey,
-    InKey(KeyBuf),
-    AfterKey(Slot),
-    ValueStart(Slot),
-    InValue(Slot),
-    AfterValue,
-    Finished,
-    Malformed,
-}
-
-/// What an oversized line asks of the transport.
+/// What a rejected line asks of the transport.
 #[derive(Debug, PartialEq, Eq)]
 enum ScanOutcome {
     /// A request; the id is `None` when it cannot be echoed.
     Request(Option<RequestId>),
-    /// A notification, a client response, or not a JSON object at all.
+    /// An object with an `id` and neither `method`, `result` nor `error`.
+    IdOnly,
+    /// A notification or a client response, whose id (if any) is not a request's.
     NoReply,
+    /// Not a JSON object, or an object with nothing to tell what it was.
+    Unstructured,
 }
 
-/// Streaming scanner for the top-level `id` and `method` members of one JSON
-/// object, in constant memory whatever the object's size.
-///
-/// It never panics on malformed input. Only a cleanly closed top-level object
-/// can ask for a reply, and the id is echoed only when its whole token was
-/// captured at depth one, so a nested `id` inside `params` is never mistaken
-/// for the request id. A leading byte order mark is skipped; member order does
-/// not matter. A key written with escapes is never matched as `id` or `method`.
+impl ScanOutcome {
+    /// Classifies a scanned line. A truncated line counts as a request only
+    /// when its `method` began and its `id` was read in full.
+    fn of(envelope: &Envelope) -> Self {
+        let Envelope {
+            shape,
+            method,
+            outcome,
+            id,
+        } = envelope;
+        match (shape, method, id) {
+            (Shape::Truncated | Shape::Malformed, true, IdToken::Complete(_)) => {
+                Self::Request(id.decode())
+            }
+            (Shape::Malformed | Shape::Truncated, ..) | (Shape::Closed, false, IdToken::Absent) => {
+                Self::Unstructured
+            }
+            (Shape::Closed, true, IdToken::Absent) => Self::NoReply,
+            (Shape::Closed, true, _) => Self::Request(id.decode()),
+            (Shape::Closed, false, _) if *outcome => Self::NoReply,
+            (Shape::Closed, false, _) => Self::IdOnly,
+        }
+    }
+
+    fn of_scan(scan: &EnvelopeScan) -> Self {
+        Self::of(&scan.finish())
+    }
+}
+
+/// Why a line was rejected.
 #[derive(Debug)]
-struct TopLevelScan {
-    phase: Phase,
-    nested: usize,
-    in_string: bool,
-    escaped: bool,
-    id: IdCapture,
-    method_seen: bool,
+enum RejectCause {
+    Oversized,
+    /// Not JSON (or too deeply nested to read): a syntax or EOF error.
+    Unparsable(serde_json::Error),
+    /// JSON the MCP codec does not accept as a message: a data error.
+    NotJsonRpc(serde_json::Error),
+    /// A message the MCP codec skipped for compatibility, which can hide a request.
+    Skipped,
 }
 
-impl Default for TopLevelScan {
-    fn default() -> Self {
-        Self {
-            phase: Phase::BeforeRoot,
-            nested: 0,
-            in_string: false,
-            escaped: false,
-            id: IdCapture::Absent,
-            method_seen: false,
-        }
-    }
-}
-
-const fn is_json_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-impl TopLevelScan {
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if matches!(self.phase, Phase::Finished | Phase::Malformed) {
-                return;
+impl RejectCause {
+    fn of_decode_error(error: serde_json::Error) -> Self {
+        match error.classify() {
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                Self::Unparsable(error)
             }
-            self.step(byte);
+            serde_json::error::Category::Data | serde_json::error::Category::Io => {
+                Self::NotJsonRpc(error)
+            }
         }
     }
 
-    fn finish(&self) -> ScanOutcome {
-        let has_id = !matches!(self.id, IdCapture::Absent);
-        if matches!(self.phase, Phase::Finished) && self.method_seen && has_id {
-            ScanOutcome::Request(self.id.resolve())
-        } else {
-            ScanOutcome::NoReply
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Oversized => "oversized",
+            Self::Unparsable(_) => "unparsable",
+            Self::NotJsonRpc(_) => "not a JSON-RPC message",
+            Self::Skipped => "skipped by the codec",
         }
     }
 
-    fn step(&mut self, byte: u8) {
-        match &mut self.phase {
-            Phase::BeforeRoot => match byte {
-                b'{' => self.phase = Phase::ExpectKey,
-                _ if is_json_space(byte) || BOM.contains(&byte) => {}
-                _ => self.phase = Phase::Malformed,
-            },
-            Phase::ExpectKey => match byte {
-                b'"' => {
-                    self.escaped = false;
-                    self.phase = Phase::InKey(KeyBuf::new());
-                }
-                b'}' => self.phase = Phase::Finished,
-                _ if is_json_space(byte) => {}
-                _ => self.phase = Phase::Malformed,
-            },
-            Phase::InKey(key) => {
-                if self.escaped {
-                    self.escaped = false;
-                    key.matchable = false;
-                } else {
-                    match byte {
-                        b'\\' => self.escaped = true,
-                        b'"' => {
-                            let slot = key.slot();
-                            self.phase = Phase::AfterKey(slot);
-                        }
-                        _ => key.push(byte),
-                    }
-                }
-            }
-            Phase::AfterKey(slot) => {
-                let slot = *slot;
-                match byte {
-                    b':' => self.phase = Phase::ValueStart(slot),
-                    _ if is_json_space(byte) => {}
-                    _ => self.phase = Phase::Malformed,
-                }
-            }
-            Phase::ValueStart(slot) => {
-                if !is_json_space(byte) {
-                    let slot = *slot;
-                    self.begin_value(slot);
-                    self.phase = Phase::InValue(slot);
-                    self.value_byte(slot, byte);
-                }
-            }
-            Phase::InValue(slot) => {
-                let slot = *slot;
-                self.value_byte(slot, byte);
-            }
-            Phase::AfterValue => match byte {
-                b',' => self.phase = Phase::ExpectKey,
-                b'}' => self.phase = Phase::Finished,
-                _ if is_json_space(byte) => {}
-                _ => self.phase = Phase::Malformed,
-            },
-            Phase::Finished | Phase::Malformed => {}
-        }
-    }
-
-    fn begin_value(&mut self, slot: Slot) {
-        self.nested = 0;
-        self.in_string = false;
-        self.escaped = false;
-        match slot {
-            Slot::Id => self.id.begin(),
-            Slot::Method => self.method_seen = true,
-            Slot::Other => {}
-        }
-    }
-
-    fn value_byte(&mut self, slot: Slot, byte: u8) {
-        let capture = slot == Slot::Id;
-        if self.in_string {
-            if capture {
-                self.id.push(byte);
-            }
-            if self.escaped {
-                self.escaped = false;
-            } else if byte == b'\\' {
-                self.escaped = true;
-            } else if byte == b'"' {
-                self.in_string = false;
-                if self.nested == 0 {
-                    self.phase = Phase::AfterValue;
-                }
-            }
-            return;
-        }
-        match byte {
-            b'"' => {
-                self.in_string = true;
-                if capture {
-                    self.id.push(byte);
-                }
-            }
-            b'{' | b'[' => {
-                self.nested = self.nested.saturating_add(1);
-                if capture {
-                    self.id.mark_unusable();
-                }
-            }
-            b'}' | b']' if self.nested == 0 => {
-                self.phase = if byte == b'}' {
-                    Phase::Finished
-                } else {
-                    Phase::Malformed
-                };
-            }
-            b'}' | b']' => {
-                self.nested = self.nested.saturating_sub(1);
-                if self.nested == 0 {
-                    self.phase = Phase::AfterValue;
-                }
-            }
-            b',' if self.nested == 0 => self.phase = Phase::ExpectKey,
-            _ if self.nested == 0 && is_json_space(byte) => self.phase = Phase::AfterValue,
-            _ => {
-                if capture && self.nested == 0 {
-                    self.id.push(byte);
-                }
-            }
+    const fn error(&self) -> Option<&serde_json::Error> {
+        match self {
+            Self::Oversized | Self::Skipped => None,
+            Self::Unparsable(error) | Self::NotJsonRpc(error) => Some(error),
         }
     }
 }
 
 #[derive(Debug)]
 struct Rejected {
+    cause: RejectCause,
     outcome: ScanOutcome,
     bytes: usize,
+}
+
+type Reply = (ErrorData, Option<RequestId>);
+
+impl Rejected {
+    /// The error to send back, with the request id it answers, if any.
+    ///
+    /// A notification, a client response and an `id`-only object never get an
+    /// id echoed: that id belongs to the server's own id space, or to nothing.
+    fn reply(&self, limit: usize) -> Option<Reply> {
+        let invalid = || ErrorData::invalid_request("Invalid request", None);
+        match (&self.cause, &self.outcome) {
+            (RejectCause::Oversized, ScanOutcome::Request(id)) => Some((
+                ErrorData::invalid_request(
+                    format!("request exceeds the {limit}-byte stdio message limit"),
+                    None,
+                ),
+                id.clone(),
+            )),
+            (RejectCause::Unparsable(error), ScanOutcome::Request(id)) => Some((
+                ErrorData::parse_error(format!("message is not parsable JSON: {error}"), None),
+                id.clone(),
+            )),
+            (RejectCause::NotJsonRpc(_) | RejectCause::Skipped, ScanOutcome::Request(id)) => {
+                Some((invalid(), id.clone()))
+            }
+            (
+                RejectCause::NotJsonRpc(_),
+                ScanOutcome::IdOnly | ScanOutcome::NoReply | ScanOutcome::Unstructured,
+            ) => Some((invalid(), None)),
+            (
+                RejectCause::Oversized | RejectCause::Unparsable(_) | RejectCause::Skipped,
+                ScanOutcome::IdOnly | ScanOutcome::NoReply | ScanOutcome::Unstructured,
+            ) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 enum ReadState {
     Buffering,
-    Discarding { scan: TopLevelScan, bytes: usize },
+    Discarding { scan: EnvelopeScan, bytes: usize },
 }
 
 enum LineRead {
@@ -367,13 +196,14 @@ enum Step {
 ///
 /// `receive` never lets a line grow past the [`StdioMessageLimit`]. An
 /// oversized line is skipped to its newline and answered per its
-/// [`TopLevelScan`]; the stream stays in sync for the next line. Replies to
-/// rejected input are written by a spawned task, because the service loop
-/// drops a pending `receive` whenever an outgoing message is ready, and a
-/// reply awaited inside it would be lost once its line was consumed. At most
-/// one such reply is in flight: `receive` settles it before reading the next
-/// line, which keeps the backpressure a peer that stops reading stdout got
-/// from an inline write.
+/// [`EnvelopeScan`]; the stream stays in sync for the next line. A line within
+/// the limit that `rmcp`'s codec cannot decode is classified the same way and
+/// answered when it was a request. Replies to rejected input are written by a
+/// spawned task, because the service loop drops a pending `receive` whenever an
+/// outgoing message is ready, and a reply awaited inside it would be lost once
+/// its line was consumed. At most one such reply is in flight: `receive`
+/// settles it before reading the next line, which keeps the backpressure a peer
+/// that stops reading stdout got from an inline write.
 pub struct StdioTransport<R, W: AsyncWrite> {
     read: BufReader<R>,
     line: BytesMut,
@@ -382,6 +212,7 @@ pub struct StdioTransport<R, W: AsyncWrite> {
     codec: JsonRpcMessageCodec<RxJsonRpcMessage<RoleServer>>,
     writer: AsyncRwTransport<RoleServer, Empty, W>,
     reply: Option<JoinHandle<()>>,
+    undecodable_log: DropCounter,
 }
 
 impl<R, W> StdioTransport<R, W>
@@ -399,6 +230,7 @@ where
             codec: JsonRpcMessageCodec::new(),
             writer: AsyncRwTransport::new(tokio::io::empty(), write),
             reply: None,
+            undecodable_log: DropCounter::new(),
         }
     }
 
@@ -426,15 +258,12 @@ where
                     ReadState::Buffering => {
                         let total = self.line.len().saturating_add(content_len);
                         if total > limit {
-                            let mut scan = TopLevelScan::default();
+                            let mut scan = EnvelopeScan::default();
                             scan.feed(&self.line);
                             scan.feed(content);
                             self.line.clear();
                             if ended {
-                                Step::Rejected(Rejected {
-                                    outcome: scan.finish(),
-                                    bytes: total,
-                                })
+                                Step::Rejected(oversized(&scan, total))
                             } else {
                                 self.state = ReadState::Discarding { scan, bytes: total };
                                 Step::More
@@ -448,10 +277,9 @@ where
                         scan.feed(content);
                         *bytes = bytes.saturating_add(content_len);
                         if ended {
-                            let outcome = scan.finish();
-                            let bytes = *bytes;
+                            let rejected = oversized(scan, *bytes);
                             self.state = ReadState::Buffering;
-                            Step::Rejected(Rejected { outcome, bytes })
+                            Step::Rejected(rejected)
                         } else {
                             Step::More
                         }
@@ -471,8 +299,8 @@ where
     fn spawn_reply(&mut self, message: TxJsonRpcMessage<RoleServer>) {
         let send = self.writer.send(message);
         self.reply = Some(tokio::spawn(async move {
-            if let Err(e) = send.await {
-                tracing::debug!("stdio reply not delivered: {e}");
+            if let Err(error) = send.await {
+                tracing::debug!(%error, "stdio reply not delivered");
             }
         }));
     }
@@ -481,35 +309,106 @@ where
     /// independent of this future and the handle stays until it completes.
     async fn settle_reply(&mut self) {
         if let Some(handle) = &mut self.reply {
-            if let Err(e) = handle.await {
-                tracing::debug!("stdio reply task failed: {e}");
+            if let Err(error) = handle.await {
+                tracing::debug!(%error, "stdio reply task failed");
             }
             self.reply = None;
         }
     }
 
-    fn reject(&mut self, rejected: Rejected) {
+    /// Logs the rejection and answers it when it asks for an answer.
+    ///
+    /// An oversized line always warns; undecodable ones warn at most once a
+    /// minute, with the number silenced since the last warning.
+    fn reject(&mut self, rejected: &Rejected) {
         let limit = self.limit.get();
-        let Rejected { outcome, bytes } = rejected;
-        let (id, replies) = match outcome {
-            ScanOutcome::Request(id) => (id, true),
-            ScanOutcome::NoReply => (None, false),
+        let reply = rejected.reply(limit);
+        let request_id = match &rejected.outcome {
+            ScanOutcome::Request(id) => id.as_ref(),
+            ScanOutcome::IdOnly | ScanOutcome::NoReply | ScanOutcome::Unstructured => None,
         };
-        tracing::warn!(
-            request_id = ?id,
-            bytes,
-            limit,
-            replied = replies,
-            "stdio message exceeds the size limit, discarding it"
-        );
-        if replies {
-            let error = ErrorData::invalid_request(
-                format!("request exceeds the {limit}-byte stdio message limit"),
-                None,
+        let suppressed = match rejected.cause {
+            RejectCause::Oversized => Some(0),
+            RejectCause::Unparsable(_) | RejectCause::NotJsonRpc(_) | RejectCause::Skipped => {
+                self.undecodable_log.record(Instant::now())
+            }
+        };
+        let cause = rejected.cause.label();
+        let error = rejected.cause.error().map(tracing::field::display);
+        let (bytes, replied) = (rejected.bytes, reply.is_some());
+        if let Some(suppressed) = suppressed {
+            tracing::warn!(
+                cause,
+                ?request_id,
+                bytes,
+                limit,
+                replied,
+                suppressed,
+                error,
+                "stdio message rejected"
             );
+        } else {
+            tracing::debug!(
+                cause,
+                ?request_id,
+                bytes,
+                limit,
+                replied,
+                error,
+                "stdio message rejected"
+            );
+        }
+        if let Some((error, id)) = reply {
             self.spawn_reply(TxJsonRpcMessage::<RoleServer>::error(error, id));
         }
     }
+
+    /// Classifies the buffered line as if its line ending followed it, so LF
+    /// and CRLF clients are treated alike.
+    fn line_outcome(&self) -> ScanOutcome {
+        let mut scan = EnvelopeScan::default();
+        scan.feed(&self.line);
+        scan.feed(b"\n");
+        ScanOutcome::of_scan(&scan)
+    }
+
+    /// Decodes the buffered line, leaving `self.line` untouched so a decode
+    /// failure can still be classified from its bytes.
+    fn decode_line(&mut self) -> Result<Option<RxJsonRpcMessage<RoleServer>>, DecodeFailure> {
+        let mut frame = BytesMut::with_capacity(self.line.len().saturating_add(1));
+        frame.extend_from_slice(&self.line);
+        frame.extend_from_slice(b"\n");
+        match self.codec.decode(&mut frame) {
+            Ok(Some(message)) => Ok(Some(message)),
+            Ok(None) => match self.line_outcome() {
+                outcome @ ScanOutcome::Request(_) => Err(DecodeFailure::Rejected(Rejected {
+                    cause: RejectCause::Skipped,
+                    outcome,
+                    bytes: self.line.len(),
+                })),
+                ScanOutcome::IdOnly | ScanOutcome::NoReply | ScanOutcome::Unstructured => Ok(None),
+            },
+            Err(JsonRpcMessageCodecError::Serde(error)) => Err(DecodeFailure::Rejected(Rejected {
+                cause: RejectCause::of_decode_error(error),
+                outcome: self.line_outcome(),
+                bytes: self.line.len(),
+            })),
+            Err(error) => Err(DecodeFailure::Fatal(error)),
+        }
+    }
+}
+
+fn oversized(scan: &EnvelopeScan, bytes: usize) -> Rejected {
+    Rejected {
+        cause: RejectCause::Oversized,
+        outcome: ScanOutcome::of_scan(scan),
+        bytes,
+    }
+}
+
+enum DecodeFailure {
+    Rejected(Rejected),
+    Fatal(JsonRpcMessageCodecError),
 }
 
 impl<R, W> Transport<RoleServer> for StdioTransport<R, W>
@@ -532,12 +431,12 @@ where
             match self.read_line().await {
                 LineRead::Line => {}
                 LineRead::Rejected(rejected) => {
-                    self.reject(rejected);
+                    self.reject(&rejected);
                     continue;
                 }
                 LineRead::Eof => return None,
-                LineRead::Io(e) => {
-                    tracing::error!("error reading from stdin: {e}");
+                LineRead::Io(error) => {
+                    tracing::error!(%error, "error reading from stdin");
                     return None;
                 }
             }
@@ -545,27 +444,19 @@ where
                 self.line.clear();
                 continue;
             }
-            self.line.extend_from_slice(b"\n");
-            let decoded = self.codec.decode(&mut self.line);
-            self.line.clear();
-            match decoded {
-                Ok(Some(message)) => return Some(message),
+            match self.decode_line() {
+                Ok(Some(message)) => {
+                    self.line.clear();
+                    return Some(message);
+                }
                 Ok(None) => {}
-                Err(JsonRpcMessageCodecError::Serde(e)) => match e.classify() {
-                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                        tracing::debug!("ignoring unparsable incoming message: {e}");
-                    }
-                    serde_json::error::Category::Data | serde_json::error::Category::Io => {
-                        tracing::debug!("protocol error on incoming message: {e}");
-                        let error = ErrorData::invalid_request("Invalid request", None);
-                        self.spawn_reply(TxJsonRpcMessage::<RoleServer>::error(error, None));
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("error decoding stdin: {e}");
+                Err(DecodeFailure::Rejected(rejected)) => self.reject(&rejected),
+                Err(DecodeFailure::Fatal(error)) => {
+                    tracing::error!(%error, "error decoding stdin");
                     return None;
                 }
             }
+            self.line.clear();
         }
     }
 
@@ -587,31 +478,11 @@ mod tests {
     use super::*;
 
     const INVALID_REQUEST: i64 = -32600;
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
     type Server = StdioTransport<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>>;
     type ClientReader = BufReader<ReadHalf<DuplexStream>>;
     type ClientWriter = WriteHalf<DuplexStream>;
-
-    #[derive(Clone, Copy)]
-    enum Id {
-        Number(i64),
-        Text(&'static str),
-        Unusable,
-    }
-
-    fn scan(line: &[u8]) -> ScanOutcome {
-        let mut scan = TopLevelScan::default();
-        scan.feed(line);
-        scan.finish()
-    }
-
-    fn request(id: Id) -> ScanOutcome {
-        ScanOutcome::Request(match id {
-            Id::Number(n) => Some(RequestId::Number(n)),
-            Id::Text(s) => Some(RequestId::String(s.into())),
-            Id::Unusable => None,
-        })
-    }
 
     fn padded(base: &str, len: usize) -> String {
         let pad = len.checked_sub(base.len()).expect("base fits the target");
@@ -678,117 +549,6 @@ mod tests {
             StdioMessageLimit::DEFAULT.get(),
             crate::RequestBodyLimit::DEFAULT.get()
         );
-    }
-
-    #[test]
-    fn test_scan_finds_id_in_any_member_order() {
-        let first = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{}}"#;
-        let last = br#"{"jsonrpc":"2.0","method":"tools/call","params":{"x":[1,{"y":2}]},"id":8}"#;
-        let spaced = b"{ \"id\" : 4 , \"method\" : \"m\" }\r";
-        assert_eq!(scan(first), request(Id::Number(7)));
-        assert_eq!(scan(last), request(Id::Number(8)));
-        assert_eq!(scan(spaced), request(Id::Number(4)));
-    }
-
-    #[test]
-    fn test_scan_ignores_nested_id_and_method() {
-        let nested = br#"{"params":{"id":99,"method":"n","s":"\"id\":5"},"jsonrpc":"2.0"}"#;
-        let with_outer_id = br#"{"params":{"id":99,"a":[{"id":1}]},"method":"m","id":3}"#;
-        assert_eq!(scan(nested), ScanOutcome::NoReply);
-        assert_eq!(scan(with_outer_id), request(Id::Number(3)));
-    }
-
-    #[test]
-    fn test_scan_decodes_string_ids_with_escapes() {
-        let line = br#"{"method":"m","id":"a\"b\\c"}"#;
-        assert_eq!(scan(line), request(Id::Text("a\"b\\c")));
-    }
-
-    #[test]
-    fn test_scan_skips_a_leading_bom() {
-        let mut line = BOM.to_vec();
-        line.extend_from_slice(br#"{"id":2,"method":"m"}"#);
-        assert_eq!(scan(&line), request(Id::Number(2)));
-    }
-
-    #[test]
-    fn test_scan_unusable_ids_get_an_id_less_request() {
-        let long = format!(r#"{{"method":"m","id":"{}"}}"#, "i".repeat(MAX_ID_BYTES));
-        let cases: [Vec<u8>; 7] = [
-            br#"{"method":"m","id":1.5}"#.to_vec(),
-            br#"{"method":"m","id":null}"#.to_vec(),
-            br#"{"method":"m","id":true}"#.to_vec(),
-            br#"{"method":"m","id":{"a":1}}"#.to_vec(),
-            br#"{"method":"m","id":[1]}"#.to_vec(),
-            br#"{"method":"m","id":1,"id":2}"#.to_vec(),
-            long.into_bytes(),
-        ];
-        for case in cases {
-            assert_eq!(
-                scan(&case),
-                request(Id::Unusable),
-                "{}",
-                String::from_utf8_lossy(&case)
-            );
-        }
-    }
-
-    #[test]
-    fn test_scan_id_just_under_the_length_cap_is_captured() {
-        let id = "i".repeat(MAX_ID_BYTES - 2);
-        let line = format!(r#"{{"method":"m","id":"{id}"}}"#);
-        assert_eq!(
-            scan(line.as_bytes()),
-            ScanOutcome::Request(Some(RequestId::String(id.into())))
-        );
-    }
-
-    #[test]
-    fn test_scan_gives_no_reply_to_notifications_responses_and_garbage() {
-        let cases: [&[u8]; 8] = [
-            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
-            br#"{"method":"m","id":1"#,
-            b"not json at all",
-            b"[1,2,3]",
-            b"",
-            br#"{"method":"m","id" 1}"#,
-            b"{\"\\u0069d\":1,\"method\":\"m\"}",
-        ];
-        for case in cases {
-            assert_eq!(
-                scan(case),
-                ScanOutcome::NoReply,
-                "{}",
-                String::from_utf8_lossy(case)
-            );
-        }
-    }
-
-    #[test]
-    fn test_scan_result_is_independent_of_chunking() {
-        let line =
-            br#"{"jsonrpc":"2.0","method":"tools/call","params":{"a":"\"}","b":[1]},"id":"x\\y"}"#;
-        let whole = scan(line);
-        assert_eq!(whole, request(Id::Text("x\\y")));
-        for split in 0..=line.len() {
-            let (head, tail) = line.split_at(split);
-            let mut chunked = TopLevelScan::default();
-            chunked.feed(head);
-            chunked.feed(tail);
-            assert_eq!(chunked.finish(), whole, "split at {split}");
-        }
-    }
-
-    #[test]
-    fn test_scan_survives_every_prefix_and_junk_bytes() {
-        let line = br#"{"jsonrpc":"2.0","method":"m","params":{"a":[1,"}"]},"id":5}"#;
-        for end in 0..=line.len() {
-            let _ = scan(&line[..end]);
-        }
-        for byte in 0..=u8::MAX {
-            let _ = scan(&[b'{', b'"', b'i', b'd', b'"', b':', byte, byte, b'}', byte]);
-        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1059,89 +819,304 @@ mod tests {
         feeder.await.unwrap();
     }
 
-    fn json_value() -> impl proptest::strategy::Strategy<Value = Value> {
-        use proptest::prelude::*;
+    const PARSE_ERROR: i64 = -32700;
 
-        let leaf = prop_oneof![
-            Just(Value::Null),
-            any::<bool>().prop_map(Value::from),
-            any::<i64>().prop_map(Value::from),
-            (-1.0e6_f64..1.0e6).prop_map(Value::from),
-            "\\PC{0,8}".prop_map(Value::from),
+    fn deep_call(depth: usize, id: u32) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"tools/call","id":{id},"params":{{"name":"get_hover","arguments":{{"file_path":"x","z":{}{}}}}}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+    }
+
+    async fn send_lines(
+        server: &mut Server,
+        reader: &mut ClientReader,
+        writer: ClientWriter,
+        lines: String,
+    ) -> (Value, Value) {
+        let feeder = tokio::spawn(async move {
+            let mut writer = writer;
+            writer.write_all(lines.as_bytes()).await.unwrap();
+            writer
+        });
+        let (delivered, reply) = tokio::join!(received_id(server), next_json(reader));
+        feeder.await.unwrap();
+        (delivered, reply)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_recursion_limit_boundary_is_decided_by_the_codec() {
+        let (mut server, mut reader, mut writer) = link(1 << 20, 64 * 1024);
+        let lines = format!(
+            "{}\n{}\n{}\n",
+            deep_call(124, 7),
+            deep_call(125, 8),
+            ping(9)
+        );
+        writer.write_all(lines.as_bytes()).await.unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(7));
+        assert_eq!(received_id(&mut server).await, json!(9));
+        let reply = next_json(&mut reader).await;
+        assert_eq!(reply["id"], json!(8));
+        assert_eq!(reply["error"]["code"], json!(PARSE_ERROR));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_nested_past_the_recursion_limit_is_answered_with_its_id() {
+        for depth in [126, 150, 100_000] {
+            let (mut server, mut reader, writer) = link(4 << 20, 64 * 1024);
+            let lines = format!("{}\n{}\n", deep_call(depth, 7), ping(99));
+
+            let (delivered, reply) = send_lines(&mut server, &mut reader, writer, lines).await;
+
+            assert_eq!(delivered, json!(99), "depth {depth}");
+            assert_eq!(reply["id"], json!(7), "depth {depth}");
+            assert_eq!(reply["error"]["code"], json!(PARSE_ERROR), "depth {depth}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_truncated_request_is_answered_with_its_id() {
+        let (mut server, mut reader, writer) = link(1024, 64 * 1024);
+        let lines = format!(
+            "{}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"x""#,
+            ping(8)
+        );
+
+        let (delivered, reply) = send_lines(&mut server, &mut reader, writer, lines).await;
+
+        assert_eq!(delivered, json!(8));
+        assert_eq!(reply["id"], json!(7));
+        assert_eq!(reply["error"]["code"], json!(PARSE_ERROR));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_unparsable_lines_without_a_readable_request_id_get_no_reply() {
+        let (mut server, mut reader, mut writer) = link(4 << 20, 64 * 1024);
+        let notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/x","params":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let response = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{}{}}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        let escaped_id_key = deep_call(200, 5).replace(r#""id""#, r#""\u0069d""#);
+        let lines = [
+            r#"{"jsonrpc":"2.0","method":"x","id":"ab"#.to_owned(),
+            r#"{"jsonrpc":"2.0","method":"x","id":"#.to_owned(),
+            notification,
+            response,
+            escaped_id_key,
+            ping(2),
         ];
-        leaf.prop_recursive(3, 24, 4, |inner| {
-            prop_oneof![
-                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
-                prop::collection::vec(("[a-z]{0,4}", inner), 0..4)
-                    .prop_map(|members| Value::Object(members.into_iter().collect())),
-            ]
-        })
+        writer
+            .write_all(format!("{}\n", lines.join("\n")).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(2));
+        assert_no_reply(&mut reader).await;
     }
 
-    fn expected_outcome(object: &serde_json::Map<String, Value>) -> ScanOutcome {
-        match (object.get("id"), object.contains_key("method")) {
-            (Some(id), true) => {
-                ScanOutcome::Request(serde_json::from_value::<RequestId>(id.clone()).ok())
-            }
-            _ => ScanOutcome::NoReply,
-        }
+    #[tokio::test(start_paused = true)]
+    async fn test_non_message_json_is_answered_per_the_scanned_envelope() {
+        let (mut server, mut reader, mut writer) = link(1024, 64 * 1024);
+        writer
+            .write_all(
+                format!(
+                    "{}\n{}\n{}\n",
+                    r#"{"jsonrpc":"2.0","id":1}"#,
+                    r#"{"jsonrpc":"2.0","id":5,"method":"initialize","params":5}"#,
+                    ping(3)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(3));
+        let id_only = next_json(&mut reader).await;
+        assert!(id_only.get("id").is_none(), "{id_only}");
+        assert_eq!(id_only["error"]["code"], json!(INVALID_REQUEST));
+        let request = next_json(&mut reader).await;
+        assert_eq!(request["id"], json!(5));
+        assert_eq!(request["error"]["code"], json!(INVALID_REQUEST));
     }
 
-    proptest::proptest! {
-        #[test]
-        fn prop_scan_agrees_with_serde_json_on_generated_objects(
-            id in proptest::option::of(json_value()),
-            method in proptest::option::of(json_value()),
-            extra in proptest::collection::vec(("[a-z]{1,4}", json_value()), 0..4),
-            rotation in 0_usize..8,
-            spacing in proptest::sample::select(vec!["", " ", "\t", "\r"]),
-            split in 0_usize..400,
-        ) {
-            let mut object: serde_json::Map<String, Value> = extra.into_iter().collect();
-            if let Some(id) = id {
-                object.insert("id".to_owned(), id);
-            }
-            if let Some(method) = method {
-                object.insert("method".to_owned(), method);
-            }
-            let mut members: Vec<(String, Value)> =
-                object.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            let rotate_by = rotation.checked_rem(members.len().max(1)).unwrap_or(0);
-            members.rotate_left(rotate_by);
-            let body = members
+    #[tokio::test(start_paused = true)]
+    async fn test_unclosed_oversized_request_with_an_id_is_answered() {
+        let (mut server, mut reader, mut writer) = link(128, 64 * 1024);
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"m","params":{{"pad":"{}"#,
+            "x".repeat(400)
+        );
+        writer
+            .write_all(format!("{line}\n{}\n", ping(5)).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(5));
+        let reply = next_json(&mut reader).await;
+        assert_eq!(reply["id"], json!(4));
+        assert_eq!(reply["error"]["code"], json!(INVALID_REQUEST));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_undecodable_lines_warn_once_with_the_silenced_count() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let (mut server, _reader, mut writer) = link(1024, 64 * 1024);
+        writer
+            .write_all(format!("not json\nstill not\nnor this\n{}\n", ping(1)).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(1));
+
+        let entries = captured.entries();
+        let count = |level| {
+            entries
                 .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}{spacing}:{spacing}{}",
-                        serde_json::to_string(k).unwrap(),
-                        serde_json::to_string(v).unwrap()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(&format!("{spacing},{spacing}"));
-            let line = format!("{{{spacing}{body}{spacing}}}");
-            let expected = expected_outcome(&object);
+                .filter(|(l, m)| *l == level && m.contains("stdio message rejected"))
+                .count()
+        };
+        assert_eq!(count(tracing::Level::WARN), 1);
+        assert_eq!(count(tracing::Level::DEBUG), 2);
+    }
 
-            proptest::prop_assert_eq!(scan(line.as_bytes()), expected);
+    fn reply_of(cause: RejectCause, outcome: ScanOutcome) -> Option<(i32, Option<RequestId>)> {
+        Rejected {
+            cause,
+            outcome,
+            bytes: 0,
+        }
+        .reply(10)
+        .map(|(error, id)| (error.code.0, id))
+    }
 
-            let cut = split.min(line.len());
-            let (head, tail) = line.as_bytes().split_at(cut);
-            let mut chunked = TopLevelScan::default();
-            chunked.feed(head);
-            chunked.feed(tail);
-            proptest::prop_assert_eq!(chunked.finish(), expected_outcome(&object));
+    #[test]
+    fn test_reply_table_for_every_cause_and_outcome() {
+        let unparsable =
+            || RejectCause::Unparsable(serde_json::from_str::<Value>("{").unwrap_err());
+        let not_json_rpc =
+            || RejectCause::NotJsonRpc(serde_json::from_str::<u8>("\"x\"").unwrap_err());
+        let request = || ScanOutcome::Request(Some(RequestId::Number(3)));
+        let id = Some(RequestId::Number(3));
+
+        assert_eq!(
+            reply_of(RejectCause::Oversized, request()),
+            Some((-32600, id.clone()))
+        );
+        assert_eq!(
+            reply_of(unparsable(), request()),
+            Some((-32700, id.clone()))
+        );
+        assert_eq!(
+            reply_of(RejectCause::Skipped, request()),
+            Some((-32600, id.clone()))
+        );
+        assert_eq!(reply_of(not_json_rpc(), request()), Some((-32600, id)));
+        let without_request: [fn() -> ScanOutcome; 3] = [
+            || ScanOutcome::IdOnly,
+            || ScanOutcome::NoReply,
+            || ScanOutcome::Unstructured,
+        ];
+        for outcome in without_request {
+            assert_eq!(reply_of(RejectCause::Oversized, outcome()), None);
+            assert_eq!(reply_of(RejectCause::Skipped, outcome()), None);
+            assert_eq!(reply_of(unparsable(), outcome()), None);
+            assert_eq!(reply_of(not_json_rpc(), outcome()), Some((-32600, None)));
         }
     }
 
     #[test]
-    fn test_scan_escaped_method_key_is_not_recognized() {
-        let line = br#"{"id":1,"\u006dethod":"m"}"#;
-        assert_eq!(scan(line), ScanOutcome::NoReply);
+    fn test_scan_outcome_classification() {
+        let scan = |bytes: &[u8]| {
+            let mut scan = EnvelopeScan::default();
+            scan.feed(bytes);
+            ScanOutcome::of_scan(&scan)
+        };
+        let request = |id: i64| ScanOutcome::Request(Some(RequestId::Number(id)));
+        assert_eq!(scan(br#"{"id":7,"method":"m"}"#), request(7));
+        assert_eq!(scan(br#"{"id":7,"method":"m","#), request(7));
+        assert_eq!(scan(br#"{"id":7,"method":"m""#), request(7));
+        assert_eq!(
+            scan(br#"{"method":"m","id":1.5}"#),
+            ScanOutcome::Request(None)
+        );
+        assert_eq!(scan(br#"{"method":"m","id":7"#), ScanOutcome::Unstructured);
+        assert_eq!(scan(br#"{"id":7,"method":"m" x}"#), request(7));
+        assert_eq!(scan(br#"{"id":7,"#), ScanOutcome::Unstructured);
+        assert_eq!(scan(br#"{"method":"m"}"#), ScanOutcome::NoReply);
+        assert_eq!(scan(br#"{"id":3,"result":{}}"#), ScanOutcome::NoReply);
+        assert_eq!(scan(br#"{"id":3,"error":{}}"#), ScanOutcome::NoReply);
+        assert_eq!(scan(br#"{"id":3}"#), ScanOutcome::IdOnly);
+        assert_eq!(scan(br#"{"jsonrpc":"2.0"}"#), ScanOutcome::Unstructured);
+        assert_eq!(scan(b"[1,2]"), ScanOutcome::Unstructured);
+        assert_eq!(scan(b""), ScanOutcome::Unstructured);
     }
 
-    #[test]
-    fn test_scan_escaped_unrelated_key_does_not_hide_the_id() {
-        let line = br#"{"id":1,"\u0078":2,"method":"m"}"#;
-        assert_eq!(scan(line), request(Id::Number(1)));
+    #[tokio::test(start_paused = true)]
+    async fn test_request_broken_after_its_method_and_id_is_answered() {
+        let (mut server, mut reader, mut writer) = link(1024, 64 * 1024);
+        let lines = [
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list" "params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":8,"method":"x",params:{}}"#,
+        ];
+        writer
+            .write_all(format!("{}\n{}\n", lines.join("\n"), ping(9)).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(9));
+        for id in [7, 8] {
+            let reply = next_json(&mut reader).await;
+            assert_eq!(reply["id"], json!(id));
+            assert_eq!(reply["error"]["code"], json!(PARSE_ERROR));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_line_ending_does_not_change_the_answer_for_a_number_id() {
+        let (mut server, mut reader, mut writer) = link(1024, 64 * 1024);
+        let cut = r#"{"jsonrpc":"2.0","method":"tools/call","id":12"#;
+        writer
+            .write_all(format!("{cut}\n{cut}\r\n{}\n", ping(9)).as_bytes())
+            .await
+            .unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(9));
+        for _ in 0..2 {
+            let reply = next_json(&mut reader).await;
+            assert_eq!(reply["id"], json!(12));
+            assert_eq!(reply["error"]["code"], json!(PARSE_ERROR));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_request_skipped_by_the_codec_is_answered_and_a_notification_is_not() {
+        let (mut server, mut reader, mut writer) = link(1024, 64 * 1024);
+        let lines = format!(
+            "{}\n{}\n{}\n",
+            r#"{"jsonrpc":"2.0","method":"notifications/x","params":5}"#,
+            r#"{"id":5,"method":"notifications/x","params":5}"#,
+            ping(9)
+        );
+        writer.write_all(lines.as_bytes()).await.unwrap();
+
+        assert_eq!(received_id(&mut server).await, json!(9));
+        let reply = next_json(&mut reader).await;
+        assert_eq!(reply["id"], json!(5));
+        assert_eq!(reply["error"]["code"], json!(INVALID_REQUEST));
+        assert_no_reply(&mut reader).await;
     }
 }

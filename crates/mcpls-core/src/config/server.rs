@@ -20,11 +20,11 @@ use super::patterns::{FilePattern, ProjectMarker};
 use super::routing::{ServerId, ToolSet};
 use super::server_args::ServerArgs;
 use super::server_env::{EnvKey, EnvValue, InvalidServerEnv, ServerEnv};
-use super::settings::LspSettings;
+use super::settings::{InitializationOptions, LspSettings};
 use super::text_newtype::{contains_nul, impl_text_newtype};
 use crate::bridge::IndexingPolicy;
 use crate::error::{ChainedError, ConfigError};
-use crate::spelling::spelled_enum;
+use crate::spelling::{Spelled, spelled_enum};
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -486,7 +486,7 @@ impl PartialEq<&str> for LaunchCommand {
 /// invalid `file_patterns`, `env` or `args` entry with the id of the server
 /// that holds it and builds the [`LaunchCommand`] from the `command` and
 /// `selection` keys.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawLspServerConfig", into = "RawLspServerConfig")]
 pub struct LspServerConfig {
     /// Language identifier (e.g., "rust", "python", "typescript").
@@ -515,7 +515,7 @@ pub struct LspServerConfig {
     /// only that installed the server fails to initialize, and the error says
     /// so. A native `tsc --lsp --stdio` command gets no pin and no generated
     /// options. See `SECURITY.md` for the trust model.
-    pub initialization_options: Option<serde_json::Value>,
+    pub initialization_options: Option<InitializationOptions>,
 
     /// Per-server settings pushed after `initialized` via
     /// `workspace/didChangeConfiguration` and served on
@@ -572,48 +572,6 @@ pub struct LspServerConfig {
     pub indexing: IndexingPolicy,
 }
 
-/// Prints `initialization_options` as structure only; the other secret-bearing
-/// fields (`args`, `env`, `settings`) have their own redacting `Debug`.
-impl std::fmt::Debug for LspServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            language_id,
-            command,
-            args,
-            env,
-            file_patterns,
-            initialization_options,
-            settings,
-            timeout_seconds,
-            request_timeout_seconds,
-            heuristics,
-            name,
-            handles,
-            indexing,
-        } = self;
-        f.debug_struct("LspServerConfig")
-            .field("language_id", language_id)
-            .field("command", command)
-            .field("args", args)
-            .field("env", env)
-            .field("file_patterns", file_patterns)
-            .field(
-                "initialization_options",
-                &initialization_options
-                    .as_ref()
-                    .map(crate::redaction::JsonShape),
-            )
-            .field("settings", settings)
-            .field("timeout_seconds", timeout_seconds)
-            .field("request_timeout_seconds", request_timeout_seconds)
-            .field("heuristics", heuristics)
-            .field("name", name)
-            .field("handles", handles)
-            .field("indexing", indexing)
-            .finish()
-    }
-}
-
 /// The deserialized form of [`LspServerConfig`], before the entry-level checks.
 ///
 /// Mirrors the public struct field for field; the `TryFrom` impl below
@@ -631,7 +589,7 @@ struct RawLspServerConfig {
     #[serde(default)]
     file_patterns: Vec<String>,
     #[serde(default)]
-    initialization_options: Option<serde_json::Value>,
+    initialization_options: Option<InitializationOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settings: Option<LspSettings>,
     #[serde(default)]
@@ -884,7 +842,7 @@ impl BuiltinServer {
     /// ```
     #[must_use]
     pub fn from_command(command: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|b| b.as_str() == command)
+        Self::from_spelling(command)
     }
 }
 
@@ -1200,7 +1158,7 @@ mod tests {
             args: crate::config::ServerArgs::try_from(vec!["--flag".to_string()]).unwrap(),
             env: env.clone(),
             file_patterns: vec![FilePattern::from_static("**/*.custom")],
-            initialization_options: Some(serde_json::json!({"key": "value"})),
+            initialization_options: Some(serde_json::json!({"key": "value"}).into()),
             settings: None,
             timeout_seconds: TimeoutSecs::new(60).unwrap(),
             request_timeout_seconds: TimeoutSecs::new(45).unwrap(),
@@ -1375,6 +1333,18 @@ mod tests {
                 .file_patterns
                 .contains(&FilePattern::from_static("**/*.tsx"))
         );
+    }
+
+    #[test]
+    fn test_debug_of_config_hides_initialization_option_values() {
+        let mut config = LspServerConfig::rust_analyzer();
+        config.initialization_options =
+            Some(serde_json::json!({"apiToken": "INITSECRET123", "nested": {"k": "v"}}).into());
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("INITSECRET123"), "{debug}");
+        assert!(debug.contains("apiToken"), "{debug}");
     }
 
     #[test]

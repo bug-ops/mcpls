@@ -8,6 +8,52 @@ use serde_json::{Map, Value};
 /// into a self-describing format such as [`serde_json::Value`].
 const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
 
+/// Server-specific `initialize` options, passed to the server as written.
+///
+/// Its `Debug` prints structure only, because option values may carry
+/// credentials; a struct holding it can derive `Debug` safely.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::config::InitializationOptions;
+///
+/// let options = InitializationOptions::from(serde_json::json!({"token": "hunter2"}));
+/// assert!(!format!("{options:?}").contains("hunter2"));
+/// assert_eq!(options.as_value()["token"], "hunter2");
+/// ```
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InitializationOptions(Value);
+
+impl std::fmt::Debug for InitializationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("InitializationOptions")
+            .field(&crate::redaction::JsonShape(&self.0))
+            .finish()
+    }
+}
+
+impl From<Value> for InitializationOptions {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+impl InitializationOptions {
+    /// The options as a JSON value.
+    #[must_use]
+    pub const fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    /// Consumes the options into the JSON value sent to the server.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
 /// Reason a `settings` table was rejected at load time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidLspSettings {

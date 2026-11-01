@@ -43,5 +43,5 @@ pub(crate) use publish_mailbox::{MailboxLimits, PublishWriter, mailbox};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LspNotification, RequestId,
+    LspNotification, RequestId, UndecodableReason,
 };

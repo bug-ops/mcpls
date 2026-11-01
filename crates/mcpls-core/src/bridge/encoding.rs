@@ -3,58 +3,68 @@
 //! Handles conversion between MCP (1-based) and LSP (0-based) positions,
 //! as well as UTF-8/UTF-16/UTF-32 encoding conversions.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use super::translator::{Position, Position2D};
+use crate::spelling::{Spelled, spelled_enum};
 
-/// Supported position encodings per LSP 3.17.
-///
-/// Serializes as the LSP kind string (`"utf-8"`, `"utf-16"`, `"utf-32"`) and
-/// rejects any other string on deserialize.
-///
-/// # Examples
-///
-/// ```
-/// use mcpls_core::bridge::PositionEncoding;
-///
-/// assert_eq!(PositionEncoding::from_lsp("utf-32"), Some(PositionEncoding::Utf32));
-/// assert!(PositionEncoding::try_from("utf-7".to_string()).is_err());
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "&'static str")]
-pub enum PositionEncoding {
-    /// UTF-8 code units.
-    #[default]
-    Utf8,
-    /// UTF-16 code units (LSP default).
-    Utf16,
-    /// UTF-32 code units (Unicode code points).
-    Utf32,
+spelled_enum! {
+    /// Supported position encodings per LSP 3.17.
+    ///
+    /// Serializes as the LSP kind string (`"utf-8"`, `"utf-16"`, `"utf-32"`) and
+    /// rejects any other string on deserialize.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::PositionEncoding;
+    ///
+    /// assert_eq!(PositionEncoding::from_lsp("utf-32"), Some(PositionEncoding::Utf32));
+    /// assert!(PositionEncoding::try_from("utf-7".to_string()).is_err());
+    /// ```
+    #[derive(Default, Serialize, Deserialize)]
+    #[serde(try_from = "String", into = "&'static str")]
+    PositionEncoding {
+        /// UTF-8 code units.
+        #[default]
+        Utf8 => "utf-8",
+        /// UTF-16 code units (LSP default).
+        Utf16 => "utf-16",
+        /// UTF-32 code units (Unicode code points).
+        Utf32 => "utf-32",
+    }
 }
 
 /// A string that is not an LSP position encoding kind.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
-#[error("invalid position encoding '{0}'; expected one of \"utf-8\", \"utf-16\", \"utf-32\"")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidPositionEncoding(String);
 
-impl PositionEncoding {
-    /// Every encoding, in LSP-spec order.
-    pub const ALL: [Self; 3] = [Self::Utf8, Self::Utf16, Self::Utf32];
+impl fmt::Display for InvalidPositionEncoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid position encoding '{}'; expected one of ",
+            self.0
+        )?;
+        for (index, encoding) in PositionEncoding::ALL.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "\"{encoding}\"")?;
+        }
+        Ok(())
+    }
+}
 
+impl std::error::Error for InvalidPositionEncoding {}
+
+impl PositionEncoding {
     /// Parse from LSP position encoding kind string.
     #[must_use]
     pub fn from_lsp(kind: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|e| e.to_lsp() == kind)
-    }
-
-    /// Convert to LSP position encoding kind string.
-    #[must_use]
-    pub const fn to_lsp(&self) -> &'static str {
-        match self {
-            Self::Utf8 => "utf-8",
-            Self::Utf16 => "utf-16",
-            Self::Utf32 => "utf-32",
-        }
+        Self::from_spelling(kind)
     }
 
     /// Convert to the [`lsp_types::PositionEncodingKind`] sent in `initialize`.
@@ -78,7 +88,7 @@ impl TryFrom<String> for PositionEncoding {
 
 impl From<PositionEncoding> for &'static str {
     fn from(encoding: PositionEncoding) -> Self {
-        encoding.to_lsp()
+        encoding.as_str()
     }
 }
 
@@ -467,7 +477,7 @@ mod tests {
     #[test]
     fn test_string_kind_and_enum_round_trip_for_every_encoding() {
         for encoding in PositionEncoding::ALL {
-            let kind = encoding.to_lsp();
+            let kind = encoding.as_str();
             assert_eq!(PositionEncoding::try_from(kind.to_string()), Ok(encoding));
             assert_eq!(<&str>::from(encoding), kind);
             assert_eq!(encoding.to_kind().as_str(), kind);
@@ -481,7 +491,7 @@ mod tests {
             .to_string();
         assert!(err.contains("utf-7"));
         for encoding in PositionEncoding::ALL {
-            assert!(err.contains(encoding.to_lsp()), "{err}");
+            assert!(err.contains(encoding.as_str()), "{err}");
         }
     }
 

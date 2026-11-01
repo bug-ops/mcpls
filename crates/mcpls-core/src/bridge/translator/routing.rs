@@ -707,6 +707,36 @@ pub(super) enum MemberPresence {
     Absent,
 }
 
+/// The two or more servers a workspace-wide search fans out over, in config
+/// order: the first and at least one more, so a fan-out always has a head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FanOutMembers {
+    first: (ServerId, MemberPresence),
+    rest: Vec<(ServerId, MemberPresence)>,
+}
+
+impl FanOutMembers {
+    /// `None` below two members, where the single-server route applies.
+    fn from_members(members: Vec<(ServerId, MemberPresence)>) -> Option<Self> {
+        let mut members = members.into_iter();
+        let first = members.next()?;
+        let rest: Vec<_> = members.collect();
+        (!rest.is_empty()).then_some(Self { first, rest })
+    }
+
+    /// Every member, in config order.
+    pub(super) fn iter(&self) -> impl Iterator<Item = &(ServerId, MemberPresence)> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    /// The first member and all the others, in config order.
+    pub(super) fn into_parts(
+        self,
+    ) -> ((ServerId, MemberPresence), Vec<(ServerId, MemberPresence)>) {
+        (self.first, self.rest)
+    }
+}
+
 /// The servers a workspace-wide `tool` fans out over, in config order, each
 /// with its presence, or `None` when fewer than two servers are eligible and
 /// the single-server route applies.
@@ -721,8 +751,8 @@ pub(super) fn workspace_fan_out_members(
     is_refused: impl Fn(&ServerId) -> bool,
     is_registered: impl Fn(&ServerId) -> bool,
     is_expected: impl Fn(&ServerId) -> bool,
-) -> Option<Vec<(ServerId, MemberPresence)>> {
-    let members: Vec<(ServerId, MemberPresence)> = configured
+) -> Option<FanOutMembers> {
+    let members = configured
         .workspace_candidates(tool)
         .into_iter()
         .filter(|id| !is_refused(id))
@@ -737,7 +767,7 @@ pub(super) fn workspace_fan_out_members(
             (id.clone(), presence)
         })
         .collect();
-    (members.len() >= 2).then_some(members)
+    FanOutMembers::from_members(members)
 }
 
 /// Fail with [`Error::CapabilityNotSupported`] if `caps` is known and does
@@ -3921,13 +3951,11 @@ mod tests {
         ])
     }
 
-    fn members_of(
-        members: Option<Vec<(ServerId, MemberPresence)>>,
-    ) -> Vec<(String, MemberPresence)> {
+    fn members_of(members: Option<FanOutMembers>) -> Vec<(String, MemberPresence)> {
         members
             .expect("two or more eligible servers")
-            .into_iter()
-            .map(|(id, presence)| (id.as_str().to_owned(), presence))
+            .iter()
+            .map(|(id, presence)| (id.as_str().to_owned(), *presence))
             .collect()
     }
 

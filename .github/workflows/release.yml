@@ -232,11 +232,10 @@ jobs:
           publish-delay: 10000
 
   # Publish the server manifest to the official MCP registry (re-runnable; last job, so a failure leaves everything else intact)
-  # Disabled until the maintainer confirms the first public registry publication (follow-up: enable publish-registry); remove `false &&` to enable
   publish-registry:
     name: Publish to MCP Registry
     needs: [publish-crates]
-    if: false && !contains(github.ref_name, '-')
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

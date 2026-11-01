@@ -1,7 +1,27 @@
 //! The `spelled_enum!` utility: closed enums whose spellings are written once.
 
-/// Declares a closed enum of spellings: the variants, `ALL`, `as_str` and
-/// `Display`, so a spelling is written once.
+/// A closed set of spellings that can be looked up from text.
+///
+/// `spelled_enum!` implements it, so a spelling is written once and the
+/// reverse lookup is not hand-kept beside it.
+pub trait Spelled: Copy + 'static {
+    /// Every variant, in declaration order.
+    const VARIANTS: &'static [Self];
+
+    /// The spelling of this variant.
+    fn as_str(self) -> &'static str;
+
+    /// The variant whose spelling is exactly `text`.
+    fn from_spelling(text: &str) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .find(|variant| variant.as_str() == text)
+    }
+}
+
+/// Declares a closed enum of spellings: the variants, `ALL`, `as_str`,
+/// `Display` and a [`Spelled`] impl, so a spelling is written once.
 macro_rules! spelled_enum {
     (
         $(#[$meta:meta])*
@@ -29,6 +49,14 @@ macro_rules! spelled_enum {
             }
         }
 
+        impl $crate::spelling::Spelled for $name {
+            const VARIANTS: &'static [Self] = &Self::ALL;
+
+            fn as_str(self) -> &'static str {
+                <$name>::as_str(self)
+            }
+        }
+
         impl ::std::fmt::Display for $name {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.write_str(self.as_str())
@@ -42,6 +70,8 @@ pub(crate) use spelled_enum;
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+
+    use super::Spelled;
 
     spelled_enum! {
         /// A sample closed set with extra derives.
@@ -76,13 +106,12 @@ mod tests {
     }
 
     #[test]
-    fn a_spelling_finds_its_variant_back_through_all() {
+    fn a_spelling_finds_its_variant_back() {
         for variant in Sample::ALL {
-            let found = Sample::ALL
-                .into_iter()
-                .find(|v| v.as_str() == variant.as_str());
-            assert_eq!(found, Some(variant));
+            assert_eq!(Sample::from_spelling(variant.as_str()), Some(variant));
         }
+        assert_eq!(Sample::from_spelling("First"), None);
+        assert_eq!(Sample::from_spelling(""), None);
     }
 
     #[test]

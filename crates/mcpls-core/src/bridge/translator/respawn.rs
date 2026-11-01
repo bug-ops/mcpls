@@ -876,7 +876,7 @@ sleep 5
             .unwrap();
             let mut pinned = stub_server_config("rust", &reporter);
             pinned.server_config_mut().initialization_options =
-                Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
+                Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}).into());
             set_respawn_config(&translator, &id, pinned);
 
             let captured = CapturedLogs::default();

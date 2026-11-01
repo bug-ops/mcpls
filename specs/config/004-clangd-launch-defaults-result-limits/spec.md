@@ -53,7 +53,7 @@ defaults, confirmed with `clangd --help`:
 |---------------|---------|-----------------------|
 | `--limit-references` | 1000 | `get_references` returns at most 1000 locations; the server stops collecting |
 | `--limit-results` | 100 | `workspace_symbol_search` returns at most 100 symbols; the same option also caps code completion |
-| `--rename-file-limit` | 50 | `rename_symbol` over more than 50 files is refused by the server |
+| `--rename-file-limit` | 50 | `rename_symbol` over more than 50 files is refused by the server; lifted to the edit cap plus one (FR-019) |
 | `--log` | `info` | One stderr line per request and parse, including full compile commands |
 
 **Reproduced.** Direct LSP client against clangd 21, scratch workspace, background index warm. A
@@ -201,13 +201,14 @@ THEN they list every option added to a default clangd launch, the rule that an o
 | FR-016 | THE configuration and language-server pages of the user guide SHALL list the options added to a clangd launch, the precedence rule (FR-008, FR-009) and the spelling to override each, and SHALL replace the example whose `args` would now collide, if any | must |
 | FR-017 | WHEN the installed clangd rejects a launch-default option THE SYSTEM SHALL NOT leave the language without a server silently; the behavior (probe, retry without defaults, or a documented minimum version) is open (section 9) | must |
 | FR-018 | THE `.local/testing/` playbooks SHALL gain a case for the references count, the symbol count and `truncated`, the duplicate-spelling suppression, the quiet stderr, and the restart path; the coverage status for config and bridge SHALL be reset | must |
+| FR-019 | THE SYSTEM SHALL launch clangd with `--rename-file-limit` set to `MAX_NORMALIZED_LOCATIONS + 1` unless `args` sets it, so a rename clangd refuses is one mcpls would cut and flag at its own edit cap anyway (#850) | must |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Type safety | A launch default is a typed value; detection of a user-written option parses `args` once into the same option-name type, with no `starts_with` string probing at the spawn site, per [[constitution]] |
-| NFR-002 | Resource bound | With the defaults, the largest references or symbol answer a server can send stays well below the 10 MiB LSP frame limit in `lsp/transport.rs`; an answer over the frame limit must remain a diagnosable error and never a hang or truncation without notice |
+| NFR-002 | Resource bound | With the defaults, the largest references or symbol answer a server can send stays well below the 10 MiB LSP frame limit in `lsp/transport.rs`; an answer over the frame limit must remain a diagnosable error that fails only its own request (`lsp/011`) and never a hang or truncation without notice |
 | NFR-003 | Resource bound | Memory and time per request stay bounded by mcpls's caps and the existing request timeout; the feature adds no unbounded collection on a huge codebase |
 | NFR-004 | Latency | A references request on the 1200-call-site fixture completes inside the default request timeout, and a default workspace-symbol query is not slower than 2x its time with clangd defaults on the same index |
 | NFR-005 | Security | The defaults do not enlarge what an untrusted workspace can make mcpls execute; they are constant, contain no path or workspace-derived text, and are identical in trusted and untrusted mode |
@@ -243,10 +244,10 @@ THEN they list every option added to a default clangd launch, the rule that an o
 | `restart_server` or respawn after a crash | The same final vector as the first start (FR-003) |
 | Untrusted mode, clangd allowed with `--allow-server` | Vetting runs on the user's args first; defaults appended afterward (FR-012); a refused server never starts and gains nothing |
 | More references than mcpls's cap | `truncated: true` at the cap; the server bound is above the cap, so the cut is observable (FR-005) |
-| Answer over the 10 MiB LSP frame limit | Surfaces as the existing frame-size error, naming the limit; not silently dropped (NFR-002) |
+| Answer over the 10 MiB LSP frame limit | Only that request fails, with an error naming the limit, and the connection stays up up to 256 MiB; above that the connection ends as before (NFR-002, `lsp/011`) |
 | Old clangd rejects `--limit-references` or repeats an option | See FR-017; the user is told, not left with no C++ language server |
 | Completion on clangd | `--limit-results` is shared with completion: lifting it changes the completion list size too; see section 9 |
-| `rename_symbol` over more than 50 files | Unchanged unless section 9 lifts `--rename-file-limit`; the server's refusal remains a loud error, not silent truncation |
+| `rename_symbol` over more than 50 files | Lifted by FR-019; a rename past the edit cap is cut and flagged by mcpls, and a larger answer than the frame limit fails only that request |
 
 ## 7. Success Criteria
 
@@ -273,7 +274,6 @@ THEN they list every option added to a default clangd launch, the rule that an o
 
 ### Ask First
 - Choosing `0` (unlimited) over a finite bound above the cap (section 9).
-- Lifting `--rename-file-limit`.
 - Running `clangd --help` or any probe process at startup (FR-017).
 - Adding a configuration key or environment variable that disables the defaults (the untrusted-mode rule forbids an env var or key for that mode, and this one must not reintroduce a second control surface).
 - Applying launch defaults to any server other than clangd.
@@ -293,7 +293,7 @@ THEN they list every option added to a default clangd launch, the rule that an o
 - **Bounds**: finite, not `0`. `--limit-references` = cap + 3 (`REFERENCES_MARGIN`), `--limit-results` = cap + 1. Measured with Apple clangd 21.0.0 on the 1200-call fixture: `--limit-references=N` returns `N - 1` locations with `includeDeclaration: false` and `N` with `true` (deficit at most 1, so margin = 1 + 2); workspace symbols return exactly the limit (100 at 100, 101 at 101). An LLVM build may differ; the margin keeps a cut at the cap visible either way.
 - **Completion cap (user decision)**: `get_completions` returns at most 100 items for every server, ranked before the cut by how well `filterText` (else label) matches the identifier before the cursor (prefix, then subsequence, then the rest; within a tier by `sortText`, else label), and sets `truncated: true` when it dropped items. At or under 100 items the server's order is unchanged. The server's `isIncomplete` is not folded into `truncated`, so FR-014 holds. If the cursor line is unavailable the prefix is empty and the server's order is kept.
 - **Completion size at the lifted limit** (NFR-002): an empty-prefix completion in a C++ unit including 20 standard headers returned 8469 items, 4.3 MiB, in 0.19 s with `--limit-results=10001` (same with `0`), under the pre-agreed 5 MiB and 10 s thresholds, so 10001 stays. A larger unit is bounded at about 5.1 MiB by the limit itself, well below the 10 MiB frame limit.
-- **`--rename-file-limit`**: unchanged; follow-up issue.
+- **`--rename-file-limit`** (#850, user decision): lifted to `MAX_NORMALIZED_LOCATIONS + 1`. Measured with clangd 21: a limit of N admits exactly N files, so one beyond the edit cap lets mcpls cut and flag the rename at its own cap. Surfacing clangd's refusal instead was rejected: the refusal is a free-text `-32001` error with no stable code to type on.
 - **Log level**: `error`. Whether clangd feeds `window/logMessage` and what a startup failure prints at that level are pending a live capture (see the playbook).
 - **Old clangd (FR-017)**: documented minimum, no probe or retry. `--limit-references` is documented in the clangd 14 manual (earliest version checked); an older clangd that rejects an option fails loudly through the existing stderr excerpt and the user can pin its options in `args`.
 - **Command classification**: `BuiltinServer::Clangd.matches_command` (file stem, case-insensitive; `clangd-18` is not matched).
