@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `RouteSupport::Unavailable` is added, `RouteSupport::Initializing` becomes a struct variant and `ServerStatus::Answered` gains `indexing_in_progress` (#851, #852, #859).
+- **Breaking:** `RouteSupport` is `#[non_exhaustive]`, no longer implements `Serialize` or `JsonSchema`, has a unit `Initializing`, fan-out rows are the new `MemberSupport` and `MemberStatus`, and `ServerStatus::Answered` gains `indexing_in_progress` (#851, #852, #859, #861, #868).
+- **Breaking:** `InboundMessage::UndecodableNotification` carries a `DroppedNotification`, and `LostPublish`, `LspNotification::LostPublish` and `PublishDelivery::LostUnidentified` are added (#863, #868).
+- **Breaking:** a TOML datetime in `initialization_options` is a config load error like in `settings`, and `InvalidLspSettings::Datetime` wraps the new `TomlDatetime` (#865, #868).
+- An unreadable LSP frame within the size limit is classified by the same envelope scanner as an oversized one, so an escaped-key request is no longer answered `-32600`, and the oversized-frame warning logs structured fields (#860, #862, #868).
 - **Breaking:** `InboundMessage::UndecodableRequest` and `UndecodableResponse` carry a `reason` (new `UndecodableReason`) (#857, #859).
 - **Breaking:** `PositionEncoding` is `#[non_exhaustive]`, gains `Display`, and `to_lsp` is replaced by `as_str(self)` (#856, #859).
 - **Breaking:** `LspServerConfig.initialization_options` is `Option<InitializationOptions>` (#856, #859).
@@ -26,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stdio requests nested past the JSON recursion limit, cut off after `method` and `id`, or skipped by the SDK are answered with `-32700` or `-32600` carrying the request id instead of being dropped (#857, #859).
 - An LSP frame between 10 and 256 MiB fails only its own request instead of closing the server connection; larger frames still close it (#857, #859).
+- A dropped or undecodable `publishDiagnostics` frame marks its file (or every file of that server when the file is unreadable) `evicted` instead of leaving stale diagnostics as current (#863, #868).
+- `book/src/tools/server-control.md` shows the `coverage` of a fanned-out tool as computed from the aggregate route, and the stdio `-32600` / `-32601` condition for skipped requests is documented (#864, #866, #868).
 
 ## [0.9.0] - 2026-11-01
 

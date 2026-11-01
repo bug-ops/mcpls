@@ -10,7 +10,7 @@ tags:
   - diagnostics
   - framing
 created: 2026-11-01
-status: draft
+status: approved
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]]"
@@ -165,7 +165,9 @@ SO THAT a server repeating the failure cannot bury other warnings.
 ```
 GIVEN a server that repeatedly sends oversized publishDiagnostics frames
 WHEN the log is read
-THEN at most one WARN per rate-limit interval reports the dropped frames, with a count
+THEN each source of the loss logs at most one WARN per rate-limit interval, with a count
+  AND an oversized publish may log up to three lines in one interval, one from each source
+      (the transport's skipped-frame line, the undecodable-run line, the lost-publish line)
 ```
 
 ## 3. Functional Requirements
@@ -174,17 +176,22 @@ THEN at most one WARN per rate-limit interval reports the dropped frames, with a
 |----|-------------|----------|
 | FR-001 | WHEN a `textDocument/publishDiagnostics` frame is dropped because it exceeds the buffering limit or cannot be decoded THE SYSTEM SHALL record the loss for the sending server in state readable by every diagnostics surface | must |
 | FR-002 | WHEN the dropped frame's `params.uri` can be identified THE SYSTEM SHALL additionally record the loss for that file and SHALL NOT serve that file's previous entry as current | should |
-| FR-003 | WHEN the dropped frame's `params.uri` cannot be identified THE SYSTEM SHALL record the loss per server and every cached file of that server SHALL be reported as possibly stale rather than as current | must |
-| FR-004 | THE loss SHALL be reported through the existing structured `availability` field and degradation flags (`push_notifications_degraded`), not through a new free-form field | must |
+| FR-003 | WHEN the dropped frame's `params.uri` cannot be identified THE SYSTEM SHALL record the loss per server and every cached file of that server SHALL be reported as possibly stale rather than as current. This covers every unidentified loss: the server's pushed entries are evicted as lost, its capacity-eviction `clean` marks become `lost` (so a file evicted while clean no longer reads published-clean), and its overflow mark is set | must |
+| FR-004 | THE loss SHALL be reported through the existing structured `availability` field as `evicted`, through the lsp/013 pipeline, and `push_notifications_degraded` SHALL stay untouched (a dropped frame does not stop push notifications); no new free-form field is added | must |
 | FR-005 | THE `get_diagnostics`, `get_cached_diagnostics` and diagnostics resource read SHALL report the same availability and degradation state at the same point in time | must |
-| FR-006 | THE loss state SHALL end by the same rules as other degraded push state: it is cleared on server respawn or restart together with the server's diagnostics, and ends where a later accepted publish for the same scope makes the loss moot, with the trade-off stated as in [[lsp/013-diagnostics-publish-burst-drops/spec|lsp/013]] FR-006 | must |
+| FR-006 | THE loss state SHALL end by the rules of [[lsp/013-diagnostics-publish-burst-drops/spec|lsp/013]]: a file's mark ends with its next accepted publish, the server's overflow mark ends at the server's next accepted write (a pull included), and both are cleared on server respawn or restart together with the server's diagnostics. Trade-off: a file with no cached entry flips from `pending` to `evicted` without a `resources/updated`, since notifying subscribers of files with no entry would need the router in the pump. A delivery queued in the old mailbox of a respawned server never evicts the replacement's entries; the abort that guarantees this is best effort, so one queued delivery can in rare timing apply once, and it ends at the replacement's first write. Known trade-off: when a mailbox overflow (lsp/013) is followed by an unidentified loss, the merged loss is delivered before newer pending publishes, whose writes then end the overflow; only files with no cached entry are affected (they read `pending` instead of `evicted`), never a stale entry | must |
 | FR-007 | WHEN a loss is recorded and the merged view of a subscribed file changed THE SYSTEM SHALL send `resources/updated` for it | must |
-| FR-008 | THE dropped-frame log lines SHALL stay rate limited through the existing mechanism, with one WARN per interval carrying a dropped count, and SHALL NOT include server-controlled frame content | must |
+| FR-008 | THE dropped-frame log lines SHALL stay rate limited through the existing mechanism, with one WARN per source per interval carrying a dropped count (the transport's skipped-frame line, the undecodable-run line and the lost-publish line), and SHALL NOT include server-controlled frame content | must |
 | FR-009 | WHEN a dropped notification is not a `publishDiagnostics` frame THE SYSTEM SHALL NOT record a diagnostics loss | must |
 | FR-010 | WHEN a loss is recorded for one server THE SYSTEM SHALL NOT mark another server's diagnostics | must |
 | FR-011 | A later valid `publishDiagnostics` for an affected file SHALL replace the entry normally and clear the file-level loss | must |
 | FR-012 | THE identification of a dropped frame as a diagnostics publish SHALL NOT require buffering the full oversized frame, and memory per frame SHALL stay within the existing limits | must |
 | FR-013 | Regression tests SHALL cover an oversized and a small malformed publish after an accepted publish, asserting the loss signal on all three surfaces and the subscriber notification | must |
+| FR-015 | WHEN a `publishDiagnostics` frame is valid JSON but its params fail the typed decode THE SYSTEM SHALL record the loss as for an undecodable frame: for the file when `params.uri` is a string, else unidentified | must |
+| FR-016 | WHEN a `publishDiagnostics` has no `params`, or `params` is not an object, THE SYSTEM SHALL record an unidentified loss, as for every unreadable publish | must |
+| FR-017 | WHEN the list of lost files is full and another named loss arrives THE SYSTEM SHALL escalate to an unidentified loss (every pushed entry of the server is evicted, and its capacity-eviction `clean` marks become `lost`, so no file keeps reading published-clean) instead of only setting the overflow mark | must |
+| FR-018 | EVERY source of a lost publish (oversized, malformed, typed-decode failure) SHALL reach the mailbox through one entry point that owns the lost-publish WARN, which carries no URI and no frame content | must |
+| FR-019 | A `uri` longer than 16 KiB SHALL be treated as unidentified | must |
 | FR-014 | THE testing playbooks under `.local/testing/` SHALL gain the oversized-publish case (fake server `--bigpub`, driver) and the coverage status for diagnostics SHALL be reset | must |
 
 ## 4. Non-Functional Requirements
@@ -203,9 +210,9 @@ THEN at most one WARN per rate-limit interval reports the dropped frames, with a
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
 | Dropped notification | Notification the transport could not deliver as a typed message | reason (oversized or malformed), size, method if identifiable, uri if identifiable |
-| Server loss marker | Per-server record that a publish was lost | owner, set or clear, cleared by the rules of FR-006 |
+| Server loss marker | Per-server record that a publish was lost: the overflow mark, plus eviction of every pushed entry for an unidentified loss | owner, set or clear, cleared by the rules of FR-006 |
 | File loss marker | Per-file record of a lost publish | owner, canonical URI, cleared by a later valid publish |
-| Diagnostics availability | Existing per-file answer state | `published`, `pending`, `evicted`, plus the outcome decided in Section 9 |
+| Diagnostics availability | Existing per-file answer state | `published`, `pending`, `evicted`; a lost publish reads `evicted` |
 
 ## 6. Edge Cases and Error Handling
 
@@ -215,7 +222,10 @@ THEN at most one WARN per rate-limit interval reports the dropped frames, with a
 | Oversized publish with a prior entry | The prior entry is not served as current (FR-002, FR-003) |
 | Oversized publish that would have been a clean (empty) result | Stale errors are not served as current; the agent sees the degradation, not the old errors |
 | Frame method cannot be determined (truncated or garbage) | Treated as an unknown notification: no diagnostics loss is recorded (FR-009); only the rate-limited log applies |
-| `uri` appears after the large `diagnostics` array in the frame | The scanner cannot rely on field order; see the open decision in Section 9 |
+| `uri` appears after the large `diagnostics` array in the frame | Resolved: the whole frame is scanned in constant memory, so member order does not matter |
+| A key written with escapes (`"\u006dethod"`, `"\u0075ri"`) | The scanner never matches it, while a decoded value does. An oversized publish whose `method` key is escaped records no loss (pinned limitation); an escaped `uri` key leaves the file unidentified |
+| `uri` or `params` repeated, or `uri` not a string | Unusable: the loss is unidentified |
+| `uri` longer than 16 KiB | Unidentified (FR-019) |
 | Several oversized publishes for different files | Each recorded; the per-server marker covers all |
 | Same file, valid publish after the loss | Entry replaced, file-level loss cleared (FR-011) |
 | Server sends only oversized publishes repeatedly | State stays degraded; log stays rate limited (FR-008) |
@@ -233,7 +243,7 @@ THEN at most one WARN per rate-limit interval reports the dropped frames, with a
 | SC-002 | Live repro with a small malformed publish | Same loss signal as SC-001 |
 | SC-003 | Subscription on the file during the repro | One `resources/updated` when the merged view changed |
 | SC-004 | Surfaces compared at the same time | Identical availability and degradation state |
-| SC-005 | Repeated oversized publishes | At most one WARN per interval with a count |
+| SC-005 | Repeated oversized publishes | At most one WARN per source per interval with a count (up to three lines for an oversized publish) |
 | SC-006 | Non-diagnostics oversized notification | No diagnostics loss recorded |
 | SC-007 | Regression test (FR-013) | Fails on `f13ba47`, passes after |
 | SC-008 | Valid publishes from rust-analyzer, pyright, clangd, gopls, typescript-language-server | Output unchanged (NFR-005) |
@@ -257,14 +267,15 @@ THEN at most one WARN per rate-limit interval reports the dropped frames, with a
 - Silence the loss by lowering the log level without recording it in state.
 - Include server-controlled frame content in log lines.
 
-## 9. Open Questions
+## 9. Decisions
 
-- [NEEDS CLARIFICATION: Loss granularity. The envelope scanner (`crates/mcpls-core/src/json_envelope.rs`) keeps only method, id, result and error markers, not `params.uri`. Options: (a) per-server marker only, every cached file of the server reads degraded until the rules of FR-006 end it; (b) extend the scanner to capture `params.uri` when it appears before the large payload and mark per file, falling back to (a) when it does not; (c) per-server marker plus per-file marking for small undecodable frames (full bytes available) only. Default suggestion: (a) as the guaranteed floor, (b) as an optional refinement.]
-- [NEEDS CLARIFICATION: Outcome shape. Options: reuse `evicted` availability for affected files (as lsp/013 does for lost publishes), reuse `pending` plus `push_notifications_degraded: true` (the pre-#859 observable state), or add a new availability variant. Default suggestion: the pre-#859 observable state, since agents and tests already know it.]
-- [NEEDS CLARIFICATION: Per-server marker end condition. Cleared by the next accepted publish of any file of that server (simple, but may hide a stale file) or only on respawn/restart or by each file's own next publish (precise, but a quiet server stays degraded). Default suggestion: stay degraded until respawn/restart, with file-level entries recovering on their own next publish.]
-- [NEEDS CLARIFICATION: How to identify the method of an oversized frame without buffering it, if the scanner sees `method` after the payload. Whether the transport can guarantee the method is known before the first skipped byte, or the classification must be post hoc.]
-- [NEEDS CLARIFICATION: Whether the same treatment applies to the undecodable `UndecodableFrame` variant (no method known) or only to frames identified as `publishDiagnostics`.]
-- [NEEDS CLARIFICATION: Issue number and whether a `get_server_messages` or log surface should also expose the drop count.]
+- Granularity: per file when `params.uri` is recovered, else per server (an unidentified loss evicts every pushed entry of the server).
+- Outcome: `availability: evicted` through the lsp/013 pipeline; `push_notifications_degraded` is untouched.
+- End of the loss: as lsp/013 (FR-006).
+- Identification: the scanner reads `method` and `params.uri` in one pass over the frame in constant memory, in any member order (FR-012).
+- A typed-decode failure of valid JSON is a loss too (FR-015).
+- Frames whose method is not `publishDiagnostics`, including `UndecodableFrame`, record no diagnostics loss (FR-009).
+- Issue: #863. The drop count is not exposed on another surface.
 
 ## 10. See Also
 

@@ -161,7 +161,7 @@ A file with no mapping fails with `no LSP server configured for language: plaint
 
 ### `initialization_options` and `settings`
 
-Free-form tables in the server's own vocabulary. Top-level dotted keys expand into nested objects, while keys inside values are left untouched. An empty `settings` table is rejected, and so is a TOML datetime.
+Free-form tables in the server's own vocabulary. Top-level dotted keys expand into nested objects, while keys inside values are left untouched. An empty `settings` table is rejected. A TOML datetime in either table is a load error, because JSON has no datetime type; write it as a string.
 
 ```toml
 [lsp_servers.initialization_options]

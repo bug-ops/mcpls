@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::Decoder as _;
 
-use crate::json_envelope::{Envelope, EnvelopeScan, IdToken, Shape};
-use crate::lsp::DropCounter;
+use crate::json_envelope::{Envelope, EnvelopeScan, MessageKind, Shape, Token};
+use crate::util::DropCounter;
 
 /// Non-zero cap, in bytes, on one incoming stdio JSON-RPC line.
 ///
@@ -64,23 +64,14 @@ impl ScanOutcome {
     /// Classifies a scanned line. A truncated line counts as a request only
     /// when its `method` began and its `id` was read in full.
     fn of(envelope: &Envelope) -> Self {
-        let Envelope {
-            shape,
-            method,
-            outcome,
-            id,
-        } = envelope;
-        match (shape, method, id) {
-            (Shape::Truncated | Shape::Malformed, true, IdToken::Complete(_)) => {
-                Self::Request(id.decode())
-            }
-            (Shape::Malformed | Shape::Truncated, ..) | (Shape::Closed, false, IdToken::Absent) => {
-                Self::Unstructured
-            }
-            (Shape::Closed, true, IdToken::Absent) => Self::NoReply,
-            (Shape::Closed, true, _) => Self::Request(id.decode()),
-            (Shape::Closed, false, _) if *outcome => Self::NoReply,
-            (Shape::Closed, false, _) => Self::IdOnly,
+        let Envelope { shape, id, .. } = envelope;
+        match (shape, envelope.kind(), id) {
+            (Shape::Truncated | Shape::Malformed, MessageKind::Request, Token::Complete(_))
+            | (Shape::Closed, MessageKind::Request, _) => Self::Request(id.decode()),
+            (Shape::Malformed | Shape::Truncated, ..)
+            | (Shape::Closed, MessageKind::Unrecognized, _) => Self::Unstructured,
+            (Shape::Closed, MessageKind::Notification | MessageKind::Response, _) => Self::NoReply,
+            (Shape::Closed, MessageKind::IncompleteResponse, _) => Self::IdOnly,
         }
     }
 

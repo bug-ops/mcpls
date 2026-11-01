@@ -63,14 +63,14 @@ A stdio line that mcpls cannot hand to the MCP SDK is answered instead of droppe
 | Larger than 4 MiB | `-32600` with the request `id` |
 | Not valid JSON, or nested 125 levels deep or more (the JSON recursion limit; 124 still works) | `-32700` with the request `id` |
 | Cut off or broken after its `method` and a complete `id` | `-32700` with the request `id` |
-| Valid JSON that is not a JSON-RPC message, or a request the SDK skips (for example method `notifications/x` with an `id`) | `-32600` with the request `id` |
+| Valid JSON that is not a JSON-RPC message, or a request the SDK skips (a `notifications/*` method with an `id` whose full decode fails for another reason, for example a `params` that is not an object) | `-32600` with the request `id` |
 | `id` and nothing else, or an `id` that is not an integer or a string | `-32600` without an `id` |
 
-Notifications and responses (`result` or `error`) get no reply, and mcpls never echoes the `id` of a response. A line cut off inside a string `id`, or whose `id` or `method` key uses escapes such as `"\u0069d"`, gets no reply because the id cannot be trusted. The session stays open in every case, and mcpls logs a warning at most once a minute for such lines.
+A `notifications/*` request with an `id` and no `params` or object `params` decodes normally, so the SDK answers it `-32601` (method not found) with the request `id`. Notifications and responses (`result` or `error`) get no reply, and mcpls never echoes the `id` of a response. A line cut off inside a string `id`, or whose `id` or `method` key uses escapes such as `"\u0069d"`, gets no reply because the id cannot be trusted. The session stays open in every case, and mcpls logs a warning at most once a minute for such lines.
 
 ## Oversized language server frames
 
-A language server message larger than 10 MiB is not fatal. Up to 256 MiB, mcpls skips the frame in constant memory and fails only the request it answers: a tool call waiting on it returns an error, a request the server sent is answered `-32600`, and a notification is dropped. The connection stays up and later messages are read. A frame announced above 256 MiB closes the connection, so a server that streams without end is still stopped.
+A language server message larger than 10 MiB is not fatal. Up to 256 MiB, mcpls skips the frame in constant memory and fails only the request it answers: a tool call waiting on it returns an error, a request the server sent is answered `-32600`, and a notification is dropped. A dropped `textDocument/publishDiagnostics` marks its file `evicted` until the server publishes it again. When the file cannot be read from the frame, every file the server reported on is marked the same way, and files it never reported on read `evicted` only until the server's next write. The connection stays up and later messages are read. A frame announced above 256 MiB closes the connection, so a server that streams without end is still stopped.
 
 While mcpls skips a frame it cannot read anything else from that server. A server that announces a large frame and then stops writing leaves its requests timing out until you call `restart_server`. The same holds for a stalled frame under 10 MiB, over a window 25 times narrower.
 

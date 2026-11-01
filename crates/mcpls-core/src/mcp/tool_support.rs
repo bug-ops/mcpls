@@ -9,8 +9,8 @@ use std::borrow::Cow;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Serialize, Serializer};
 
-use crate::bridge::{Capability, RouteSupport, ToolSupportSnapshot};
-use crate::config::{LanguageId, ToolKind, ToolPrefix};
+use crate::bridge::{Capability, MemberStatus, MemberSupport, RouteSupport, ToolSupportSnapshot};
+use crate::config::{LanguageId, ServerId, ToolKind, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
 
 /// Where a tool's request is served.
@@ -235,10 +235,8 @@ impl ToolCoverage {
                 RouteSupport::Supported { .. } | RouteSupport::PushOnly { .. } => {
                     supported = supported.saturating_add(1);
                 }
-                RouteSupport::Initializing { .. } => initializing = true,
-                RouteSupport::CapabilityNotAdvertised { .. }
-                | RouteSupport::Unavailable { .. }
-                | RouteSupport::NoServer => {}
+                RouteSupport::Initializing => initializing = true,
+                RouteSupport::CapabilityNotAdvertised { .. } | RouteSupport::NoServer => {}
             }
         }
         if total == 0 {
@@ -255,12 +253,89 @@ impl ToolCoverage {
     }
 }
 
+/// One route as the report spells it: the wire shape of [`RouteSupport`] and
+/// [`MemberSupport`], where a fan-out member's server is optional so both
+/// serialize alike.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RouteStatus {
+    /// The routed server is registered and advertises the tool's capability.
+    Supported {
+        /// The routed server.
+        server: ServerId,
+    },
+    /// Registered and publishing diagnostics without a pull provider: answers come from the push cache.
+    PushOnly {
+        /// The routed server.
+        server: ServerId,
+    },
+    /// Registered but does not advertise the capability.
+    CapabilityNotAdvertised {
+        /// The routed server.
+        server: ServerId,
+        /// The capability the server does not advertise.
+        capability: Capability,
+    },
+    /// The routed server is still initializing, or its capabilities are unknown.
+    Initializing {
+        /// Set for fan-out members only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "ServerId")]
+        server: Option<ServerId>,
+    },
+    /// Failed to start or died; this check does not restart it.
+    Unavailable {
+        /// The server.
+        server: ServerId,
+    },
+    /// No server is routed for this tool.
+    NoServer,
+}
+
+impl From<&RouteSupport> for RouteStatus {
+    fn from(support: &RouteSupport) -> Self {
+        match support {
+            RouteSupport::Supported { server } => Self::Supported {
+                server: server.clone(),
+            },
+            RouteSupport::PushOnly { server } => Self::PushOnly {
+                server: server.clone(),
+            },
+            RouteSupport::CapabilityNotAdvertised { server, capability } => {
+                Self::CapabilityNotAdvertised {
+                    server: server.clone(),
+                    capability: *capability,
+                }
+            }
+            RouteSupport::Initializing => Self::Initializing { server: None },
+            RouteSupport::NoServer => Self::NoServer,
+        }
+    }
+}
+
+impl From<&MemberSupport> for RouteStatus {
+    fn from(member: &MemberSupport) -> Self {
+        let server = member.server().clone();
+        match member.status() {
+            MemberStatus::Supported => Self::Supported { server },
+            MemberStatus::CapabilityNotAdvertised { capability } => Self::CapabilityNotAdvertised {
+                server,
+                capability: *capability,
+            },
+            MemberStatus::Initializing => Self::Initializing {
+                server: Some(server),
+            },
+            MemberStatus::Unavailable => Self::Unavailable { server },
+        }
+    }
+}
+
 /// The languages of one tool that share an identical [`RouteSupport`].
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LanguageGroup {
     languages: Vec<LanguageId>,
     #[serde(flatten)]
-    support: RouteSupport,
+    support: RouteStatus,
 }
 
 /// The routes of one tool in the report.
@@ -277,7 +352,7 @@ pub(super) enum ToolRoutes {
     Workspace(RouteSupport),
     /// Workspace-wide tool asked of several servers: one route per server, in
     /// config order.
-    FanOut(Vec<RouteSupport>),
+    FanOut(Vec<MemberSupport>),
 }
 
 impl ToolRoutes {
@@ -286,6 +361,7 @@ impl ToolRoutes {
     fn grouped(routes: Vec<(LanguageId, RouteSupport)>) -> Self {
         let mut groups: Vec<LanguageGroup> = Vec::new();
         for (language, support) in routes {
+            let support = RouteStatus::from(&support);
             match groups.iter_mut().find(|group| group.support == support) {
                 Some(group) => group.languages.push(language),
                 None => groups.push(LanguageGroup {
@@ -309,7 +385,7 @@ impl ToolRoutes {
 struct RouteShape {
     languages: Option<Vec<LanguageId>>,
     #[serde(flatten)]
-    support: RouteSupport,
+    support: RouteStatus,
 }
 
 impl JsonSchema for ToolRoutes {
@@ -326,8 +402,10 @@ impl Serialize for ToolRoutes {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Document(groups) => serializer.collect_seq(groups),
-            Self::Workspace(support) => serializer.collect_seq(std::iter::once(support)),
-            Self::FanOut(members) => serializer.collect_seq(members),
+            Self::Workspace(support) => {
+                serializer.collect_seq(std::iter::once(RouteStatus::from(support)))
+            }
+            Self::FanOut(members) => serializer.collect_seq(members.iter().map(RouteStatus::from)),
         }
     }
 }
@@ -450,15 +528,11 @@ mod tests {
             ToolCoverage::Partial
         );
         assert_eq!(
-            ToolCoverage::from_routes(
-                [supported(), RouteSupport::Initializing { server: None }].iter()
-            ),
+            ToolCoverage::from_routes([supported(), RouteSupport::Initializing].iter()),
             ToolCoverage::Partial
         );
         assert_eq!(
-            ToolCoverage::from_routes(
-                [missing.clone(), RouteSupport::Initializing { server: None }].iter()
-            ),
+            ToolCoverage::from_routes([missing.clone(), RouteSupport::Initializing].iter()),
             ToolCoverage::Unknown
         );
         assert_eq!(
@@ -530,7 +604,7 @@ mod tests {
             server: ServerId::from_static("ts"),
         };
         assert_eq!(
-            serde_json::to_value(&push_only).unwrap(),
+            serde_json::to_value(RouteStatus::from(&push_only)).unwrap(),
             serde_json::json!({"status": "push_only", "server": "ts"})
         );
         assert_eq!(
@@ -549,14 +623,19 @@ mod tests {
 
     #[test]
     fn fan_out_routes_serialize_one_entry_per_server_without_languages() {
+        let member = |server: &'static str, status| {
+            MemberSupport::new(ServerId::from_static(server), status)
+        };
         let routes = ToolRoutes::FanOut(vec![
-            supported(),
-            RouteSupport::Initializing {
-                server: Some(ServerId::from_static("b")),
-            },
-            RouteSupport::Unavailable {
-                server: ServerId::from_static("c"),
-            },
+            member("s", MemberStatus::Supported),
+            member("b", MemberStatus::Initializing),
+            member("c", MemberStatus::Unavailable),
+            member(
+                "d",
+                MemberStatus::CapabilityNotAdvertised {
+                    capability: Capability::WorkspaceSymbols,
+                },
+            ),
         ]);
         assert_eq!(
             serde_json::to_value(&routes).unwrap(),
@@ -564,6 +643,11 @@ mod tests {
                 {"status": "supported", "server": "s"},
                 {"status": "initializing", "server": "b"},
                 {"status": "unavailable", "server": "c"},
+                {
+                    "status": "capability_not_advertised",
+                    "server": "d",
+                    "capability": "workspaceSymbolProvider",
+                },
             ])
         );
     }
@@ -571,19 +655,8 @@ mod tests {
     #[test]
     fn an_anonymous_initializing_route_omits_the_server() {
         assert_eq!(
-            serde_json::to_value(RouteSupport::Initializing { server: None }).unwrap(),
+            serde_json::to_value(RouteStatus::from(&RouteSupport::Initializing)).unwrap(),
             serde_json::json!({"status": "initializing"})
-        );
-    }
-
-    #[test]
-    fn an_unavailable_route_counts_as_unsupported_not_initializing() {
-        let unavailable = RouteSupport::Unavailable {
-            server: ServerId::from_static("c"),
-        };
-        assert_eq!(
-            ToolCoverage::from_routes([&unavailable].into_iter()),
-            ToolCoverage::Unsupported
         );
     }
 }

@@ -31,8 +31,8 @@ A tool that is sent to several servers at once, today `workspace_symbol_search` 
 
 ```json
 {
-  "tool": "workspace_symbol_search",
-  "coverage": "some",
+  "name": "workspace_symbol_search",
+  "coverage": "all",
   "routes": [
     { "server": "rust-analyzer", "status": "supported" },
     { "server": "pyright", "status": "unavailable" }
@@ -40,7 +40,7 @@ A tool that is sent to several servers at once, today `workspace_symbol_search` 
 }
 ```
 
-`coverage` is computed over the whole set, and an `unavailable` member counts as having no server. A server that untrusted-workspace mode refused is not listed. With a single eligible server the entry keeps its usual shape.
+`coverage` follows the aggregate of the set, not the per-server list: it is `all` as soon as one member is `supported`, whatever the others report (as in the example), `unknown` when none is but one is `initializing`, and `none` otherwise. Read the routes to see which servers will not answer. A server that untrusted-workspace mode refused is not listed. With a single eligible server the entry keeps its usual shape.
 
 `supported` means the call will be dispatched, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.
 

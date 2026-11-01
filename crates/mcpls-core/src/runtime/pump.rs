@@ -344,6 +344,7 @@ impl Pump {
                 PublishDelivery::Lost(files) => {
                     self.apply_lost(&files, &mut inputs.lifecycle).await
                 }
+                PublishDelivery::LostUnidentified => self.apply_unidentified_loss().await,
                 PublishDelivery::LostUnnamed => self.apply_unnamed_loss().await,
             };
             if flow == Flow::Stop {
@@ -478,6 +479,21 @@ impl Pump {
             .lock()
             .await
             .record_lost_files(&self.server_id, &published);
+        publish_invalidated(&self.subs, &changed).await;
+        Flow::Continue
+    }
+
+    /// Evicts every entry the server pushed, since a publish it sent could not
+    /// be read, and tells the subscribers of the files that changed.
+    async fn apply_unidentified_loss(&self) -> Flow {
+        if !self.role_rx.borrow().caches() {
+            return Flow::Continue;
+        }
+        let changed = self
+            .notification_cache
+            .lock()
+            .await
+            .record_unidentified_loss(&self.server_id);
         publish_invalidated(&self.subs, &changed).await;
         Flow::Continue
     }
@@ -1486,6 +1502,123 @@ mod pump_tests {
             "notified once"
         );
         assert_matches!(rx_other.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    /// lsp/014 FR-013: a publish the transport could not read, named or not,
+    /// replaces the cached entry with the evicted state every surface reads
+    /// (`availability` is what `get_diagnostics`, `get_cached_diagnostics` and
+    /// the resource share), notifies the file's subscriber exactly once, and
+    /// the server's next publish restores the entry.
+    #[tokio::test]
+    async fn test_lost_publish_evicts_notifies_once_and_the_next_publish_restores() {
+        use crate::bridge::DiagnosticsAvailability::{Evicted, Published};
+        use crate::lsp::LostPublish;
+        use crate::mcp::{SessionHandle, Target};
+
+        let server = ServerId::from_static("rust");
+        for lost in [
+            LostPublish::File(test_uri("a.rs")),
+            LostPublish::Unidentified,
+        ] {
+            let subs = make_subs();
+            let session = SessionHandle::new(subs.clone());
+            let (tx_sub, mut rx_sub) = mpsc::channel(8);
+            let resource = test_mcp_uri("a.rs");
+            session
+                .subscribe_for_test(&resource, Target::Channel(tx_sub.clone()))
+                .await
+                .unwrap();
+            let cache = make_cache();
+            let (feed, _cancel) =
+                spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
+            let with_error = |message: &str| {
+                LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+                    uri: test_uri("a.rs"),
+                    diagnostics: vec![lsp_types::Diagnostic {
+                        message: message.to_owned().into(),
+                        ..lsp_types::Diagnostic::default()
+                    }],
+                    version: None,
+                })
+            };
+
+            feed.send(with_error("first error")).await.unwrap();
+            assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
+            assert_eq!(
+                cache
+                    .lock()
+                    .await
+                    .availability(&test_uri("a.rs"), Some(&server)),
+                Published
+            );
+
+            feed.send(LspNotification::LostPublish(lost)).await.unwrap();
+            assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_matches!(rx_sub.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+            {
+                let cache = cache.lock().await;
+                assert!(!cache.has_diagnostics(&test_uri("a.rs")));
+                assert_eq!(
+                    cache.availability(&test_uri("a.rs"), Some(&server)),
+                    Evicted
+                );
+            }
+
+            feed.send(with_error("second error")).await.unwrap();
+            assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
+            let cache = cache.lock().await;
+            assert!(cache.has_diagnostics(&test_uri("a.rs")));
+            assert_eq!(
+                cache.availability(&test_uri("a.rs"), Some(&server)),
+                Published
+            );
+        }
+    }
+
+    /// lsp/014 Q1 (best effort): a delivery queued for the old pump of a
+    /// respawned server never evicts the replacement's entries. The pump is
+    /// parked on the cache lock with the loss in hand, aborted as respawn does,
+    /// and the replacement writes under the lock the pump was waiting for.
+    #[tokio::test]
+    async fn test_a_queued_delivery_never_evicts_the_replacements_entries() {
+        let server = ServerId::from_static("rust");
+        let uri = test_uri("a.rs");
+        let (messages_tx, messages_rx) = mpsc::channel(4);
+        let (sink, publish_rx) = crate::lsp::NotificationSink::new(messages_tx);
+        let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+        let cache = make_cache();
+        let mut guard = cache.lock().await;
+        sink.publishes().lose(crate::lsp::LostPublish::Unidentified);
+        let pump = tokio::spawn(diagnostics_pump(
+            server.clone(),
+            NotificationInbox::new(messages_rx, publish_rx),
+            lifecycle_rx,
+            CancellationToken::new(),
+            watch::channel(DiagnosticsRole::Authoritative).1,
+            None,
+            PumpShared {
+                roles: DiagnosticsRoles::default(),
+                notification_cache: Arc::clone(&cache),
+                subs: make_subs(),
+                workspace_roots: test_workspace_roots(),
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !sink.publishes().has_undelivered_loss(),
+            "the pump must have taken the loss"
+        );
+        assert!(!pump.is_finished(), "the pump must be parked on the lock");
+
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+        guard.clear_server_diagnostics(&server);
+        guard.store_diagnostics(&server, &uri, None, vec![lsp_types::Diagnostic::default()]);
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        assert!(cache.lock().await.has_diagnostics(&uri));
     }
 
     /// A pull that changed a file notifies the subscribers of that file only.
@@ -2727,6 +2860,65 @@ mod burst_tests {
                 .availability(&lost, Some(&ServerId::from_static("rust"))),
             DiagnosticsAvailability::Evicted
         );
+    }
+
+    /// lsp/014: an unreadable publish evicts what the server pushed, only
+    /// while this pump is the one that caches.
+    #[tokio::test]
+    async fn test_unidentified_loss_evicts_the_pushed_entries_unless_demoted() {
+        let server = ServerId::from_static("rust");
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        for (role, evicted) in [
+            (DiagnosticsRole::Authoritative, true),
+            (DiagnosticsRole::Secondary, false),
+        ] {
+            let uri = bridge::path_to_uri(&root.join("a.rs")).unwrap();
+            let (messages_tx, messages_rx) = mpsc::channel(4);
+            let (sink, publish_rx) = NotificationSink::new(messages_tx);
+            sink.publishes().lose(crate::lsp::LostPublish::Unidentified);
+            drop(sink);
+            let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
+            drop(lifecycle_tx);
+            let cache = make_cache();
+            cache.lock().await.store_diagnostics(
+                &server,
+                &uri,
+                None,
+                vec![Diagnostic {
+                    message: "old".to_owned().into(),
+                    ..Diagnostic::default()
+                }],
+            );
+
+            let pump = tokio::spawn(diagnostics_pump(
+                server.clone(),
+                NotificationInbox::new(messages_rx, publish_rx),
+                lifecycle_rx,
+                CancellationToken::new(),
+                watch::channel(role).1,
+                None,
+                shared_over(
+                    &cache,
+                    WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
+                ),
+            ));
+            tokio::time::timeout(Duration::from_secs(60), pump)
+                .await
+                .expect("the pump must end once the mailbox is drained and closed")
+                .unwrap();
+
+            let cache = cache.lock().await;
+            assert_eq!(cache.has_diagnostics(&uri), !evicted);
+            assert_eq!(
+                cache.availability(&uri, Some(&server)),
+                if evicted {
+                    DiagnosticsAvailability::Evicted
+                } else {
+                    DiagnosticsAvailability::Published
+                }
+            );
+        }
     }
 
     /// #742: a demotion while the lost files are still resolving stops the

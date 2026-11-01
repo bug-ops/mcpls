@@ -13,14 +13,16 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams, Uri};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::bridge::{BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES};
-use crate::util::{MAX_LOG_STRING_BYTES, WarnLimiter, escape_bounded, lock_std};
+use crate::json_envelope::MAX_LOST_URI_BYTES;
+use crate::lsp::types::LostPublish;
+use crate::util::{DropCounter, MAX_LOG_STRING_BYTES, escape_bounded, lock_std};
 
 /// Most files with an undelivered publish; as many as the cache holds, so the
 /// mailbox is never the narrower bound.
@@ -30,10 +32,11 @@ pub const MAX_PENDING_PUBLISHES: usize = MAX_DIAGNOSTIC_ENTRIES;
 pub const MAILBOX_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Most lost files remembered per server before only the fact of a loss is.
+///
+/// Each remembered file holds a URI of up to `MAX_LOST_URI_BYTES`, so the list
+/// retains at most 1000 x 16 KiB = 16 MiB per server, outside the
+/// `MAILBOX_MAX_BYTES` budget of undelivered diagnostics.
 const MAX_LOST_FILES: usize = MAX_DIAGNOSTIC_ENTRIES;
-
-/// Period of the dropped-frame warning of one lane.
-pub const DROP_WARN_PERIOD: Duration = WarnLimiter::DEFAULT_PERIOD;
 
 /// What the mailbox holds at most.
 #[derive(Debug, Clone, Copy)]
@@ -49,36 +52,6 @@ impl Default for MailboxLimits {
         Self {
             max_pending: MAX_PENDING_PUBLISHES,
             max_bytes: MAILBOX_MAX_BYTES,
-        }
-    }
-}
-
-/// Counts dropped frames and says when one is worth a warning: at most once
-/// per [`DROP_WARN_PERIOD`], so a flood cannot flood the log.
-#[derive(Debug, Default)]
-pub struct DropCounter {
-    warn: WarnLimiter,
-    suppressed: usize,
-}
-
-impl DropCounter {
-    /// A counter whose first drop warns at once.
-    pub const fn new() -> Self {
-        Self {
-            warn: WarnLimiter::new(),
-            suppressed: 0,
-        }
-    }
-
-    /// Records one drop at `now`. `Some(n)` when a warning is due, with `n` the
-    /// drops silenced since the previous warning; the caller logs it once it
-    /// holds no lock.
-    pub fn record(&mut self, now: Instant) -> Option<usize> {
-        if self.warn.due(now, DROP_WARN_PERIOD) {
-            Some(std::mem::take(&mut self.suppressed))
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
-            None
         }
     }
 }
@@ -162,8 +135,15 @@ pub enum PublishDelivery {
     Publish(BoundedPublish),
     /// Named files whose publish never made it into the mailbox.
     Lost(LostFiles),
-    /// More files were lost than the mailbox could name. Handed over on its
-    /// own, after the pending publishes.
+    /// A publish was lost whose file is unknown, or named files were lost
+    /// past what the mailbox can list: every file the server pushed is
+    /// suspect, so each pushed entry is evicted and the overflow mark is set.
+    /// Handed over after the named losses and before the pending publishes,
+    /// which are all newer than the loss.
+    LostUnidentified,
+    /// More files were lost than the mailbox could name. Only the overflow
+    /// mark is set; entries the cache holds are kept. Handed over on its own,
+    /// after the pending publishes.
     LostUnnamed,
 }
 
@@ -185,6 +165,16 @@ struct Pending {
     seq: u64,
 }
 
+/// Losses the mailbox cannot name a file for; the later variant subsumes the
+/// earlier ones, since it evicts everything the earlier ones would.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UnnamedLoss {
+    #[default]
+    None,
+    Overflowed,
+    Unidentified,
+}
+
 #[derive(Debug, Default)]
 struct State {
     pending: HashMap<DiagnosticsKey, Pending>,
@@ -196,8 +186,9 @@ struct State {
     bytes: usize,
     lost: Vec<Uri>,
     lost_keys: HashSet<DiagnosticsKey>,
-    lost_overflowed: bool,
+    unnamed_loss: UnnamedLoss,
     drops: DropCounter,
+    lost_frames: DropCounter,
     writer_gone: bool,
     reader_gone: bool,
 }
@@ -240,11 +231,15 @@ impl State {
         }
     }
 
-    /// The next delivery that is ready: lost files, then pending publishes in
-    /// arrival order, then the unnamed losses.
+    /// The next delivery that is ready: lost files, an unidentified loss, then
+    /// pending publishes in arrival order, then the unnamed losses.
     fn next_ready(&mut self) -> Option<PublishDelivery> {
         if let Some(lost) = self.take_lost_files() {
             return Some(PublishDelivery::Lost(lost));
+        }
+        if self.unnamed_loss == UnnamedLoss::Unidentified {
+            self.unnamed_loss = UnnamedLoss::None;
+            return Some(PublishDelivery::LostUnidentified);
         }
         while let Some((key, seq)) = self.order.pop_front() {
             let Entry::Occupied(entry) = self.pending.entry(key) else {
@@ -257,7 +252,8 @@ impl State {
             self.bytes = self.bytes.saturating_sub(pending.bytes);
             return Some(PublishDelivery::Publish(pending.publish));
         }
-        std::mem::take(&mut self.lost_overflowed).then_some(PublishDelivery::LostUnnamed)
+        (std::mem::take(&mut self.unnamed_loss) == UnnamedLoss::Overflowed)
+            .then_some(PublishDelivery::LostUnnamed)
     }
 
     fn mark_lost(&mut self, key: DiagnosticsKey, uri: Uri) {
@@ -265,11 +261,36 @@ impl State {
             return;
         }
         if self.lost.len() >= MAX_LOST_FILES {
-            self.lost_overflowed = true;
+            self.unnamed_loss = self.unnamed_loss.max(UnnamedLoss::Overflowed);
             return;
         }
         self.lost_keys.insert(key);
         self.lost.push(uri);
+    }
+
+    /// Records the loss of the publish of `key`; a full list of lost files
+    /// escalates to an unidentified loss, which loses more than the overflow
+    /// mark of [`Self::mark_lost`] does.
+    fn lose_named(&mut self, key: DiagnosticsKey, uri: Uri) {
+        self.withdraw(&key);
+        if self.lost_keys.contains(&key) {
+            return;
+        }
+        if self.lost.len() >= MAX_LOST_FILES {
+            self.lose_all();
+            return;
+        }
+        self.lost_keys.insert(key);
+        self.lost.push(uri);
+    }
+
+    /// Records a loss that no file can be named for: every pending publish
+    /// predates it and is withdrawn.
+    fn lose_all(&mut self) {
+        self.pending.clear();
+        self.order.clear();
+        self.bytes = 0;
+        self.unnamed_loss = UnnamedLoss::Unidentified;
     }
 
     fn take_lost_files(&mut self) -> Option<LostFiles> {
@@ -376,6 +397,52 @@ impl PublishWriter {
             );
         }
         self.shared.wake.notify_one();
+    }
+
+    /// Records a `publishDiagnostics` that was dropped before it could be
+    /// buffered because its frame could not be decoded.
+    ///
+    /// A named file is marked lost like one the mailbox could not hold, and its
+    /// pending publish is withdrawn, since the lost one was newer. An
+    /// unidentified loss (or a file named by more than [`MAX_LOST_URI_BYTES`]
+    /// bytes) withdraws every pending publish and has the reader hand over
+    /// [`PublishDelivery::LostUnidentified`]. Every source of a lost publish
+    /// passes here, so this is the one place that warns about it: at most
+    /// once per period of [`WarnLimiter::DEFAULT_PERIOD`][period], without the
+    /// URI or any frame content.
+    ///
+    /// [period]: crate::util::WarnLimiter::DEFAULT_PERIOD
+    pub fn lose(&self, lost: LostPublish) {
+        let mut state = lock_std(&self.shared.state);
+        if state.reader_gone {
+            return;
+        }
+        match lost {
+            LostPublish::File(uri) if uri.as_ref().len() <= MAX_LOST_URI_BYTES => {
+                let key = DiagnosticsKey::of(&uri);
+                state.lose_named(key, uri);
+            }
+            LostPublish::File(_) | LostPublish::Unidentified => state.lose_all(),
+        }
+        let warn_due = state.lost_frames.record(Instant::now());
+        drop(state);
+        if let Some(suppressed) = warn_due {
+            warn!(
+                suppressed,
+                "dropped an unreadable publishDiagnostics; its files read as evicted until the \
+                 server publishes them again"
+            );
+        }
+        self.shared.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl PublishWriter {
+    /// Whether a loss is recorded that the reader has not taken yet.
+    pub(crate) fn has_undelivered_loss(&self) -> bool {
+        let state = lock_std(&self.shared.state);
+        !state.lost.is_empty() || state.unnamed_loss != UnnamedLoss::None
     }
 }
 
@@ -517,7 +584,10 @@ impl Lane {
 }
 
 /// Counts the frames one lane dropped and warns about them at most once per
-/// [`DROP_WARN_PERIOD`], naming the lane and the count since the last warning.
+/// [`WarnLimiter::DEFAULT_PERIOD`][period], naming the lane and the count
+/// since the last warning.
+///
+/// [period]: crate::util::WarnLimiter::DEFAULT_PERIOD
 #[derive(Debug)]
 pub struct DropLog {
     lane: Lane,
@@ -785,18 +855,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_counter_warns_once_per_period_and_counts_the_silenced() {
-        let mut counter = DropCounter::new();
-        let start = Instant::now();
-        let at = |secs| start + Duration::from_secs(secs);
-
-        assert_eq!(counter.record(at(0)), Some(0));
-        assert_eq!(counter.record(at(1)), None);
-        assert_eq!(counter.record(at(2)), None);
-        assert_eq!(counter.record(at(61)), Some(2));
-    }
-
-    #[test]
     fn each_lane_has_its_own_drop_log() {
         for lane in [Lane::Notification, Lane::Lifecycle] {
             assert_eq!(DropLog::of(lane).lane, lane);
@@ -818,7 +876,9 @@ mod tests {
             match item {
                 PublishDelivery::Publish(_) => delivered += 1,
                 PublishDelivery::Lost(files) => lost += files.uris().len(),
-                PublishDelivery::LostUnnamed => panic!("no unnamed losses expected"),
+                PublishDelivery::LostUnidentified | PublishDelivery::LostUnnamed => {
+                    panic!("no unnamed losses expected")
+                }
             }
         }
         assert_eq!((delivered, lost), (3, 7));
@@ -838,6 +898,95 @@ mod tests {
         assert_eq!(lost.uris().len(), MAX_LOST_FILES);
         assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnnamed));
         assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn named_loss_withdraws_the_pending_publish_of_its_file_only() {
+        let (writer, mut reader) = mailbox(MailboxLimits::default());
+        writer.publish(publish_of(1, "old"));
+        writer.publish(publish_of(2, "kept"));
+
+        writer.lose(LostPublish::File(uri(1)));
+        drop(writer);
+
+        let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
+            panic!("expected the lost file first");
+        };
+        assert_eq!(lost.uris(), [uri(1)]);
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
+        assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn unidentified_loss_withdraws_every_pending_publish_and_comes_before_later_ones() {
+        let (writer, mut reader) = mailbox(MailboxLimits::default());
+        writer.publish(publish_of(1, "old"));
+        writer.publish(publish_of(2, "old"));
+
+        writer.lose(LostPublish::Unidentified);
+        writer.publish(publish_of(3, "new"));
+        drop(writer);
+
+        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
+        assert_eq!(next_publish(&mut reader).await.uri(), &uri(3));
+        assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn named_loss_with_a_full_lost_list_escalates_to_an_unidentified_loss() {
+        let (writer, mut reader) = mailbox(small(0, usize::MAX));
+        for n in 0..MAX_LOST_FILES {
+            writer.publish(publish_of(n, "e"));
+        }
+
+        writer.lose(LostPublish::File(uri(MAX_LOST_FILES)));
+        drop(writer);
+
+        assert_matches!(reader.recv().await, Some(PublishDelivery::Lost(_)));
+        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
+        assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_file_named_by_too_long_a_uri_is_an_unidentified_loss() {
+        let (writer, mut reader) = mailbox(MailboxLimits::default());
+        let long = Uri::from(format!("file:///{}", "u".repeat(MAX_LOST_URI_BYTES)));
+
+        writer.lose(LostPublish::File(long));
+        drop(writer);
+
+        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
+    }
+
+    #[tokio::test]
+    async fn every_source_of_a_lost_publish_warns_once_per_period_without_the_uri() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs = crate::test_lsp::CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+        let (writer, _reader) = mailbox(MailboxLimits::default());
+
+        writer.lose(LostPublish::File(uri(1)));
+        writer.lose(LostPublish::Unidentified);
+        writer.lose(LostPublish::File(uri(2)));
+
+        let warnings: Vec<String> = logs
+            .entries()
+            .into_iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, message)| message)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!warnings[0].contains("f1.rs"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_loss_after_the_reader_is_gone_is_ignored() {
+        let (writer, reader) = mailbox(MailboxLimits::default());
+        drop(reader);
+
+        writer.lose(LostPublish::Unidentified);
     }
 
     #[tokio::test]

@@ -1295,7 +1295,6 @@ mod plan_tests {
                             .server_config()
                             .initialization_options
                             .as_ref()
-                            .map(crate::config::InitializationOptions::as_value)
                     ),
                     Some(tsserver)
                 );

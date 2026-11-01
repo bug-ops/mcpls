@@ -90,7 +90,7 @@ pub use restart::{
     ServerIds, ServerIdsError, ServerRestartEntry,
 };
 pub use routing::Capability;
-pub use support::{RouteSupport, ToolSupportSnapshot};
+pub use support::{MemberStatus, MemberSupport, RouteSupport, ToolSupportSnapshot};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.
 ///
@@ -1035,7 +1035,7 @@ mod tests {
                 translator
                     .tool_support_snapshot()
                     .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-                RouteSupport::Initializing { server: None }
+                RouteSupport::Initializing
             );
             assert!(
                 logs.entries()
@@ -1083,7 +1083,7 @@ mod tests {
             translator
                 .tool_support_snapshot()
                 .document_support(&LanguageId::from_static("rust"), ToolKind::Hover),
-            RouteSupport::Initializing { server: None }
+            RouteSupport::Initializing
         );
 
         translator.settle_failed(&spawn_failure(&configs[0]));

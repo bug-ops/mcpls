@@ -22,9 +22,23 @@ const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
 /// assert!(!format!("{options:?}").contains("hunter2"));
 /// assert_eq!(options.as_value()["token"], "hunter2");
 /// ```
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct InitializationOptions(Value);
+
+impl<'de> Deserialize<'de> for InitializationOptions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        find_toml_datetime(None, &value).map_or_else(
+            || Ok(Self(value)),
+            |datetime| {
+                Err(serde::de::Error::custom(format_args!(
+                    "initialization_options {datetime}"
+                )))
+            },
+        )
+    }
+}
 
 impl std::fmt::Debug for InitializationOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,8 +91,24 @@ pub enum InvalidLspSettings {
     },
 
     /// A TOML datetime appears in the settings, which JSON cannot represent.
-    #[error("settings value at `{path}` is a TOML datetime, which is not supported")]
-    Datetime {
+    #[error("settings {0}")]
+    Datetime(TomlDatetime),
+}
+
+/// Location of a TOML datetime found in a free-form table, which JSON cannot
+/// represent.
+///
+/// Shared by `settings` and `initialization_options` so both reject a
+/// datetime with the same wording.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TomlDatetime {
+    /// The whole value is a datetime.
+    #[error("value is a TOML datetime, which is not supported")]
+    Root,
+
+    /// A nested value is a datetime.
+    #[error("value at `{path}` is a TOML datetime, which is not supported")]
+    At {
         /// Dotted path of the datetime value.
         path: String,
     },
@@ -132,7 +162,9 @@ impl LspSettings {
         let mut plain = Map::new();
         let mut dotted = Vec::new();
         for (key, value) in raw {
-            reject_datetime(&key, &value)?;
+            if let Some(datetime) = find_toml_datetime(Some(&key), &value) {
+                return Err(InvalidLspSettings::Datetime(datetime));
+            }
             let segments: Vec<String> = key.split('.').map(str::to_owned).collect();
             if segments.iter().any(String::is_empty) {
                 return Err(InvalidLspSettings::EmptySegment { key });
@@ -207,22 +239,25 @@ fn insert_at(
     Ok(())
 }
 
-fn reject_datetime(path: &str, value: &Value) -> Result<(), InvalidLspSettings> {
+/// Finds the first TOML datetime under `value`; `path` is `None` at the root.
+fn find_toml_datetime(path: Option<&str>, value: &Value) -> Option<TomlDatetime> {
     match value {
         Value::Object(map) => {
             if map.len() == 1 && map.contains_key(TOML_DATETIME_KEY) {
-                return Err(InvalidLspSettings::Datetime {
+                return Some(path.map_or(TomlDatetime::Root, |path| TomlDatetime::At {
                     path: path.to_owned(),
-                });
+                }));
             }
-            map.iter()
-                .try_for_each(|(key, inner)| reject_datetime(&format!("{path}.{key}"), inner))
+            map.iter().find_map(|(key, inner)| {
+                let child = path.map_or_else(|| key.clone(), |parent| format!("{parent}.{key}"));
+                find_toml_datetime(Some(&child), inner)
+            })
         }
-        Value::Array(items) => items
-            .iter()
-            .enumerate()
-            .try_for_each(|(index, inner)| reject_datetime(&format!("{path}[{index}]"), inner)),
-        _ => Ok(()),
+        Value::Array(items) => items.iter().enumerate().find_map(|(index, inner)| {
+            let child = format!("{}[{index}]", path.unwrap_or_default());
+            find_toml_datetime(Some(&child), inner)
+        }),
+        _ => None,
     }
 }
 
@@ -317,6 +352,55 @@ mod tests {
         assert!(top.unwrap_err().to_string().contains("datetime"));
         let nested = toml::from_str::<Wrapper>("[settings.a]\nlist = [1979-05-27]\n");
         assert!(nested.unwrap_err().to_string().contains("datetime"));
+    }
+
+    #[test]
+    fn settings_datetime_message_is_unchanged() {
+        let err = parse(r#"{"when": {"$__toml_private_datetime": "1979-05-27"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("settings value at `when` is a TOML datetime, which is not supported"),
+            "{err}"
+        );
+        let nested = parse(r#"{"a": {"b": [1, {"$__toml_private_datetime": "1979-05-27"}]}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(nested.contains("value at `a.b[1]` is"), "{nested}");
+    }
+
+    #[test]
+    fn initialization_options_reject_datetime_with_position() {
+        type Wrapper = std::collections::HashMap<String, InitializationOptions>;
+        let err = toml::from_str::<Wrapper>(
+            "[initialization_options.nested]\nwhen = 1979-05-27T07:32:00Z\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(
+                "initialization_options value at `nested.when` is a TOML datetime, which is not supported"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("line 1, column 2"), "{err}");
+    }
+
+    #[test]
+    fn initialization_options_accept_plain_values() {
+        let options: InitializationOptions =
+            serde_json::from_str(r#"{"a": [1, {"b": "2020-01-01"}]}"#).unwrap();
+        assert_eq!(options.as_value(), &json!({"a": [1, {"b": "2020-01-01"}]}));
+    }
+
+    #[test]
+    fn root_datetime_has_no_path() {
+        let value = json!({TOML_DATETIME_KEY: "1979-05-27"});
+        assert_eq!(find_toml_datetime(None, &value), Some(TomlDatetime::Root));
+        assert_eq!(
+            TomlDatetime::Root.to_string(),
+            "value is a TOML datetime, which is not supported"
+        );
     }
 
     #[test]

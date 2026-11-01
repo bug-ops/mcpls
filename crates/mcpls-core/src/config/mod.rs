@@ -58,7 +58,7 @@ pub use server_env::{
     DuplicateEnvKey, EnvKey, EnvTooLarge, EnvValue, InvalidEnvKey, InvalidEnvValue,
     InvalidServerEnv, MAX_ENV_TOTAL_BYTES, ServerEnv,
 };
-pub use settings::{InitializationOptions, InvalidLspSettings, LspSettings};
+pub use settings::{InitializationOptions, InvalidLspSettings, LspSettings, TomlDatetime};
 use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;
 pub use trust::{ServerAllowlist, WorkspaceTrust};
@@ -2559,6 +2559,33 @@ mod tests {
             err.message().contains("lsp_servers entry 'mine'"),
             "{}",
             err.message()
+        );
+    }
+
+    #[test]
+    fn test_initialization_options_datetime_is_a_load_error_like_settings() {
+        let build = |table: &str| {
+            format!(
+                "[[lsp_servers]]\nlanguage_id = \"python\"\ncommand = \"pylsp\"\n\
+                 [lsp_servers.{table}]\nwhen = 1979-05-27T07:32:00Z\n"
+            )
+        };
+        let options = toml::from_str::<ServerConfig>(&build("initialization_options")).unwrap_err();
+        assert!(
+            options.message().contains(
+                "initialization_options value at `when` is a TOML datetime, which is not supported"
+            ),
+            "{}",
+            options.message()
+        );
+        assert!(options.span().is_some());
+        let settings = toml::from_str::<ServerConfig>(&build("settings")).unwrap_err();
+        assert!(
+            settings
+                .message()
+                .contains("settings value at `when` is a TOML datetime, which is not supported"),
+            "{}",
+            settings.message()
         );
     }
 

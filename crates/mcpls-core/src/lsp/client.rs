@@ -16,12 +16,13 @@ use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader, MAX_CONTENT_LENGTH};
 use crate::lsp::types::{
-    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome, JsonRpcReply,
-    JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LspNotification, RequestId, UndecodableReason,
+    DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome,
+    JsonRpcReply, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LostPublish, LspNotification,
+    RequestId, UndecodableReason,
 };
-use crate::lsp::{DropCounter, DropLog, Lane, NotificationSink, ServerMessage};
+use crate::lsp::{DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
-use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;
+use crate::util::{DropCounter, MAX_ERROR_MESSAGE_CALLER_BYTES};
 
 mod cancel;
 mod notification;
@@ -348,6 +349,8 @@ struct Lanes {
 enum Route<'a> {
     /// The diagnostics mailbox.
     Mailbox(&'a NotificationSink, PublishDiagnosticsParams),
+    /// The diagnostics mailbox, told that a publish was lost.
+    Lost(&'a NotificationSink, LostPublish),
     /// The log and `showMessage` lane.
     Messages(&'a NotificationSink, ServerMessage),
     /// The lifecycle lane.
@@ -1109,6 +1112,7 @@ impl LspClient {
             LspNotification::PublishDiagnostics(params) => {
                 Route::Mailbox(&lanes.notifications, params)
             }
+            LspNotification::LostPublish(lost) => Route::Lost(&lanes.notifications, lost),
             LspNotification::LogMessage(params) => {
                 Route::Messages(&lanes.notifications, ServerMessage::Log(params))
             }
@@ -1151,6 +1155,10 @@ impl LspClient {
                     params.diagnostics.len()
                 );
                 sink.publishes().publish(params);
+                Delivery::Delivered
+            }
+            Route::Lost(sink, lost) => {
+                sink.publishes().lose(lost);
                 Delivery::Delivered
             }
             Route::Messages(sink, message) => delivery(
@@ -1360,7 +1368,13 @@ impl LspClient {
                 );
                 transport.send(&serde_json::to_value(&reply)?).await?;
             }
-            InboundMessage::UndecodableNotification | InboundMessage::UndecodableFrame => {}
+            InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost)) => {
+                if let Some(lanes) = lanes {
+                    lanes.notifications.publishes().lose(lost);
+                }
+            }
+            InboundMessage::UndecodableNotification(DroppedNotification::Other)
+            | InboundMessage::UndecodableFrame => {}
             InboundMessage::Request(request) => {
                 debug!(
                     "Received server request: {} (id={:?})",
@@ -1382,7 +1396,7 @@ impl LspClient {
                     let forwarded: Option<&dyn std::fmt::Debug> = match &route {
                         Route::Messages(_, message) => Some(message),
                         Route::Lifecycle(_, notification) => Some(notification),
-                        Route::Mailbox(..) | Route::Floor => None,
+                        Route::Mailbox(..) | Route::Lost(..) | Route::Floor => None,
                     };
                     if let Some(payload) = forwarded {
                         trace!(
@@ -1421,7 +1435,7 @@ impl LspClient {
                 }
             }
             LspNotification::Progress(params) => redactions.redact_progress(&mut params.value),
-            LspNotification::Other { .. } => {}
+            LspNotification::LostPublish(_) | LspNotification::Other { .. } => {}
         }
     }
 
@@ -1755,6 +1769,45 @@ mod tests {
         let shown = format!("{forwarded:?}");
         assert!(shown.contains("[redacted:API_TOKEN]"), "{shown}");
         assert!(!shown.contains("SuperSecretValue123"), "{shown}");
+    }
+
+    /// lsp/014: a publish the client cannot use reaches the mailbox as a loss,
+    /// whether it fails the typed decode, is malformed JSON, or names no file.
+    #[tokio::test]
+    async fn test_unusable_publishes_reach_the_mailbox_as_losses() {
+        use crate::lsp::PublishDelivery;
+        use crate::test_lsp::{fake_lsp_client_with_lanes, write_notification, write_raw_frame};
+
+        let (_client, mut server, mut lanes) = fake_lsp_client_with_lanes();
+        let head = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","#;
+
+        write_notification(
+            &mut server.read_half_stdin,
+            "textDocument/publishDiagnostics",
+            serde_json::json!({"uri": "file:///typed.rs", "diagnostics": "x"}),
+        )
+        .await;
+        write_raw_frame(
+            &mut server.read_half_stdin,
+            &format!(r#"{head}"params":{{"uri":"file:///malformed.rs","diagnostics":[}}}}"#),
+        )
+        .await;
+        write_raw_frame(&mut server.read_half_stdin, &format!(r#"{head}"x":1}}"#)).await;
+
+        let mut named = Vec::new();
+        loop {
+            let delivery = timeout(Duration::from_secs(2), lanes.publishes.recv())
+                .await
+                .unwrap();
+            match delivery {
+                Some(PublishDelivery::Lost(lost)) => {
+                    named.extend(lost.uris().iter().map(|uri| uri.as_ref().to_owned()));
+                }
+                Some(PublishDelivery::LostUnidentified) => break,
+                other => panic!("unexpected delivery {other:?}"),
+            }
+        }
+        assert_eq!(named, ["file:///typed.rs", "file:///malformed.rs"]);
     }
 
     /// With nothing to hide the notification is forwarded as received.

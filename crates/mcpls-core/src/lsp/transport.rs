@@ -13,16 +13,19 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lsp_types::Uri;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{Level, debug, trace, warn};
 
 use crate::error::{Error, RedactedText, Result};
-use crate::json_envelope::{Envelope, EnvelopeScan, Shape};
-use crate::lsp::DropCounter;
-use crate::lsp::types::{InboundMessage, RequestId, UndecodableReason};
+use crate::json_envelope::{Envelope, EnvelopeScan, Members, MessageKind, Shape};
+use crate::lsp::types::{
+    DroppedNotification, InboundMessage, JsonRpcNotification, JsonRpcVersion, LostPublish,
+    RequestId, UndecodableReason, is_publish_diagnostics,
+};
 use crate::redaction::Redactions;
-use crate::util::WarnLimiter;
+use crate::util::{DropCounter, WarnLimiter};
 
 /// Largest frame that is buffered and decoded (10 MiB).
 pub const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
@@ -223,11 +226,17 @@ impl LspTransportReader {
                 let envelope = self.skip_content(content_length).await?;
                 if let Some(suppressed) = self.skipped_frames.record(Instant::now()) {
                     warn!(
-                        "Skipped an oversized LSP frame of {content_length} bytes \
-                         ({suppressed} others skipped since the last warning)"
+                        bytes = content_length,
+                        limit = MAX_CONTENT_LENGTH,
+                        suppressed,
+                        "skipped an oversized LSP frame"
                     );
                 } else {
-                    debug!("Skipped an oversized LSP frame of {content_length} bytes");
+                    debug!(
+                        bytes = content_length,
+                        limit = MAX_CONTENT_LENGTH,
+                        "skipped an oversized LSP frame"
+                    );
                 }
                 return Ok(oversized_message(&envelope, content_length));
             }
@@ -355,7 +364,7 @@ impl LspTransportReader {
     ///
     /// [`Error::ServerTerminated`] when the stream ends inside the frame.
     async fn skip_content(&mut self, length: usize) -> Result<Envelope> {
-        let mut scan = EnvelopeScan::default();
+        let mut scan = EnvelopeScan::with_params_uri();
         let mut remaining = length;
         while remaining > 0 {
             let available = self.stdout.fill_buf().await?;
@@ -371,134 +380,44 @@ impl LspTransportReader {
     }
 }
 
-/// Whether a key is present, whatever its value (`null` included), the way
-/// [`Keys::of`] tests `value.get(key).is_some()`.
-#[derive(Default)]
-struct Present(bool);
-
-impl<'de> serde::Deserialize<'de> for Present {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_ignored_any(serde::de::IgnoredAny)?;
-        Ok(Self(true))
-    }
-}
-
-/// The `id` key of a message: whether it is present at all, and the request id
-/// it holds when that is a number or a string.
-#[derive(Default)]
-struct IdField {
-    present: bool,
-    id: Option<RequestId>,
-}
-
-impl<'de> serde::Deserialize<'de> for IdField {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        Ok(Self {
-            present: true,
-            id: Option::<RequestId>::deserialize(deserializer)?,
-        })
-    }
-}
-
-/// Which of the JSON-RPC keys a message carries; `outcome` is `result` or `error`.
-#[derive(Clone, Copy)]
-struct Keys {
-    method: bool,
-    id: bool,
-    outcome: bool,
-}
-
-/// What a message is, decided from its [`Keys`] alone, so a message that
-/// decodes and one that does not are classified by one rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageKind {
-    Request,
-    Notification,
-    Response,
-    /// An `id` with neither `result` nor `error` and no `method`.
-    IncompleteResponse,
-    Unrecognized,
-}
-
-impl Keys {
-    fn of(value: &Value) -> Self {
-        let has = |key: &str| value.get(key).is_some();
-        Self {
-            method: has("method"),
-            id: has("id"),
-            outcome: has("result") || has("error"),
-        }
-    }
-
-    const fn kind(self) -> MessageKind {
-        match (self.method, self.id, self.outcome) {
-            (true, true, _) => MessageKind::Request,
-            (true, false, _) => MessageKind::Notification,
-            (false, true, true) => MessageKind::Response,
-            (false, true, false) => MessageKind::IncompleteResponse,
-            (false, false, _) => MessageKind::Unrecognized,
-        }
-    }
-}
-
 /// The message to hand on for a frame whose body could not be decoded: what it
 /// was and, for a request or response, whom it addresses, recovered without
-/// building its body. Skipping values with `IgnoredAny` is iterative and
-/// tolerant, so what made the full decode fail (nesting past the parser's
-/// recursion limit, a lone surrogate escape, an out-of-range number) does not
-/// stop it.
+/// building its body. The scan is tolerant, so what made the full decode fail
+/// (nesting past the parser's recursion limit, a lone surrogate escape, an
+/// out-of-range number) does not stop it.
 fn undecodable_message(content: &[u8]) -> InboundMessage {
-    #[derive(serde::Deserialize)]
-    struct Envelope {
-        #[serde(default)]
-        id: IdField,
-        #[serde(default)]
-        method: Present,
-        #[serde(default)]
-        result: Present,
-        #[serde(default)]
-        error: Present,
-    }
-
-    // A top-level array would otherwise be read as the struct's fields in order.
-    let envelope = content
-        .trim_ascii_start()
-        .starts_with(b"{")
-        .then(|| serde_json::from_slice::<Envelope>(content).ok())
-        .flatten();
-    let Some(envelope) = envelope else {
-        return InboundMessage::UndecodableFrame;
-    };
-    let kind = Keys {
-        method: envelope.method.0,
-        id: envelope.id.present,
-        outcome: envelope.result.0 || envelope.error.0,
-    }
-    .kind();
-    undecodable_of_kind(kind, envelope.id.id, UndecodableReason::Malformed)
+    let mut scan = EnvelopeScan::with_params_uri();
+    scan.feed(content);
+    dropped_message(&scan.finish(), UndecodableReason::Malformed)
 }
 
 /// The message for a frame that was skipped for its size, from the envelope
-/// scanned while skipping it. Only a closed object says what it was.
+/// scanned while skipping it.
 fn oversized_message(envelope: &Envelope, bytes: usize) -> InboundMessage {
+    dropped_message(envelope, UndecodableReason::Oversized { bytes })
+}
+
+/// What a frame that could not be decoded was, from its scanned envelope. A
+/// `publishDiagnostics` is recognized whatever the shape of the rest, since
+/// losing one makes the cache stale; any other message needs a closed object.
+fn dropped_message(envelope: &Envelope, reason: UndecodableReason) -> InboundMessage {
+    let kind = envelope.kind();
+    if kind == MessageKind::Notification
+        && envelope
+            .method
+            .decode::<String>()
+            .is_some_and(|method| is_publish_diagnostics(&method))
+    {
+        let lost = envelope
+            .params_uri
+            .decode::<Uri>()
+            .map_or(LostPublish::Unidentified, LostPublish::File);
+        return InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost));
+    }
     if envelope.shape != Shape::Closed {
         return InboundMessage::UndecodableFrame;
     }
-    let kind = Keys {
-        method: envelope.method,
-        id: envelope.id.is_present(),
-        outcome: envelope.outcome,
-    }
-    .kind();
-    undecodable_of_kind(
-        kind,
-        envelope.id.decode(),
-        UndecodableReason::Oversized { bytes },
-    )
+    undecodable_of_kind(kind, envelope.id.decode(), reason)
 }
 
 fn undecodable_of_kind(
@@ -508,7 +427,9 @@ fn undecodable_of_kind(
 ) -> InboundMessage {
     match (kind, id) {
         (MessageKind::Request, Some(id)) => InboundMessage::UndecodableRequest { id, reason },
-        (MessageKind::Notification, _) => InboundMessage::UndecodableNotification,
+        (MessageKind::Notification, _) => {
+            InboundMessage::UndecodableNotification(DroppedNotification::Other)
+        }
         (MessageKind::Response | MessageKind::IncompleteResponse, Some(id)) => {
             InboundMessage::UndecodableResponse { id, reason }
         }
@@ -523,17 +444,49 @@ fn request_id_of(value: &Value) -> Option<RequestId> {
         .and_then(|id| serde_json::from_value(id.clone()).ok())
 }
 
+/// The envelope of a notification, without its `params`.
+#[derive(serde::Deserialize)]
+struct NotificationHead {
+    jsonrpc: JsonRpcVersion,
+    method: String,
+}
+
+/// Decodes a notification object. Its `params` are moved out first, so the
+/// message is built without copying them and a failed decode still knows which
+/// file a `publishDiagnostics` was for.
+fn decode_notification(mut value: Value, redactions: &Redactions) -> InboundMessage {
+    let is_publish = value
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(is_publish_diagnostics);
+    let params = value
+        .get_mut("params")
+        .map(Value::take)
+        .filter(|params| !params.is_null());
+    match decode::<NotificationHead>(value, "notification", redactions) {
+        Some(NotificationHead { jsonrpc, method }) => {
+            InboundMessage::Notification(JsonRpcNotification {
+                jsonrpc,
+                method,
+                params,
+            })
+        }
+        None if is_publish => InboundMessage::UndecodableNotification(
+            DroppedNotification::Publish(LostPublish::of_params(params.as_ref())),
+        ),
+        None => InboundMessage::UndecodableNotification(DroppedNotification::Other),
+    }
+}
+
 /// Decodes `value` as the message its keys say it is. A message that does not
 /// decode becomes the matching `Undecodable*` message; what serde said is
 /// logged redacted, since it can echo server-controlled text.
 fn parse_inbound_message(value: Value, redactions: &Redactions) -> InboundMessage {
-    let kind = Keys::of(&value).kind();
+    let kind = MessageKind::of(Members::of_value(&value));
     let id = request_id_of(&value);
     let decoded = match kind {
         MessageKind::Request => decode(value, "request", redactions).map(InboundMessage::Request),
-        MessageKind::Notification => {
-            decode(value, "notification", redactions).map(InboundMessage::Notification)
-        }
+        MessageKind::Notification => return decode_notification(value, redactions),
         MessageKind::Response => {
             decode(value, "response", redactions).map(InboundMessage::Response)
         }
@@ -867,7 +820,12 @@ mod tests {
 
         let received = receive_all(format!("{deep}{next}")).await;
 
-        assert_matches!(&received[0], Ok(InboundMessage::UndecodableNotification));
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableNotification(
+                DroppedNotification::Other
+            ))
+        );
         assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
     }
 
@@ -910,7 +868,7 @@ mod tests {
             let message = received[0].as_ref().unwrap();
             let expected = match what {
                 "request" => matches!(message, InboundMessage::UndecodableRequest { .. }),
-                "notification" => matches!(message, InboundMessage::UndecodableNotification),
+                "notification" => matches!(message, InboundMessage::UndecodableNotification(_)),
                 "response" | "incomplete response" => {
                     matches!(message, InboundMessage::UndecodableResponse { id, .. } if *id == RequestId::Number(3))
                 }
@@ -927,40 +885,6 @@ mod tests {
         let received = receive_all(frame(&nested_array)).await;
 
         assert_matches!(&received[0], Ok(InboundMessage::UndecodableFrame));
-    }
-
-    #[test]
-    fn test_message_kind_is_decided_by_the_keys_alone() {
-        let kind = |value: serde_json::Value| Keys::of(&value).kind();
-
-        assert_eq!(
-            kind(serde_json::json!({"method": "m", "id": 1})),
-            MessageKind::Request
-        );
-        assert_eq!(
-            kind(serde_json::json!({"method": "m"})),
-            MessageKind::Notification
-        );
-        assert_eq!(
-            kind(serde_json::json!({"id": 1, "result": null})),
-            MessageKind::Response
-        );
-        assert_eq!(
-            kind(serde_json::json!({"id": 1, "error": {}})),
-            MessageKind::Response
-        );
-        assert_eq!(
-            kind(serde_json::json!({"id": 1})),
-            MessageKind::IncompleteResponse
-        );
-        assert_eq!(
-            kind(serde_json::json!({"result": 1})),
-            MessageKind::Unrecognized
-        );
-        assert_eq!(
-            kind(serde_json::json!({"method": "m", "id": 1, "result": 1})),
-            MessageKind::Request
-        );
     }
 
     #[test]
@@ -1214,7 +1138,12 @@ mod tests {
 
         let received = receive_all(format!("{}{next}", frame(&body))).await;
 
-        assert_matches!(&received[0], Ok(InboundMessage::UndecodableNotification));
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableNotification(
+                DroppedNotification::Other
+            ))
+        );
         assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
     }
 
@@ -1245,6 +1174,166 @@ mod tests {
 
         assert_matches!(&received[0], Ok(InboundMessage::UndecodableFrame));
         assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
+    }
+
+    const PUBLISH_HEAD: &str = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","#;
+
+    fn lost_publish_of(message: &Result<InboundMessage>) -> LostPublish {
+        match message {
+            Ok(InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost))) => {
+                lost.clone()
+            }
+            other => panic!("expected a lost publish, got {other:?}"),
+        }
+    }
+
+    fn file(uri: &str) -> LostPublish {
+        LostPublish::File(Uri::from(uri.to_owned()))
+    }
+
+    #[tokio::test]
+    async fn test_oversized_publish_names_its_file_whatever_the_member_order() {
+        let uri = r#""uri":"file:///a.rs""#;
+        let heads = [
+            format!(r#"{PUBLISH_HEAD}"params":{{{uri},"diagnostics":""#),
+            format!(r#"{PUBLISH_HEAD}"params":{{"diagnostics":"{{}}",{uri},"x":""#),
+        ];
+        for head in heads {
+            let body = oversized_body(&head, r#""}}"#);
+            let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+            let received = receive_all(format!("{}{next}", frame(&body))).await;
+
+            assert_eq!(lost_publish_of(&received[0]), file("file:///a.rs"));
+            assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_publish_without_a_usable_uri_is_unidentified() {
+        let bodies = [
+            oversized_body(
+                &format!(r#"{PUBLISH_HEAD}"params":{{"diagnostics":""#),
+                r#""}}"#,
+            ),
+            oversized_body(
+                &format!(r#"{PUBLISH_HEAD}"params":{{"uri":5,"d":""#),
+                r#""}}"#,
+            ),
+            oversized_body(&format!(r#"{PUBLISH_HEAD}"params":[""#), r#""]}"#),
+            oversized_body(
+                &format!(r#"{PUBLISH_HEAD}"params":{{"uri":"a","uri":"b","d":""#),
+                r#""}}"#,
+            ),
+            oversized_body(PUBLISH_HEAD, r#""x":1}"#),
+            oversized_body(
+                &format!(
+                    r#"{PUBLISH_HEAD}"params":{{"uri":"{}","d":""#,
+                    "u".repeat(20_000)
+                ),
+                r#""}}"#,
+            ),
+        ];
+        for body in bodies {
+            let received = receive_all(frame(&body)).await;
+
+            assert_eq!(
+                lost_publish_of(&received[0]),
+                LostPublish::Unidentified,
+                "{}",
+                &body[..120]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_publish_that_never_closes_is_still_a_lost_publish() {
+        let body = oversized_body(
+            &format!(r#"{PUBLISH_HEAD}"params":{{"uri":"file:///a.rs","d":""#),
+            "",
+        );
+
+        let received = receive_all(frame(&body)).await;
+
+        assert_eq!(lost_publish_of(&received[0]), file("file:///a.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_publish_with_an_escaped_method_key_records_no_loss() {
+        let body = oversized_body(
+            r#"{"jsonrpc":"2.0","\u006dethod":"textDocument/publishDiagnostics","params":{"uri":"file:///a.rs","d":""#,
+            r#""}}"#,
+        );
+
+        let received = receive_all(frame(&body)).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::UndecodableFrame));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_publish_within_the_limit_names_its_file() {
+        let deep = frame(&format!(
+            r#"{PUBLISH_HEAD}"params":{{"uri":"file:///a.rs","diagnostics":{}}}}}"#,
+            deeply_nested(200)
+        ));
+        let no_uri = frame(&format!(
+            r#"{PUBLISH_HEAD}"params":{{"diagnostics":{}}}}}"#,
+            deeply_nested(200)
+        ));
+
+        let received = receive_all(format!("{deep}{no_uri}")).await;
+
+        assert_eq!(lost_publish_of(&received[0]), file("file:///a.rs"));
+        assert_eq!(lost_publish_of(&received[1]), LostPublish::Unidentified);
+    }
+
+    #[tokio::test]
+    async fn test_publish_with_a_bad_jsonrpc_version_names_its_file() {
+        let bad_version = frame(
+            r#"{"jsonrpc":"1.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///b.rs","diagnostics":[]}}"#,
+        );
+
+        let received = receive_all(bad_version).await;
+
+        assert_eq!(lost_publish_of(&received[0]), file("file:///b.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_publishes_with_bad_params_pass_the_transport_as_notifications() {
+        let bad_body = frame(&format!(
+            r#"{PUBLISH_HEAD}"params":{{"uri":"file:///a.rs","diagnostics":"x"}}}}"#
+        ));
+        let no_params = frame(&format!(r#"{PUBLISH_HEAD}"x":1}}"#));
+
+        let received = receive_all(format!("{bad_body}{no_params}")).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::Notification(_)));
+        assert_matches!(&received[1], Ok(InboundMessage::Notification(_)));
+    }
+
+    #[test]
+    fn test_notification_with_a_bad_envelope_is_dropped_as_other_unless_it_is_a_publish() {
+        let other =
+            serde_json::json!({"jsonrpc": "1.0", "method": "window/logMessage", "params": {}});
+
+        let message = parse_inbound_message(other, &Redactions::default());
+
+        assert_matches!(
+            message,
+            InboundMessage::UndecodableNotification(DroppedNotification::Other)
+        );
+    }
+
+    #[test]
+    fn test_notification_keeps_its_params_and_treats_null_as_absent() {
+        let with_null = serde_json::json!({"jsonrpc": "2.0", "method": "m", "params": null});
+        let with_params = serde_json::json!({"jsonrpc": "2.0", "method": "m", "params": {"a": 1}});
+
+        let null = parse_inbound_message(with_null, &Redactions::default());
+        let kept = parse_inbound_message(with_params, &Redactions::default());
+
+        assert_matches!(null, InboundMessage::Notification(n) if n.params.is_none());
+        assert_matches!(kept, InboundMessage::Notification(n) if n.params == Some(serde_json::json!({"a": 1})));
     }
 
     #[tokio::test]
@@ -1298,13 +1387,25 @@ mod tests {
 
         receive_all(frame(&body)).await;
 
-        let warning = captured
-            .entries()
-            .into_iter()
-            .find(|(level, _)| *level == tracing::Level::WARN)
-            .map(|(_, message)| message)
-            .unwrap_or_default();
-        assert!(warning.contains(&body.len().to_string()), "{warning}");
+        let fields = captured.fields();
+        assert!(
+            fields.contains(&format!("bytes={}", body.len())),
+            "{fields:?}"
+        );
+        assert!(
+            fields.contains(&format!("limit={MAX_CONTENT_LENGTH}")),
+            "{fields:?}"
+        );
+        assert!(fields.contains(&"suppressed=0".to_owned()), "{fields:?}");
+        assert!(
+            captured
+                .entries()
+                .iter()
+                .any(|(level, message)| *level == tracing::Level::WARN
+                    && message == "skipped an oversized LSP frame"),
+            "{:?}",
+            captured.entries()
+        );
     }
 
     mod properties {

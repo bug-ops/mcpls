@@ -572,6 +572,36 @@ impl WarnLimiter {
     }
 }
 
+/// Counts dropped frames and says when one is worth a warning: at most once
+/// per [`WarnLimiter::DEFAULT_PERIOD`], so a flood cannot flood the log.
+#[derive(Debug, Default)]
+pub struct DropCounter {
+    warn: WarnLimiter,
+    suppressed: usize,
+}
+
+impl DropCounter {
+    /// A counter whose first drop warns at once.
+    pub const fn new() -> Self {
+        Self {
+            warn: WarnLimiter::new(),
+            suppressed: 0,
+        }
+    }
+
+    /// Records one drop at `now`. `Some(n)` when a warning is due, with `n` the
+    /// drops silenced since the previous warning; the caller logs it once it
+    /// holds no lock.
+    pub fn record(&mut self, now: Instant) -> Option<usize> {
+        if self.warn.due(now, WarnLimiter::DEFAULT_PERIOD) {
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
 /// Locks a `std::sync::Mutex`, recovering the guard if a previous holder
 /// panicked while holding it.
 ///
@@ -600,6 +630,18 @@ mod tests {
         assert!(!limiter.due(start + every, every));
         assert!(limiter.due(start + every + Duration::from_millis(1), every));
         assert!(!limiter.due(start + every + Duration::from_secs(2), every));
+    }
+
+    #[test]
+    fn drop_counter_warns_once_per_period_and_counts_the_silenced() {
+        let mut counter = DropCounter::new();
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+
+        assert_eq!(counter.record(at(0)), Some(0));
+        assert_eq!(counter.record(at(1)), None);
+        assert_eq!(counter.record(at(2)), None);
+        assert_eq!(counter.record(at(61)), Some(2));
     }
 
     #[tokio::test]
