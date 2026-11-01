@@ -14,6 +14,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 001 | [[config/001-config-discovery-and-heuristics/spec\|config-discovery-and-heuristics]] | enhancement | P1 | implemented (retroactive) | — |
 | 002 | [[config/002-typescript-7-native-server-support/spec\|typescript-7-native-server-support]] | bug | P1 | implemented | #615, #634 |
 | 003 | [[config/003-unsupported-file-pattern-forms/spec\|unsupported-file-pattern-forms]] | bug | P3 | implemented (#669) | #669 |
+| 004 | [[config/004-clangd-launch-defaults-result-limits/spec\|clangd-launch-defaults-result-limits]] | enhancement | P3 | draft | #845 |
 
 ## lsp
 
@@ -77,6 +78,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | implemented (coverage-based exclusion, learned pull sources) | #703 |
 | 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | implemented (rule (i), typed `index_coverage` note) | #796 |
 | 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
+| 017 | [[bridge/017-workspace-symbol-multi-server-fanout/spec\|workspace-symbol-multi-server-fanout]] | enhancement (competitor-gap) | P3 | draft | #844 |
 
 ## runtime
 
@@ -120,7 +122,7 @@ subsystem.
 >
 > Within each block, specs are ordered: any new retroactive foundational spec first (documents the
 > subsystem itself), then the original historical bug/enhancement specs in their original relative
-> order, then research/tracking specs last. `config` has three specs today — a real reflection of
+> order, then research/tracking specs last. `config` has four specs today — a real reflection of
 > the `config/` module's spec coverage, not a placeholder.
 >
 > Numbers are **block-scoped**, not global: `bridge/001` and `lsp/001` are different, unrelated
