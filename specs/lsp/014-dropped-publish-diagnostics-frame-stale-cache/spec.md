@@ -10,7 +10,7 @@ tags:
   - diagnostics
   - framing
 created: 2026-11-01
-status: approved
+status: implemented
 related:
   - "[[constitution]]"
   - "[[lsp/001-lsp-server-lifecycle-and-respawn/spec|lsp/001-lsp-server-lifecycle-and-respawn]]"
@@ -96,7 +96,6 @@ existing structured fields, so a stale entry is never presented as the current s
 - Undecodable responses and server requests: handled by their own per-request error paths.
 - The publish burst and channel overflow path (settled in
   [[lsp/013-diagnostics-publish-burst-drops/spec|lsp/013]]) and capacity eviction.
-- Technical design: recorded in a plan after this spec is approved.
 
 ## 2. User Stories
 

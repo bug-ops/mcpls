@@ -29,11 +29,11 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
 | 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
-| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve) |
-| 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery) |
+| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve); #868 (datetime in `initialization_options` rejected) |
+| 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery); #850 (FR-020, oversized frames) |
 | 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | implemented | #665 |
 | 013 | [[lsp/013-diagnostics-publish-burst-drops/spec\|diagnostics-publish-burst-drops]] | bug | P2 | implemented (per-client publish mailbox, lost files read evicted) | #704 |
-| 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | implemented (lost publish evicts its file or the server's files) | #863 |
+| 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | implemented (lost publish evicts its file or the server's files; marks bounded per server, #869; `BoundedUri` 16 KiB, #874) | #863; #868; #869; #874 |
 
 ## mcp
 
@@ -43,7 +43,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | implemented | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012) |
 | 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298; #493 (stateless subscriptions, closed as research); #522 (subscriptions/listen implemented); #593 (paced replay, bounded eviction record) |
 | 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
-| 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461 |
+| 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461; #851 (FR-007) |
 | 006 | [[mcp/006-http-stream-liveness/spec\|http-stream-liveness]] | enhancement | P3 | implemented | #543 |
 | 007 | [[mcp/007-symbol-name-addressing/spec\|symbol-name-addressing]] | research | P2 | implemented (MVP, signature help deferred) | #563 |
 | 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | implemented | #564 |
@@ -56,7 +56,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | implemented | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
-| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730; #845 (FR-013), #848 (FR-014..FR-016) |
+| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730; #845 (FR-013), #848 (FR-014..FR-016); #857 (FR-017, undecodable stdio requests) |
 | 019 | [[mcp/019-mcp-registry-listing/spec\|mcp-registry-listing]] | research (competitor-gap) | P4 | implemented (publish-registry job disabled until first publication is confirmed) | #813; #843 |
 
 ## bridge
@@ -79,7 +79,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 014 | [[bridge/014-stale-push-entry-merged-with-fresh-pull/spec\|stale-push-entry-merged-with-fresh-pull]] | bug | P2 | implemented (coverage-based exclusion, learned pull sources) | #703 |
 | 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | implemented (rule (i), typed `index_coverage` note) | #796 |
 | 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
-| 017 | [[bridge/017-workspace-symbol-multi-server-fanout/spec\|workspace-symbol-multi-server-fanout]] | enhancement (competitor-gap) | P3 | implemented | #844 |
+| 017 | [[bridge/017-workspace-symbol-multi-server-fanout/spec\|workspace-symbol-multi-server-fanout]] | enhancement (competitor-gap) | P3 | implemented | #844; #851, #852, #864 (per-server `get_tool_support`, indexing flag) |
 
 ## runtime
 

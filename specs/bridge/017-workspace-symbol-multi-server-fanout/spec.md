@@ -372,7 +372,7 @@ Open questions of the draft, resolved on 2026-11-01 (the user decided FR-001, FR
 - FR-022: refused servers are not listed.
 - NFR-003: raise the total tools/list budget.
 - NFR-005: bounded by the `limit + 1` stop.
-- `get_tool_support`: aggregate with no shape change; per-server detail is a follow-up.
+- `get_tool_support`: aggregate first, per-server `routes` added by #851 (FR-023); a fan-out member is a `MemberSupport` (always names its server, may be `unavailable`) and is kept out of `RouteSupport`, which stays anonymous about servers it does not dispatch to (#868).
 - The outcome list is present whenever the eligible set has two or more members.
 - No server answered: a server still `initializing` wins because it is the retryable answer (all of them give `WorkspaceServersInitializing`, a mix gives that server's `ServerInitializing`); else, when every member failed to start, `AllServersFailedToInit` lists every failure (#527); else the first breakage (`unavailable`, `timed_out`, `failed`) in config order gives its own error, else the first server's capability error.
 

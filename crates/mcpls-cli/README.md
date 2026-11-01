@@ -40,12 +40,12 @@ Rust projects work with no configuration. For other languages, see [Minimal Conf
 ## Features
 
 - 31 tools: hover, definition, references, diagnostics, rename, code actions, call and type hierarchies, selection and folding ranges, and more
-- Symbol-name addressing, `get_tool_support` discovery and `restart_server`
+- Symbol-name addressing, `restart_server` and `get_tool_support`, which reports per-server support and indexing status for fanned-out tools
 - `workspace_symbol_search` fans out to every eligible language server and tags each symbol with its server; `get_completions` returns at most 100 ranked items
 - Several language servers at once, started concurrently and stopped with mcpls, with graceful degradation
 - stdio transport by default; optional HTTP transport behind the `transport-http` feature
 - Untrusted-workspace mode (`--workspace-trust untrusted`) for code you do not trust
-- Diagnostics resources (`lsp-diagnostics://`) update on disk edits for subscribed clients, and cancelled calls cancel the language server request
+- Diagnostics resources (`lsp-diagnostics://`) update on disk edits for subscribed clients, files whose `publishDiagnostics` was dropped read `evicted` instead of stale, and cancelled calls cancel the language server request
 
 ## Learn more
 
