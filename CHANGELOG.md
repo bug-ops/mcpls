@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stdio requests nested past the JSON recursion limit, cut off after `method` and `id`, or skipped by the SDK are answered with `-32700` or `-32600` carrying the request id instead of being dropped (#857, #859).
 - An LSP frame between 10 and 256 MiB fails only its own request instead of closing the server connection; larger frames still close it (#857, #859).
 - A dropped or undecodable `publishDiagnostics` frame marks its file (or every file of that server when the file is unreadable) `evicted` instead of leaving stale diagnostics as current (#863, #868).
-- Diagnostics eviction marks and their overflow flag are bounded per server, so one server no longer displaces or flags another (#TBD).
+- Diagnostics eviction marks and their overflow flag are bounded per server, so one server no longer displaces or flags another (#869).
 - `book/src/tools/server-control.md` shows the `coverage` of a fanned-out tool as computed from the aggregate route, and the stdio `-32600` / `-32601` condition for skipped requests is documented (#864, #866, #868).
 
 ## [0.9.0] - 2026-11-01
