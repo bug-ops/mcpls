@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["Andrei G. <k05h31@gmail.com>"]
@@ -24,18 +24,18 @@ clap = "4.6"
 dirs = "7.0"
 dunce = "1.0.5"
 futures = "0.3"
-http-body = "1.0"
-hyper = "1.11"
-hyper-util = "0.1.20"
+http-body = "1.1"
+hyper = "1.12"
+hyper-util = "0.1"
 ignore = "0.4"
 libc = "0.2"
 lsp-types = { package = "gen-lsp-types", version = "=0.11.0" }
-mcpls-core = { path = "crates/mcpls-core", version = "0.8.0" }
+mcpls-core = { path = "crates/mcpls-core", version = "0.9.0" }
 nix = { version = "0.31", default-features = false, features = ["user"] }
 predicates = "3.1"
 process-wrap = { version = "10.0.1", default-features = false }
-proptest = "1.11"
-rmcp = "3.5.1"
+proptest = "1.12"
+rmcp = "3.8"
 rstest = "0.28"
 rustix = { version = "1.1", features = ["process"] }
 schemars = "1.2"
@@ -44,7 +44,7 @@ serde_json = "1.0"
 socket2 = "0.6"
 tempfile = "3.27"
 thiserror = "2.0"
-tokio = "1.53"
+tokio = "1.54"
 tokio-util = "0.7"
 toml = "1.1"
 tracing = "0.1"

@@ -7,12 +7,12 @@
     "url": "https://github.com/bug-ops/mcpls",
     "source": "github"
   },
-  "version": "0.8.0",
+  "version": "0.9.0",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "mcpls",
-      "version": "0.8.0",
+      "version": "0.9.0",
       "transport": {
         "type": "stdio"
       }

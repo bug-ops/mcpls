@@ -11,7 +11,7 @@ tags:
   - multi-server
   - competitor-gap
 created: 2026-11-01
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[mcp/001-mcp-tool-surface-and-routing/spec|mcp/001-mcp-tool-surface-and-routing]]"

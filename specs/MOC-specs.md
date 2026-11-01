@@ -55,7 +55,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | implemented | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
-| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730 |
+| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730; #845 (FR-013), #848 (FR-014..FR-016) |
 | 019 | [[mcp/019-mcp-registry-listing/spec\|mcp-registry-listing]] | research (competitor-gap) | P4 | implemented (publish-registry job disabled until first publication is confirmed) | #813; #843 |
 
 ## bridge
@@ -71,7 +71,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 007 | [[bridge/007-enclosing-symbol-context/spec\|enclosing-symbol-context]] | research | P4 | implemented | #565 |
 | 008 | [[bridge/008-workspace-root-configured-spelling/spec\|workspace-root-configured-spelling]] | bug (regression of #533/#552) | P1 | implemented (#580); root-level system symlink aliases (#579) | #571, #579 |
 | 009 | [[bridge/009-diagnostics-subscription-staleness/spec\|diagnostics-subscription-staleness]] | enhancement | P3 | implemented | #574; #648 (FR-017..FR-021, option E); #649 (follow-up) |
-| 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580; open-then-verify #783, no-follow Unix open #788, #826; Windows long paths #817) | #558; #783, #788 |
+| 010 | [[bridge/010-workspace-containment-single-predicate/spec\|workspace-containment-single-predicate]] | refactor | P2 | implemented (#580; open-then-verify #783, no-follow Unix open #788, #826; Windows long paths #817; Windows final-entry symlink #825) | #558; #783, #788 |
 | 011 | [[bridge/011-push-only-server-diagnostics/spec\|push-only-server-diagnostics]] | bug | P2 | implemented (#666, #670) | #666; #670 |
 | 012 | [[bridge/012-indexing-gate-after-restart/spec\|indexing-gate-after-restart]] | bug | P1 | implemented (#667) | #667 |
 | 013 | [[bridge/013-indexing-state-on-ungated-prepare-tools/spec\|indexing-state-on-ungated-prepare-tools]] | enhancement | P3 | implemented (#668) | #668 |
@@ -90,7 +90,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 | 001 | [[runtime/001-log-json-bool-env-parsing/spec\|log-json-bool-env-parsing]] | bug | P2 | implemented (#314) | — |
 | 002 | [[runtime/002-sigterm-stdin-blocking-pool-hang/spec\|sigterm-stdin-blocking-pool-hang]] | bug | P1 | implemented (#321, #328) | — |
 | 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md, untrusted-workspace mode, launcher refusals, untrusted working directory) | #566; #652, #653, #657 |
-| 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599 |
+| 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599; #842 (FR-017) |
 | 005 | [[runtime/005-untrusted-unlisted-wrapper-workspace-program/spec\|untrusted-unlisted-wrapper-workspace-program]] | enhancement | P3 | implemented (#724) | #724 |
 
 ## testing
