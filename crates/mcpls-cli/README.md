@@ -9,6 +9,8 @@ The mcpls command-line tool bridges the Model Context Protocol (MCP) and the Lan
 
 Documentation: <https://bug-ops.github.io/mcpls/>
 
+MCP Registry name: `mcp-name: io.github.bug-ops/mcpls`
+
 ## Installation
 
 ```bash

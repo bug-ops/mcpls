@@ -18,8 +18,8 @@ use serde::Serialize;
 use super::Translator;
 use super::pull_support::PullSupport;
 use super::routing::{
-    Capability, LanguageCandidates, RouteLookup, WorkspaceRouteLookup, lookup_route,
-    lookup_workspace_route,
+    Capability, LanguageCandidates, MemberPresence, RouteLookup, WorkspaceRouteLookup,
+    is_untrusted_refusal, lookup_route, lookup_workspace_route, workspace_fan_out_members,
 };
 use crate::bridge::ClientPath;
 use crate::config::{LanguageId, LanguageMap, ServerId, ToolKind, ToolRouter};
@@ -92,6 +92,8 @@ impl CapabilitySet {
 pub struct ToolSupportSnapshot {
     language_map: Arc<LanguageMap>,
     router: Arc<ToolRouter>,
+    configured_router: Arc<ToolRouter>,
+    refused: HashSet<ServerId>,
     expected: HashSet<ServerId>,
     running: HashMap<ServerId, RunningSupport>,
     registered: HashSet<ServerId>,
@@ -176,7 +178,20 @@ impl ToolSupportSnapshot {
     }
 
     /// Support for a workspace-wide `tool` (no document, hence no language).
+    ///
+    /// With two or more eligible servers (the set the handler fans out over)
+    /// the answer aggregates them; see [`Self::fan_out_support`].
     pub(crate) fn workspace_support(&self, tool: ToolKind) -> RouteSupport {
+        let members = workspace_fan_out_members(
+            &self.configured_router,
+            tool,
+            |id| self.refused.contains(id),
+            |id| self.registered.contains(id),
+            |id| self.expected.contains(id),
+        );
+        if let Some(members) = members {
+            return self.fan_out_support(tool, members);
+        }
         let lookup = lookup_workspace_route(
             || self.router.resolve_any(tool).cloned(),
             |id| self.registered.contains(id),
@@ -194,6 +209,35 @@ impl ToolSupportSnapshot {
             | WorkspaceRouteLookup::NothingConfigured
             | WorkspaceRouteLookup::NoClaimant => RouteSupport::NoServer,
         }
+    }
+
+    /// The best support among fan-out `members`: the first server in config
+    /// order that would be asked and advertises the capability, else
+    /// initializing when any member is, else the first capability gap, else no
+    /// server.
+    fn fan_out_support(
+        &self,
+        tool: ToolKind,
+        members: Vec<(ServerId, MemberPresence)>,
+    ) -> RouteSupport {
+        let capability = Capability::for_tool(tool);
+        let supports: Vec<RouteSupport> = members
+            .into_iter()
+            .map(|(server, presence)| match presence {
+                MemberPresence::Registered => self.registered_support(server, capability),
+                MemberPresence::Initializing => RouteSupport::Initializing,
+                MemberPresence::Absent => RouteSupport::NoServer,
+            })
+            .collect();
+        let first = |wanted: fn(&RouteSupport) -> bool| {
+            supports.iter().find(|support| wanted(support)).cloned()
+        };
+        first(|support| matches!(support, RouteSupport::Supported { .. }))
+            .or_else(|| first(|support| matches!(support, RouteSupport::Initializing)))
+            .or_else(|| {
+                first(|support| matches!(support, RouteSupport::CapabilityNotAdvertised { .. }))
+            })
+            .unwrap_or(RouteSupport::NoServer)
     }
 
     /// Whether `get_diagnostics` reads `server`'s push cache because it
@@ -244,6 +288,12 @@ impl Translator {
             .filter(|id| servers.client(id).is_some())
             .cloned()
             .collect();
+        let refused = servers
+            .failures()
+            .into_iter()
+            .filter(is_untrusted_refusal)
+            .map(|failure| failure.server_id)
+            .collect();
         drop(servers);
         // Read after the registry: a settlement writes the registry first and
         // the router after, so a router that is newer than the registry only
@@ -252,6 +302,8 @@ impl Translator {
         ToolSupportSnapshot {
             language_map: Arc::clone(&self.language_map),
             router,
+            configured_router: Arc::clone(&self.configured_router),
+            refused,
             expected,
             running,
             registered,
@@ -278,7 +330,7 @@ mod tests {
 
     use super::super::testing::translator_with_capabilities;
     use super::*;
-    use crate::config::FileExtension;
+    use crate::config::{FileExtension, ServerSettlement};
     use crate::test_lsp::client_path;
 
     fn rust_language_map() -> Arc<LanguageMap> {
@@ -301,12 +353,15 @@ mod tests {
         caps: &[(&str, ServerCapabilities)],
     ) -> ToolSupportSnapshot {
         let ids = |names: &[&str]| names.iter().map(|n| ServerId::new(*n).unwrap()).collect();
+        let router = Arc::new(ToolRouter::catch_all([(
+            ServerId::from_static("rust"),
+            LanguageId::from_static("rust"),
+        )]));
         ToolSupportSnapshot {
             language_map: rust_language_map(),
-            router: Arc::new(ToolRouter::catch_all([(
-                ServerId::from_static("rust"),
-                LanguageId::from_static("rust"),
-            )])),
+            configured_router: Arc::clone(&router),
+            router,
+            refused: HashSet::new(),
             expected: ids(expected),
             running: caps
                 .iter()
@@ -580,6 +635,8 @@ mod tests {
         let snap = ToolSupportSnapshot {
             language_map: rust_language_map(),
             router: Arc::new(router),
+            configured_router: Arc::new(ToolRouter::default()),
+            refused: HashSet::new(),
             expected: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
@@ -627,6 +684,8 @@ mod tests {
                     LanguageId::from_static("zig"),
                 ),
             ])),
+            configured_router: Arc::new(ToolRouter::default()),
+            refused: HashSet::new(),
             expected: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
@@ -639,6 +698,8 @@ mod tests {
         let snap = ToolSupportSnapshot {
             language_map: rust_language_map(),
             router: Arc::new(ToolRouter::default()),
+            configured_router: Arc::new(ToolRouter::default()),
+            refused: HashSet::new(),
             expected: HashSet::new(),
             running: HashMap::new(),
             registered: HashSet::new(),
@@ -691,6 +752,121 @@ mod tests {
                 .language_for_path(&client_path("/definitely/missing.rs"))
                 .await
                 .is_err()
+        );
+    }
+
+    fn workspace_symbol_caps(advertised: bool) -> ServerCapabilities {
+        ServerCapabilities {
+            workspace_symbol_provider: advertised
+                .then_some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+            ..Default::default()
+        }
+    }
+
+    fn polyglot_snapshot(
+        registered: &[(&str, bool)],
+        expected: &[&str],
+        refused: &[&str],
+    ) -> ToolSupportSnapshot {
+        let ids = |names: &[&str]| -> HashSet<ServerId> {
+            names.iter().map(|n| ServerId::new(*n).unwrap()).collect()
+        };
+        let configured = ToolRouter::catch_all([
+            (ServerId::from_static("a"), LanguageId::from_static("rust")),
+            (
+                ServerId::from_static("b"),
+                LanguageId::from_static("python"),
+            ),
+        ]);
+        let refused = ids(refused);
+        let mut live = configured.clone();
+        live.rebind(|id| {
+            if refused.contains(id) {
+                ServerSettlement::Failed
+            } else {
+                ServerSettlement::Registered
+            }
+        });
+        ToolSupportSnapshot {
+            language_map: rust_language_map(),
+            configured_router: Arc::new(configured),
+            router: Arc::new(live),
+            refused,
+            expected: ids(expected),
+            running: registered
+                .iter()
+                .map(|(id, advertised)| {
+                    (
+                        ServerId::new(*id).unwrap(),
+                        RunningSupport {
+                            caps: CapabilitySet::of(&workspace_symbol_caps(*advertised)),
+                            pull: PullSupport::Advertised,
+                        },
+                    )
+                })
+                .collect(),
+            registered: ids(&registered.iter().map(|(id, _)| *id).collect::<Vec<_>>()),
+        }
+    }
+
+    #[test]
+    fn workspace_fan_out_support_names_the_first_capable_server_in_config_order() {
+        let snap = polyglot_snapshot(&[("a", false), ("b", true)], &[], &[]);
+        assert_eq!(
+            snap.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Supported {
+                server: ServerId::from_static("b")
+            }
+        );
+        let both = polyglot_snapshot(&[("a", true), ("b", true)], &[], &[]);
+        assert_eq!(
+            both.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Supported {
+                server: ServerId::from_static("a")
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_fan_out_support_reports_initializing_before_a_capability_gap() {
+        let snap = polyglot_snapshot(&[("a", false)], &["b"], &[]);
+        assert_eq!(
+            snap.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Initializing
+        );
+    }
+
+    #[test]
+    fn workspace_fan_out_support_reports_the_first_gap_when_nothing_is_capable() {
+        let snap = polyglot_snapshot(&[("a", false), ("b", false)], &[], &[]);
+        assert_eq!(
+            snap.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::CapabilityNotAdvertised {
+                server: ServerId::from_static("a"),
+                capability: Capability::WorkspaceSymbols,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_fan_out_support_without_registered_or_expected_servers_is_no_server() {
+        let snap = polyglot_snapshot(&[], &[], &[]);
+        assert_eq!(
+            snap.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::NoServer
+        );
+    }
+
+    /// With one server refused by untrusted-workspace mode the eligible set
+    /// is a single server and the single-server route applies.
+    #[test]
+    fn workspace_support_ignores_a_refused_server() {
+        let snap = polyglot_snapshot(&[("a", false), ("b", true)], &[], &["a"]);
+        assert_eq!(
+            snap.workspace_support(ToolKind::WorkspaceSymbols),
+            RouteSupport::Supported {
+                server: ServerId::from_static("b")
+            }
         );
     }
 }

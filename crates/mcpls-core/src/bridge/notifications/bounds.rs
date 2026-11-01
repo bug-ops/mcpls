@@ -191,7 +191,7 @@ fn cheap_size_estimate(diagnostics: &[LspDiagnostic]) -> Option<usize> {
             .map(|d| {
                 let raw_string_bytes = message_as_str(&d.message)
                     .len()
-                    .saturating_add(d.source.as_deref().map_or(0, str::len))
+                    .saturating_add(d.source.as_deref().map_or_default(str::len))
                     .saturating_add(match &d.code {
                         Some(lsp_types::Code::String(s)) => s.len(),
                         _ => 0,

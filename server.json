@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.bug-ops/mcpls",
+  "title": "mcpls",
+  "description": "Universal MCP to LSP bridge exposing language server code intelligence as MCP tools",
+  "repository": {
+    "url": "https://github.com/bug-ops/mcpls",
+    "source": "github"
+  },
+  "version": "0.8.0",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "mcpls",
+      "version": "0.8.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

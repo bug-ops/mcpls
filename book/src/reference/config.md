@@ -129,7 +129,7 @@ One table per language server.
 |-----|------|---------|-------------|
 | `language_id` | string | required | Language identifier sent to the server |
 | `command` | string | required | Executable, on `PATH` or absolute |
-| `args` | array of strings | `[]` | Command-line arguments; must not contain a NUL byte |
+| `args` | array of strings | `[]` | Command-line arguments; must not contain a NUL byte. For `clangd`, mcpls appends result-limit and log options you did not write ([details](../guide/language-servers.md)) |
 | `file_patterns` | array of strings | `[]` | Files this server serves ([forms](#file_patterns)) |
 | `timeout_seconds` | integer, 1 to 900 | `30` | The `initialize` handshake |
 | `request_timeout_seconds` | integer, 1 to 900 | `30` | Each LSP request behind a tool call |
@@ -235,7 +235,7 @@ Rules:
 - If two servers for one language are both applicable in the same workspace and share an identity, both omit `handles`, or both claim a tool, mcpls refuses to start and names the entries. Mutually exclusive `heuristics` make a pair unambiguous.
 - If the server a tool is routed to fails to spawn, the tool falls back to the language's catch-all, if one is running. Otherwise it reports that no server is available, and never falls back to a server that declined it through `handles`.
 - When a language has no catch-all, mcpls logs a warning naming the routing values no server claims.
-- `workspace_symbol_search` has no language. It goes to the first server that claims `workspace_symbols`, else the first catch-all, and fails if neither exists.
+- `workspace_symbol_search` has no language. It is sent to every server that claims `workspace_symbols` and to every catch-all, merged in config order, and fails only if none of them answers.
 
 ### `indexing`
 

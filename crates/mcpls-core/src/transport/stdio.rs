@@ -3,6 +3,7 @@
 use rmcp::ServiceExt as _;
 
 use super::shutdown::ShutdownSignal;
+use super::stdio_transport::{StdioMessageLimit, StdioTransport};
 
 /// Run the MCP server over stdio.
 ///
@@ -39,7 +40,9 @@ pub async fn run_stdio(
     mcp_server: crate::mcp::McplsServer,
     mut shutdown_signal: ShutdownSignal,
 ) -> Result<(), crate::Error> {
-    serve_until(mcp_server, rmcp::transport::stdio(), async move {
+    let (stdin, stdout) = rmcp::transport::stdio();
+    let transport = StdioTransport::new(stdin, stdout, StdioMessageLimit::DEFAULT);
+    serve_until(mcp_server, transport, async move {
         shutdown_signal.recv().await;
     })
     .await

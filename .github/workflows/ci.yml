@@ -37,6 +37,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'fuzz/**'
+              - 'server.json'
               - 'README.md'
               - 'book/src/getting-started/installation.md'
               - 'book/src/guide/language-servers.md'
@@ -308,8 +309,23 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Shellcheck install script
-        run: shellcheck --shell=sh scripts/install.sh
+      - name: Shellcheck scripts
+        run: shellcheck --shell=sh scripts/install.sh scripts/check-server-json-version.sh scripts/test-check-server-json-version.sh
+
+  server-json:
+    name: Registry Manifest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-full-ci == 'true' || needs.detect-changes.outputs.scripts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check server.json against workspace version
+        run: scripts/check-server-json-version.sh
+      - name: Check that broken manifests are rejected
+        run: scripts/test-check-server-json-version.sh
 
   security:
     name: Security Audit
@@ -382,7 +398,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, security, fuzz-build, coverage]
+    needs: [fmt, clippy, build-tests, build, test, test-integration, test-e2e, msrv, docs, shellcheck, server-json, security, fuzz-build, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -399,6 +415,7 @@ jobs:
             "${{ needs.msrv.result }}"
             "${{ needs.docs.result }}"
             "${{ needs.shellcheck.result }}"
+            "${{ needs.server-json.result }}"
             "${{ needs.security.result }}"
             "${{ needs.fuzz-build.result }}"
             "${{ needs.coverage.result }}"

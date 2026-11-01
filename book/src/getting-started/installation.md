@@ -49,7 +49,13 @@ cd mcpls
 cargo install --path crates/mcpls-cli
 ```
 
-**Manual download.** Download the archive for your platform from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest). Each archive has a `.sha256` file next to it; verify it when you download by hand.
+**MCP Registry.** mcpls is described by a `server.json` manifest for the official MCP registry under the name `io.github.bug-ops/mcpls`. The registry package is the crates.io crate, so registry-aware clients install it with `cargo install mcpls` and start the `mcpls` binary over stdio. The manifest sets no arguments or environment variables; language servers still have to be installed separately.
+
+**Manual download.** Download the archive for your platform from [GitHub Releases](https://github.com/bug-ops/mcpls/releases/latest). Each archive has a `.sha256` file next to it and a build-provenance attestation. The checksum comes from the same build as the archive, so prefer the attestation:
+
+```bash
+gh attestation verify mcpls-x86_64-unknown-linux-gnu.tar.gz --repo bug-ops/mcpls
+```
 
 | Platform | Architecture | Archive |
 |----------|--------------|---------|

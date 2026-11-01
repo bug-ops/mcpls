@@ -14,8 +14,11 @@
 //!   `fcntl(F_GETPATH)` and checks it against the roots.
 //! - Windows has no safe handle-to-path API in the dependencies, so every
 //!   ancestor directory is pinned (opened without `FILE_SHARE_DELETE`, so it
-//!   cannot be renamed or replaced) and the opened file is compared by
-//!   identity with a second, non-following open of the same path.
+//!   cannot be renamed or replaced) and the final entry is opened once with
+//!   `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink there is seen, never
+//!   followed, and an outside target is never opened. A reparse point that is
+//!   not a link (WOF, deduplication, cloud placeholder) is pinned without
+//!   delete sharing, reopened normally and compared by identity.
 //! - Other Unix systems walk the components with `O_NOFOLLOW` from the root
 //!   directory, so no symlink is followed and no outside target is opened.
 
@@ -225,7 +228,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use std::fs::{File, OpenOptions};
-    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::path::Path;
 
     use super::{WorkspacePath, WorkspaceRoots, file_io, open_regular, outside};
@@ -236,8 +239,26 @@ mod platform {
     const FILE_TRAVERSE: u32 = 0x20;
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    /// Whether other openers may rename or delete the entry while it is open.
+    #[derive(Debug, Clone, Copy)]
+    enum EntrySharing {
+        WithDelete,
+        WithoutDelete,
+    }
+
+    impl EntrySharing {
+        const fn mode(self) -> u32 {
+            match self {
+                Self::WithDelete => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                Self::WithoutDelete => FILE_SHARE_READ | FILE_SHARE_WRITE,
+            }
+        }
+    }
 
     impl WorkspaceRoots {
         /// Opens every directory from the canonical root down to the parent of
@@ -263,32 +284,71 @@ mod platform {
             after_open: impl FnOnce(),
         ) -> Result<RegularFile, Error> {
             let _pins = self.pin_ancestors(path)?;
-            let file = open_regular(path)?;
+            let first = open_entry(path, EntrySharing::WithDelete)?;
             after_open();
-            let unfollowed = OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path.as_path())
-                .map_err(|source| file_io(path, source))?;
-            let swapped = unfollowed
-                .metadata()
-                .map_err(|source| file_io(path, source))?
-                .file_type()
-                .is_symlink();
-            let same = FileIdentity::of_file(file.file())
-                .map_err(|source| file_io(path, source))?
-                == FileIdentity::of_file(&unfollowed).map_err(|source| file_io(path, source))?;
-            if swapped || !same {
+            let metadata = first.metadata().map_err(|source| file_io(path, source))?;
+            if metadata.file_type().is_symlink() {
                 return Err(outside(path));
             }
-            Ok(file)
+            if metadata.is_dir() {
+                return Err(Error::NotARegularFile(path.as_path().to_path_buf()));
+            }
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                return RegularFile::from_file(first)
+                    .map_err(|error| error.into_error(path.as_path()));
+            }
+            reopen_following_reparse_data(path, &first)
         }
+    }
+
+    /// Reads a file whose entry is a reparse point that is not a link (WOF
+    /// compression, deduplication, cloud placeholders), whose content only a
+    /// normal open returns.
+    ///
+    /// A pin without delete sharing keeps the entry from being renamed or
+    /// replaced by a link while the path is opened again, so that open cannot
+    /// reach an outside target. Identity is compared before and after.
+    ///
+    /// Residual: the pin does not stop a writer from rewriting the pinned
+    /// file's reparse data in place (same file id) into a symlink to an
+    /// outside device or pipe. The reopen then follows it and opens the target
+    /// before the identity check refuses it. This needs a workspace writer who
+    /// can set reparse data on a file they own, and is narrower than a rename
+    /// swap, which the pin does block; the common path is not affected.
+    fn reopen_following_reparse_data(
+        path: &WorkspacePath,
+        first: &File,
+    ) -> Result<RegularFile, Error> {
+        let pinned = open_entry(path, EntrySharing::WithoutDelete)?;
+        let first_identity = identity(path, first)?;
+        if identity(path, &pinned)? != first_identity {
+            return Err(outside(path));
+        }
+        let reopened = open_regular(path)?;
+        if identity(path, reopened.file())? != first_identity {
+            return Err(outside(path));
+        }
+        Ok(reopened)
+    }
+
+    fn identity(path: &WorkspacePath, file: &File) -> Result<FileIdentity, Error> {
+        FileIdentity::of_file(file).map_err(|source| file_io(path, source))
+    }
+
+    /// Opens the entry itself, never its target.
+    fn open_entry(path: &WorkspacePath, sharing: EntrySharing) -> Result<File, Error> {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(sharing.mode())
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path.as_path())
+            .map_err(|source| file_io(path, source))
     }
 
     fn pin(path: &WorkspacePath, dir: &Path) -> Result<File, Error> {
         let handle = OpenOptions::new()
             .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(EntrySharing::WithoutDelete.mode())
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(dir)
             .map_err(|source| Error::FileIo {
@@ -591,5 +651,205 @@ mod tests {
             roots.open_contained(&path),
             Err(Error::PathOutsideWorkspace(_))
         );
+    }
+
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    /// Whether this process may create symlinks; a runner without the privilege
+    /// skips locally and fails under `CI`, where the tests must run.
+    #[cfg(windows)]
+    fn symlinks_allowed(dir: &std::path::Path) -> bool {
+        let probe = dir.join("probe-link");
+        match std::os::windows::fs::symlink_file(dir.join("probe-target"), &probe) {
+            Ok(()) => {
+                std::fs::remove_file(&probe).unwrap();
+                true
+            }
+            Err(error) => {
+                assert!(
+                    std::env::var_os("CI").is_none(),
+                    "symlinks must be creatable on CI: {error}"
+                );
+                eprintln!("symlink privilege missing ({error}), test skipped");
+                false
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct PipeServer {
+        runtime: tokio::runtime::Runtime,
+        server: tokio::net::windows::named_pipe::NamedPipeServer,
+        name: String,
+    }
+
+    #[cfg(windows)]
+    impl PipeServer {
+        fn start(tag: &str) -> Self {
+            let name = format!(
+                r"\\.\pipe\mcpls-open-contained-{}-{tag}",
+                std::process::id()
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let server = runtime.block_on(async {
+                tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&name)
+                    .unwrap()
+            });
+            Self {
+                runtime,
+                server,
+                name,
+            }
+        }
+
+        /// A plain open through `link` must reach this pipe. It fails with a
+        /// busy pipe when an earlier open already took the only instance, so
+        /// passing proves nothing connected before and that `link` is wired up.
+        fn assert_untouched_and_reachable_through(&self, link: &std::path::Path) {
+            let client = std::fs::File::open(link)
+                .expect("the control open must reach a pipe that no earlier open used");
+            self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.server.connect())
+                    .await
+                    .expect("the control client must connect")
+                    .unwrap();
+            });
+            drop(client);
+        }
+    }
+
+    #[cfg(windows)]
+    fn compacted_file(file: &std::path::Path) -> Option<String> {
+        let text = "fn compressible() { let value = 1; }\n".repeat(4096);
+        std::fs::write(file, &text).unwrap();
+        let status = std::process::Command::new("compact")
+            .arg("/exe:lzx")
+            .arg(file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let attributes =
+            std::os::windows::fs::MetadataExt::file_attributes(&std::fs::metadata(file).unwrap());
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            eprintln!("compact left no WOF reparse point on this volume, test skipped");
+            return None;
+        }
+        Some(text)
+    }
+
+    #[cfg(windows)]
+    fn read_all(opened: RegularFile) -> String {
+        use std::io::Read as _;
+
+        let (mut file, _) = opened.into_parts();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_open_contained_refuses_final_entry_symlink_to_outside_file() {
+        let (_guard, base, roots) = workspace();
+        if !symlinks_allowed(&base) {
+            return;
+        }
+        let file = base.join("ws/sub/a.rs");
+        std::fs::write(&file, "inside").unwrap();
+        let path = validated(&roots, file.clone());
+        std::fs::write(base.join("out/a.rs"), "secret").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::windows::fs::symlink_file(base.join("out/a.rs"), &file).unwrap();
+
+        assert_matches!(
+            roots.open_contained(&path),
+            Err(Error::PathOutsideWorkspace(_))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_open_contained_refuses_final_entry_junction() {
+        let (_guard, base, roots) = workspace();
+        let file = base.join("ws/sub/a.rs");
+        std::fs::write(&file, "inside").unwrap();
+        let path = validated(&roots, file.clone());
+        std::fs::remove_file(&file).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(base.join("ws").join("sub").join("a.rs"))
+            .arg(base.join("out"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        assert_matches!(
+            roots.open_contained(&path),
+            Err(Error::PathOutsideWorkspace(_))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_open_contained_refuses_symlink_to_pipe_without_opening_it() {
+        let (_guard, base, roots) = workspace();
+        if !symlinks_allowed(&base) {
+            return;
+        }
+        let file = base.join("ws/sub/a.rs");
+        std::fs::write(&file, "inside").unwrap();
+        let path = validated(&roots, file.clone());
+        let pipe = PipeServer::start("refused");
+        std::fs::remove_file(&file).unwrap();
+        std::os::windows::fs::symlink_file(&pipe.name, &file).unwrap();
+
+        let result = roots.open_contained(&path);
+
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
+        pipe.assert_untouched_and_reachable_through(&file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_open_contained_reads_wof_compressed_file() {
+        let (_guard, base, roots) = workspace();
+        let file = base.join("ws/sub/a.rs");
+        let Some(text) = compacted_file(&file) else {
+            return;
+        };
+        let path = validated(&roots, file);
+
+        let opened = roots.open_contained(&path).unwrap();
+
+        assert_eq!(read_all(opened), text);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_open_contained_refuses_wof_file_swapped_for_pipe_symlink() {
+        let (_guard, base, roots) = workspace();
+        if !symlinks_allowed(&base) {
+            return;
+        }
+        let file = base.join("ws/sub/a.rs");
+        if compacted_file(&file).is_none() {
+            return;
+        }
+        let path = validated(&roots, file.clone());
+        let pipe = PipeServer::start("wof-swap");
+
+        let result = roots.open_contained_with(&path, || {
+            std::fs::rename(&file, base.join("ws/sub/a.old")).unwrap();
+            std::os::windows::fs::symlink_file(&pipe.name, &file).unwrap();
+        });
+
+        assert_matches!(result, Err(Error::PathOutsideWorkspace(_)));
+        pipe.assert_untouched_and_reachable_through(&file);
     }
 }

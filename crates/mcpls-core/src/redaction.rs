@@ -528,6 +528,73 @@ fn collect_secret_json(
     }
 }
 
+/// Deepest nesting [`JsonShape`] prints before eliding the rest as `{..}`.
+const MAX_SHAPE_DEPTH: usize = 8;
+
+/// `Debug` adapter that prints the structure of a JSON value and none of its
+/// leaves.
+///
+/// Objects keep their keys, arrays keep their length, and every string and
+/// number prints as `<redacted>`; booleans and `null` are not secret. A key
+/// holding `://` or `@` can embed a credential (URL-keyed settings such as
+/// `yaml.schemas`), so it prints as `<redacted key>`.
+pub struct JsonShape<'a>(pub &'a serde_json::Value);
+
+/// Writes its text verbatim, without the quotes `str`'s `Debug` adds.
+struct Verbatim<'a>(&'a str);
+
+impl std::fmt::Debug for Verbatim<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+struct Shaped<'a> {
+    value: &'a serde_json::Value,
+    depth: usize,
+}
+
+impl std::fmt::Debug for Shaped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use serde_json::Value;
+
+        let nested = |value| Shaped {
+            value,
+            depth: self.depth.saturating_add(1),
+        };
+        match self.value {
+            Value::Null => f.write_str("null"),
+            Value::Bool(flag) => write!(f, "{flag}"),
+            Value::Number(_) | Value::String(_) => f.write_str("<redacted>"),
+            Value::Array(_) | Value::Object(_) if self.depth >= MAX_SHAPE_DEPTH => {
+                f.write_str("{..}")
+            }
+            Value::Array(items) => f.debug_list().entries(items.iter().map(nested)).finish(),
+            Value::Object(map) => {
+                let mut out = f.debug_map();
+                for (key, child) in map {
+                    if key.contains("://") || key.contains('@') {
+                        out.entry(&Verbatim("<redacted key>"), &nested(child));
+                    } else {
+                        out.entry(key, &nested(child));
+                    }
+                }
+                out.finish()
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for JsonShape<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Shaped {
+            value: self.0,
+            depth: 0,
+        }
+        .fmt(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
@@ -591,6 +658,52 @@ mod tests {
 
         assert!(printed.eq(&printed_other));
         assert!(printed.contains("secrets: 1"));
+    }
+
+    #[test]
+    fn test_server_config_debug_prints_no_secret_of_any_field() {
+        let config: LspServerConfig = toml::from_str(
+            r#"
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio", "--api-key=ARGSECRET123"]
+env = { API_TOKEN = "ENVSECRET123" }
+initialization_options = { apiToken = "INITSECRET123", nested = { list = [{ pw = "NESTEDSECRET123" }] } }
+settings = { "tool.apiToken" = "SETTINGSSECRET123", "yaml.schemas" = { "https://tok@host/s.json" = "KEYSECRET123" } }
+"#,
+        )
+        .unwrap();
+
+        let printed = format!("{config:?}");
+
+        for needle in [
+            "ARGSECRET123",
+            "ENVSECRET123",
+            "INITSECRET123",
+            "NESTEDSECRET123",
+            "SETTINGSSECRET123",
+            "KEYSECRET123",
+            "tok@host",
+        ] {
+            assert!(!printed.contains(needle), "{needle} leaked: {printed}");
+        }
+        assert!(printed.contains("apiToken"));
+        assert!(printed.contains("<redacted key>"));
+    }
+
+    #[test]
+    fn test_json_shape_keeps_booleans_and_elides_past_the_depth_cap() {
+        let mut value = serde_json::json!({"on": true, "off": null});
+        for _ in 0..MAX_SHAPE_DEPTH {
+            value = serde_json::json!({ "k": value });
+        }
+        let printed = format!("{:?}", JsonShape(&value));
+        assert!(printed.contains("{..}"));
+        assert!(!printed.contains("true"));
+        assert_eq!(
+            format!("{:?}", JsonShape(&serde_json::json!({"on": true, "n": 1}))),
+            r#"{"n": <redacted>, "on": true}"#
+        );
     }
 
     #[test]

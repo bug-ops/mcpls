@@ -12,6 +12,10 @@ The client starts `mcpls` as a child process and exchanges MCP messages on its s
 
 stdio needs no network, no authentication and no ports, which is why it is the default and the safest choice.
 
+### Message size limit
+
+Each JSON-RPC message is one line, and mcpls accepts at most 4 MiB per line (the same cap as the HTTP request body), not counting the final newline. A larger request is skipped and answered with a `-32600` error that carries the request `id`, and the next line is read normally. mcpls logs a `WARN` naming the `id`, the line size and the limit. A request whose `id` is not an integer or a string, or is longer than 128 bytes, is answered with a `-32600` error without an `id`. Oversized notifications (no `id`) and client responses (no `method`) get no reply, and neither does a line whose `id` or `method` key is written with escape sequences, because mcpls does not recognize it. The limit is fixed and has no flag or config key.
+
 ## HTTP (Streamable HTTP)
 
 With HTTP, mcpls binds a TCP address and serves MCP 2025-11-25 Streamable HTTP. Several clients can connect, and mcpls runs independently of them.

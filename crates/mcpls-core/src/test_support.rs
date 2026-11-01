@@ -6,6 +6,7 @@
 //! makes that true across every module's tests in this crate, not just
 //! within one module (#348).
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -47,9 +48,54 @@ impl Drop for CwdGuard {
     }
 }
 
+/// Writes an executable file named `name` in `dir`, holding `body`, and
+/// returns its path, creating `dir` first.
+///
+/// An extensionless `name` gets `EXE_SUFFIX` (`.exe` on Windows, where an
+/// extensionless command spawns as `<command>.exe`; empty elsewhere). A `name`
+/// that already carries an extension (`.cmd`, `.mjs`, `.exe`) is kept as is,
+/// so it never becomes `x.exe.exe`. The file mode is `0o755` on Unix.
+pub fn fake_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let suffix = if Path::new(name).extension().is_some() {
+        ""
+    } else {
+        std::env::consts::EXE_SUFFIX
+    };
+    let path = dir.join(format!("{name}{suffix}"));
+    fs::write(&path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CwdGuard;
+    use super::{CwdGuard, fake_executable};
+
+    #[test]
+    fn test_fake_executable_applies_the_platform_suffix_and_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = fake_executable(&dir.path().join("bin"), "srv", "#!/bin/sh\n");
+
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("srv{}", std::env::consts::EXE_SUFFIX)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\n");
+        for kept in ["tool.cmd", "cli.mjs", "srv.exe"] {
+            let path = fake_executable(dir.path(), kept, "");
+            assert_eq!(path.file_name().unwrap().to_str().unwrap(), kept);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+        }
+    }
 
     #[test]
     fn test_cwd_guard_restores_cwd_on_panic() {

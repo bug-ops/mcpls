@@ -341,7 +341,7 @@ impl PublishWriter {
         let is_new = replaced.is_none();
         let fits = state
             .bytes
-            .saturating_sub(replaced.map_or(0, |(bytes, _)| bytes))
+            .saturating_sub(replaced.map_or_default(|(bytes, _)| bytes))
             .saturating_add(bytes)
             <= limits.max_bytes
             && (!is_new || state.pending.len() < limits.max_pending);

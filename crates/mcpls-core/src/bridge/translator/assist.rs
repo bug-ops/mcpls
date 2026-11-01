@@ -22,6 +22,104 @@ fn extract_documentation(doc: lsp_types::Documentation) -> String {
     }
 }
 
+/// Most completion items returned per call, for every server.
+///
+/// Servers that leave filtering to the client (tsserver returns every global
+/// at an identifier position) can answer with thousands of items, which would
+/// fill an agent's context.
+pub(super) const MAX_COMPLETION_ITEMS: usize = 100;
+
+/// Most characters of the typed prefix used for ranking, counted back from the
+/// cursor, so a hostile line cannot make ranking cost items times line length.
+const MAX_PREFIX_CHARS: usize = 256;
+
+/// How well an item matches the identifier typed before the cursor; the
+/// declaration order is the ranking order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PrefixMatch {
+    Prefix,
+    Subsequence,
+    None,
+}
+
+impl PrefixMatch {
+    /// Compares case-insensitively, as editors filter completions; `prefix`
+    /// must already be lowercase (see [`fold_prefix`]).
+    fn of(prefix: &str, candidate: &str) -> Self {
+        let candidate = candidate.to_lowercase();
+        if candidate.starts_with(prefix) {
+            return Self::Prefix;
+        }
+        let mut remaining = candidate.chars();
+        if prefix
+            .chars()
+            .all(|typed| remaining.any(|candidate_char| candidate_char == typed))
+        {
+            Self::Subsequence
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// The last [`MAX_PREFIX_CHARS`] characters of `prefix`, lowercased once for
+/// all items.
+fn fold_prefix(prefix: &str) -> String {
+    let skipped = prefix.chars().count().saturating_sub(MAX_PREFIX_CHARS);
+    prefix
+        .chars()
+        .skip(skipped)
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn is_identifier_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
+}
+
+/// The identifier characters directly before the cursor, where
+/// `utf16_column` is the 0-based cursor column in UTF-16 units.
+fn typed_prefix(line: &str, utf16_column: u32) -> &str {
+    let mut units = 0_u32;
+    let end = line
+        .char_indices()
+        .find(|(_, character)| {
+            let reached = units >= utf16_column;
+            units = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
+            reached
+        })
+        .map_or(line.len(), |(index, _)| index);
+    let before = &line[..end];
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_identifier_char(*character))
+        .last()
+        .map_or(before.len(), |(index, _)| index);
+    &before[start..]
+}
+
+/// Keeps at most [`MAX_COMPLETION_ITEMS`] items, ranking by [`PrefixMatch`]
+/// against `prefix` and then by `sortText` (else label) before the cut, so a
+/// match for what was typed survives. At or under the cap the server's order
+/// is untouched. The flag is set only when this cut dropped items.
+fn cap_completions(
+    mut items: Vec<lsp_types::CompletionItem>,
+    prefix: &str,
+) -> (Vec<lsp_types::CompletionItem>, bool) {
+    if items.len() <= MAX_COMPLETION_ITEMS {
+        return (items, false);
+    }
+    let prefix = fold_prefix(prefix);
+    items.sort_by_cached_key(|item| {
+        let filter = item.filter_text.as_deref().unwrap_or(&item.label);
+        let rank = item.sort_text.as_deref().unwrap_or(&item.label);
+        (PrefixMatch::of(&prefix, filter), rank.to_owned())
+    });
+    items.truncate(MAX_COMPLETION_ITEMS);
+    (items, true)
+}
+
 /// Most parameters kept per signature; the rest are dropped (logged).
 const MAX_SIGNATURE_PARAMETERS: usize = 256;
 
@@ -122,7 +220,7 @@ impl Translator {
         let Positioned {
             result: response,
             ctx,
-            doc: _doc,
+            doc,
         } = self
             .position_request::<lsp_types::CompletionRequest>(
                 &file_path,
@@ -138,6 +236,12 @@ impl Translator {
             None => vec![],
         };
 
+        let prefix = self
+            .document_tracker
+            .line_text(doc.path(), position.lsp_line())
+            .map_or_default(|line| typed_prefix(&line, position.lsp_character()).to_owned());
+        let (items, truncated) = cap_completions(items, &prefix);
+
         let result = CompletionsResult {
             items: items
                 .into_iter()
@@ -148,6 +252,7 @@ impl Translator {
                     documentation: item.documentation.map(extract_documentation),
                 })
                 .collect(),
+            truncated,
             positions_degraded: ctx.positions_degraded(),
         };
 
@@ -531,6 +636,7 @@ mod tests {
         line: u32,
         character: u32,
         method: &str,
+        response: serde_json::Value,
     ) -> serde_json::Value {
         use std::sync::Arc;
 
@@ -580,11 +686,6 @@ mod tests {
         assert_eq!(opened["method"], "textDocument/didOpen");
         let request = read_framed_message(&mut wire).await;
         assert_eq!(request["method"], method);
-        let response = if method == "textDocument/completion" {
-            serde_json::json!([])
-        } else {
-            serde_json::Value::Null
-        };
         write_response(&mut server.read_half_stdin, &request["id"], response).await;
 
         handle.await.unwrap().unwrap()
@@ -594,8 +695,145 @@ mod tests {
     /// line, so column 1 on it converts exactly and must not be flagged.
     #[tokio::test]
     async fn test_handle_completions_trailing_empty_line_is_not_degraded() {
-        let wire = utf8_degradation("fn main() {}\n", 2, 1, "textDocument/completion").await;
+        let wire = utf8_degradation(
+            "fn main() {}\n",
+            2,
+            1,
+            "textDocument/completion",
+            serde_json::json!([]),
+        )
+        .await;
         assert!(wire.get("positions_degraded").is_none());
+    }
+
+    fn completion_item(label: &str) -> lsp_types::CompletionItem {
+        lsp_types::CompletionItem {
+            label: label.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn labels(items: &[lsp_types::CompletionItem]) -> Vec<&str> {
+        items.iter().map(|item| item.label.as_str()).collect()
+    }
+
+    /// 300 items, the one matching the typed `getEl` sorting last by label.
+    fn flooded_items() -> Vec<lsp_types::CompletionItem> {
+        (0..299)
+            .map(|index| completion_item(&format!("A{index:03}")))
+            .chain([completion_item("getElementById")])
+            .collect()
+    }
+
+    #[test]
+    fn test_cap_keeps_the_typed_prefix_match_that_sorts_last() {
+        let (items, truncated) = cap_completions(flooded_items(), "getEl");
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_COMPLETION_ITEMS);
+        assert_eq!(items[0].label, "getElementById");
+    }
+
+    #[test]
+    fn test_cap_ranks_subsequence_above_non_match_and_prefix_above_both() {
+        let mut items: Vec<_> = (0..120)
+            .map(|i| completion_item(&format!("a{i:03}")))
+            .collect();
+        items.push(completion_item("gxexteyl"));
+        items.push(completion_item("getElement"));
+        let (items, _) = cap_completions(items, "getEl");
+        assert_eq!(&labels(&items)[..2], ["getElement", "gxexteyl"]);
+    }
+
+    #[test]
+    fn test_cap_with_empty_prefix_keeps_stable_sort_text_order() {
+        let items: Vec<_> = (0..150)
+            .map(|index| lsp_types::CompletionItem {
+                label: format!("z{index}"),
+                sort_text: Some(format!("{:03}", 149 - index)),
+                ..Default::default()
+            })
+            .collect();
+        let (items, truncated) = cap_completions(items, "");
+        assert!(truncated);
+        assert_eq!(items[0].label, "z149");
+        assert_eq!(items[99].label, "z50");
+    }
+
+    #[test]
+    fn test_cap_matches_on_filter_text_before_label() {
+        let mut items = flooded_items();
+        items[299] = lsp_types::CompletionItem {
+            label: "shown".to_owned(),
+            filter_text: Some("getElementById".to_owned()),
+            ..Default::default()
+        };
+        let (items, _) = cap_completions(items, "getEl");
+        assert_eq!(items[0].label, "shown");
+    }
+
+    #[test]
+    fn test_cap_at_the_limit_keeps_server_order_unflagged() {
+        let items: Vec<_> = (0..MAX_COMPLETION_ITEMS)
+            .rev()
+            .map(|index| completion_item(&format!("m{index:03}")))
+            .collect();
+        let before = labels(&items).join(",");
+        let (items, truncated) = cap_completions(items, "zzz");
+        assert!(!truncated);
+        assert_eq!(labels(&items).join(","), before);
+    }
+
+    #[test]
+    fn test_a_huge_prefix_is_bounded_and_folded_once() {
+        let huge = "A".repeat(1_000_000);
+        let folded = fold_prefix(&huge);
+        assert_eq!(folded.chars().count(), MAX_PREFIX_CHARS);
+        assert!(folded.chars().all(|character| character == 'a'));
+
+        let (items, truncated) = cap_completions(flooded_items(), &huge);
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_COMPLETION_ITEMS);
+    }
+
+    #[test]
+    fn test_fold_prefix_keeps_the_characters_nearest_the_cursor() {
+        let prefix = format!("{}GetEl", "x".repeat(MAX_PREFIX_CHARS));
+        let folded = fold_prefix(&prefix);
+        assert!(folded.ends_with("getel"));
+        assert_eq!(folded.chars().count(), MAX_PREFIX_CHARS);
+    }
+
+    #[test]
+    fn test_typed_prefix_walks_back_over_identifier_characters() {
+        assert_eq!(typed_prefix("doc.getEl", 9), "getEl");
+        assert_eq!(typed_prefix("  $my_var1", 10), "$my_var1");
+        assert_eq!(typed_prefix("foo(", 4), "");
+        assert_eq!(typed_prefix("abc def", 3), "abc");
+        assert_eq!(typed_prefix("abc", 99), "abc");
+        assert_eq!(typed_prefix("", 0), "");
+        assert_eq!(typed_prefix("𝄞x ab", 6), "ab");
+    }
+
+    #[tokio::test]
+    async fn test_handle_completions_over_the_cap_ranks_by_the_typed_prefix() {
+        let items: Vec<_> = flooded_items()
+            .into_iter()
+            .map(|item| serde_json::json!({"label": item.label}))
+            .collect();
+        let wire = utf8_degradation(
+            "doc.getEl",
+            1,
+            10,
+            "textDocument/completion",
+            serde_json::Value::Array(items),
+        )
+        .await;
+        assert_eq!(wire["truncated"], true);
+        assert_eq!(
+            wire["items"].as_array().unwrap().len(),
+            MAX_COMPLETION_ITEMS
+        );
+        assert_eq!(wire["items"][0]["label"], "getElementById");
     }
 
     /// #641: a line past the end is rejected before any request, so it can no
@@ -630,7 +868,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_signature_help_in_range_position_is_not_degraded() {
-        let wire = utf8_degradation("fn main() {}", 1, 4, "textDocument/signatureHelp").await;
+        let wire = utf8_degradation(
+            "fn main() {}",
+            1,
+            4,
+            "textDocument/signatureHelp",
+            serde_json::Value::Null,
+        )
+        .await;
         assert!(wire.get("positions_degraded").is_none());
     }
 

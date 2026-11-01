@@ -890,7 +890,7 @@ impl McplsServer {
 
     /// Get code completion suggestions.
     #[tool(
-        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
+        description = "Completion suggestions at position. Returns methods, functions, variables, types, and snippets. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted. At most 100 items are returned, best matches for the typed prefix first; `truncated: true` means more existed, so type more of the identifier.",
         title = "Completions"
     )]
     async fn get_completions(
@@ -958,7 +958,7 @@ impl McplsServer {
 
     /// Search for symbols across the workspace.
     #[tool(
-        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. ", positions_note_response!(), " ", out_of_workspace_note!(), " ", index_coverage_note!()),
+        description = concat!("Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. With several servers eligible every capable one is asked: each symbol names its `server`, and `servers` holds one outcome per asked server, each with its own `index_coverage`. A server whose `handles` omit this tool, or that untrusted mode refused, is neither asked nor listed; `restart_server` revives an `unavailable` one. ", positions_note_response!(), " ", out_of_workspace_note!(), " ", index_coverage_note!()),
         title = "Workspace Symbol Search"
     )]
     async fn workspace_symbol_search(
@@ -6839,12 +6839,12 @@ sleep 0.3
     fn capabilities_advertising(capability: Capability) -> lsp_types::ServerCapabilities {
         let json = match capability {
             Capability::Completions | Capability::SignatureHelp => {
-                serde_json::json!({ capability.name(): {} })
+                serde_json::json!({ capability.as_str(): {} })
             }
             Capability::PrepareRename => {
                 serde_json::json!({ "renameProvider": { "prepareProvider": true } })
             }
-            _ => serde_json::json!({ capability.name(): true }),
+            _ => serde_json::json!({ capability.as_str(): true }),
         };
         serde_json::from_value(json).unwrap()
     }
@@ -7487,13 +7487,19 @@ sleep 0.3
                         "{} with only {advertised:?} on rust",
                         tool.name()
                     ),
-                    // `resolve_any` picks the first catch-all in config order,
-                    // which advertises nothing, whatever "rust" advertises.
+                    // Workspace search asks every catch-all: it is supported
+                    // when "rust" advertises it, else the first server's gap.
                     ToolBackend::Workspace(_) => assert_eq!(
                         reported,
-                        RouteSupport::CapabilityNotAdvertised {
-                            server: crate::config::ServerId::from_static("a-srv"),
-                            capability: Capability::WorkspaceSymbols,
+                        if advertised == Capability::WorkspaceSymbols {
+                            RouteSupport::Supported {
+                                server: crate::config::ServerId::from_static("rust"),
+                            }
+                        } else {
+                            RouteSupport::CapabilityNotAdvertised {
+                                server: crate::config::ServerId::from_static("a-srv"),
+                                capability: Capability::WorkspaceSymbols,
+                            }
                         }
                     ),
                     ToolBackend::Local => {}

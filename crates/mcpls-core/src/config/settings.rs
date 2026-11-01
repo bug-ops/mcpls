@@ -59,9 +59,18 @@ pub enum InvalidLspSettings {
 ///     serde_json::json!({"typeCheckingMode": "strict"})
 /// );
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct LspSettings(Map<String, Value>);
+
+/// Prints keys and structure only: setting values may carry credentials.
+impl std::fmt::Debug for LspSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LspSettings")
+            .field(&crate::redaction::JsonShape(&Value::Object(self.0.clone())))
+            .finish()
+    }
+}
 
 impl LspSettings {
     /// Builds settings from a raw object, expanding top-level dotted keys.

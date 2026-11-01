@@ -1042,10 +1042,42 @@ mod tests {
         assert_eq!(message, "failed to spawn LSP server 'x': permission denied");
     }
 
+    /// Puts `server`'s init config under untrusted vetting against `boundary`
+    /// with `tool` as an extra argument, so a restart rechecks the argument.
+    fn vet_server_arguments(
+        translator: &Translator,
+        server: &ServerId,
+        boundary: crate::bridge::WorkspaceRoots,
+        tool: &std::path::Path,
+    ) {
+        let init = lock_std(&translator.servers)
+            .server_mut(server)
+            .unwrap()
+            .init_config()
+            .clone();
+        let command = init.server_config().command.server_command().clone();
+        let mut init = init.with_trust(crate::lsp::SpawnTrust::Untrusted(
+            crate::lsp::vetting::UntrustedVetting::new(boundary, command),
+        ));
+        let config = init.server_config_mut();
+        config.args = crate::config::ServerArgs::new(
+            config
+                .args
+                .iter()
+                .cloned()
+                .chain([tool.to_string_lossy().into_owned()]),
+        )
+        .unwrap();
+        lock_std(&translator.servers)
+            .server_mut(server)
+            .unwrap()
+            .set_init_config(init);
+    }
+
     /// #815: a refusal stops nothing, so it must not start the restart
-    /// cooldown. Needs no process: the refusal is the argument recheck, whose
-    /// trigger (an executable file named `tool.exe` in the workspace) holds on
-    /// every host.
+    /// cooldown. Runs on every host: the in-process fake server needs no
+    /// process, and the refusal is the argument recheck, which an executable
+    /// file inside the workspace triggers.
     #[tokio::test]
     async fn test_refused_restart_leaves_the_cooldown_untouched() {
         use tokio::sync::Mutex;
@@ -1058,15 +1090,8 @@ mod tests {
         use crate::runtime::pump::{DiagnosticsRoles, PumpShared, PumpWiring};
 
         let dir = tempfile::TempDir::new().unwrap();
-        let tool = dir.path().join("tool.exe");
-        std::fs::write(&tool, "").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let tool = crate::test_support::fake_executable(dir.path(), "tool", "");
         let roots = WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap();
-
         let id = ServerId::from_static("rust");
         let cache = Arc::new(Mutex::new(NotificationCache::new()));
         let clock = Arc::new(FakeClock::new());
@@ -1090,22 +1115,7 @@ mod tests {
             },
             CancellationToken::new(),
         )));
-
-        let init = lock_std(&translator.servers)
-            .server_mut(&id)
-            .unwrap()
-            .init_config()
-            .clone();
-        let command = init.server_config().command.server_command().clone();
-        let mut init = init.with_trust(crate::lsp::SpawnTrust::Untrusted(
-            crate::lsp::vetting::UntrustedVetting::new(roots, command),
-        ));
-        init.server_config_mut().args =
-            crate::config::ServerArgs::new([tool.to_string_lossy().into_owned()]).unwrap();
-        lock_std(&translator.servers)
-            .server_mut(&id)
-            .unwrap()
-            .set_init_config(init);
+        vet_server_arguments(&translator, &id, roots, &tool);
 
         let result = translator
             .restart_servers(RestartTarget::All)
@@ -1226,27 +1236,7 @@ mod tests {
 
             #[cfg(unix)]
             fn vet_arguments_against(&self, boundary: WorkspaceRoots, tool: &Path) {
-                let init = lock_std(&self.translator.servers)
-                    .server_mut(&self.id)
-                    .unwrap()
-                    .init_config()
-                    .clone();
-                let command = init.server_config().command.server_command().clone();
-                let mut init = init.with_trust(crate::lsp::SpawnTrust::Untrusted(
-                    crate::lsp::vetting::UntrustedVetting::new(boundary, command),
-                ));
-                let args = init.server_config_mut();
-                args.args = crate::config::ServerArgs::new(
-                    args.args
-                        .iter()
-                        .cloned()
-                        .chain([tool.to_string_lossy().into_owned()]),
-                )
-                .unwrap();
-                lock_std(&self.translator.servers)
-                    .server_mut(&self.id)
-                    .unwrap()
-                    .set_init_config(init);
+                vet_server_arguments(&self.translator, &self.id, boundary, tool);
             }
 
             fn registered(&self) -> bool {

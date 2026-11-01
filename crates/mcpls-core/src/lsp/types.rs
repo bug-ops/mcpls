@@ -2,8 +2,6 @@
 
 use std::borrow::Cow;
 
-// Brings `Notification::METHOD` into scope for `<Type>::METHOD` below.
-use lsp_types::Notification as _;
 // Re-export LSP notification types from lsp_types to avoid duplication.
 pub use lsp_types::{
     LogMessageParams, ProgressParams, PublishDiagnosticsParams, ShowMessageParams,
@@ -30,14 +28,11 @@ impl Serialize for JsonRpcVersion {
 impl<'de> Deserialize<'de> for JsonRpcVersion {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let version = Cow::<str>::deserialize(deserializer)?;
-        if version == JSONRPC_VERSION {
-            Ok(Self)
-        } else {
-            Err(de::Error::invalid_value(
-                de::Unexpected::Str(&version),
-                &JSONRPC_VERSION,
-            ))
-        }
+        (version == JSONRPC_VERSION)
+            .ok_or_else(|| {
+                de::Error::invalid_value(de::Unexpected::Str(&version), &JSONRPC_VERSION)
+            })
+            .map(|()| Self)
     }
 }
 
@@ -336,18 +331,18 @@ impl LspNotification {
     /// ```
     #[must_use]
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
-        match method {
-            m if m == lsp_types::PublishDiagnosticsNotification::METHOD.as_str() => {
-                Self::typed(m, params, Self::PublishDiagnostics)
+        match lsp_types::LspNotificationMethod::from(method) {
+            lsp_types::LspNotificationMethod::TextDocumentPublishDiagnostics => {
+                Self::typed(method, params, Self::PublishDiagnostics)
             }
-            m if m == lsp_types::LogMessageNotification::METHOD.as_str() => {
-                Self::typed(m, params, Self::LogMessage)
+            lsp_types::LspNotificationMethod::WindowLogMessage => {
+                Self::typed(method, params, Self::LogMessage)
             }
-            m if m == lsp_types::ShowMessageNotification::METHOD.as_str() => {
-                Self::typed(m, params, Self::ShowMessage)
+            lsp_types::LspNotificationMethod::WindowShowMessage => {
+                Self::typed(method, params, Self::ShowMessage)
             }
-            m if m == lsp_types::ProgressNotification::METHOD.as_str() => {
-                Self::typed(m, params, Self::Progress)
+            lsp_types::LspNotificationMethod::Progress => {
+                Self::typed(method, params, Self::Progress)
             }
             _ => Self::Other {
                 method: Cow::Owned(method.to_string()),

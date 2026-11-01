@@ -870,7 +870,7 @@
   {
     "name": "get_completions",
     "title": "Completions",
-    "description": "Completion suggestions at position. Returns methods, functions, variables, types, and snippets. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted.",
+    "description": "Completion suggestions at position. Returns methods, functions, variables, types, and snippets. `positions_degraded: \"request\"` (non-UTF-16 servers only) means the queried position was sent unconverted, so the result may not match the position asked about and should not be trusted. At most 100 items are returned, best matches for the typed prefix first; `truncated: true` means more existed, so type more of the identifier.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -977,6 +977,10 @@
             }
           ],
           "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
+        },
+        "truncated": {
+          "description": "Whether mcpls dropped items to stay within its completion cap.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -7346,7 +7350,7 @@
   {
     "name": "workspace_symbol_search",
     "title": "Workspace Symbol Search",
-    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory). On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence.",
+    "description": "Search workspace symbols by name. Supports partial matching and fuzzy search. `limit` is capped at a fixed server-side maximum regardless of the value requested; `truncated: true` on the result means more matches exist than are returned. With several servers eligible every capable one is asked: each symbol names its `server`, and `servers` holds one outcome per asked server, each with its own `index_coverage`. A server whose `handles` omit this tool, or that untrusted mode refused, is neither asked nor listed; `restart_server` revives an `unavailable` one. `positions_degraded: \"response\"` (non-UTF-16 servers only) means some returned `character` offsets may be inexact. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory). On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -7507,6 +7511,114 @@
           ],
           "type": "object"
         },
+        "ServerId": {
+          "description": "Unique identity of a configured LSP server within a workspace.",
+          "type": "string"
+        },
+        "ServerOutcome": {
+          "description": "What one server contributed to a multi-server workspace symbol search.",
+          "oneOf": [
+            {
+              "description": "The server answered.",
+              "properties": {
+                "index_coverage": {
+                  "$ref": "#/$defs/IndexCoverage",
+                  "description": "Set only when the server answered with no symbols: what its answer covers."
+                },
+                "outcome": {
+                  "const": "answered",
+                  "type": "string"
+                },
+                "symbols": {
+                  "description": "Symbols the server returned, before `kind_filter` and `limit`.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "outcome",
+                "symbols"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server has not finished starting; retry later.",
+              "properties": {
+                "outcome": {
+                  "const": "initializing",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Failed to start or died; this search never restarts it (use `restart_server`).",
+              "properties": {
+                "outcome": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server did not answer before its request deadline.",
+              "properties": {
+                "outcome": {
+                  "const": "timed_out",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server rejected the request or the request failed.",
+              "properties": {
+                "outcome": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The server does not advertise workspace symbol support.",
+              "properties": {
+                "outcome": {
+                  "const": "capability_not_advertised",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "outcome"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "server": {
+              "$ref": "#/$defs/ServerId",
+              "description": "The server this entry describes."
+            }
+          },
+          "required": [
+            "server"
+          ],
+          "type": "object"
+        },
         "WorkspaceSymbol": {
           "description": "A workspace symbol.",
           "properties": {
@@ -7530,6 +7642,10 @@
             "name": {
               "description": "Name of the symbol.",
               "type": "string"
+            },
+            "server": {
+              "$ref": "#/$defs/ServerId",
+              "description": "The server that produced the symbol; set only when several servers were asked."
             }
           },
           "required": [
@@ -7556,6 +7672,13 @@
             }
           ],
           "description": "Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise."
+        },
+        "servers": {
+          "description": "One entry per eligible server, in config order; present only when several servers were asked.",
+          "items": {
+            "$ref": "#/$defs/ServerOutcome"
+          },
+          "type": "array"
         },
         "symbols": {
           "description": "List of symbols found.",

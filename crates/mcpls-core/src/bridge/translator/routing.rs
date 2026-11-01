@@ -13,8 +13,9 @@ use crate::bridge::{
 use crate::config::{
     FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
-use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure};
+use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::LspClient;
+use crate::spelling::spelled_enum;
 use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded, lock_std};
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
@@ -186,102 +187,66 @@ impl From<DisclosedCapability> for Capability {
     }
 }
 
-/// An LSP server capability mcpls gates a tool on before dispatching its request.
-///
-/// Ties the [`ServerCapabilities`](lsp_types::ServerCapabilities) field name
-/// (used only for the error message, through `Display`) to the predicate that
-/// actually checks it, so the two cannot drift apart the way two independent,
-/// hand-picked call-site values could.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Capability {
-    /// `completionProvider` (`textDocument/completion`).
-    Completions,
-    /// `signatureHelpProvider` (`textDocument/signatureHelp`).
-    SignatureHelp,
-    /// `inlayHintProvider` (`textDocument/inlayHint`).
-    InlayHints,
-    /// `hoverProvider` (`textDocument/hover`).
-    Hover,
-    /// `definitionProvider` (`textDocument/definition`).
-    Definition,
-    /// `referencesProvider` (`textDocument/references`).
-    References,
-    /// `implementationProvider` (`textDocument/implementation`).
-    Implementation,
-    /// `typeDefinitionProvider` (`textDocument/typeDefinition`).
-    TypeDefinition,
-    /// `callHierarchyProvider` (`textDocument/prepareCallHierarchy`,
-    /// `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`).
-    CallHierarchy,
-    /// `renameProvider` (`textDocument/rename`).
-    Rename,
-    /// `documentFormattingProvider` (`textDocument/formatting`).
-    FormatDocument,
-    /// `codeActionProvider` (`textDocument/codeAction`).
-    CodeActions,
-    /// `documentSymbolProvider` (`textDocument/documentSymbol`).
-    DocumentSymbols,
-    /// `workspaceSymbolProvider` (`workspace/symbol`).
-    WorkspaceSymbols,
-    /// `declarationProvider` (`textDocument/declaration`).
-    Declaration,
-    /// `typeHierarchyProvider` (`textDocument/prepareTypeHierarchy`,
-    /// `typeHierarchy/supertypes`, `typeHierarchy/subtypes`).
-    TypeHierarchy,
-    /// `renameProvider.prepareProvider` (`textDocument/prepareRename`). Gated
-    /// on the [`ToolKind::Rename`] route, so it is never the primary
-    /// capability of its tool.
-    PrepareRename,
-    /// `documentHighlightProvider` (`textDocument/documentHighlight`).
-    DocumentHighlights,
-    /// `documentRangeFormattingProvider` (`textDocument/rangeFormatting`).
-    FormatRange,
-    /// `selectionRangeProvider` (`textDocument/selectionRange`).
-    SelectionRange,
-    /// `foldingRangeProvider` (`textDocument/foldingRange`).
-    FoldingRange,
+spelled_enum! {
+    /// An LSP server capability mcpls gates a tool on before dispatching its request.
+    ///
+    /// Ties the [`ServerCapabilities`](lsp_types::ServerCapabilities) field name
+    /// (used only for the error message, through `Display`) to the predicate that
+    /// actually checks it, so the two cannot drift apart the way two independent,
+    /// hand-picked call-site values could.
+    Capability {
+        /// `completionProvider` (`textDocument/completion`).
+        Completions => "completionProvider",
+        /// `signatureHelpProvider` (`textDocument/signatureHelp`).
+        SignatureHelp => "signatureHelpProvider",
+        /// `inlayHintProvider` (`textDocument/inlayHint`).
+        InlayHints => "inlayHintProvider",
+        /// `hoverProvider` (`textDocument/hover`).
+        Hover => "hoverProvider",
+        /// `definitionProvider` (`textDocument/definition`).
+        Definition => "definitionProvider",
+        /// `referencesProvider` (`textDocument/references`).
+        References => "referencesProvider",
+        /// `implementationProvider` (`textDocument/implementation`).
+        Implementation => "implementationProvider",
+        /// `typeDefinitionProvider` (`textDocument/typeDefinition`).
+        TypeDefinition => "typeDefinitionProvider",
+        /// `callHierarchyProvider` (`textDocument/prepareCallHierarchy`,
+        /// `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`).
+        CallHierarchy => "callHierarchyProvider",
+        /// `renameProvider` (`textDocument/rename`).
+        Rename => "renameProvider",
+        /// `documentFormattingProvider` (`textDocument/formatting`).
+        FormatDocument => "documentFormattingProvider",
+        /// `codeActionProvider` (`textDocument/codeAction`).
+        CodeActions => "codeActionProvider",
+        /// `documentSymbolProvider` (`textDocument/documentSymbol`).
+        DocumentSymbols => "documentSymbolProvider",
+        /// `workspaceSymbolProvider` (`workspace/symbol`).
+        WorkspaceSymbols => "workspaceSymbolProvider",
+        /// `declarationProvider` (`textDocument/declaration`).
+        Declaration => "declarationProvider",
+        /// `typeHierarchyProvider` (`textDocument/prepareTypeHierarchy`,
+        /// `typeHierarchy/supertypes`, `typeHierarchy/subtypes`).
+        TypeHierarchy => "typeHierarchyProvider",
+        /// `renameProvider.prepareProvider` (`textDocument/prepareRename`). Gated
+        /// on the [`ToolKind::Rename`] route, so it is never the primary
+        /// capability of its tool.
+        PrepareRename => "renameProvider.prepareProvider",
+        /// `documentHighlightProvider` (`textDocument/documentHighlight`).
+        DocumentHighlights => "documentHighlightProvider",
+        /// `documentRangeFormattingProvider` (`textDocument/rangeFormatting`).
+        FormatRange => "documentRangeFormattingProvider",
+        /// `selectionRangeProvider` (`textDocument/selectionRange`).
+        SelectionRange => "selectionRangeProvider",
+        /// `foldingRangeProvider` (`textDocument/foldingRange`).
+        FoldingRange => "foldingRangeProvider",
+    }
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "compile-time check; the loop condition keeps `i` below `ALL.len()`"
-)]
-const _: () = {
-    assert!(Capability::ALL.len() == Capability::FoldingRange as usize + 1);
-    assert!(Capability::ALL.len() <= u32::BITS as usize);
-    let mut i = 0;
-    while i < Capability::ALL.len() {
-        assert!(Capability::ALL[i] as usize == i);
-        i += 1;
-    }
-};
+const _: () = assert!(Capability::ALL.len() <= u32::BITS as usize);
 
 impl Capability {
-    /// Every capability, in discriminant order.
-    pub(crate) const ALL: [Self; 21] = [
-        Self::Completions,
-        Self::SignatureHelp,
-        Self::InlayHints,
-        Self::Hover,
-        Self::Definition,
-        Self::References,
-        Self::Implementation,
-        Self::TypeDefinition,
-        Self::CallHierarchy,
-        Self::Rename,
-        Self::FormatDocument,
-        Self::CodeActions,
-        Self::DocumentSymbols,
-        Self::WorkspaceSymbols,
-        Self::Declaration,
-        Self::TypeHierarchy,
-        Self::PrepareRename,
-        Self::DocumentHighlights,
-        Self::FormatRange,
-        Self::SelectionRange,
-        Self::FoldingRange,
-    ];
-
     /// The [`ToolKind`] whose route this capability gates -- the single
     /// source tying a gated handler's routing to its capability check.
     pub(crate) const fn tool_kind(self) -> ToolKind {
@@ -346,34 +311,6 @@ impl Capability {
         match caps {
             Some(caps) => self.is_supported(caps),
             None => true,
-        }
-    }
-
-    /// The `ServerCapabilities` field name, as reported to the MCP caller in
-    /// [`Error::CapabilityNotSupported`].
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Completions => "completionProvider",
-            Self::SignatureHelp => "signatureHelpProvider",
-            Self::InlayHints => "inlayHintProvider",
-            Self::Hover => "hoverProvider",
-            Self::Definition => "definitionProvider",
-            Self::References => "referencesProvider",
-            Self::Implementation => "implementationProvider",
-            Self::TypeDefinition => "typeDefinitionProvider",
-            Self::CallHierarchy => "callHierarchyProvider",
-            Self::Rename => "renameProvider",
-            Self::FormatDocument => "documentFormattingProvider",
-            Self::CodeActions => "codeActionProvider",
-            Self::DocumentSymbols => "documentSymbolProvider",
-            Self::WorkspaceSymbols => "workspaceSymbolProvider",
-            Self::Declaration => "declarationProvider",
-            Self::TypeHierarchy => "typeHierarchyProvider",
-            Self::PrepareRename => "renameProvider.prepareProvider",
-            Self::DocumentHighlights => "documentHighlightProvider",
-            Self::FormatRange => "documentRangeFormattingProvider",
-            Self::SelectionRange => "selectionRangeProvider",
-            Self::FoldingRange => "foldingRangeProvider",
         }
     }
 
@@ -530,18 +467,12 @@ impl Capability {
     }
 }
 
-impl std::fmt::Display for Capability {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
 impl serde::Serialize for Capability {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.name())
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -757,6 +688,56 @@ pub(super) fn lookup_workspace_route(
         Err(NoServerReason::NothingRegistered) => WorkspaceRouteLookup::AllInitializing,
         Err(NoServerReason::NoClaimant) => WorkspaceRouteLookup::NoClaimant,
     }
+}
+
+/// Whether `failure` is a refusal by untrusted-workspace mode rather than a
+/// startup error.
+pub(super) const fn is_untrusted_refusal(failure: &ServerSpawnFailure) -> bool {
+    matches!(failure.reason, StartupFailure::RefusedUntrustedWorkspace(_))
+}
+
+/// Where one eligible server of a workspace-wide fan-out stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MemberPresence {
+    /// Registered with the translator.
+    Registered,
+    /// Expected to register but has not yet.
+    Initializing,
+    /// Neither registered nor expected: it failed to start or is gone.
+    Absent,
+}
+
+/// The servers a workspace-wide `tool` fans out over, in config order, each
+/// with its presence, or `None` when fewer than two servers are eligible and
+/// the single-server route applies.
+///
+/// Eligibility comes from the configured router (so a server that failed to
+/// start still counts) minus every server untrusted-workspace mode refused.
+/// The handler and `get_tool_support` both call this, so they cannot disagree
+/// on the set.
+pub(super) fn workspace_fan_out_members(
+    configured: &ToolRouter,
+    tool: ToolKind,
+    is_refused: impl Fn(&ServerId) -> bool,
+    is_registered: impl Fn(&ServerId) -> bool,
+    is_expected: impl Fn(&ServerId) -> bool,
+) -> Option<Vec<(ServerId, MemberPresence)>> {
+    let members: Vec<(ServerId, MemberPresence)> = configured
+        .workspace_candidates(tool)
+        .into_iter()
+        .filter(|id| !is_refused(id))
+        .map(|id| {
+            let presence = if is_registered(id) {
+                MemberPresence::Registered
+            } else if is_expected(id) {
+                MemberPresence::Initializing
+            } else {
+                MemberPresence::Absent
+            };
+            (id.clone(), presence)
+        })
+        .collect();
+    (members.len() >= 2).then_some(members)
 }
 
 /// Fail with [`Error::CapabilityNotSupported`] if `caps` is known and does
@@ -3926,6 +3907,81 @@ mod tests {
                 ),
             ],
             Provider::Bool(false),
+        );
+    }
+
+    fn three_catch_all_router() -> ToolRouter {
+        ToolRouter::catch_all([
+            (ServerId::from_static("a"), LanguageId::from_static("rust")),
+            (
+                ServerId::from_static("b"),
+                LanguageId::from_static("python"),
+            ),
+            (ServerId::from_static("c"), LanguageId::from_static("go")),
+        ])
+    }
+
+    fn members_of(
+        members: Option<Vec<(ServerId, MemberPresence)>>,
+    ) -> Vec<(String, MemberPresence)> {
+        members
+            .expect("two or more eligible servers")
+            .into_iter()
+            .map(|(id, presence)| (id.as_str().to_owned(), presence))
+            .collect()
+    }
+
+    #[test]
+    fn fan_out_members_classify_presence_in_config_order() {
+        let members = workspace_fan_out_members(
+            &three_catch_all_router(),
+            ToolKind::WorkspaceSymbols,
+            |_| false,
+            |id| id.as_str() == "a",
+            |id| id.as_str() == "b",
+        );
+        assert_eq!(
+            members_of(members),
+            [
+                ("a".to_owned(), MemberPresence::Registered),
+                ("b".to_owned(), MemberPresence::Initializing),
+                ("c".to_owned(), MemberPresence::Absent),
+            ]
+        );
+    }
+
+    #[test]
+    fn fan_out_members_drop_refused_servers() {
+        let members = workspace_fan_out_members(
+            &three_catch_all_router(),
+            ToolKind::WorkspaceSymbols,
+            |id| id.as_str() == "b",
+            |_| true,
+            |_| false,
+        );
+        let ids: Vec<String> = members_of(members).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn fan_out_members_are_none_below_two_eligible_servers() {
+        let refused_all_but_one = workspace_fan_out_members(
+            &three_catch_all_router(),
+            ToolKind::WorkspaceSymbols,
+            |id| id.as_str() != "a",
+            |_| true,
+            |_| false,
+        );
+        assert_eq!(refused_all_but_one, None);
+        assert_eq!(
+            workspace_fan_out_members(
+                &ToolRouter::default(),
+                ToolKind::WorkspaceSymbols,
+                |_| false,
+                |_| true,
+                |_| false,
+            ),
+            None
         );
     }
 }

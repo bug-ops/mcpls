@@ -57,6 +57,7 @@ Pointing mcpls at an untrusted checkout, such as a cloned third-party repository
 | A repository you do not trust | Use a container or VM, and consider [untrusted mode](untrusted-mode.md) |
 | A team-shared client config | Remember that a project-scoped `.mcp.json` is controlled by the repository |
 | HTTP on a non-loopback address | Always put an authenticating reverse proxy in front |
+| Installed through the MCP registry | The instance starts in the default trust mode, like a manual install; untrusted mode is enabled only on the command line, never by the registry manifest, an environment variable or a config key |
 
 ## What's Next
 

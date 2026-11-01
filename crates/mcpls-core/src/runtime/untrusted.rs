@@ -291,7 +291,7 @@ fn home_overrides(
     let host = effective.env.host();
     let unset = HomeVariable::ALL
         .into_iter()
-        .filter(|variable| !effective.env.contains_key(variable.name()));
+        .filter(|variable| !effective.env.contains_key(variable.as_str()));
     if let Some(login_home) = login_home
         .and_then(Path::to_str)
         .and_then(|home| EnvValue::new(home).ok())
@@ -301,7 +301,7 @@ fn home_overrides(
             .collect());
     }
     for variable in unset {
-        let Some(value) = parent_env(variable.name()) else {
+        let Some(value) = parent_env(variable.as_str()) else {
             if variable == HomeVariable::Home && host == HostOs::Other {
                 return Err(UntrustedRefusal::UnknownHome);
             }
@@ -673,15 +673,7 @@ mod plan_tests {
         let (dir, roots) = rust_workspace();
         std::fs::write(dir.path().join("go.mod"), "").unwrap();
         let tools = tempfile::TempDir::new().unwrap();
-        let gopls = tools
-            .path()
-            .join(if cfg!(windows) { "gopls.exe" } else { "gopls" });
-        std::fs::write(&gopls, "").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&gopls, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let gopls = crate::test_support::fake_executable(tools.path(), "gopls", "");
         let mut go = LspServerConfig::gopls();
         go.command = ServerCommand::new(gopls.to_string_lossy().into_owned())
             .unwrap()
@@ -819,8 +811,8 @@ mod plan_tests {
         }
 
         fn executable(path: &Path) {
-            std::fs::write(path, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let stem = path.file_name().unwrap().to_str().unwrap();
+            crate::test_support::fake_executable(path.parent().unwrap(), stem, "#!/bin/sh\n");
         }
 
         fn relative_from_cwd(target: &Path) -> PathBuf {
@@ -1177,7 +1169,7 @@ mod plan_tests {
             let fx = fixture();
 
             for variable in HomeVariable::ALL {
-                let mut env = vec![(variable.name(), Path::new(""))];
+                let mut env = vec![(variable.as_str(), Path::new(""))];
                 if variable != HomeVariable::Home {
                     env.push(("HOME", fx.outside.as_path()));
                 }
@@ -2525,7 +2517,6 @@ mod plan_tests {
 #[cfg(test)]
 #[cfg(unix)]
 mod refusal_spawn_tests {
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     use tokio::sync::Mutex;
@@ -2551,8 +2542,8 @@ mod refusal_spawn_tests {
     }
 
     fn executable(path: &Path, body: &str) {
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stem = path.file_name().unwrap().to_str().unwrap();
+        crate::test_support::fake_executable(path.parent().unwrap(), stem, body);
     }
 
     fn case_with(

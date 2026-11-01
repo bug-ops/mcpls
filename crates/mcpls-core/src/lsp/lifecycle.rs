@@ -24,7 +24,9 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{debug, info, warn};
 
 use crate::bridge::{WorkspaceRoots, try_path_to_uri};
-use crate::config::{LspServerConfig, LspSettings, PositionEncodings, ServerCommand};
+use crate::config::{
+    LspServerConfig, LspSettings, PositionEncodings, ServerCommand, launch_defaults,
+};
 use crate::error::{
     BackgroundTask, Error, InitFailureHint, InitPhase, Result, ServerSpawnFailure, StartupFailure,
     StdioStream, UntrustedRefusal,
@@ -32,7 +34,9 @@ use crate::error::{
 use crate::lsp::client::{LspClient, SHUTDOWN_TIMEOUT};
 #[cfg(unix)]
 use crate::lsp::process::Binding;
-use crate::lsp::process::{MarkOutcome, ServerProcess};
+use crate::lsp::process::ServerProcess;
+#[cfg(unix)]
+use crate::lsp::process::{MarkFailure, MarkOutcome};
 use crate::lsp::stderr::{EofWait, StderrCapture};
 use crate::lsp::transport::LspTransport;
 use crate::lsp::types::LspNotification;
@@ -87,23 +91,25 @@ pub enum ExitGrace {
     IfAnswered(Duration),
 }
 
-/// Whether the LSP `exit` notification reached the server on shutdown.
+/// How the `shutdown` handshake ended, computed once from its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitNotice {
-    /// The `shutdown` handshake completed and `exit` was sent.
-    Sent,
-    /// The handshake failed or was cut short, or `exit` was withheld because
-    /// escaping descendants could not be marked.
-    NotSent,
+enum Handshake {
+    /// `shutdown` was answered and `exit` was sent.
+    ExitSent,
+    /// Escaping descendants could not be marked, so `exit` was withheld and
+    /// the tree is terminated at once.
+    #[cfg(unix)]
+    ExitWithheld(MarkFailure),
+    /// The handshake failed or was cut short before `exit`.
+    Failed,
 }
 
-impl ExitNotice {
-    /// Judged from the handshake's own result, before it is merged with the
-    /// message loop's stop.
-    const fn of(handshake: &Result<MarkOutcome>) -> Self {
-        match handshake {
-            Ok(MarkOutcome::Confirmed) => Self::Sent,
-            _ => Self::NotSent,
+impl Handshake {
+    const fn exit_withheld(self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::ExitWithheld(_) => true,
+            Self::ExitSent | Self::Failed => false,
         }
     }
 }
@@ -111,14 +117,18 @@ impl ExitNotice {
 /// How long the leader process is given to exit on its own after the
 /// handshake, with `remaining` of the shutdown budget left. `answered` is the
 /// merged result of the handshake and the message loop's stop.
+///
+/// The wait covers a server that was sent no `exit` as well: closing the
+/// client's stdin ends the server's input, which a well-behaved server treats
+/// as `exit`. Only a withheld `exit` skips it.
 fn child_exit_wait(
     grace: ExitGrace,
-    mark: MarkOutcome,
+    handshake: Handshake,
     answered: &Result<()>,
     remaining: Duration,
 ) -> Duration {
     match grace {
-        _ if mark != MarkOutcome::Confirmed => Duration::ZERO,
+        _ if handshake.exit_withheld() => Duration::ZERO,
         ExitGrace::WithinBudget => remaining.min(CHILD_EXIT_GRACE),
         ExitGrace::IfAnswered(grace) if answered.is_ok() => grace,
         ExitGrace::IfAnswered(_) => Duration::ZERO,
@@ -882,6 +892,17 @@ impl LspServer {
                 .map(|arg| redactions.apply(arg))
                 .collect::<Vec<_>>()
         );
+        let appended = launch_defaults::appended(server_config);
+        if !appended.is_empty() {
+            debug!(
+                "LSP server launch options appended by mcpls: {}",
+                appended
+                    .iter()
+                    .map(|option| option.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
 
     /// Build the child `Command` for a spawned LSP server, without spawning it.
@@ -899,7 +920,14 @@ impl LspServer {
         parent_env: impl ParentEnv,
     ) -> Command {
         let mut command = Command::new(&config.command);
-        command.args(&config.args).env_clear();
+        command
+            .args(&config.args)
+            .args(
+                launch_defaults::appended(config)
+                    .iter()
+                    .map(ToString::to_string),
+            )
+            .env_clear();
         if let ChildWorkingDir::Fixed(dir) = working_dir {
             command.current_dir(dir);
         }
@@ -1315,7 +1343,7 @@ impl LspServer {
         let client = &mut self.client;
         let shutdown_request_timeout = Duration::from_secs(5).min(budget);
 
-        let handshake: Result<MarkOutcome> = timeout_at(deadline, async {
+        let handshake: Result<Handshake> = timeout_at(deadline, async {
             client.suppress_cancels();
             let _: serde_json::Value = client
                 .request(
@@ -1325,23 +1353,19 @@ impl LspServer {
                 )
                 .await?;
             #[cfg(unix)]
-            let mark = match self.child.as_mut() {
-                Some(child) => child.mark_escapees().await,
-                None => MarkOutcome::Confirmed,
-            };
-            #[cfg(windows)]
-            let mark = MarkOutcome::Confirmed;
-            if mark == MarkOutcome::Confirmed {
-                client.notify_typed::<ExitNotification>(()).await?;
+            if let Some(child) = self.child.as_mut()
+                && let MarkOutcome::Failed(failure) = child.mark_escapees().await
+            {
+                return Ok(Handshake::ExitWithheld(failure));
             }
-            Ok(mark)
+            client.notify_typed::<ExitNotification>(()).await?;
+            Ok(Handshake::ExitSent)
         })
         .await
         .unwrap_or(Err(Error::ShutdownTimeout));
-        let mark = handshake
+        let outcome = handshake
             .as_ref()
-            .map_or(MarkOutcome::Confirmed, |mark| *mark);
-        let notice = ExitNotice::of(&handshake);
+            .map_or(Handshake::Failed, |outcome| *outcome);
         let handshake = handshake.map(drop);
         let handshake = match client.shutdown_until(deadline).await {
             Ok(()) => handshake,
@@ -1351,39 +1375,34 @@ impl LspServer {
         if let Some(child) = &mut self.child {
             let wait = child_exit_wait(
                 grace,
-                mark,
+                outcome,
                 &handshake,
                 deadline.saturating_duration_since(Instant::now()),
             );
             match timeout(wait, child.wait()).await {
-                Ok(Ok(status)) => match notice {
-                    ExitNotice::Sent => {
-                        debug!(
-                            ?status,
-                            "LSP server process exited after `exit` notification"
-                        );
-                    }
-                    ExitNotice::NotSent => {
-                        debug!(
-                            ?status,
-                            "LSP server process exited without an `exit` notification"
-                        );
-                    }
-                },
+                Ok(Ok(status)) if outcome == Handshake::ExitSent => {
+                    debug!(
+                        ?status,
+                        "LSP server process exited after `exit` notification"
+                    );
+                }
+                Ok(Ok(status)) => {
+                    debug!(
+                        ?status,
+                        "LSP server process exited without an `exit` notification"
+                    );
+                }
                 Ok(Err(e)) => warn!(error = %e, "failed to wait for LSP server process exit"),
-                Err(_) => match notice {
-                    ExitNotice::Sent => warn!(
-                        waited = ?wait,
-                        exit = ?notice,
-                        "LSP server process did not exit within the wait after `exit` \
-                         notification, killing it"
-                    ),
-                    ExitNotice::NotSent => warn!(
-                        waited = ?wait,
-                        exit = ?notice,
-                        "LSP server process killed without an `exit` notification"
-                    ),
-                },
+                Err(_) if outcome == Handshake::ExitSent => warn!(
+                    waited = ?wait,
+                    "LSP server process did not exit within the wait after `exit` \
+                     notification, killing it"
+                ),
+                Err(_) => warn!(
+                    waited = ?wait,
+                    ?outcome,
+                    "LSP server process killed without an `exit` notification"
+                ),
             }
             let sweep_budget = deadline
                 .saturating_duration_since(Instant::now())
@@ -1672,35 +1691,31 @@ mod tests {
         let grace = Duration::from_secs(7);
         let answered = Ok(());
         let unanswered = Err(Error::ShutdownTimeout);
-        let wait = |policy, mark, answered: &Result<()>| {
-            child_exit_wait(policy, mark, answered, remaining)
+        let wait = |policy, handshake, answered: &Result<()>| {
+            child_exit_wait(policy, handshake, answered, remaining)
         };
 
         assert_eq!(
-            wait(ExitGrace::WithinBudget, MarkOutcome::Confirmed, &answered),
+            wait(ExitGrace::WithinBudget, Handshake::ExitSent, &answered),
             CHILD_EXIT_GRACE
         );
         assert_eq!(
             child_exit_wait(
                 ExitGrace::WithinBudget,
-                MarkOutcome::Confirmed,
+                Handshake::ExitSent,
                 &answered,
                 Duration::from_secs(1)
             ),
             Duration::from_secs(1)
         );
         assert_eq!(
-            wait(
-                ExitGrace::IfAnswered(grace),
-                MarkOutcome::Confirmed,
-                &answered
-            ),
+            wait(ExitGrace::IfAnswered(grace), Handshake::ExitSent, &answered),
             grace
         );
         assert_eq!(
             wait(
                 ExitGrace::IfAnswered(grace),
-                MarkOutcome::Confirmed,
+                Handshake::ExitSent,
                 &unanswered
             ),
             Duration::ZERO
@@ -1708,22 +1723,21 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_notice_is_sent_only_after_a_confirmed_handshake() {
-        assert_eq!(
-            ExitNotice::of(&Ok(MarkOutcome::Confirmed)),
-            ExitNotice::Sent
-        );
-        assert_eq!(
-            ExitNotice::of(&Err(Error::ShutdownTimeout)),
-            ExitNotice::NotSent
-        );
+    fn test_child_exit_wait_is_skipped_only_when_exit_is_withheld() {
+        let wait = |handshake| {
+            child_exit_wait(
+                ExitGrace::WithinBudget,
+                handshake,
+                &Ok(()),
+                Duration::from_secs(10),
+            )
+        };
+        assert_eq!(wait(Handshake::ExitSent), CHILD_EXIT_GRACE);
+        assert_eq!(wait(Handshake::Failed), CHILD_EXIT_GRACE);
         #[cfg(unix)]
         assert_eq!(
-            ExitNotice::of(&Ok(MarkOutcome::Failed(
-                crate::lsp::process::MarkFailure::NoConfirmation
-            ))),
-            ExitNotice::NotSent,
-            "a withheld `exit` is not a sent one"
+            wait(Handshake::ExitWithheld(MarkFailure::NoConfirmation)),
+            Duration::ZERO
         );
     }
 
@@ -3033,6 +3047,94 @@ sleep 5
             handles: None,
             indexing: crate::bridge::IndexingPolicy::Auto,
         }
+    }
+
+    fn argv(config: &LspServerConfig) -> Vec<String> {
+        LspServer::build_command(config, &ChildWorkingDir::Inherit, |_: &str| None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn test_build_command_puts_user_args_first_then_clangd_defaults() {
+        let mut config = bare_server_config(HashMap::new());
+        config.command = ServerCommand::from_static("clangd").into();
+        config.args =
+            crate::config::ServerArgs::new(["--background-index", "--log=verbose"]).unwrap();
+
+        let argv = argv(&config);
+
+        assert_eq!(argv[..2], ["--background-index", "--log=verbose"]);
+        assert_eq!(argv.len(), 4);
+        assert!(argv[2].starts_with("--limit-references="));
+        assert!(argv[3].starts_with("--limit-results="));
+    }
+
+    /// FR-004 and SC-007: an entry persisted with `args = []` gets the
+    /// defaults, and the start, restart and respawn paths build one argv.
+    #[tokio::test]
+    async fn test_persisted_empty_args_clangd_gets_the_same_argv_on_every_launch_path() {
+        let persisted: LspServerConfig = toml::from_str(
+            r#"
+language_id = "cpp"
+command = "clangd"
+args = []
+"#,
+        )
+        .unwrap();
+        let init = crate::test_lsp::init_config_for(persisted);
+
+        let started = argv(init.server_config());
+        let restarted = argv(init.clone().for_respawn().await.unwrap().server_config());
+        let respawned = argv(init.for_respawn().await.unwrap().server_config());
+
+        assert_eq!(started.len(), 3, "{started:?}");
+        assert_eq!(started, restarted);
+        assert_eq!(started, respawned);
+    }
+
+    /// #842: the types that wrap a server entry print no secret of it.
+    #[tokio::test]
+    async fn test_debug_of_every_config_wrapper_hides_the_entry_secrets() {
+        let config: crate::config::ServerConfig = toml::from_str(
+            r#"
+[[lsp_servers]]
+language_id = "python"
+command = "pyright-langserver"
+args = ["--stdio", "--api-key=ARGSECRET123"]
+env = { API_TOKEN = "ENVSECRET123" }
+initialization_options = { apiToken = "INITSECRET123" }
+settings = { "tool.apiToken" = "SETTINGSSECRET123" }
+"#,
+        )
+        .unwrap();
+        let entry = config.lsp_servers[0].clone();
+        let init = crate::test_lsp::init_config_for(entry);
+        let vetted = init.for_respawn().await.unwrap();
+
+        for printed in [
+            format!("{config:?}"),
+            format!("{init:?}"),
+            format!("{vetted:?}"),
+        ] {
+            for needle in [
+                "ARGSECRET123",
+                "ENVSECRET123",
+                "INITSECRET123",
+                "SETTINGSSECRET123",
+            ] {
+                assert!(!printed.contains(needle), "{needle} leaked: {printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_command_adds_no_defaults_for_other_servers() {
+        let mut config = bare_server_config(HashMap::new());
+        config.args = crate::config::ServerArgs::new(["--stdio"]).unwrap();
+        assert_eq!(argv(&config), ["--stdio"]);
     }
 
     /// Collects the env vars a `Command` would set, resolving `env_clear`

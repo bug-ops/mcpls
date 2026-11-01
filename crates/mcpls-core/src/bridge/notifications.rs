@@ -1482,7 +1482,7 @@ impl NotificationCache {
 
     /// Number of pushed slots (canonical and aliases) indexed under `file`.
     fn pushed_slot_count(&self, file: &DiagnosticsKey) -> usize {
-        self.files.get(file).map_or(0, |slots| {
+        self.files.get(file).map_or_default(|slots| {
             slots
                 .iter()
                 .filter(|slot| slot.provenance == Provenance::Pushed)
