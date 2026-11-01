@@ -9,26 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `workspace_symbol_search` queries every eligible server of a polyglot workspace, tags each symbol with its server and lists per-server outcomes; a single eligible server keeps the old output (#844).
-- `get_completions` returns at most 100 items for every server, ranked by match with the typed prefix, and sets `truncated` when it cut (#845).
-- `server.json` registry manifest (crates.io package) with a version check in CI and the release workflow; the `publish-registry` job stays disabled (#813).
-- Release archives carry build-provenance attestations (#843).
+- `workspace_symbol_search` queries every eligible server of a polyglot workspace, tags each symbol with its server and lists per-server outcomes; a single eligible server keeps the old output (#844) (#849).
+- `get_completions` returns at most 100 items for every server, ranked by match with the typed prefix, and sets `truncated` when it cut (#845) (#849).
+- `server.json` registry manifest (crates.io package) with a version check in CI and the release workflow; the `publish-registry` job stays disabled (#813) (#849).
+- Release archives carry build-provenance attestations (#843) (#849).
 
 ### Changed
 
-- **Breaking:** stdio requests over 4 MiB are answered with `-32600` carrying the request id (previously lines over 16 MiB got no response); the limit is fixed (#848).
-- **Breaking:** `get_completions` output is capped at 100 items for all servers (#845).
-- **Breaking:** the default clangd launch lifts `--limit-references` and `--limit-results` and logs at error level unless `args` already set them (not applied to wrappers, `clangd-18` or `@file` arguments) (#845).
-- **Breaking:** an explicit `handles` claimer no longer hides catch-all servers for `workspace_symbol_search`; servers refused by untrusted mode are never queried or listed (#844).
-- **Breaking:** `Capability::name` becomes `as_str` and `Capability` is `#[non_exhaustive]` (#846).
-- The `tools/list` size budget is raised to 139,000 B (#844).
-- Release workflow: read-only build job, `cross` and its image pinned, `contents: write` only in the upload job, version check before the release is created (#843).
-- Internal: `spelled_enum!` moved to its own module and applied to the remaining spelling tables, LSP notification methods are typed, `Handshake` replaces the shutdown exit mark, the notification guard is a typestate, sweep enqueue and test fixtures are shared (#810, #846, #847).
+- **Breaking:** stdio requests over 4 MiB are answered with `-32600` carrying the request id (previously lines over 16 MiB got no response); the limit is fixed (#848) (#849).
+- **Breaking:** `get_completions` output is capped at 100 items for all servers (#845) (#849).
+- **Breaking:** the default clangd launch lifts `--limit-references` and `--limit-results` and logs at error level unless `args` already set them (not applied to wrappers, `clangd-18` or `@file` arguments) (#845) (#849).
+- **Breaking:** an explicit `handles` claimer no longer hides catch-all servers for `workspace_symbol_search`; servers refused by untrusted mode are never queried or listed (#844) (#849).
+- **Breaking:** `Capability::name` becomes `as_str` and `Capability` is `#[non_exhaustive]` (#846) (#849).
+- The `tools/list` size budget is raised to 139,000 B (#844) (#849).
+- Release workflow: read-only build job, `cross` and its image pinned, `contents: write` only in the upload job, version check before the release is created (#843) (#849).
+- Internal: `spelled_enum!` moved to its own module and applied to the remaining spelling tables, LSP notification methods are typed, `Handshake` replaces the shutdown exit mark, the notification guard is a typestate, sweep enqueue and test fixtures are shared (#810, #846, #847) (#849).
 
 ### Fixed
 
-- `Debug` of `LspServerConfig` and `LspSettings` no longer prints `initialization_options` or `settings` values (#842).
-- Windows workspace file open no longer opens an outside final-entry symlink target before refusing it (#825).
+- `Debug` of `LspServerConfig` and `LspSettings` no longer prints `initialization_options` or `settings` values (#842) (#849).
+- Windows workspace file open no longer opens an outside final-entry symlink target before refusing it (#825) (#849).
 
 ## [0.8.0] - 2026-10-20
 
