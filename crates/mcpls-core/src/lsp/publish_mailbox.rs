@@ -20,8 +20,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::bridge::{BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES};
-use crate::json_envelope::MAX_LOST_URI_BYTES;
-use crate::lsp::types::LostPublish;
+use crate::lsp::types::{BoundedUri, LostPublish};
 use crate::util::{DropCounter, MAX_LOG_STRING_BYTES, escape_bounded, lock_std};
 
 /// Most files with an undelivered publish; as many as the cache holds, so the
@@ -33,8 +32,9 @@ pub const MAILBOX_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Most lost files remembered per server before only the fact of a loss is.
 ///
-/// Each remembered file holds a URI of up to `MAX_LOST_URI_BYTES`, so the list
-/// retains at most 1000 x 16 KiB = 16 MiB per server, outside the
+/// Each remembered file holds a [`BoundedUri`] of up to
+/// [`BoundedUri::MAX_BYTES`] and its dedupe key of the same length, so the
+/// list retains at most 1000 x 2 x 16 KiB = 32 MiB per server, outside the
 /// `MAILBOX_MAX_BYTES` budget of undelivered diagnostics.
 const MAX_LOST_FILES: usize = MAX_DIAGNOSTIC_ENTRIES;
 
@@ -60,36 +60,38 @@ impl Default for MailboxLimits {
 /// cache stores them, so no later stage bounds them again.
 #[derive(Debug)]
 pub struct BoundedPublish {
-    uri: Uri,
+    uri: BoundedUri,
     version: Option<i32>,
     diagnostics: BoundedDiagnostics,
 }
 
 impl BoundedPublish {
-    fn new(params: PublishDiagnosticsParams) -> (Self, usize) {
+    /// `None` when the URI is past [`BoundedUri::MAX_BYTES`].
+    fn new(params: PublishDiagnosticsParams) -> Option<(Self, usize)> {
         let PublishDiagnosticsParams {
             uri,
             diagnostics,
             version,
         } = params;
-        let diagnostics = BoundedDiagnostics::new(&uri, diagnostics);
+        let uri = BoundedUri::new(uri)?;
+        let diagnostics = BoundedDiagnostics::new(uri.uri(), diagnostics);
         let bytes = diagnostics
             .buffered_bytes()
-            .saturating_add(AsRef::<str>::as_ref(&uri).len());
-        (
+            .saturating_add(AsRef::<str>::as_ref(uri.uri()).len());
+        Some((
             Self {
                 uri,
                 version,
                 diagnostics,
             },
             bytes,
-        )
+        ))
     }
 
     /// The file the server published for, exactly as it spelled it.
     #[must_use]
     pub const fn uri(&self) -> &Uri {
-        &self.uri
+        self.uri.uri()
     }
 
     /// The document version the diagnostics are for, if the server said.
@@ -106,7 +108,7 @@ impl BoundedPublish {
 
     /// The URI, version and bounded diagnostics.
     #[must_use]
-    pub fn into_parts(self) -> (Uri, Option<i32>, BoundedDiagnostics) {
+    pub fn into_parts(self) -> (BoundedUri, Option<i32>, BoundedDiagnostics) {
         (self.uri, self.version, self.diagnostics)
     }
 }
@@ -114,22 +116,23 @@ impl BoundedPublish {
 /// A non-empty list of files whose publish the mailbox could not deliver,
 /// oldest loss first.
 #[derive(Debug, PartialEq, Eq)]
-pub struct LostFiles(Vec<Uri>);
+pub struct LostFiles(Vec<BoundedUri>);
 
 impl LostFiles {
-    fn new(uris: Vec<Uri>) -> Option<Self> {
+    fn new(uris: Vec<BoundedUri>) -> Option<Self> {
         (!uris.is_empty()).then_some(Self(uris))
     }
 
     /// The lost files.
     #[must_use]
-    pub fn uris(&self) -> &[Uri] {
+    pub fn uris(&self) -> &[BoundedUri] {
         &self.0
     }
 }
 
 /// One thing the reader takes out of the mailbox.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PublishDelivery {
     /// The latest pending publish of a file.
     Publish(BoundedPublish),
@@ -175,6 +178,13 @@ enum UnnamedLoss {
     Unidentified,
 }
 
+/// What a full list of lost files escalates to.
+#[derive(Debug, Clone, Copy)]
+enum OnFull {
+    MarkOverflowed,
+    LoseAll,
+}
+
 #[derive(Debug, Default)]
 struct State {
     pending: HashMap<DiagnosticsKey, Pending>,
@@ -184,7 +194,7 @@ struct State {
     order: VecDeque<(DiagnosticsKey, u64)>,
     next_seq: u64,
     bytes: usize,
-    lost: Vec<Uri>,
+    lost: Vec<BoundedUri>,
     lost_keys: HashSet<DiagnosticsKey>,
     unnamed_loss: UnnamedLoss,
     drops: DropCounter,
@@ -256,28 +266,19 @@ impl State {
             .then_some(PublishDelivery::LostUnnamed)
     }
 
-    fn mark_lost(&mut self, key: DiagnosticsKey, uri: Uri) {
+    /// Remembers `uri` as a lost file unless it already is; a full list
+    /// escalates to `on_full`.
+    fn remember_lost(&mut self, key: DiagnosticsKey, uri: BoundedUri, on_full: OnFull) {
         if self.lost_keys.contains(&key) {
             return;
         }
         if self.lost.len() >= MAX_LOST_FILES {
-            self.unnamed_loss = self.unnamed_loss.max(UnnamedLoss::Overflowed);
-            return;
-        }
-        self.lost_keys.insert(key);
-        self.lost.push(uri);
-    }
-
-    /// Records the loss of the publish of `key`; a full list of lost files
-    /// escalates to an unidentified loss, which loses more than the overflow
-    /// mark of [`Self::mark_lost`] does.
-    fn lose_named(&mut self, key: DiagnosticsKey, uri: Uri) {
-        self.withdraw(&key);
-        if self.lost_keys.contains(&key) {
-            return;
-        }
-        if self.lost.len() >= MAX_LOST_FILES {
-            self.lose_all();
+            match on_full {
+                OnFull::LoseAll => self.lose_all(),
+                OnFull::MarkOverflowed => {
+                    self.unnamed_loss = self.unnamed_loss.max(UnnamedLoss::Overflowed);
+                }
+            }
             return;
         }
         self.lost_keys.insert(key);
@@ -344,14 +345,17 @@ impl PublishWriter {
     /// publish of the file is withdrawn too, so the file never reads as
     /// published with content older than what the server last said.
     pub fn publish(&self, params: PublishDiagnosticsParams) {
-        let (publish, bytes) = BoundedPublish::new(params);
+        let Some((publish, bytes)) = BoundedPublish::new(params) else {
+            self.lose(LostPublish::Unidentified);
+            return;
+        };
         let key = DiagnosticsKey::of(publish.uri());
         let limits = self.shared.limits;
         let mut state = lock_std(&self.shared.state);
         if state.reader_gone {
             debug!(
-                "dropping a publish for {}: nobody reads the mailbox",
-                publish.uri().as_ref()
+                uri = publish.uri().as_ref(),
+                "dropping a publish: nobody reads the mailbox"
             );
             return;
         }
@@ -385,27 +389,27 @@ impl PublishWriter {
             None
         } else {
             let (uri, ..) = publish.into_parts();
-            state.mark_lost(key, uri);
+            state.remember_lost(key, uri, OnFull::MarkOverflowed);
             state.count_drop()
         };
         drop(state);
         if let Some(suppressed) = warn_due {
             warn!(
-                "publishDiagnostics mailbox is full: dropped a publish ({suppressed} others \
-                 since the last warning); the files read as evicted until the server publishes \
-                 again"
+                suppressed,
+                "publishDiagnostics mailbox is full: dropped a publish; the files read as \
+                 evicted until the server publishes again"
             );
         }
         self.shared.wake.notify_one();
     }
 
     /// Records a `publishDiagnostics` that was dropped before it could be
-    /// buffered because its frame could not be decoded.
+    /// buffered: its frame could not be decoded, or it named a URI past
+    /// [`BoundedUri::MAX_BYTES`].
     ///
     /// A named file is marked lost like one the mailbox could not hold, and its
     /// pending publish is withdrawn, since the lost one was newer. An
-    /// unidentified loss (or a file named by more than [`MAX_LOST_URI_BYTES`]
-    /// bytes) withdraws every pending publish and has the reader hand over
+    /// unidentified loss withdraws every pending publish and has the reader hand over
     /// [`PublishDelivery::LostUnidentified`]. Every source of a lost publish
     /// passes here, so this is the one place that warns about it: at most
     /// once per period of [`WarnLimiter::DEFAULT_PERIOD`][period], without the
@@ -418,19 +422,20 @@ impl PublishWriter {
             return;
         }
         match lost {
-            LostPublish::File(uri) if uri.as_ref().len() <= MAX_LOST_URI_BYTES => {
-                let key = DiagnosticsKey::of(&uri);
-                state.lose_named(key, uri);
+            LostPublish::File(uri) => {
+                let key = DiagnosticsKey::of(uri.uri());
+                state.withdraw(&key);
+                state.remember_lost(key, uri, OnFull::LoseAll);
             }
-            LostPublish::File(_) | LostPublish::Unidentified => state.lose_all(),
+            LostPublish::Unidentified => state.lose_all(),
         }
         let warn_due = state.lost_frames.record(Instant::now());
         drop(state);
         if let Some(suppressed) = warn_due {
             warn!(
                 suppressed,
-                "dropped an unreadable publishDiagnostics; its files read as evicted until the \
-                 server publishes them again"
+                "dropped an unreadable or over-long-uri publishDiagnostics; its files read as \
+                 evicted until the server publishes them again"
             );
         }
         self.shared.wake.notify_one();
@@ -641,6 +646,15 @@ mod tests {
         Uri::from(format!("file:///ws/f{n}.rs"))
     }
 
+    fn bounded(n: usize) -> BoundedUri {
+        BoundedUri::new(uri(n)).unwrap()
+    }
+
+    fn long_uri(bytes: usize) -> Uri {
+        let prefix = "file:///";
+        Uri::from(format!("{prefix}{}", "u".repeat(bytes - prefix.len())))
+    }
+
     fn publish_of(n: usize, message: &str) -> PublishDiagnosticsParams {
         PublishDiagnosticsParams {
             uri: uri(n),
@@ -653,7 +667,7 @@ mod tests {
     }
 
     fn bytes_of(n: usize, message: &str) -> usize {
-        BoundedPublish::new(publish_of(n, message)).1
+        BoundedPublish::new(publish_of(n, message)).unwrap().1
     }
 
     /// #738: the method of a dropped frame is escaped and bounded in the log.
@@ -705,7 +719,7 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("expected the lost file first");
         };
-        assert_eq!(lost.uris(), [uri(1)]);
+        assert_eq!(lost.uris(), [bounded(1)]);
         assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
         assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
         assert!(reader.recv().await.is_none());
@@ -769,7 +783,7 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("the loss must be handed over first");
         };
-        assert_eq!(lost.uris(), [uri(2), uri(3)]);
+        assert_eq!(lost.uris(), [bounded(2), bounded(3)]);
         assert_eq!(next_publish(&mut reader).await.uri(), &uri(0));
         assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
     }
@@ -787,7 +801,7 @@ mod tests {
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("expected the lost file");
         };
-        assert_eq!(lost.uris(), [uri(1)]);
+        assert_eq!(lost.uris(), [bounded(1)]);
         assert!(reader.recv().await.is_none());
     }
 
@@ -906,13 +920,13 @@ mod tests {
         writer.publish(publish_of(1, "old"));
         writer.publish(publish_of(2, "kept"));
 
-        writer.lose(LostPublish::File(uri(1)));
+        writer.lose(LostPublish::File(bounded(1)));
         drop(writer);
 
         let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
             panic!("expected the lost file first");
         };
-        assert_eq!(lost.uris(), [uri(1)]);
+        assert_eq!(lost.uris(), [bounded(1)]);
         assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
         assert!(reader.recv().await.is_none());
     }
@@ -939,7 +953,7 @@ mod tests {
             writer.publish(publish_of(n, "e"));
         }
 
-        writer.lose(LostPublish::File(uri(MAX_LOST_FILES)));
+        writer.lose(LostPublish::File(bounded(MAX_LOST_FILES)));
         drop(writer);
 
         assert_matches!(reader.recv().await, Some(PublishDelivery::Lost(_)));
@@ -948,13 +962,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_named_by_too_long_a_uri_is_an_unidentified_loss() {
+    async fn a_publish_with_a_uri_past_the_bound_is_an_unidentified_loss_not_a_pending_one() {
         let (writer, mut reader) = mailbox(MailboxLimits::default());
-        let long = Uri::from(format!("file:///{}", "u".repeat(MAX_LOST_URI_BYTES)));
+        writer.publish(publish_of(1, "old"));
+        let mut over = publish_of(2, "e");
+        over.uri = long_uri(BoundedUri::MAX_BYTES + 1);
 
-        writer.lose(LostPublish::File(long));
+        writer.publish(over);
         drop(writer);
 
+        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
+        assert!(reader.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_publish_with_a_uri_at_the_bound_is_buffered() {
+        let (writer, mut reader) = mailbox(MailboxLimits::default());
+        let mut at = publish_of(2, "e");
+        at.uri = long_uri(BoundedUri::MAX_BYTES);
+
+        writer.publish(at);
+        drop(writer);
+
+        assert_eq!(
+            next_publish(&mut reader).await.uri().as_ref().len(),
+            BoundedUri::MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capacity_drop_never_stores_a_uri_past_the_bound() {
+        let (writer, mut reader) = mailbox(small(0, usize::MAX));
+        let mut over = publish_of(1, "e");
+        over.uri = long_uri(BoundedUri::MAX_BYTES + 1);
+
+        writer.publish(over);
+        writer.publish(publish_of(2, "e"));
+        drop(writer);
+
+        let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
+            panic!("expected the named loss of the second file");
+        };
+        assert_eq!(lost.uris(), [bounded(2)]);
         assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
     }
 
@@ -967,9 +1016,9 @@ mod tests {
             tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
         let (writer, _reader) = mailbox(MailboxLimits::default());
 
-        writer.lose(LostPublish::File(uri(1)));
+        writer.lose(LostPublish::File(bounded(1)));
         writer.lose(LostPublish::Unidentified);
-        writer.lose(LostPublish::File(uri(2)));
+        writer.lose(LostPublish::File(bounded(2)));
 
         let warnings: Vec<String> = logs
             .entries()
@@ -1011,6 +1060,6 @@ mod tests {
 
         writer.publish(publish_of(7, "e"));
 
-        assert_eq!(waiting.await.unwrap(), uri(7));
+        assert_eq!(waiting.await.unwrap(), bounded(7));
     }
 }

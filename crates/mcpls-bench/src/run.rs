@@ -366,7 +366,7 @@ impl Recorder {
 fn invocation_log_dir(work_dir: &Path, scenario: &Scenario, now: SystemTime) -> PathBuf {
     let millis = now
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis());
+        .map_or_default(|elapsed| elapsed.as_millis());
     work_dir
         .join("logs")
         .join(scenario.name.as_str())

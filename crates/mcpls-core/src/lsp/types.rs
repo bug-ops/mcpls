@@ -221,37 +221,100 @@ pub enum UndecodableReason {
     },
 }
 
-/// A `textDocument/publishDiagnostics` that never reached the cache because
-/// its frame could not be decoded, so the diagnostics cached before it are no
-/// longer known to be current.
+/// A file URI short enough to be retained per file: at most
+/// [`BoundedUri::MAX_BYTES`] bytes.
+///
+/// Every place that remembers a `publishDiagnostics` URI (the diagnostics cache
+/// and the mailbox's list of lost files) holds it up to 1000 times per server,
+/// so the length is bounded once, here, instead of being re-checked by each
+/// holder.
 ///
 /// # Examples
 ///
 /// ```
 /// use lsp_types::Uri;
-/// use mcpls_core::lsp::LostPublish;
+/// use mcpls_core::lsp::BoundedUri;
 ///
-/// let lost = LostPublish::File(Uri::from("file:///workspace/main.rs".to_owned()));
-/// assert_ne!(lost, LostPublish::Unidentified);
+/// let short = Uri::from("file:///workspace/main.rs".to_owned());
+/// assert!(BoundedUri::new(short).is_some());
+///
+/// let long = Uri::from(format!("file:///{}", "u".repeat(BoundedUri::MAX_BYTES)));
+/// assert!(BoundedUri::new(long).is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedUri(Uri);
+
+impl BoundedUri {
+    /// Longest URI kept, in bytes; far above any real path (`PATH_MAX` is 1-4
+    /// KiB).
+    pub const MAX_BYTES: usize = 16 * 1024;
+
+    /// `uri` if it is at most [`Self::MAX_BYTES`] bytes long.
+    #[must_use]
+    pub fn new(uri: Uri) -> Option<Self> {
+        (uri.as_ref().len() <= Self::MAX_BYTES).then_some(Self(uri))
+    }
+
+    /// The URI.
+    #[must_use]
+    pub const fn uri(&self) -> &Uri {
+        &self.0
+    }
+
+    /// The URI, no longer known to be bounded.
+    #[must_use]
+    pub fn into_uri(self) -> Uri {
+        self.0
+    }
+
+    /// The URI of a JSON `uri` member, if it is a valid URI within the bound.
+    /// The one reading of a publish's `uri`, shared by every path that looks
+    /// at one.
+    fn of_value(value: Value) -> Option<Self> {
+        serde_json::from_value::<Uri>(value)
+            .ok()
+            .and_then(Self::new)
+    }
+}
+
+/// A `textDocument/publishDiagnostics` that never reached the cache.
+///
+/// Its frame could not be decoded, or it named a URI past
+/// [`BoundedUri::MAX_BYTES`], so the diagnostics cached before it are no longer
+/// known to be current.
+///
+/// # Examples
+///
+/// ```
+/// use lsp_types::Uri;
+/// use mcpls_core::lsp::{BoundedUri, LostPublish};
+///
+/// let uri = BoundedUri::new(Uri::from("file:///workspace/main.rs".to_owned())).unwrap();
+/// assert_ne!(LostPublish::File(uri), LostPublish::Unidentified);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LostPublish {
     /// The publish named this file, exactly as the server spelled it.
-    File(Uri),
-    /// The file could not be read, so every file of the server is suspect.
+    File(BoundedUri),
+    /// The file could not be read or is named past the bound, so every file of
+    /// the server is suspect.
     Unidentified,
 }
 
 impl LostPublish {
-    /// The loss of a publish whose `params` were `params`; the file is taken
-    /// from `params.uri` when that is a string.
+    /// The loss of a publish whose `params` were `params`, named by the same
+    /// reading of `params.uri` that the decoder of a publish uses.
     pub(crate) fn of_params(params: Option<&Value>) -> Self {
         params
             .and_then(|params| params.get("uri"))
-            .and_then(Value::as_str)
-            .map_or(Self::Unidentified, |uri| {
-                Self::File(Uri::from(uri.to_owned()))
+            .filter(|uri| {
+                uri.as_str()
+                    .is_none_or(|uri| uri.len() <= BoundedUri::MAX_BYTES)
             })
+            .cloned()
+            .and_then(BoundedUri::of_value)
+            .map_or(Self::Unidentified, Self::File)
     }
 }
 
@@ -349,6 +412,7 @@ impl InboundMessage {
 ///
 /// Uses types from `lsp_types` crate for LSP-standard notifications.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LspNotification {
     /// textDocument/publishDiagnostics
     PublishDiagnostics(PublishDiagnosticsParams),
@@ -377,21 +441,22 @@ struct PublishBody {
 }
 
 /// Decodes `publishDiagnostics` params without copying them: the `uri` is
-/// moved out first, so a body that fails to decode still names its file.
+/// moved out first, so a body that fails to decode still names its file. A
+/// `uri` past [`BoundedUri::MAX_BYTES`] is unidentified, never cached.
 fn decode_publish(params: Option<Value>) -> Result<PublishDiagnosticsParams, LostPublish> {
     let Some(Value::Object(mut members)) = params else {
         return Err(LostPublish::Unidentified);
     };
     let uri = members
         .remove("uri")
-        .and_then(|uri| serde_json::from_value::<Uri>(uri).ok())
+        .and_then(BoundedUri::of_value)
         .ok_or(LostPublish::Unidentified)?;
     match serde_json::from_value::<PublishBody>(Value::Object(members)) {
         Ok(PublishBody {
             diagnostics,
             version,
         }) => Ok(PublishDiagnosticsParams {
-            uri,
+            uri: uri.into_uri(),
             version,
             diagnostics,
         }),
@@ -874,8 +939,57 @@ mod tests {
 
         assert_matches!(
             notification,
-            super::LspNotification::LostPublish(LostPublish::File(uri)) if uri.as_ref() == "file:///a.rs"
+            super::LspNotification::LostPublish(LostPublish::File(uri)) if uri.uri().as_ref() == "file:///a.rs"
         );
+    }
+
+    fn publish_params_with_uri_of(bytes: usize) -> Value {
+        let prefix = "file:///";
+        json!({"uri": format!("{prefix}{}", "u".repeat(bytes - prefix.len())), "diagnostics": []})
+    }
+
+    #[test]
+    fn test_publish_uri_at_the_bound_decodes_and_one_past_it_is_unidentified() {
+        let at = super::LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(publish_params_with_uri_of(BoundedUri::MAX_BYTES)),
+        );
+        assert_matches!(at, super::LspNotification::PublishDiagnostics(_));
+
+        let over = super::LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(publish_params_with_uri_of(BoundedUri::MAX_BYTES + 1)),
+        );
+        assert_matches!(
+            over,
+            super::LspNotification::LostPublish(LostPublish::Unidentified)
+        );
+    }
+
+    #[test]
+    fn test_lost_publish_of_params_agrees_with_decode_on_the_uri() {
+        let cases = [
+            publish_params_with_uri_of(BoundedUri::MAX_BYTES),
+            publish_params_with_uri_of(BoundedUri::MAX_BYTES + 1),
+            json!({"uri": 7, "diagnostics": "x"}),
+            json!({"diagnostics": "x"}),
+            json!({"uri": "file:///a.rs", "diagnostics": "x"}),
+        ];
+        for params in cases {
+            let lost = LostPublish::of_params(Some(&params));
+            let decoded = super::decode_publish(Some(params));
+            match decoded {
+                Ok(_) => assert_matches!(lost, LostPublish::File(_)),
+                Err(expected) => assert_eq!(lost, expected),
+            }
+        }
+    }
+
+    #[test]
+    fn test_bounded_uri_accepts_exactly_the_bound() {
+        let uri = |bytes: usize| Uri::from(format!("file:///{}", "u".repeat(bytes - 8)));
+        assert!(BoundedUri::new(uri(BoundedUri::MAX_BYTES)).is_some());
+        assert!(BoundedUri::new(uri(BoundedUri::MAX_BYTES + 1)).is_none());
     }
 
     #[test]

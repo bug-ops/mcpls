@@ -455,6 +455,7 @@ impl Pump {
         let uris: Vec<&lsp_types::Uri> = lost
             .uris()
             .iter()
+            .map(crate::lsp::BoundedUri::uri)
             .filter(|uri| self.workspace_roots.admits_uri(uri))
             .collect();
         let publications: Vec<Publication<'_>> = uris
@@ -544,7 +545,7 @@ async fn apply_publish(
     let Some(published) = published else {
         debug!(
             "dropping diagnostics for URI outside the workspace or unresolvable: {}",
-            uri.as_ref()
+            uri.uri().as_ref()
         );
         return;
     };
@@ -1517,7 +1518,7 @@ mod pump_tests {
 
         let server = ServerId::from_static("rust");
         for lost in [
-            LostPublish::File(test_uri("a.rs")),
+            LostPublish::File(crate::lsp::BoundedUri::new(test_uri("a.rs")).unwrap()),
             LostPublish::Unidentified,
         ] {
             let subs = make_subs();
@@ -1574,6 +1575,65 @@ mod pump_tests {
                 Published
             );
         }
+    }
+
+    /// #873: a publish whose URI is past the bound never reaches the cache; it
+    /// reads as an unidentified loss, so the server's cached entries read evicted.
+    #[tokio::test]
+    async fn test_a_publish_with_a_uri_past_the_bound_is_never_cached_and_evicts() {
+        use crate::bridge::DiagnosticsAvailability::{Evicted, Published};
+        use crate::lsp::BoundedUri;
+        use crate::mcp::{SessionHandle, Target};
+
+        let server = ServerId::from_static("rust");
+        let subs = make_subs();
+        let session = SessionHandle::new(subs.clone());
+        let (tx_sub, mut rx_sub) = mpsc::channel(8);
+        let resource = test_mcp_uri("a.rs");
+        session
+            .subscribe_for_test(&resource, Target::Channel(tx_sub))
+            .await
+            .unwrap();
+        let cache = make_cache();
+        let (feed, _cancel) =
+            spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
+        let publish_for = |uri: Uri| {
+            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+                uri,
+                diagnostics: vec![lsp_types::Diagnostic {
+                    message: "e".to_owned().into(),
+                    ..lsp_types::Diagnostic::default()
+                }],
+                version: None,
+            })
+        };
+        let sized = |len: usize| {
+            let base = test_uri("a.rs");
+            let base: &str = base.as_ref();
+            Uri::from(format!("{base}{}", "u".repeat(len - base.len())).as_str())
+        };
+
+        feed.send(publish_for(test_uri("a.rs"))).await.unwrap();
+        assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
+        assert_eq!(
+            cache
+                .lock()
+                .await
+                .availability(&test_uri("a.rs"), Some(&server)),
+            Published
+        );
+
+        feed.send(publish_for(sized(BoundedUri::MAX_BYTES + 1)))
+            .await
+            .unwrap();
+        assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
+        let guard = cache.lock().await;
+        assert_eq!(
+            guard.availability(&test_uri("a.rs"), Some(&server)),
+            Evicted
+        );
+        assert!(!guard.has_diagnostics(&sized(BoundedUri::MAX_BYTES + 1)));
+        drop(guard);
     }
 
     /// lsp/014 Q1 (best effort): a delivery queued for the old pump of a

@@ -404,7 +404,7 @@ fn textual_verdict(probe: &Probe, marker: Option<&str>, text: &str) -> Result<()
     use crate::scenario::DiagnosticsExpect;
 
     let missing = |what: &str| Err(Incorrect(format!("the answer does not mention {what}")));
-    let counted = || marker.map_or(0, |marker| text.matches(marker).count());
+    let counted = || marker.map_or_default(|marker| text.matches(marker).count());
     match probe {
         Probe::Hover { contains, .. } if !text.contains(contains.as_str()) => {
             missing(&format!("`{contains}`"))

@@ -20,11 +20,10 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::lsp::BoundedUri;
+
 const MAX_ID_BYTES: usize = 128;
 const MAX_METHOD_BYTES: usize = 128;
-/// Longest `uri` a lost `publishDiagnostics` can name, in bytes. A longer one
-/// is treated as unidentified.
-pub const MAX_LOST_URI_BYTES: usize = 16 * 1024;
 const QUOTES: usize = 2;
 const KEY_BYTES: usize = 6;
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -475,7 +474,7 @@ struct UriLayout {
 impl UriLayout {
     const fn new() -> Self {
         Self {
-            uri: Capture::new(MAX_LOST_URI_BYTES + QUOTES),
+            uri: Capture::new(BoundedUri::MAX_BYTES + QUOTES),
         }
     }
 }
@@ -874,8 +873,8 @@ mod tests {
 
     #[test]
     fn test_params_uri_over_its_bound_is_unusable_and_a_cut_one_is_never_complete() {
-        let at_bound = "u".repeat(MAX_LOST_URI_BYTES);
-        let over_bound = "u".repeat(MAX_LOST_URI_BYTES + 1);
+        let at_bound = "u".repeat(BoundedUri::MAX_BYTES);
+        let over_bound = "u".repeat(BoundedUri::MAX_BYTES + 1);
         let line = |uri: &str| format!(r#"{{"method":"m","params":{{"uri":"{uri}"}}}}"#);
         assert_eq!(
             scan_with_params_uri(line(&at_bound).as_bytes())

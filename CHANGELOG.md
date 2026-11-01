@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `RouteSupport` is `#[non_exhaustive]`, no longer implements `Serialize` or `JsonSchema`, has a unit `Initializing`, fan-out rows are the new `MemberSupport` and `MemberStatus`, and `ServerStatus::Answered` gains `indexing_in_progress` (#851, #852, #859, #861, #868).
+- **Breaking:** `LostPublish::File` carries the new `BoundedUri` (at most 16 KiB), and a `publishDiagnostics` whose `uri` is longer is never cached or listed as lost: it is an unidentified loss, so the server's entries read `evicted` (#870, #873, #874).
+- **Breaking:** `BoundedPublish::into_parts` returns a `BoundedUri` and `LostFiles::uris` returns `&[BoundedUri]` (#870, #874).
+- **Breaking:** `LspNotification`, `PublishDelivery`, `LostPublish`, `TomlDatetime` and `InvalidLspSettings` are `#[non_exhaustive]` (#871, #874).
 - **Breaking:** `InboundMessage::UndecodableNotification` carries a `DroppedNotification`, and `LostPublish`, `LspNotification::LostPublish` and `PublishDelivery::LostUnidentified` are added (#863, #868).
 - **Breaking:** a TOML datetime in `initialization_options` is a config load error like in `settings`, and `InvalidLspSettings::Datetime` wraps the new `TomlDatetime` (#865, #868).
 - An unreadable LSP frame within the size limit is classified by the same envelope scanner as an oversized one, so an escaped-key request is no longer answered `-32600`, and the oversized-frame warning logs structured fields (#860, #862, #868).
@@ -23,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `LspServerConfig.initialization_options` is `Option<InitializationOptions>` (#856, #859).
 - The default clangd launch passes `--rename-file-limit`, so `rename_symbol` is no longer refused above 50 files (#850, #859).
 - The `publish-registry` release job is enabled for stable tags (#853, #859).
+- Internal: a transport-level lost publish takes the same route as a decoded one, `LostPublish::of_params` and the publish decoder share one `uri` reading, bench code uses `map_or_default`, and drop warnings use structured fields (#872, #874).
 - Internal: workspace symbol search shares one request, limit and normalization path and a typed dedupe key; `get_completions` prefix ranking reuses `EncodingConverter`; spelling lookups share `Spelled::from_spelling`; log fields are structured; const `NonZero` limits use `expect` (#854, #855, #856, #859).
 
 ### Fixed
@@ -30,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stdio requests nested past the JSON recursion limit, cut off after `method` and `id`, or skipped by the SDK are answered with `-32700` or `-32600` carrying the request id instead of being dropped (#857, #859).
 - An LSP frame between 10 and 256 MiB fails only its own request instead of closing the server connection; larger frames still close it (#857, #859).
 - A dropped or undecodable `publishDiagnostics` frame marks its file (or every file of that server when the file is unreadable) `evicted` instead of leaving stale diagnostics as current (#863, #868).
+- The publish mailbox's lost-file list no longer retains URIs past its documented 16 MiB bound on capacity drops, and the diagnostics cache no longer retains publish URIs of any length (#870, #873, #874).
 - Diagnostics eviction marks and their overflow flag are bounded per server, so one server no longer displaces or flags another (#869).
 - `book/src/tools/server-control.md` shows the `coverage` of a fanned-out tool as computed from the aggregate route, and the stdio `-32600` / `-32601` condition for skipped requests is documented (#864, #866, #868).
 
