@@ -1130,6 +1130,7 @@ mod launch_tests {
     use std::{assert_matches, fs};
 
     use super::*;
+    use crate::test_support::fake_executable;
 
     struct Install {
         _dir: tempfile::TempDir,
@@ -1139,21 +1140,6 @@ mod launch_tests {
     fn write(path: &Path, body: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, body).unwrap();
-    }
-
-    fn write_executable(path: &Path, body: &str) {
-        // Windows spawns an extensionless command as `<command>.exe`.
-        let path = &if cfg!(windows) && path.extension().is_none() {
-            path.with_added_extension("exe")
-        } else {
-            path.to_path_buf()
-        };
-        write(path, body);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
     }
 
     fn typescript(dir: &Path, version: &str, with_tsserver: bool) -> PathBuf {
@@ -1195,7 +1181,7 @@ mod launch_tests {
     fn npm_shim_install(shim: &str, version: &str, with_tsserver: bool) -> (Install, PathBuf) {
         let install = install();
         let npm = install.base.join("npm");
-        write_executable(&npm.join(shim), "");
+        fake_executable(&npm, shim, "");
         server_package(&npm);
         let tsserver = typescript(&npm, version, with_tsserver);
         (install, tsserver)
@@ -1203,7 +1189,7 @@ mod launch_tests {
 
     fn pnpm_home(install: &Install) -> PathBuf {
         let home = install.base.join("pnpm");
-        write_executable(&home.join(SERVER_STEM), "");
+        fake_executable(&home, SERVER_STEM, "");
         home
     }
 
@@ -1387,7 +1373,7 @@ mod launch_tests {
     fn test_shim_without_server_package_is_unsupported() {
         let install = install();
         let npm = install.base.join("npm");
-        write_executable(&npm.join("typescript-language-server.cmd"), "");
+        fake_executable(&npm, "typescript-language-server.cmd", "");
         let resolved = resolve(
             &config("typescript-language-server.cmd", &[]),
             env_with_path(&npm),
@@ -1454,16 +1440,18 @@ mod launch_tests {
         let npm = install.base.join("npm");
         let marker = install.base.join("shim-ran");
         for shim in [SERVER_STEM, "typescript-language-server.cmd"] {
-            write_executable(
-                &npm.join(shim),
+            fake_executable(
+                &npm,
+                shim,
                 &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
             );
         }
         server_package(&npm);
         typescript(&npm, "5.4.0", true);
         let home = pnpm_home(&install);
-        write_executable(
-            &home.join(SERVER_STEM),
+        fake_executable(
+            &home,
+            SERVER_STEM,
             &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
         );
 
@@ -1497,7 +1485,7 @@ mod launch_tests {
         server_package(&decoy);
         let decoy_tsserver = typescript(&decoy, "5.4.0", true);
         let real = install.base.join("real");
-        write_executable(&real.join(SERVER_STEM), "");
+        fake_executable(&real, SERVER_STEM, "");
         server_package(&real);
         let real_tsserver = typescript(&real, "5.4.0", true);
         let path = std::env::join_paths([&decoy, &real]).unwrap();
@@ -1580,7 +1568,6 @@ mod launch_tests {
     #[test]
     fn test_selection_auto_picks_native_for_pnpm_shim_with_typescript_seven() {
         use std::assert_matches;
-        use std::os::unix::fs::PermissionsExt as _;
 
         let install = install();
         let home = pnpm_home(&install);
@@ -1588,8 +1575,7 @@ mod launch_tests {
         server_package(&store);
         typescript(&store, "7.0.1", false);
         let tsc = store.join("node_modules/typescript/bin/tsc");
-        write(&tsc, "#!/bin/sh\n");
-        fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_executable(tsc.parent().unwrap(), "tsc", "#!/bin/sh\n");
 
         let auto = config(SERVER_STEM, &[]);
         let choice =
@@ -1623,6 +1609,7 @@ mod tests {
 
     use super::*;
     use crate::config::{BuiltinServer, ServerCommand};
+    use crate::test_support::fake_executable;
 
     struct Layout {
         _dir: tempfile::TempDir,
@@ -1640,12 +1627,7 @@ mod tests {
         let package = modules.join(SERVER_STEM);
         fs::create_dir_all(package.join("lib")).unwrap();
         fs::write(package.join("package.json"), "{}").unwrap();
-        fs::write(package.join("lib/cli.mjs"), "").unwrap();
-        fs::set_permissions(
-            package.join("lib/cli.mjs"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        fake_executable(&package.join("lib"), "cli.mjs", "");
         let tsserver = modules.join("typescript/lib/tsserver.js");
         if with_typescript {
             fs::create_dir_all(tsserver.parent().unwrap()).unwrap();
@@ -1753,13 +1735,7 @@ mod tests {
     fn test_resolve_script_launcher_is_unsupported() {
         let layout = global_install(true);
         let shim_dir = layout.base.join("shims");
-        fs::create_dir_all(&shim_dir).unwrap();
-        fs::write(shim_dir.join(SERVER_STEM), "#!/bin/sh\n").unwrap();
-        fs::set_permissions(
-            shim_dir.join(SERVER_STEM),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        fake_executable(&shim_dir, SERVER_STEM, "#!/bin/sh\n");
         let resolved = resolve(&config(SERVER_STEM), env_with_path(&shim_dir));
         assert_eq!(
             resolved,
@@ -2212,8 +2188,6 @@ mod tests {
     /// TypeScript 7 is installed in the workspace.
     #[tokio::test]
     async fn test_spawn_failure_carries_native_typescript_hint() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         use crate::lsp::{LspServer, ServerInitConfig};
 
         let layout = global_install(false);
@@ -2222,8 +2196,7 @@ mod tests {
             .join("prefix/lib/node_modules")
             .join(SERVER_STEM)
             .join("lib/cli.mjs");
-        fs::write(&cli, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_executable(cli.parent().unwrap(), "cli.mjs", "#!/bin/sh\nexit 1\n");
         let root = layout.base.join("ws");
         write_typescript(&root, "7.0.2", false);
 
@@ -2405,14 +2378,7 @@ mod tests {
     fn test_path_tsc_that_is_not_a_typescript_bin_is_rejected() {
         let layout = global_install(false);
         let wrapper_dir = layout.base.join("wrappers");
-        fs::create_dir_all(&wrapper_dir).unwrap();
-        let wrapper = wrapper_dir.join("tsc");
-        fs::write(&wrapper, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            &wrapper,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        fake_executable(&wrapper_dir, "tsc", "#!/bin/sh\n");
         let choice = select_typescript_server(
             &config(SERVER_STEM),
             &WorkspaceRoots::default(),
@@ -2450,9 +2416,7 @@ mod tests {
     #[test]
     fn test_cmd_shim_launcher_keeps_tsserver() {
         let layout = global_install(false);
-        let cmd = layout.bin.join("typescript-language-server.cmd");
-        fs::write(&cmd, "").unwrap();
-        fs::set_permissions(&cmd, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        fake_executable(&layout.bin, "typescript-language-server.cmd", "");
         assert_eq!(
             select(
                 &layout,
@@ -2507,12 +2471,9 @@ mod tests {
 
     #[test]
     fn test_node_script_tsc_needs_node_on_path() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let layout = global_install(false);
         let tsc = native_install_next_to_server(&layout);
-        fs::write(&tsc, "#!/usr/bin/env node\n").unwrap();
-        fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_executable(tsc.parent().unwrap(), "tsc", "#!/usr/bin/env node\n");
         let base = config(SERVER_STEM);
         assert_eq!(
             select(&layout, &base, &WorkspaceRoots::default()),
@@ -2522,10 +2483,7 @@ mod tests {
         );
 
         let node_dir = layout.base.join("node-bin");
-        fs::create_dir_all(&node_dir).unwrap();
-        let node = node_dir.join("node");
-        fs::write(&node, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_executable(&node_dir, "node", "#!/bin/sh\n");
         let path = std::env::join_paths([&layout.bin, &node_dir]).unwrap();
         let choice = select_typescript_server(
             &base,
@@ -2608,10 +2566,7 @@ mod tests {
     fn test_plan_flags_a_version_manager_shim_as_an_unpinnable_launcher() {
         let dir = tempfile::tempdir().unwrap();
         let shims = dunce::canonicalize(dir.path()).unwrap().join(".volta/bin");
-        fs::create_dir_all(&shims).unwrap();
-        let shim = shims.join(SERVER_STEM);
-        fs::write(&shim, "#!/bin/sh\n").unwrap();
-        fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        fake_executable(&shims, SERVER_STEM, "#!/bin/sh\n");
 
         let plan = plan_typescript(config(SERVER_STEM), env_with_path(&shims));
 

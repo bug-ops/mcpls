@@ -10,6 +10,7 @@ mod host_os;
 mod language;
 mod language_id;
 mod language_map;
+pub(crate) mod launch_defaults;
 mod limits;
 mod patterns;
 mod position_encodings;

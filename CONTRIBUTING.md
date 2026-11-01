@@ -149,6 +149,12 @@ Major architectural decisions are documented in `docs/adr/`. When proposing sign
 2. Describe the context, decision, and consequences
 3. Reference the ADR in your PR
 
+## Releasing
+
+Maintainers bump the workspace `version` in the root `Cargo.toml` and the `version` fields of `server.json` (top level and the package entry) in the same change. `scripts/check-server-json-version.sh` enforces this in CI and in the release workflow before anything is published.
+
+Release archives carry build-provenance attestations. The `publish-registry` job of the release workflow is disabled until the first registry publication is confirmed (#813); once enabled it publishes `server.json` to the official MCP registry through GitHub OIDC, after the crate is on crates.io, and can be re-run for the same tag.
+
 ## Getting Help
 
 - Open an issue for bugs or feature requests

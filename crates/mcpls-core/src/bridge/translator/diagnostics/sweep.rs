@@ -358,6 +358,45 @@ impl MemoState {
     fn epoch(&self, server: &ServerId) -> SweepEpoch {
         self.epochs.get(server).copied().unwrap_or_default()
     }
+
+    /// Queues `candidate` for `server`'s running pass when it is due at
+    /// `epoch`: `None` when it is not due, [`Deferral::QueueFull`] when the
+    /// queue has no room for a new path. An already queued path takes `mode`.
+    fn enqueue(
+        &mut self,
+        server: &ServerId,
+        epoch: SweepEpoch,
+        candidate: &PullCandidate,
+        mode: QueueInsert,
+    ) -> Option<Deferral> {
+        let PullCandidate { path, resynced } = candidate;
+        self.due(path, resynced.current, epoch)?;
+        let queue = self.queued.entry(server.clone()).or_default();
+        if !queue.contains_key(path) && queue.len() >= MAX_QUEUED_PULLS_PER_SERVER {
+            return Some(Deferral::QueueFull);
+        }
+        match mode {
+            QueueInsert::Replace => {
+                queue.insert(path.clone(), resynced.clone());
+            }
+            QueueInsert::KeepNewer => {
+                queue
+                    .entry(path.clone())
+                    .or_insert_with(|| resynced.clone());
+            }
+        }
+        Some(Deferral::Queued)
+    }
+}
+
+/// How a queued path that is already in a server's queue takes a new resync.
+#[derive(Debug, Clone, Copy)]
+enum QueueInsert {
+    /// The new resync replaces the queued one: a job just visited the file.
+    Replace,
+    /// The queued resync stays: the new one is from a pass that took the file
+    /// earlier.
+    KeepNewer,
 }
 
 /// The document state each file was last seen at by the sweep, and the pull
@@ -433,7 +472,7 @@ pub(super) struct PullPass {
 impl PullPass {
     /// Puts back the files this pass took from the queue and did not pull, so
     /// the next pass pulls them instead of leaving them to their next visit.
-    fn requeue(&self, candidates: Vec<PullCandidate>) {
+    fn requeue(&self, candidates: &[PullCandidate]) {
         if let Some(server) = &self.server {
             self.memo.requeue(server, candidates);
         }
@@ -528,38 +567,26 @@ impl SweepMemo {
                 leftovers: leftovers.into_iter().map(PullCandidate::from).collect(),
             };
         }
-        let mut deferrals = Vec::new();
-        for (index, candidate) in candidates {
-            let PullCandidate { path, resynced } = candidate;
-            let epoch = state.epoch(server);
-            if state.due(path, resynced.current, epoch).is_none() {
-                continue;
-            }
-            let queue = state.queued.entry(server.clone()).or_default();
-            if queue.contains_key(path) || queue.len() < MAX_QUEUED_PULLS_PER_SERVER {
-                queue.insert(path.clone(), resynced.clone());
-                deferrals.push((*index, Deferral::Queued));
-            } else {
-                deferrals.push((*index, Deferral::QueueFull));
-            }
-        }
+        let epoch = state.epoch(server);
+        let deferrals = candidates
+            .iter()
+            .filter_map(|(index, candidate)| {
+                state
+                    .enqueue(server, epoch, candidate, QueueInsert::Replace)
+                    .map(|deferral| (*index, deferral))
+            })
+            .collect();
         drop(state);
         PassStart::Queued(deferrals)
     }
 
     /// Queues the `candidates` a pass took and did not pull, with the rules
     /// of [`Self::begin_or_queue`]; a newer entry of the same path stays.
-    fn requeue(&self, server: &ServerId, candidates: Vec<PullCandidate>) {
+    fn requeue(&self, server: &ServerId, candidates: &[PullCandidate]) {
         let mut state = lock_std(&self.0);
-        for PullCandidate { path, resynced } in candidates {
-            let epoch = state.epoch(server);
-            if state.due(&path, resynced.current, epoch).is_none() {
-                continue;
-            }
-            let queue = state.queued.entry(server.clone()).or_default();
-            if queue.len() < MAX_QUEUED_PULLS_PER_SERVER {
-                queue.entry(path).or_insert(resynced);
-            }
+        let epoch = state.epoch(server);
+        for candidate in candidates {
+            state.enqueue(server, epoch, candidate, QueueInsert::KeepNewer);
         }
         drop(state);
     }
@@ -1107,14 +1134,15 @@ impl SweepContext {
         candidates: Vec<(usize, PullCandidate)>,
         leftovers: Vec<PullCandidate>,
         visits: Vec<(PathBuf, Interest)>,
-        mut steps: Vec<SweepStep>,
+        steps: Vec<SweepStep>,
     ) {
         let mut pulled = PulledStates::default();
+        let mut log = VisitLog { visits, steps };
         let mut unpulled = self
-            .pull_due(candidates, &mut steps, &mut pulled)
+            .pull_due(candidates, &mut log.steps, &mut pulled)
             .await
             .into_unpulled();
-        log_steps(&visits, &steps);
+        drop(log);
         let mut next = Some(leftovers);
         while unpulled.is_empty() {
             let Some(batch) = next
@@ -1127,7 +1155,7 @@ impl SweepContext {
             unpulled = self.pull_batch(batch, &mut pulled).await.into_unpulled();
         }
         unpulled.extend(next.into_iter().flatten());
-        pass.requeue(unpulled);
+        pass.requeue(&unpulled);
     }
 
     /// Pulls files that were queued for the pass, which no job visits now.
@@ -1348,6 +1376,19 @@ impl SweepContext {
 fn set_step(steps: &mut [SweepStep], index: usize, step: SweepStep) {
     if let Some(slot) = steps.get_mut(index) {
         *slot = step;
+    }
+}
+
+/// A pass's visits and the steps it reached, logged on drop so a pass that
+/// the sweep stop cuts short still reports them.
+struct VisitLog {
+    visits: Vec<(PathBuf, Interest)>,
+    steps: Vec<SweepStep>,
+}
+
+impl Drop for VisitLog {
+    fn drop(&mut self) {
+        log_steps(&self.visits, &self.steps);
     }
 }
 
@@ -1938,7 +1979,7 @@ mod tests {
         memo.record_answered(Path::new("/w/c.rs"), stamp(1), epoch(0));
         queued(memo.begin_or_queue(&rust(), &[candidate(0, "/w/a.rs", 2)]));
 
-        pass.requeue(taken);
+        pass.requeue(&taken);
         drop(pass);
 
         let (_next, leftovers) = started(memo.begin_or_queue(&rust(), &[]));
@@ -1953,6 +1994,27 @@ mod tests {
                 (PathBuf::from("/w/b.rs"), stamp(1)),
             ]
         );
+    }
+
+    #[test]
+    fn a_queued_path_takes_a_replacing_resync_but_keeps_its_own_against_a_requeue() {
+        let memo = memo_with(&["/w/a.rs"]);
+        let mut state = lock_std(&memo.0);
+        let epoch = state.epoch(&rust());
+        let (_, old) = candidate(0, "/w/a.rs", 1);
+        let (_, new) = candidate(0, "/w/a.rs", 2);
+        let queued_stamp = |state: &MemoState| state.queued[&rust()][Path::new("/w/a.rs")].current;
+
+        assert_eq!(
+            state.enqueue(&rust(), epoch, &old, QueueInsert::Replace),
+            Some(Deferral::Queued)
+        );
+        state.enqueue(&rust(), epoch, &new, QueueInsert::KeepNewer);
+        assert_eq!(queued_stamp(&state), stamp(1));
+
+        state.enqueue(&rust(), epoch, &new, QueueInsert::Replace);
+        assert_eq!(queued_stamp(&state), stamp(2));
+        drop(state);
     }
 
     #[test]
@@ -1971,5 +2033,25 @@ mod tests {
         assert!(!state(1, "a").same_text(state(1, "b")));
         assert!(!lagging.same_text(lagging));
         assert!(!state(1, "a").same_text(lagging));
+    }
+
+    #[test]
+    fn a_dropped_visit_log_reports_the_steps_it_reached() {
+        use tracing_subscriber::prelude::*;
+
+        let logs = crate::test_lsp::CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let log = VisitLog {
+                visits: vec![
+                    (PathBuf::from("/w/a.rs"), Interest::Subscribed),
+                    (PathBuf::from("/w/b.rs"), Interest::Subscribed),
+                ],
+                steps: vec![SweepStep::Synced, SweepStep::Synced],
+            };
+            drop(log);
+        });
+
+        assert_eq!(logs.messages().len(), 2);
     }
 }

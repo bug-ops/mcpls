@@ -17,32 +17,22 @@ use serde::{Deserialize, Serialize, Serializer};
 use super::addressing::MAX_SYMBOL_NAME_BYTES;
 use crate::error::Error;
 use crate::lsp::SUPPORTED_SYMBOL_KINDS;
+use crate::spelling::spelled_enum;
 
 pub(super) mod sealed {
     /// Keeps [`super::KindFilter`] implementable only inside this crate.
     pub trait Sealed {}
 }
 
-/// The tool input a kind filter arrives in, named in rejection messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KindFilterField {
-    /// `kind_filter` of `workspace_symbol_search` and `get_code_actions`.
-    KindFilter,
-    /// `symbol_kind` of an addressed tool.
-    SymbolKind,
-    /// `kind` of `get_folding_ranges`.
-    Kind,
-}
-
-impl KindFilterField {
-    /// The input's name on the wire.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::KindFilter => "kind_filter",
-            Self::SymbolKind => "symbol_kind",
-            Self::Kind => "kind",
-        }
+spelled_enum! {
+    /// The tool input a kind filter arrives in, named in rejection messages.
+    KindFilterField {
+        /// `kind_filter` of `workspace_symbol_search` and `get_code_actions`.
+        KindFilter => "kind_filter",
+        /// `symbol_kind` of an addressed tool.
+        SymbolKind => "symbol_kind",
+        /// `kind` of `get_folding_ranges`.
+        Kind => "kind",
     }
 }
 
@@ -228,60 +218,30 @@ impl<K: KindFilter> JsonSchema for KindFilterInput<K> {
     }
 }
 
-/// A code action kind a `get_code_actions` filter can name.
-///
-/// Accepted in any case and sent to the server in its canonical LSP spelling,
-/// which is case-sensitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodeActionKindFilter {
-    /// `quickfix`.
-    QuickFix,
-    /// `refactor`.
-    Refactor,
-    /// `refactor.extract`.
-    RefactorExtract,
-    /// `refactor.inline`.
-    RefactorInline,
-    /// `refactor.move`.
-    RefactorMove,
-    /// `refactor.rewrite`.
-    RefactorRewrite,
-    /// `source`.
-    Source,
-    /// `source.organizeImports`.
-    SourceOrganizeImports,
-    /// `source.fixAll`.
-    SourceFixAll,
-}
-
-impl CodeActionKindFilter {
-    /// Every kind, in documentation order.
-    pub const ALL: [Self; 9] = [
-        Self::QuickFix,
-        Self::Refactor,
-        Self::RefactorExtract,
-        Self::RefactorInline,
-        Self::RefactorMove,
-        Self::RefactorRewrite,
-        Self::Source,
-        Self::SourceOrganizeImports,
-        Self::SourceFixAll,
-    ];
-
-    /// The canonical LSP spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::QuickFix => "quickfix",
-            Self::Refactor => "refactor",
-            Self::RefactorExtract => "refactor.extract",
-            Self::RefactorInline => "refactor.inline",
-            Self::RefactorMove => "refactor.move",
-            Self::RefactorRewrite => "refactor.rewrite",
-            Self::Source => "source",
-            Self::SourceOrganizeImports => "source.organizeImports",
-            Self::SourceFixAll => "source.fixAll",
-        }
+spelled_enum! {
+    /// A code action kind a `get_code_actions` filter can name.
+    ///
+    /// Accepted in any case and sent to the server in its canonical LSP spelling,
+    /// which is case-sensitive.
+    CodeActionKindFilter {
+        /// `quickfix`.
+        QuickFix => "quickfix",
+        /// `refactor`.
+        Refactor => "refactor",
+        /// `refactor.extract`.
+        RefactorExtract => "refactor.extract",
+        /// `refactor.inline`.
+        RefactorInline => "refactor.inline",
+        /// `refactor.move`.
+        RefactorMove => "refactor.move",
+        /// `refactor.rewrite`.
+        RefactorRewrite => "refactor.rewrite",
+        /// `source`.
+        Source => "source",
+        /// `source.organizeImports`.
+        SourceOrganizeImports => "source.organizeImports",
+        /// `source.fixAll`.
+        SourceFixAll => "source.fixAll",
     }
 }
 

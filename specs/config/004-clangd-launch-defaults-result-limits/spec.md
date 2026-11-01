@@ -11,7 +11,7 @@ tags:
   - clangd
   - truncation
 created: 2026-11-01
-status: draft
+status: approved
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]]"
@@ -195,9 +195,9 @@ THEN they list every option added to a default clangd launch, the rule that an o
 | FR-010 | WHEN the command is not clangd itself (a wrapper or launcher such as `nice`, `env`, `ccache` or a shell script whose target is clangd) THE SYSTEM SHALL NOT add any option, because the arguments belong to the wrapper | must |
 | FR-011 | THE SYSTEM SHALL NOT write the launch defaults into the generated or persisted configuration, and SHALL NOT show them as part of the entry's `args` | should |
 | FR-012 | WHEN untrusted-workspace mode is enabled THE SYSTEM SHALL vet the executable and the user's arguments exactly as before; the defaults are fixed literals chosen by mcpls, contain no path and cannot be supplied by workspace configuration, and SHALL be appended after the vetted arguments so that the indices recorded for wrapped programs stay valid | must |
-| FR-013 | THE SYSTEM SHALL NOT change the `tools/list` payload: no tool name, schema or description changes with this feature | must |
+| FR-013 | THE SYSTEM SHALL change the `tools/list` payload only for `get_completions`: its result schema gains an optional `truncated` flag and its description one sentence stating the 100-item cap; no other tool name, schema or description changes with this feature (amended: user decision to cap `get_completions` in this feature) | must |
 | FR-014 | WHEN a server-side bound is above mcpls's cap THE existing `truncated` semantics SHALL hold unchanged: `truncated: true` means mcpls dropped items past its own cap or past the caller's `limit` | must |
-| FR-015 | THE tool descriptions SHALL NOT change; the user guide SHALL state that on a default clangd a server-side cut-off no longer occurs below the cap, and that a limit the user writes in `args` is not reported as `truncated` | must |
+| FR-015 | THE tool descriptions SHALL NOT change except for `get_completions` (FR-013); the user guide SHALL state that on a default clangd a server-side cut-off no longer occurs below the cap, and that a limit the user writes in `args` is not reported as `truncated` | must |
 | FR-016 | THE configuration and language-server pages of the user guide SHALL list the options added to a clangd launch, the precedence rule (FR-008, FR-009) and the spelling to override each, and SHALL replace the example whose `args` would now collide, if any | must |
 | FR-017 | WHEN the installed clangd rejects a launch-default option THE SYSTEM SHALL NOT leave the language without a server silently; the behavior (probe, retry without defaults, or a documented minimum version) is open (section 9) | must |
 | FR-018 | THE `.local/testing/` playbooks SHALL gain a case for the references count, the symbol count and `truncated`, the duplicate-spelling suppression, the quiet stderr, and the restart path; the coverage status for config and bridge SHALL be reset | must |
@@ -257,7 +257,7 @@ THEN they list every option added to a default clangd launch, the rule that an o
 | SC-003 | Symbol with more than 10,000 references | Exactly 10,000 locations and `truncated: true` |
 | SC-004 | User `args` containing each of the four spellings of each option | The final argument vector holds that option exactly once, in the user's form; test covers every row of the spelling matrix |
 | SC-005 | stderr bytes for 200 requests, default entry | At least 90% fewer bytes than at `--log=info`, and zero per-request lines |
-| SC-006 | `tools/list` payload | Byte-identical to the golden `tool_surface.json`; the 136,000 B budget of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] unchanged |
+| SC-006 | `tools/list` payload | Differs from the previous golden `tool_surface.json` only by the `get_completions` description sentence and the optional `truncated` result field; the budget of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] is re-measured by that spec |
 | SC-007 | Initial start, `restart_server` and respawn | The recorded spawn argument vectors are equal |
 | SC-008 | Untrusted mode with and without the feature | The same admit or refuse decision for every row of the existing launcher and argument refusal tables |
 | SC-009 | Documentation | Both guide pages list the added options and the override rule; the review finds no example that collides with a default |
@@ -288,17 +288,17 @@ THEN they list every option added to a default clangd launch, the rule that an o
 
 ## 9. Open Questions
 
-> [!question] To resolve before `/sdd plan`
+> [!success] Resolved at implementation
 
-- [NEEDS CLARIFICATION: unlimited (`0`) or a finite bound above the cap? Recommended: a finite bound of cap + 1 for both options. It keeps the answer under the 10 MiB frame limit and bounds server memory and time on a huge codebase, while a cut at mcpls's cap is still visible as `truncated`. `0` is simpler but turns a very large answer into a frame-size error.]
-- [NEEDS CLARIFICATION: `--limit-results` is shared with code completion. Does `get_completions` cap its own list? If not, lifting the option to a large value inflates every completion response; a lower bound that still covers `workspace_symbol_search` may conflict with a bound that suits completion. Decide whether to lift it for both, or accept a smaller workspace-symbol bound than the 10,000 cap.]
-- [NEEDS CLARIFICATION: `--rename-file-limit` (default 50). The server's refusal is loud, not silent, so the finding is weaker than for references. Lift it to a finite bound (for example the cap), leave it and document the error plus the `args` override, or lift it only once a rename-specific error text exists? Recommended: leave unchanged in this spec and record a follow-up.]
-- [NEEDS CLARIFICATION: exact log level. `error` gives the quietest stderr but may hide the warnings that explain a missing `compile_commands.json`; `info` is the current behavior; `verbose` is a user-chosen override. Recommended: `error`, confirmed by a live capture of what a startup failure prints at that level.]
-- [NEEDS CLARIFICATION: does clangd emit `window/logMessage`? If it does, `get_server_logs` is fed by it and `--log` may or may not change that volume; if it does not, the buffer-flooding claim in the source finding is wrong and only the stderr tail excerpt benefits. Verify with a live capture of both streams and record the result in the playbook.]
-- [NEEDS CLARIFICATION: minimum clangd version that accepts `--limit-references`, `--limit-results`, `--log` and tolerates the chosen spelling. An older clangd that rejects an unknown flag exits at startup, which would break the C++ language for those users. Options: documented minimum version; retry once without the defaults when the stderr excerpt reports an unknown argument; probe `--help` after vetting (costly, NFR-008). Pick one (FR-017).]
-- [NEEDS CLARIFICATION: how is "the command is clangd" decided: the configured command's file name exactly `clangd`, also `clangd.exe`, also versioned names such as `clangd-18`, or the existing `BuiltinServer::Clangd` classification in `config/server.rs`? Reuse one existing classification rather than adding a second rule.]
-- [NEEDS CLARIFICATION: response-file arguments (`@file`) in `args`: skip all defaults (safe against duplicates, loses the benefit) or ignore the file (may duplicate)? Recommended: skip the defaults and log it at debug level.]
-- [NEEDS CLARIFICATION: real size of a 10,001-location references answer on the wire and its parse time, to confirm NFR-002 and NFR-004 with numbers instead of the estimate that it is far below 10 MiB.]
+- **Bounds**: finite, not `0`. `--limit-references` = cap + 3 (`REFERENCES_MARGIN`), `--limit-results` = cap + 1. Measured with Apple clangd 21.0.0 on the 1200-call fixture: `--limit-references=N` returns `N - 1` locations with `includeDeclaration: false` and `N` with `true` (deficit at most 1, so margin = 1 + 2); workspace symbols return exactly the limit (100 at 100, 101 at 101). An LLVM build may differ; the margin keeps a cut at the cap visible either way.
+- **Completion cap (user decision)**: `get_completions` returns at most 100 items for every server, ranked before the cut by how well `filterText` (else label) matches the identifier before the cursor (prefix, then subsequence, then the rest; within a tier by `sortText`, else label), and sets `truncated: true` when it dropped items. At or under 100 items the server's order is unchanged. The server's `isIncomplete` is not folded into `truncated`, so FR-014 holds. If the cursor line is unavailable the prefix is empty and the server's order is kept.
+- **Completion size at the lifted limit** (NFR-002): an empty-prefix completion in a C++ unit including 20 standard headers returned 8469 items, 4.3 MiB, in 0.19 s with `--limit-results=10001` (same with `0`), under the pre-agreed 5 MiB and 10 s thresholds, so 10001 stays. A larger unit is bounded at about 5.1 MiB by the limit itself, well below the 10 MiB frame limit.
+- **`--rename-file-limit`**: unchanged; follow-up issue.
+- **Log level**: `error`. Whether clangd feeds `window/logMessage` and what a startup failure prints at that level are pending a live capture (see the playbook).
+- **Old clangd (FR-017)**: documented minimum, no probe or retry. `--limit-references` is documented in the clangd 14 manual (earliest version checked); an older clangd that rejects an option fails loudly through the existing stderr excerpt and the user can pin its options in `args`.
+- **Command classification**: `BuiltinServer::Clangd.matches_command` (file stem, case-insensitive; `clangd-18` is not matched).
+- **Response files**: an `@file` argument suppresses every default.
+- **References answer size** (NFR-002): 1200 references measured 247 KiB on the wire in 0.02 s; a 10,003-reference answer scales to about 2 MiB.
 
 ### Decisions taken in this draft
 

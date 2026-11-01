@@ -23,7 +23,8 @@ use super::server_env::{EnvKey, EnvValue, InvalidServerEnv, ServerEnv};
 use super::settings::LspSettings;
 use super::text_newtype::{contains_nul, impl_text_newtype};
 use crate::bridge::IndexingPolicy;
-use crate::error::{ChainedError, ConfigError, spelled_enum};
+use crate::error::{ChainedError, ConfigError};
+use crate::spelling::spelled_enum;
 
 /// Directories excluded from recursive marker search.
 /// These are well-known directories that should never contain project markers.
@@ -485,7 +486,7 @@ impl PartialEq<&str> for LaunchCommand {
 /// invalid `file_patterns`, `env` or `args` entry with the id of the server
 /// that holds it and builds the [`LaunchCommand`] from the `command` and
 /// `selection` keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawLspServerConfig", into = "RawLspServerConfig")]
 pub struct LspServerConfig {
     /// Language identifier (e.g., "rust", "python", "typescript").
@@ -569,6 +570,48 @@ pub struct LspServerConfig {
     /// Set to `"disabled"` for a server whose signal shape doesn't fit this
     /// tracker's assumptions -- see [`IndexingPolicy::Disabled`].
     pub indexing: IndexingPolicy,
+}
+
+/// Prints `initialization_options` as structure only; the other secret-bearing
+/// fields (`args`, `env`, `settings`) have their own redacting `Debug`.
+impl std::fmt::Debug for LspServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            language_id,
+            command,
+            args,
+            env,
+            file_patterns,
+            initialization_options,
+            settings,
+            timeout_seconds,
+            request_timeout_seconds,
+            heuristics,
+            name,
+            handles,
+            indexing,
+        } = self;
+        f.debug_struct("LspServerConfig")
+            .field("language_id", language_id)
+            .field("command", command)
+            .field("args", args)
+            .field("env", env)
+            .field("file_patterns", file_patterns)
+            .field(
+                "initialization_options",
+                &initialization_options
+                    .as_ref()
+                    .map(crate::redaction::JsonShape),
+            )
+            .field("settings", settings)
+            .field("timeout_seconds", timeout_seconds)
+            .field("request_timeout_seconds", request_timeout_seconds)
+            .field("heuristics", heuristics)
+            .field("name", name)
+            .field("handles", handles)
+            .field("indexing", indexing)
+            .finish()
+    }
 }
 
 /// The deserialized form of [`LspServerConfig`], before the entry-level checks.

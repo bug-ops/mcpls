@@ -11,9 +11,9 @@ use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSumma
 use super::kind_filter::{self, KindFilter};
 use crate::bridge::notifications::ReportedSeverity;
 use crate::config::text_newtype::impl_text_newtype;
-use crate::config::{BoundedText, InvalidBoundedText};
-use crate::error::spelled_enum;
+use crate::config::{BoundedText, InvalidBoundedText, ServerId};
 use crate::redaction::{Redactions, ServerText};
+use crate::spelling::spelled_enum;
 
 /// Convert an LSP integer-valued enum (`SymbolKind`, `CompletionItemKind`,
 /// `InlayHintKind`, ...) to its wire-format `u32`.
@@ -695,6 +695,13 @@ pub struct Completion {
 pub struct CompletionsResult {
     /// List of completion items.
     pub items: Vec<Completion>,
+    /// Whether mcpls dropped items to stay within its completion cap.
+    ///
+    /// Items are ranked by how well they match the identifier typed before the cursor, so a
+    /// longer typed prefix narrows the list. A server's own `isIncomplete` is not reflected here.
+    /// Omitted (defaults to `false`) when serialized.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// Set only when some `character` offsets are inexact (non-UTF-16 servers); omitted otherwise.
     ///
     /// Tells whether the queried position or only the returned offsets are affected.
@@ -755,6 +762,45 @@ pub struct WorkspaceSymbol {
     /// Optional container name (parent scope).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    /// The server that produced the symbol; set only when several servers were asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "ServerId")]
+    pub server: Option<ServerId>,
+}
+
+/// What one server contributed to a multi-server workspace symbol search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ServerOutcome {
+    /// The server this entry describes.
+    pub server: ServerId,
+    /// What the server did for this call.
+    #[serde(flatten)]
+    pub status: ServerStatus,
+}
+
+/// Whether a server answered a workspace symbol search, and why not if it did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ServerStatus {
+    /// The server answered.
+    Answered {
+        /// Symbols the server returned, before `kind_filter` and `limit`.
+        symbols: u32,
+        /// Set only when the server answered with no symbols: what its answer covers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "IndexCoverage")]
+        index_coverage: Option<IndexCoverage>,
+    },
+    /// The server has not finished starting; retry later.
+    Initializing,
+    /// Failed to start or died; this search never restarts it (use `restart_server`).
+    Unavailable,
+    /// The server did not answer before its request deadline.
+    TimedOut,
+    /// The server rejected the request or the request failed.
+    Failed,
+    /// The server does not advertise workspace symbol support.
+    CapabilityNotAdvertised,
 }
 
 /// Result of workspace symbol search.
@@ -780,6 +826,9 @@ pub struct WorkspaceSymbolResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "IndexCoverage")]
     pub index_coverage: Option<IndexCoverage>,
+    /// One entry per eligible server, in config order; present only when several servers were asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<ServerOutcome>,
 }
 
 /// A single code action.
@@ -1351,23 +1400,24 @@ pub enum FoldingKind {
     Unspecified,
 }
 
-/// Which folding regions to return.
-///
-/// `Unspecified` regions are returned only by [`Self::All`]. Accepted in any
-/// case, like every other kind filter.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FoldingKindFilter {
-    /// Every region.
-    #[default]
-    All,
-    /// Comment blocks only.
-    Comment,
-    /// Import groups only.
-    Imports,
-    /// Marked regions only.
-    Region,
+spelled_enum! {
+    /// Which folding regions to return.
+    ///
+    /// `Unspecified` regions are returned only by [`Self::All`]. Accepted in any
+    /// case, like every other kind filter.
+    #[derive(Default)]
+    FoldingKindFilter {
+        /// Every region.
+        #[default]
+        All => "all",
+        /// Comment blocks only.
+        Comment => "comment",
+        /// Import groups only.
+        Imports => "imports",
+        /// Marked regions only.
+        Region => "region",
+    }
 }
-
 /// Schema of the closed string sets, compact on the wire.
 impl JsonSchema for FoldingKind {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -1395,20 +1445,6 @@ impl JsonSchema for FoldingKindFilter {
 kind_filter::closed_kind_filter!(FoldingKindFilter, "FoldingKindFilter");
 
 impl FoldingKindFilter {
-    /// Every filter, in documentation order.
-    pub const ALL: [Self; 4] = [Self::All, Self::Comment, Self::Imports, Self::Region];
-
-    /// The lowercase spelling the schema documents.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Comment => "comment",
-            Self::Imports => "imports",
-            Self::Region => "region",
-        }
-    }
-
     /// Whether a region of `kind` passes this filter.
     ///
     /// # Examples
@@ -1609,6 +1645,7 @@ impl ServerText for CompletionsResult {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self {
             items,
+            truncated: _,
             positions_degraded: _,
         } = self;
         items.redact_server_text(redactions);
@@ -1658,6 +1695,7 @@ impl ServerText for WorkspaceSymbol {
             kind: _,
             location,
             container_name,
+            server: _,
         } = self;
         redactions.note_payload(name);
         if let Some(container) = container_name {
@@ -1674,6 +1712,7 @@ impl ServerText for WorkspaceSymbolResult {
             truncated: _,
             positions_degraded: _,
             index_coverage: _,
+            servers: _,
         } = self;
         symbols.redact_server_text(redactions);
     }

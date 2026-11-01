@@ -48,12 +48,12 @@ pub enum MarkFailure {
 }
 
 /// Result of freezing and recording a server's escapees before `exit`.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkOutcome {
     /// The escapees are recorded (or there are none to record): `exit` may go.
     Confirmed,
     /// `exit` must be withheld and the tree terminated at once.
-    #[cfg(unix)]
     Failed(MarkFailure),
 }
 
@@ -147,6 +147,7 @@ impl ServerProcess {
     /// group, before the server is told to exit. Anything but
     /// [`MarkOutcome::Confirmed`] means the server must not be allowed to exit
     /// on its own: the caller should [`Self::terminate_tree`] it instead.
+    #[cfg(unix)]
     pub(crate) async fn mark_escapees(&mut self) -> MarkOutcome {
         match &mut self.lifeline {
             Some(lifeline) => lifeline.mark().await,

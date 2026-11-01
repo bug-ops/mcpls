@@ -309,7 +309,7 @@ impl SweepWindow {
         let start = self
             .after
             .as_ref()
-            .map_or(0, |after| items.partition_point(|(path, _)| path <= after));
+            .map_or_default(|after| items.partition_point(|(path, _)| path <= after));
         let mut window = Vec::new();
         let mut last = None;
         for (path, server) in items

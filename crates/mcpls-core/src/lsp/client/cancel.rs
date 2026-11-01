@@ -161,74 +161,85 @@ struct CancelParams<'a> {
     id: &'a RequestId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuardState {
-    /// Registered, not yet enqueued: the server cannot know the id.
-    Registered,
-    /// Enqueued; dropping the guard cancels the request.
-    Sent,
-    /// Answered or deliberately abandoned; dropping does nothing.
-    Settled,
-}
-
-/// The lifetime of one request attempt.
+/// A request registered in the pending table but not yet on the command
+/// channel: the server cannot know the id, so dropping it only forgets the
+/// slot and never sends a cancel.
 ///
-/// Dropping it while the request is outstanding cancels the request on the
-/// server with `$/cancelRequest` and leaves a tombstone so the late reply is
-/// dropped quietly. Dropping it after the reply, after a bulk failure or
-/// before the request was enqueued sends nothing.
+/// [`Self::into_sent`] is the only way to an [`InFlightRequest`], so a cancel
+/// before the send and a second send are both unrepresentable.
 #[derive(Debug)]
-#[must_use = "dropping the guard ends the request's registration"]
-pub(super) struct InFlightRequest<'a> {
+#[must_use = "dropping the registration forgets the request's slot"]
+pub(super) struct PendingRegistration<'a> {
     client: &'a LspClient,
-    id: RequestId,
-    state: GuardState,
+    id: &'a RequestId,
 }
 
-impl<'a> InFlightRequest<'a> {
+impl<'a> PendingRegistration<'a> {
     /// Registers `id` as waiting on `responder`.
-    pub(super) fn register(client: &'a LspClient, id: RequestId, responder: Responder) -> Self {
+    pub(super) fn register(client: &'a LspClient, id: &'a RequestId, responder: Responder) -> Self {
         client.pending_requests.register(id.clone(), responder);
-        Self {
-            client,
-            id,
-            state: GuardState::Registered,
-        }
+        Self { client, id }
     }
 
     /// Records that the request is on the command channel, so the server will
     /// see the id before any cancel for it.
-    pub(super) const fn mark_sent(&mut self) {
-        self.state = GuardState::Sent;
+    pub(super) const fn into_sent(self) -> InFlightRequest<'a> {
+        let in_flight = InFlightRequest {
+            client: self.client,
+            id: self.id,
+        };
+        // Only references are held; forgetting skips the slot-forgetting Drop.
+        std::mem::forget(self);
+        in_flight
     }
+}
 
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        self.client.pending_requests.forget(self.id);
+    }
+}
+
+/// A request that is on the command channel and still outstanding.
+///
+/// Dropping it cancels the request on the server with `$/cancelRequest` and
+/// leaves a tombstone so the late reply is dropped quietly. [`Self::settle`]
+/// and [`Self::expire`] consume it, so an answered request sends nothing.
+#[derive(Debug)]
+#[must_use = "dropping the guard cancels the request"]
+pub(super) struct InFlightRequest<'a> {
+    client: &'a LspClient,
+    id: &'a RequestId,
+}
+
+impl InFlightRequest<'_> {
     /// Records that the outcome was consumed; nothing is left to cancel.
-    pub(super) const fn mark_settled(&mut self) {
-        self.state = GuardState::Settled;
+    pub(super) const fn settle(self) {
+        // Settled: skip the cancelling Drop.
+        std::mem::forget(self);
     }
 
     /// Ends the attempt because its timeout elapsed.
-    pub(super) fn expire(mut self) {
+    pub(super) fn expire(self) {
         self.cancel(CancelCause::Timeout);
-        self.state = GuardState::Settled;
+        // Already cancelled: skip the cancelling Drop.
+        std::mem::forget(self);
     }
 
     fn cancel(&self, cause: CancelCause) {
-        if self.state != GuardState::Sent || self.client.cancels_suppressed() {
-            self.client.pending_requests.forget(&self.id);
+        if self.client.cancels_suppressed() {
+            self.client.pending_requests.forget(self.id);
             return;
         }
-        if self.client.pending_requests.cancel(&self.id, cause) {
-            self.client.send_cancel(&self.id, cause);
+        if self.client.pending_requests.cancel(self.id, cause) {
+            self.client.send_cancel(self.id, cause);
         }
     }
 }
 
 impl Drop for InFlightRequest<'_> {
     fn drop(&mut self) {
-        if self.state != GuardState::Settled {
-            self.cancel(CancelCause::Abandoned);
-        }
+        self.cancel(CancelCause::Abandoned);
     }
 }
 
@@ -634,5 +645,57 @@ mod tests {
         drop_task(blocked).await;
         drop_task(filler).await;
         assert!(client.pending_requests.no_waiting());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_command_channel_leaves_no_slot_and_sends_no_cancel() {
+        let (command_tx, command_rx) = mpsc::channel(1);
+        drop(command_rx);
+        let client = LspClient {
+            command_tx,
+            ..LspClient::new(LspServerConfig::rust_analyzer())
+        };
+
+        let outcome: Result<Value> = client
+            .request("textDocument/hover", json!({}), TIMEOUT)
+            .await;
+
+        assert_matches!(outcome, Err(Error::ServerTerminated));
+        assert!(client.pending_requests.no_waiting());
+        assert_eq!(client.pending_requests.tombstone_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_dropped_while_blocked_on_a_full_channel_forgets_its_slot() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let client = LspClient {
+            command_tx,
+            ..LspClient::new(LspServerConfig::rust_analyzer())
+        };
+        let sent = spawn_request(&client, "textDocument/hover");
+        tokio::task::yield_now().await;
+        let blocked = spawn_request(&client, "textDocument/hover");
+        tokio::task::yield_now().await;
+        drop_task(blocked).await;
+
+        let Some(ClientCommand::SendRequest { request }) = command_rx.recv().await else {
+            panic!("the first request must be on the channel");
+        };
+        assert_matches!(
+            command_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "neither the blocked request nor a cancel for it may be sent"
+        );
+        let RequestId::Number(first) = request.id else {
+            panic!("ids are numbers");
+        };
+        assert_matches!(
+            client
+                .pending_requests
+                .resolve(&RequestId::Number(first + 1)),
+            Resolution::Unknown
+        );
+        assert_eq!(client.pending_requests.tombstone_count(), 0);
+        drop_task(sent).await;
     }
 }

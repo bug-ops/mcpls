@@ -648,26 +648,60 @@ impl ToolRouter {
     /// registered at all, or [`NoServerReason::NoClaimant`] if servers are
     /// registered but none explicitly claims `tool` and none is a catch-all.
     pub fn resolve_any(&self, tool: ToolKind) -> std::result::Result<&ServerId, NoServerReason> {
-        let claims_explicitly = |id: &ServerId| {
-            self.by_language
-                .values()
-                .any(|r| r.explicit.get(&tool) == Some(id))
-        };
-        let is_catch_all = |id: &ServerId| {
-            self.by_language
-                .values()
-                .any(|r| r.default.as_ref() == Some(id))
-        };
-
         self.order
             .iter()
-            .find(|id| claims_explicitly(id))
-            .or_else(|| self.order.iter().find(|id| is_catch_all(id)))
+            .find(|id| self.claims_explicitly(id, tool))
+            .or_else(|| self.order.iter().find(|id| self.is_catch_all(id)))
             .ok_or(if self.order.is_empty() {
                 NoServerReason::NothingRegistered
             } else {
                 NoServerReason::NoClaimant
             })
+    }
+
+    /// Every server that may answer the workspace-wide `tool`, in config
+    /// declaration order: the explicit claimers and the catch-alls of every
+    /// language.
+    ///
+    /// Unlike [`Self::resolve_any`] an explicit claimer does not shadow a
+    /// catch-all, so a fan-out over the result covers every language. A server
+    /// whose `handles` list omits `tool` is never included, for the same
+    /// reason `resolve_any` never falls back to "the first server at all".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::config::{LanguageId, ServerId, ToolKind, ToolRouter};
+    ///
+    /// let router = ToolRouter::catch_all([
+    ///     (ServerId::from_static("pyright"), LanguageId::from_static("python")),
+    ///     (ServerId::from_static("rust-analyzer"), LanguageId::from_static("rust")),
+    /// ]);
+    /// let ids: Vec<&str> = router
+    ///     .workspace_candidates(ToolKind::WorkspaceSymbols)
+    ///     .into_iter()
+    ///     .map(ServerId::as_str)
+    ///     .collect();
+    /// assert_eq!(ids, ["pyright", "rust-analyzer"]);
+    /// ```
+    #[must_use]
+    pub fn workspace_candidates(&self, tool: ToolKind) -> Vec<&ServerId> {
+        self.order
+            .iter()
+            .filter(|id| self.claims_explicitly(id, tool) || self.is_catch_all(id))
+            .collect()
+    }
+
+    fn claims_explicitly(&self, id: &ServerId, tool: ToolKind) -> bool {
+        self.by_language
+            .values()
+            .any(|routes| routes.explicit.get(&tool) == Some(id))
+    }
+
+    fn is_catch_all(&self, id: &ServerId) -> bool {
+        self.by_language
+            .values()
+            .any(|routes| routes.default.as_ref() == Some(id))
     }
 
     /// Whether `language_id` currently has at least one live-or-configured

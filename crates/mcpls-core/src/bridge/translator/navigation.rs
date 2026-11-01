@@ -97,7 +97,7 @@ fn definition_link_to_location(link: lsp_types::DefinitionLink) -> lsp_types::Lo
 /// the work actually done rather than just the size of the returned list.
 /// Also used by `Translator::handle_workspace_symbol` to clamp its
 /// caller-supplied `limit`, which otherwise has no upper bound of its own.
-pub(super) const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
+pub const MAX_NORMALIZED_LOCATIONS: usize = 10_000;
 
 /// Per-response allowance of items, [`MAX_NORMALIZED_LOCATIONS`] unless built
 /// with [`ItemBudget::with_cap`].

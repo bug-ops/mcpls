@@ -45,7 +45,7 @@ In this chapter you find every boundary mcpls enforces or cannot cross, in one p
 - **mcpls does not write your files.** Edits are returned for the client to apply.
 - **Routing is by extension.** `file_patterns` cannot confine a server to a directory, and two servers that claim the same extension both receive every file with it unless `handles` separates them.
 - **`file_patterns` forms.** Only `*.EXT` (with an optional `**/` prefix) and bare extensionless names such as `Makefile` are accepted. Brace expansion, character classes, `?`, dotfiles, dotted names, single files and multi-part extensions such as `*.tar.gz` are rejected at startup.
-- **`workspace_symbol_search` has no document.** It goes to the first server that claims `workspace_symbols`, else the first catch-all, and fails if there is none.
+- **`workspace_symbol_search` has no document.** It asks every server that claims `workspace_symbols` or is a catch-all, and reports what each one did (see [Code Intelligence](../tools/code-intelligence.md#workspace_symbol_search)). It fails only if no server answers.
 - **A configuration file replaces the built-in server list.** A file with no `[[lsp_servers]]` starts no servers.
 - **Same-size restores are invisible.** A file restored with an identical size and modification time is not seen as changed; see [Troubleshooting](../guide/troubleshooting.md#results-look-stale-after-a-file-changed).
 - **Position conversion can degrade** for non-UTF-16 servers ([Positions and Encodings](positions.md)).

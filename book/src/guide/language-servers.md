@@ -74,6 +74,16 @@ file_patterns = ["**/*.c", "**/*.cpp", "**/*.cc", "**/*.h", "**/*.hpp"]
 compilationDatabasePath = "build"
 ```
 
+When the command is `clangd` (by file name, so `/usr/bin/clangd` counts; wrappers such as `nice` and versioned names such as `clangd-18` do not), mcpls appends these options after your `args` unless you already wrote them:
+
+| Option | Value | Why |
+|--------|-------|-----|
+| `--limit-references` | 10003 | clangd's default of 1000 would cut `get_references` silently; now only mcpls's own flagged cap of 10,000 applies |
+| `--limit-results` | 10001 | clangd's default of 100 would cut `workspace_symbol_search` silently; the default `limit` of 100 now reports `truncated: true` when more match |
+| `--log` | `error` | no stderr line per request |
+
+An option counts as written in any of `--name=value`, `-name=value`, `--name value` and `-name value`; an `@file` argument suppresses all three. A limit you write yourself is respected and is not reported as `truncated` when clangd applies it. These options need a clangd that accepts them (`--limit-references` appears in the clangd 14 manual); an older one fails to start and the error shows its stderr. Because `--limit-results` also bounds completion, `get_completions` caps its own answer at 100 items for every server and sets `truncated` when it drops any.
+
 Use the `language_id` from the [default language table](../reference/config.md#default-language-mappings); it is the identifier sent to the server when a file is opened.
 
 ## Files with unusual extensions

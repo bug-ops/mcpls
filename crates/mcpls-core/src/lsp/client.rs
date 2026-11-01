@@ -3,9 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{
-    ErrorCodes, LspErrorCodes, LspRequestMethod, Notification as _, PublishDiagnosticsParams,
-};
+use lsp_types::{ErrorCodes, LspErrorCodes, LspRequestMethod, PublishDiagnosticsParams};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -28,7 +26,7 @@ use crate::util::MAX_ERROR_MESSAGE_CALLER_BYTES;
 mod cancel;
 mod notification;
 
-use cancel::{InFlightRequest, PendingRequests, Resolution};
+use cancel::{InFlightRequest, PendingRegistration, PendingRequests, Resolution};
 use notification::OutboundNotification;
 
 /// Maximum number of retry attempts for server-cancelled requests.
@@ -636,18 +634,18 @@ impl LspClient {
     /// loop's own transport read), so a reply can never beat its entry. The
     /// returned guard cancels the request on the server if it is dropped while
     /// the request is outstanding.
-    async fn register_and_send_request(
-        &self,
+    async fn register_and_send_request<'a>(
+        &'a self,
+        id: &'a RequestId,
         request: JsonRpcRequest,
         responder: oneshot::Sender<Result<Value>>,
-    ) -> Result<InFlightRequest<'_>> {
-        let mut in_flight = InFlightRequest::register(self, request.id.clone(), responder);
+    ) -> Result<InFlightRequest<'a>> {
+        let registration = PendingRegistration::register(self, id, responder);
         self.command_tx
             .send(ClientCommand::SendRequest { request })
             .await
             .map_err(|_| Error::ServerTerminated)?;
-        in_flight.mark_sent();
-        Ok(in_flight)
+        Ok(registration.into_sent())
     }
 
     /// Send request and wait for response with timeout.
@@ -739,14 +737,14 @@ impl LspClient {
 
             debug!("Sending request: {} (id={:?})", method, id);
 
-            let mut in_flight = self
-                .register_and_send_request(request, response_tx)
+            let in_flight = self
+                .register_and_send_request(&id, request, response_tx)
                 .await
                 .map_err(UnclassifiedError::logged)?;
 
             let outcome = match timeout(timeout_duration, response_rx).await {
                 Ok(received) => {
-                    in_flight.mark_settled();
+                    in_flight.settle();
                     received.map_err(|_| UnclassifiedError::logged(Error::ServerTerminated))?
                 }
                 Err(_elapsed) => {
@@ -1123,7 +1121,10 @@ impl LspClient {
                 Route::Lifecycle(&lanes.lifecycle, LspNotification::Progress(params))
             }
             LspNotification::Other { method, params }
-                if method.as_ref() != lsp_types::ProgressNotification::METHOD.as_str() =>
+                if !matches!(
+                    lsp_types::LspNotificationMethod::from(method.as_ref()),
+                    lsp_types::LspNotificationMethod::Progress
+                ) =>
             {
                 Route::Lifecycle(&lanes.lifecycle, LspNotification::Other { method, params })
             }
@@ -1463,7 +1464,10 @@ impl LspClient {
             .and_then(|params| params.get("items"))
             .and_then(Value::as_array);
         let Some(settings) = settings else {
-            return Ok(Value::Array(vec![Value::Null; items.map_or(0, Vec::len)]));
+            return Ok(Value::Array(vec![
+                Value::Null;
+                items.map_or_default(Vec::len)
+            ]));
         };
         let items = items.ok_or_else(|| {
             JsonRpcError::new(

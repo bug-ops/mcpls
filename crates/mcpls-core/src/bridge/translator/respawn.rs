@@ -405,9 +405,11 @@ impl Translator {
                 NotificationRouting::Discard => {
                     if role == DiagnosticsRole::Authoritative {
                         tracing::warn!(
-                            "LSP server '{id}' (language '{language_id}') respawned; its diagnostics \
-                             push notifications are discarded rather than cached until it is \
-                             restarted with `restart_server` or mcpls is restarted"
+                            %id,
+                            %language_id,
+                            "LSP server respawned; its diagnostics push notifications are \
+                             discarded rather than cached until it is restarted with \
+                             `restart_server` or mcpls is restarted"
                         );
                     }
                     PushDelivery::Degraded

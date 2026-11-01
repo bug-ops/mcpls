@@ -48,6 +48,7 @@ pub mod lsp;
 pub mod mcp;
 mod redaction;
 pub(crate) mod runtime;
+mod spelling;
 pub mod transport;
 mod util;
 

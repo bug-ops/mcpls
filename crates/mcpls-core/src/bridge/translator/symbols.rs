@@ -1,5 +1,8 @@
 //! Document symbols and workspace symbol search handlers.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use lsp_types::{
     BaseSymbolInformation, DocumentSymbol, PartialResultParams, WorkDoneProgressParams,
     WorkspaceSymbolParams as LspWorkspaceSymbolParams,
@@ -7,16 +10,16 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    DocumentSymbolsResult, Location, Symbol, WorkspaceSymbol, WorkspaceSymbolResult,
-    lsp_kind_to_u32,
+    DocumentSymbolsResult, Location, ServerOutcome, ServerStatus, Symbol, WorkspaceSymbol,
+    WorkspaceSymbolResult, lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::SymbolKindFilter;
 use super::navigation::MAX_NORMALIZED_LOCATIONS;
 use super::positioned::{budgeted, document_request};
 use super::routing::{
-    Capability, FileLocalCapability, IndexingGate, PreparedDocument, WorkspaceRouteLookup,
-    lookup_workspace_route,
+    Capability, FileLocalCapability, IndexingGate, MemberPresence, PreparedDocument,
+    WorkspaceRouteLookup, is_untrusted_refusal, lookup_workspace_route, workspace_fan_out_members,
 };
 use crate::bridge::ClientPath;
 use crate::config::{ServerId, ToolKind};
@@ -208,6 +211,14 @@ impl Translator {
 
     /// Handle workspace symbol search.
     ///
+    /// With two or more eligible servers (the explicit claimers and catch-alls
+    /// of every language, minus any refused by untrusted-workspace mode)
+    /// the query goes to every live capable one concurrently, each bounded by
+    /// its own request deadline, and the answers are merged in config order
+    /// with a producing-server tag and a per-server outcome list. A dead
+    /// server is reported, never respawned. With fewer, the single-server
+    /// path below applies unchanged.
+    ///
     /// Deliberately not gated on indexing readiness, unlike other
     /// whole-workspace queries (e.g. `references`, call hierarchy
     /// incoming/outgoing calls): it resolves via `resolve_any` rather than a
@@ -228,6 +239,12 @@ impl Translator {
     ) -> Result<WorkspaceSymbolResult> {
         validate_query_length(&query)?;
         let kind_filter = kind_filter.map(|filter| u32::from(filter.kind()));
+
+        if let Some(members) = self.fan_out_members() {
+            return self
+                .workspace_symbol_fan_out(query, kind_filter, limit, members)
+                .await;
+        }
 
         let server_id = self.workspace_symbol_server()?;
         self.respawn_if_dead(&server_id).await?;
@@ -285,6 +302,7 @@ impl Translator {
                     out_of_workspace: raw.out_of_workspace,
                 },
                 container_name: raw.container_name,
+                server: None,
             });
         }
 
@@ -294,7 +312,174 @@ impl Translator {
             truncated,
             positions_degraded: ctx.positions_degraded(),
             index_coverage,
+            servers: Vec::new(),
         })
+    }
+
+    /// The servers a workspace symbol search fans out over, or `None` when
+    /// fewer than two are eligible. One `servers` guard serves every closure.
+    fn fan_out_members(&self) -> Option<Vec<(ServerId, MemberPresence)>> {
+        let servers = lock_std(&self.servers);
+        workspace_fan_out_members(
+            &self.configured_router,
+            ToolKind::WorkspaceSymbols,
+            |id| servers.failure(id).is_some_and(is_untrusted_refusal),
+            |id| servers.client(id).is_some(),
+            |id| servers.is_expected(id),
+        )
+    }
+
+    /// Fans a workspace symbol search out over `members`.
+    ///
+    /// Every branch is bounded by its own request deadline, so the call takes
+    /// as long as the slowest server, not the sum. A server that is not live,
+    /// not capable or failed is reported in the outcome list while the others'
+    /// symbols are kept; only when no server answered does the call fail.
+    async fn workspace_symbol_fan_out(
+        &self,
+        query: String,
+        kind_filter: Option<u32>,
+        limit: u32,
+        members: Vec<(ServerId, MemberPresence)>,
+    ) -> Result<WorkspaceSymbolResult> {
+        let params = LspWorkspaceSymbolParams {
+            query,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        // Bounded by the configured server count, as `members` is.
+        let answers = futures::future::join_all(members.into_iter().map(|(id, presence)| {
+            let params = params.clone();
+            async move {
+                let result = self.ask_workspace_member(&id, presence, params).await;
+                (id, result)
+            }
+        }))
+        .await;
+
+        // `limit` is clamped to MAX_NORMALIZED_LOCATIONS (see #474); one
+        // extra unique symbol is enough to know the result was cut.
+        let effective_limit = (limit as usize).min(MAX_NORMALIZED_LOCATIONS);
+        let mut merged = MergedSymbols::new(effective_limit.saturating_add(1));
+        let mut producers = Vec::new();
+        let mut failures = Vec::new();
+        let mut outcomes = Vec::with_capacity(answers.len());
+        for (id, answer) in answers {
+            let status = match answer {
+                Ok(response) => {
+                    let producer = Arc::new(Producer {
+                        ctx: self.encoding_ctx(&id),
+                        id: id.clone(),
+                    });
+                    let raw = raw_workspace_symbols(response, &producer.ctx);
+                    let returned = raw.len();
+                    merged.extend(
+                        &producer,
+                        raw.into_iter()
+                            .filter(|symbol| kind_filter.is_none_or(|kind| symbol.kind == kind)),
+                    );
+                    producers.push(producer);
+                    ServerStatus::Answered {
+                        symbols: u32::try_from(returned).unwrap_or(u32::MAX),
+                        index_coverage: (returned == 0).then(|| self.index_coverage(&id)),
+                    }
+                }
+                Err(failure) => {
+                    tracing::debug!(
+                        server = %id,
+                        outcome = ?failure.kind,
+                        error = %failure.error,
+                        "workspace symbol search: server did not answer"
+                    );
+                    let status = failure.kind.into();
+                    failures.push(failure);
+                    status
+                }
+            };
+            outcomes.push(ServerOutcome { server: id, status });
+        }
+
+        if producers.is_empty() {
+            return Err(aggregate_failure(failures));
+        }
+
+        let (accepted, truncated) = merged.finish(effective_limit);
+        let mut symbols = Vec::with_capacity(accepted.len());
+        for (producer, raw) in accepted {
+            let range = producer.ctx.normalize_range(&raw.uri, raw.range).await;
+            symbols.push(WorkspaceSymbol {
+                name: raw.name,
+                kind: raw.kind,
+                location: Location {
+                    uri: raw.uri.to_string(),
+                    range,
+                    out_of_workspace: raw.out_of_workspace,
+                },
+                container_name: raw.container_name,
+                server: Some(producer.id.clone()),
+            });
+        }
+
+        Ok(WorkspaceSymbolResult {
+            symbols,
+            truncated,
+            positions_degraded: producers
+                .iter()
+                .filter_map(|producer| producer.ctx.positions_degraded())
+                .max(),
+            index_coverage: None,
+            servers: outcomes,
+        })
+    }
+
+    /// Asks one fan-out member for its workspace symbols, never respawning it.
+    async fn ask_workspace_member(
+        &self,
+        id: &ServerId,
+        presence: MemberPresence,
+        params: LspWorkspaceSymbolParams,
+    ) -> std::result::Result<Option<lsp_types::WorkspaceSymbolResponse>, MemberFailure> {
+        match presence {
+            MemberPresence::Registered => {}
+            MemberPresence::Initializing => {
+                return Err(MemberFailure::new(
+                    Unanswered::Initializing,
+                    Error::ServerInitializing {
+                        server_id: id.clone(),
+                    },
+                ));
+            }
+            MemberPresence::Absent => {
+                let error = self
+                    .startup_failure(id)
+                    .map_or(Error::NoServerConfigured, |failure| {
+                        Error::ServerFailedToStart(Box::new(failure))
+                    });
+                return Err(MemberFailure::new(Unanswered::Unavailable, error));
+            }
+        }
+        if self.dead_server_config(id).is_some() {
+            return Err(MemberFailure::new(
+                Unanswered::Unavailable,
+                Error::ServerTerminated,
+            ));
+        }
+        let client = lock_std(&self.servers).client(id);
+        let Some(client) = client else {
+            return Err(MemberFailure::new(
+                Unanswered::Unavailable,
+                Error::NoServerConfigured,
+            ));
+        };
+        if let Err(error) = self.require_capability(id, Capability::WorkspaceSymbols) {
+            return Err(MemberFailure::new(
+                Unanswered::CapabilityNotAdvertised,
+                error,
+            ));
+        }
+        budgeted::<lsp_types::WorkspaceSymbolRequest>(&client, params)
+            .await
+            .map_err(MemberFailure::from_request_error)
     }
 
     /// The server a workspace symbol search goes to.
@@ -351,6 +536,167 @@ impl Translator {
     }
 }
 
+/// Why a fan-out member contributed no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unanswered {
+    Initializing,
+    Unavailable,
+    TimedOut,
+    Failed,
+    CapabilityNotAdvertised,
+}
+
+impl Unanswered {
+    /// Whether the member broke rather than being merely early or incapable.
+    const fn is_breakage(self) -> bool {
+        matches!(self, Self::Unavailable | Self::TimedOut | Self::Failed)
+    }
+}
+
+impl From<Unanswered> for ServerStatus {
+    fn from(kind: Unanswered) -> Self {
+        match kind {
+            Unanswered::Initializing => Self::Initializing,
+            Unanswered::Unavailable => Self::Unavailable,
+            Unanswered::TimedOut => Self::TimedOut,
+            Unanswered::Failed => Self::Failed,
+            Unanswered::CapabilityNotAdvertised => Self::CapabilityNotAdvertised,
+        }
+    }
+}
+
+/// A fan-out member that did not answer, with the error the single-server
+/// path would have returned for it.
+#[derive(Debug)]
+struct MemberFailure {
+    kind: Unanswered,
+    error: Error,
+}
+
+impl MemberFailure {
+    const fn new(kind: Unanswered, error: Error) -> Self {
+        Self { kind, error }
+    }
+
+    /// A process that died mid-request is unavailable, not failed, so the
+    /// outcome does not depend on how soon its command channel closed.
+    const fn from_request_error(error: Error) -> Self {
+        let kind = match error {
+            Error::Timeout(_) => Unanswered::TimedOut,
+            Error::ServerTerminated => Unanswered::Unavailable,
+            _ => Unanswered::Failed,
+        };
+        Self::new(kind, error)
+    }
+}
+
+/// The error for a fan-out in which no member answered.
+///
+/// A member still initializing wins, because that is the retryable answer:
+/// all of them give the aggregate, a mix gives the first one's error. Failing
+/// that, members that all failed to start give the all-failed aggregate (#527),
+/// then the first breakage stands, else the first member's own error.
+fn aggregate_failure(failures: Vec<MemberFailure>) -> Error {
+    if let Some(first) = failures
+        .iter()
+        .position(|failure| failure.kind == Unanswered::Initializing)
+    {
+        if failures
+            .iter()
+            .all(|failure| failure.kind == Unanswered::Initializing)
+        {
+            return Error::WorkspaceServersInitializing;
+        }
+        return failures
+            .into_iter()
+            .nth(first)
+            .map_or(Error::NoServerConfigured, |failure| failure.error);
+    }
+    if failures
+        .iter()
+        .all(|failure| matches!(failure.error, Error::ServerFailedToStart(_)))
+    {
+        return Error::AllServersFailedToInit {
+            failures: failures
+                .into_iter()
+                .filter_map(|failure| match failure.error {
+                    Error::ServerFailedToStart(spawn) => Some(*spawn),
+                    _ => None,
+                })
+                .collect(),
+        };
+    }
+    let chosen = failures
+        .iter()
+        .position(|failure| failure.kind.is_breakage())
+        .unwrap_or(0);
+    failures
+        .into_iter()
+        .nth(chosen)
+        .map_or(Error::NoServerConfigured, |failure| failure.error)
+}
+
+/// A server that answered a fan-out, with the context its symbols are
+/// normalized in.
+struct Producer {
+    id: ServerId,
+    ctx: EncodingCtx,
+}
+
+/// A symbol's identity for duplicate detection: everything the server
+/// reported, with the range as the raw LSP coordinates (the same symbol
+/// reported in two encodings is deliberately kept twice).
+#[derive(PartialEq, Eq, Hash)]
+struct SymbolIdentity {
+    name: String,
+    kind: u32,
+    container_name: Option<String>,
+    uri: String,
+    range: [u32; 4],
+}
+
+/// The unique symbols of a fan-out, concatenated in config order, collection
+/// stopping at `cap`.
+struct MergedSymbols {
+    cap: usize,
+    seen: HashSet<SymbolIdentity>,
+    accepted: Vec<(Arc<Producer>, RawWorkspaceSymbol)>,
+}
+
+impl MergedSymbols {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            seen: HashSet::new(),
+            accepted: Vec::new(),
+        }
+    }
+
+    /// Adds `symbols` of `producer`, dropping any already accepted from this
+    /// server or an earlier one before it counts towards the cap.
+    fn extend(
+        &mut self,
+        producer: &Arc<Producer>,
+        symbols: impl IntoIterator<Item = RawWorkspaceSymbol>,
+    ) {
+        for symbol in symbols {
+            if self.accepted.len() >= self.cap {
+                return;
+            }
+            if self.seen.insert(symbol.identity()) {
+                self.accepted.push((Arc::clone(producer), symbol));
+            }
+        }
+    }
+
+    /// The first `limit` symbols, and whether more were collected.
+    fn finish(mut self, limit: usize) -> (Vec<(Arc<Producer>, RawWorkspaceSymbol)>, bool) {
+        let truncated = self.accepted.len() > limit;
+        self.accepted.truncate(limit);
+        (self.accepted, truncated)
+    }
+}
+
 /// A workspace symbol not yet normalized into MCP coordinates -- lets
 /// [`Translator::handle_workspace_symbol`] apply `kind_filter`/`limit` before
 /// paying for [`EncodingCtx::normalize_range`] on each surviving entry (see
@@ -365,6 +711,17 @@ struct RawWorkspaceSymbol {
 }
 
 impl RawWorkspaceSymbol {
+    fn identity(&self) -> SymbolIdentity {
+        let (start, end) = (self.range.start, self.range.end);
+        SymbolIdentity {
+            name: self.name.clone(),
+            kind: self.kind,
+            container_name: self.container_name.clone(),
+            uri: self.uri.to_string(),
+            range: [start.line, start.character, end.line, end.character],
+        }
+    }
+
     fn new(
         base: BaseSymbolInformation,
         uri: lsp_types::Uri,
@@ -1249,5 +1606,894 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.symbols.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use std::assert_matches;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures::FutureExt as _;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, BufReader};
+    use tokio::task::JoinHandle;
+    use url::Url;
+
+    use super::*;
+    use crate::bridge::WorkspaceRoots;
+    use crate::bridge::translator::dto::IndexCoverage;
+    use crate::bridge::translator::kind_filter::KindFilter as _;
+    use crate::bridge::translator::testing::*;
+    use crate::config::{LanguageId, ToolKind, ToolRouter, ToolSet};
+    use crate::error::{ServerSpawnFailure, StartupFailure, UntrustedRefusal};
+    use crate::lsp::LspServer;
+    use crate::test_lsp::next_framed_message;
+
+    enum Member {
+        Live { capable: bool },
+        LiveUtf8,
+        Initializing,
+        Absent,
+    }
+
+    struct Polyglot {
+        dir: TempDir,
+        translator: Arc<Translator>,
+        servers: HashMap<String, FakeServer>,
+    }
+
+    impl Polyglot {
+        fn new(members: &[(&str, Member)]) -> Self {
+            let router = ToolRouter::catch_all(
+                members
+                    .iter()
+                    .map(|(id, _)| (ServerId::new(*id).unwrap(), LanguageId::new(*id).unwrap())),
+            );
+            Self::with_router(members, router)
+        }
+
+        fn with_router(members: &[(&str, Member)], router: ToolRouter) -> Self {
+            let dir = TempDir::new().unwrap();
+            let mut translator = Translator::new().with_router(router);
+            translator.set_workspace_roots(
+                WorkspaceRoots::from_paths(&[dir.path().to_path_buf()]).unwrap(),
+            );
+            let mut servers = HashMap::new();
+            let mut expected = HashSet::new();
+            for (id, member) in members {
+                let server_id = ServerId::new(*id).unwrap();
+                match member {
+                    Member::Live { capable } => {
+                        let (client, server) = fake_lsp_client();
+                        translator.register_client(server_id.clone(), client);
+                        translator.register_server(
+                            server_id,
+                            LspServer::new_for_test(lsp_types::ServerCapabilities {
+                                workspace_symbol_provider: capable
+                                    .then_some(lsp_types::WorkspaceSymbolProvider::Bool(true)),
+                                ..Default::default()
+                            }),
+                        );
+                        servers.insert((*id).to_owned(), server);
+                    }
+                    Member::LiveUtf8 => {
+                        let (client, server) = fake_lsp_client();
+                        translator.register_client(server_id.clone(), client);
+                        translator.register_server(
+                            server_id,
+                            LspServer::new_for_test_with_encoding(
+                                lsp_types::ServerCapabilities {
+                                    workspace_symbol_provider: Some(
+                                        lsp_types::WorkspaceSymbolProvider::Bool(true),
+                                    ),
+                                    ..Default::default()
+                                },
+                                lsp_types::PositionEncodingKind::UTF8,
+                            ),
+                        );
+                        servers.insert((*id).to_owned(), server);
+                    }
+                    Member::Initializing => {
+                        expected.insert(server_id);
+                    }
+                    Member::Absent => {}
+                }
+            }
+            translator.set_expected_servers(expected);
+            Self {
+                dir,
+                translator: Arc::new(translator),
+                servers,
+            }
+        }
+
+        fn symbol(&self, name: &str, file: &str, line: u32) -> Value {
+            let uri = Url::from_file_path(self.dir.path().join(file))
+                .unwrap()
+                .to_string();
+            json!({
+                "name": name,
+                "kind": 12,
+                "location": {
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": line, "character": 0},
+                        "end": {"line": line, "character": 5},
+                    },
+                },
+            })
+        }
+
+        fn take(&mut self, id: &str) -> FakeServer {
+            self.servers.remove(id).unwrap()
+        }
+
+        async fn search(&self, kind: Option<&str>, limit: u32) -> Result<WorkspaceSymbolResult> {
+            let filter = kind.map(|name| SymbolKindFilter::parse(name).expect("a known kind"));
+            self.translator
+                .handle_workspace_symbol("q".to_owned(), filter, limit)
+                .await
+        }
+    }
+
+    fn answer(mut server: FakeServer, delay: Duration, symbols: Value) -> JoinHandle<FakeServer> {
+        tokio::spawn(async move {
+            let id = {
+                let mut wire = BufReader::new(&mut server.write_stdout);
+                let request = next_framed_message(&mut wire).await;
+                assert_eq!(request["method"], "workspace/symbol");
+                request["id"].clone()
+            };
+            tokio::time::sleep(delay).await;
+            write_response(&mut server.read_half_stdin, &id, symbols).await;
+            server
+        })
+    }
+
+    fn assert_no_traffic(server: &mut FakeServer) {
+        let mut byte = [0_u8; 1];
+        assert!(
+            server.write_stdout.read(&mut byte).now_or_never().is_none(),
+            "the server must not have been sent anything"
+        );
+    }
+
+    fn names(result: &WorkspaceSymbolResult) -> Vec<(&str, &str)> {
+        result
+            .symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.name.as_str(),
+                    symbol.server.as_ref().map_or("", ServerId::as_str),
+                )
+            })
+            .collect()
+    }
+
+    fn status_of<'a>(result: &'a WorkspaceSymbolResult, id: &str) -> &'a ServerStatus {
+        &result
+            .servers
+            .iter()
+            .find(|outcome| outcome.server.as_str() == id)
+            .unwrap()
+            .status
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn merges_in_config_order_with_producer_tags() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::from_millis(50),
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([p.symbol("Beta", "b.py", 1)]),
+        );
+
+        let result = p.search(None, 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(names(&result), [("Alpha", "a"), ("Beta", "b")]);
+        assert!(!result.truncated);
+        assert!(result.index_coverage.is_none());
+        assert_eq!(
+            result
+                .servers
+                .iter()
+                .map(|o| o.server.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(
+            status_of(&result, "a"),
+            &ServerStatus::Answered {
+                symbols: 1,
+                index_coverage: None
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reversed_reply_latency_gives_the_same_bytes() {
+        let mut bytes = Vec::new();
+        for (a_delay, b_delay) in [(10, 200), (200, 10)] {
+            let mut p = Polyglot::new(&[
+                ("a", Member::Live { capable: true }),
+                ("b", Member::Live { capable: true }),
+            ]);
+            let a = answer(
+                p.take("a"),
+                Duration::from_millis(a_delay),
+                json!([p.symbol("Alpha", "a.rs", 0)]),
+            );
+            let b = answer(
+                p.take("b"),
+                Duration::from_millis(b_delay),
+                json!([p.symbol("Beta", "b.py", 1)]),
+            );
+            let result = p.search(None, 100).await.unwrap();
+            let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+            let mut value = serde_json::to_value(&result).unwrap();
+            if let Some(symbols) = value["symbols"].as_array_mut() {
+                for symbol in symbols {
+                    symbol["location"]["uri"] = Value::Null;
+                }
+            }
+            bytes.push(value.to_string());
+        }
+        assert_eq!(bytes[0], bytes[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_latency_is_the_slowest_server_not_the_sum() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+            ("c", Member::Live { capable: true }),
+        ]);
+        let handles: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| answer(p.take(id), Duration::from_millis(200), json!([])))
+            .collect();
+
+        let started = tokio::time::Instant::now();
+        let result = p.search(None, 100).await.unwrap();
+        let elapsed = started.elapsed();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert!(elapsed < Duration::from_millis(400), "{elapsed:?}");
+        assert_eq!(result.servers.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identical_duplicates_are_dropped_before_they_count_towards_the_cut() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let x = p.symbol("X", "x.rs", 0);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([x.clone(), x.clone(), x.clone()]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([x, p.symbol("Z", "z.rs", 0)]),
+        );
+
+        let result = p.search(None, 2).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(names(&result), [("X", "a"), ("Z", "b")]);
+        assert!(!result.truncated, "only two unique symbols exist");
+        assert_eq!(
+            status_of(&result, "a"),
+            &ServerStatus::Answered {
+                symbols: 3,
+                index_coverage: None
+            },
+            "the count is the answer's, before duplicates are dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn limit_cuts_the_merged_set_and_flags_truncation() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("A1", "a.rs", 0), p.symbol("A2", "a.rs", 1)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([p.symbol("B1", "b.py", 0)]),
+        );
+
+        let result = p.search(None, 2).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(names(&result), [("A1", "a"), ("A2", "a")]);
+        assert!(result.truncated);
+        assert_eq!(
+            status_of(&result, "b"),
+            &ServerStatus::Answered {
+                symbols: 1,
+                index_coverage: None
+            },
+            "a server past the cut still reports its count"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn kind_filter_applies_to_every_server() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let mut class = p.symbol("Klass", "b.py", 0);
+        class["kind"] = json!(5);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("func", "a.rs", 0)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([class, p.symbol("other", "b.py", 1)]),
+        );
+
+        let result = p.search(Some("class"), 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(names(&result), [("Klass", "b")]);
+        assert_eq!(
+            status_of(&result, "a"),
+            &ServerStatus::Answered {
+                symbols: 1,
+                index_coverage: None
+            },
+            "filtered-out symbols are not an empty answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_initializing_server_is_reported_without_waiting_for_it() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Initializing),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+
+        let started = tokio::time::Instant::now();
+        let result = p.search(None, 100).await.unwrap();
+        a.await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(names(&result), [("Alpha", "a")]);
+        assert_eq!(status_of(&result, "b"), &ServerStatus::Initializing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_without_the_capability_is_never_asked() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: false }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let mut b = p.take("b");
+
+        let result = p.search(None, 100).await.unwrap();
+        a.await.unwrap();
+
+        assert_no_traffic(&mut b);
+        assert_eq!(
+            status_of(&result, "b"),
+            &ServerStatus::CapabilityNotAdvertised
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_server_times_out_at_its_own_deadline_and_others_survive() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+            ("c", Member::Live { capable: true }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let c = answer(
+            p.take("c"),
+            Duration::ZERO,
+            json!([p.symbol("Gamma", "c.go", 0)]),
+        );
+        let _silent = p.take("b");
+        let deadline = crate::config::LspServerConfig::rust_analyzer()
+            .request_timeout_seconds
+            .as_duration();
+
+        let started = tokio::time::Instant::now();
+        let result = p.search(None, 100).await.unwrap();
+        let elapsed = started.elapsed();
+        let (_a, _c) = (a.await.unwrap(), c.await.unwrap());
+
+        assert!(elapsed >= deadline, "{elapsed:?}");
+        assert!(
+            elapsed < deadline + Duration::from_millis(100),
+            "{elapsed:?}"
+        );
+        assert_eq!(names(&result), [("Alpha", "a"), ("Gamma", "c")]);
+        assert_eq!(status_of(&result, "b"), &ServerStatus::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_failed_to_start_is_listed_as_unavailable() {
+        let mut p = Polyglot::new(&[("a", Member::Live { capable: true }), ("b", Member::Absent)]);
+        p.translator.record_startup_failures(&[ServerSpawnFailure {
+            server_id: ServerId::from_static("b"),
+            language_id: LanguageId::from_static("b"),
+            command: crate::config::ServerCommand::from_static("b-ls"),
+            reason: StartupFailure::InitTaskPanicked,
+        }]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+
+        let result = p.search(None, 100).await.unwrap();
+        a.await.unwrap();
+
+        assert_eq!(names(&result), [("Alpha", "a")]);
+        assert_eq!(status_of(&result, "b"), &ServerStatus::Unavailable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_answer_carries_its_own_index_coverage() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let b = answer(p.take("b"), Duration::ZERO, Value::Null);
+
+        let result = p.search(None, 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert!(result.index_coverage.is_none());
+        assert_eq!(
+            status_of(&result, "b"),
+            &ServerStatus::Answered {
+                symbols: 0,
+                index_coverage: Some(IndexCoverage {
+                    synced_documents: 0,
+                    server_restarted: false,
+                }),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_server_initializing_is_the_retryable_aggregate() {
+        let p = Polyglot::new(&[("a", Member::Initializing), ("b", Member::Initializing)]);
+        assert_matches!(
+            p.search(None, 100).await,
+            Err(Error::WorkspaceServersInitializing)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_capable_server_is_a_capability_error_never_an_empty_success() {
+        let p = Polyglot::new(&[
+            ("a", Member::Live { capable: false }),
+            ("b", Member::Live { capable: false }),
+        ]);
+        assert_matches!(
+            p.search(None, 100).await,
+            Err(Error::CapabilityNotSupported { server_id, .. }) if server_id.as_str() == "a"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_server_leaves_the_single_server_shape_and_is_never_asked() {
+        let mut p = Polyglot::new(&[("a", Member::Live { capable: true }), ("b", Member::Absent)]);
+        p.translator.record_startup_failures(&[ServerSpawnFailure {
+            server_id: ServerId::from_static("b"),
+            language_id: LanguageId::from_static("b"),
+            command: crate::config::ServerCommand::from_static("b-ls"),
+            reason: StartupFailure::RefusedUntrustedWorkspace(UntrustedRefusal::NotAllowed {
+                builtin: None,
+            }),
+        }]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+
+        let result = p.search(None, 100).await.unwrap();
+        a.await.unwrap();
+
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value.get("servers").is_none(), "{value}");
+        assert!(value["symbols"][0].get("server").is_none(), "{value}");
+        assert_eq!(result.symbols.len(), 1);
+    }
+
+    /// A server whose `handles` omit the tool is never asked, while an
+    /// explicit claimer no longer hides the catch-alls of other languages.
+    #[tokio::test(start_paused = true)]
+    async fn handles_declarations_decide_who_is_asked() {
+        let configs = [
+            crate::config::LspServerConfig {
+                language_id: LanguageId::from_static("a"),
+                name: Some(ServerId::from_static("a")),
+                handles: Some(ToolSet::new(vec![ToolKind::WorkspaceSymbols]).unwrap()),
+                ..crate::config::LspServerConfig::rust_analyzer()
+            },
+            crate::config::LspServerConfig {
+                language_id: LanguageId::from_static("narrow"),
+                name: Some(ServerId::from_static("narrow")),
+                handles: Some(ToolSet::new(vec![ToolKind::Hover]).unwrap()),
+                ..crate::config::LspServerConfig::rust_analyzer()
+            },
+            crate::config::LspServerConfig {
+                language_id: LanguageId::from_static("b"),
+                name: Some(ServerId::from_static("b")),
+                handles: None,
+                ..crate::config::LspServerConfig::rust_analyzer()
+            },
+        ];
+        let router = ToolRouter::from_configs(&configs).unwrap();
+        let mut p = Polyglot::with_router(
+            &[
+                ("a", Member::Live { capable: true }),
+                ("narrow", Member::Live { capable: true }),
+                ("b", Member::Live { capable: true }),
+            ],
+            router,
+        );
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([p.symbol("Beta", "b.go", 0)]),
+        );
+        let mut narrow = p.take("narrow");
+
+        let result = p.search(None, 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_no_traffic(&mut narrow);
+        assert_eq!(names(&result), [("Alpha", "a"), ("Beta", "b")]);
+        assert_eq!(
+            result.servers.len(),
+            2,
+            "the declining server is not listed"
+        );
+    }
+
+    fn start_failure(id: &'static str) -> ServerSpawnFailure {
+        ServerSpawnFailure {
+            server_id: ServerId::from_static(id),
+            language_id: LanguageId::from_static(id),
+            command: crate::config::ServerCommand::from_static("ls"),
+            reason: StartupFailure::InitTaskPanicked,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_server_next_to_an_initializing_one_stays_retryable() {
+        let p = Polyglot::new(&[("a", Member::Absent), ("b", Member::Initializing)]);
+        p.translator.record_startup_failures(&[start_failure("a")]);
+        assert_matches!(
+            p.search(None, 100).await,
+            Err(Error::ServerInitializing { server_id }) if server_id.as_str() == "b"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_server_failing_to_start_reports_all_failures() {
+        let p = Polyglot::new(&[("a", Member::Absent), ("b", Member::Absent)]);
+        p.translator
+            .record_startup_failures(&[start_failure("a"), start_failure("b")]);
+        let Err(Error::AllServersFailedToInit { failures }) = p.search(None, 100).await else {
+            panic!("expected AllServersFailedToInit");
+        };
+        assert_eq!(failures.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_server_output_is_byte_identical_to_the_pre_fan_out_shape() {
+        let mut p = Polyglot::new(&[("a", Member::Live { capable: true })]);
+        let symbol = p.symbol("Alpha", "a.rs", 0);
+        let uri = symbol["location"]["uri"].clone();
+        let a = answer(p.take("a"), Duration::ZERO, json!([symbol]));
+
+        let result = p.search(None, 100).await.unwrap();
+        let mut a = a.await.unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            format!(
+                r#"{{"symbols":[{{"name":"Alpha","kind":12,"location":{{"uri":{uri},"range":{{"start":{{"line":1,"character":1}},"end":{{"line":1,"character":6}}}}}}}}]}}"#
+            )
+        );
+        assert_no_traffic(&mut a);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn degradation_of_a_contributing_server_is_reported() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::LiveUtf8),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([p.symbol("Beta", "b.py", 0)]),
+        );
+
+        let result = p.search(None, 100).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(
+            result.positions_degraded,
+            Some(crate::bridge::translator::dto::PositionDegradation::Response)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn degradation_of_a_server_cut_by_the_limit_is_not_reported() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::LiveUtf8),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::ZERO,
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let b = answer(
+            p.take("b"),
+            Duration::ZERO,
+            json!([p.symbol("Beta", "b.py", 0)]),
+        );
+
+        let result = p.search(None, 1).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(names(&result), [("Alpha", "a")]);
+        assert_eq!(result.positions_degraded, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cap_bounds_the_merged_result_across_servers() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let many = |prefix: &str| {
+            Value::Array(
+                (0..6_000)
+                    .map(|n| p.symbol(&format!("{prefix}{n}"), "x.rs", n))
+                    .collect(),
+            )
+        };
+        let (a_symbols, b_symbols) = (many("a"), many("b"));
+        let a = answer(p.take("a"), Duration::ZERO, a_symbols);
+        let b = answer(p.take("b"), Duration::ZERO, b_symbols);
+
+        let result = p.search(None, u32::MAX).await.unwrap();
+        let (_a, _b) = (a.await.unwrap(), b.await.unwrap());
+
+        assert_eq!(result.symbols.len(), MAX_NORMALIZED_LOCATIONS);
+        assert!(result.truncated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_dies_mid_call_is_unavailable_and_the_rest_survive() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let a = answer(
+            p.take("a"),
+            Duration::from_millis(10),
+            json!([p.symbol("Alpha", "a.rs", 0)]),
+        );
+        let mut b = p.take("b");
+        let dying = tokio::spawn(async move {
+            {
+                let mut wire = BufReader::new(&mut b.write_stdout);
+                next_framed_message(&mut wire).await;
+            }
+            drop(b);
+        });
+
+        let result = p.search(None, 100).await.unwrap();
+        a.await.unwrap();
+        dying.await.unwrap();
+
+        assert_eq!(names(&result), [("Alpha", "a")]);
+        assert_eq!(status_of(&result, "b"), &ServerStatus::Unavailable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_call_cancels_every_outstanding_request() {
+        let mut p = Polyglot::new(&[
+            ("a", Member::Live { capable: true }),
+            ("b", Member::Live { capable: true }),
+        ]);
+        let mut a = p.take("a");
+        let mut b = p.take("b");
+        let translator = Arc::clone(&p.translator);
+        let call = tokio::spawn(async move {
+            translator
+                .handle_workspace_symbol("q".to_owned(), None, 100)
+                .await
+        });
+
+        for server in [&mut a, &mut b] {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let request = next_framed_message(&mut wire).await;
+            assert_eq!(request["method"], "workspace/symbol");
+        }
+        call.abort();
+        let _ = call.await;
+
+        for server in [&mut a, &mut b] {
+            let mut wire = BufReader::new(&mut server.write_stdout);
+            let cancel = next_framed_message(&mut wire).await;
+            assert_eq!(cancel["method"], "$/cancelRequest");
+        }
+    }
+
+    fn producer(id: &str) -> Arc<Producer> {
+        Arc::new(Producer {
+            id: ServerId::new(id).unwrap(),
+            ctx: test_ctx(),
+        })
+    }
+
+    fn raw(name: &str, line: u32) -> RawWorkspaceSymbol {
+        RawWorkspaceSymbol {
+            name: name.to_owned(),
+            kind: 12,
+            container_name: None,
+            out_of_workspace: false,
+            uri: lsp_types::Uri::from("file:///w/a.rs"),
+            range: lsp_types::Range {
+                start: lsp_types::Position { line, character: 0 },
+                end: lsp_types::Position { line, character: 1 },
+            },
+        }
+    }
+
+    #[test]
+    fn merged_symbols_stop_collecting_at_the_cap() {
+        let mut merged = MergedSymbols::new(3);
+        merged.extend(&producer("a"), (0..10).map(|line| raw("s", line)));
+        merged.extend(&producer("b"), (10..20).map(|line| raw("s", line)));
+        let (accepted, truncated) = merged.finish(2);
+        assert_eq!(accepted.len(), 2);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn merged_symbols_keep_the_same_name_at_a_different_range() {
+        let mut merged = MergedSymbols::new(10);
+        merged.extend(&producer("a"), [raw("s", 0), raw("s", 0), raw("s", 1)]);
+        let (accepted, truncated) = merged.finish(10);
+        assert_eq!(accepted.len(), 2);
+        assert!(!truncated);
+    }
+
+    fn failure(kind: Unanswered, error: Error) -> MemberFailure {
+        MemberFailure::new(kind, error)
+    }
+
+    #[test]
+    fn aggregate_failure_prefers_an_initializing_server_over_a_breakage() {
+        let error = aggregate_failure(vec![
+            failure(Unanswered::TimedOut, Error::Timeout(Duration::from_secs(1))),
+            failure(
+                Unanswered::Initializing,
+                Error::ServerInitializing {
+                    server_id: ServerId::from_static("b"),
+                },
+            ),
+        ]);
+        assert_matches!(error, Error::ServerInitializing { server_id } if server_id.as_str() == "b");
+    }
+
+    #[test]
+    fn aggregate_failure_prefers_a_breakage_over_a_capability_gap() {
+        let error = aggregate_failure(vec![
+            failure(
+                Unanswered::CapabilityNotAdvertised,
+                Error::CapabilityNotSupported {
+                    server_id: ServerId::from_static("a"),
+                    capability: Capability::WorkspaceSymbols,
+                },
+            ),
+            failure(Unanswered::TimedOut, Error::Timeout(Duration::from_secs(1))),
+        ]);
+        assert_matches!(error, Error::Timeout(_));
+    }
+
+    #[test]
+    fn aggregate_failure_of_initializing_and_incapable_servers_is_initializing() {
+        let error = aggregate_failure(vec![
+            failure(
+                Unanswered::CapabilityNotAdvertised,
+                Error::CapabilityNotSupported {
+                    server_id: ServerId::from_static("a"),
+                    capability: Capability::WorkspaceSymbols,
+                },
+            ),
+            failure(
+                Unanswered::Initializing,
+                Error::ServerInitializing {
+                    server_id: ServerId::from_static("b"),
+                },
+            ),
+        ]);
+        assert_matches!(error, Error::ServerInitializing { .. });
+    }
+
+    #[test]
+    fn a_process_that_died_mid_request_is_unavailable_not_failed() {
+        assert_eq!(
+            MemberFailure::from_request_error(Error::ServerTerminated).kind,
+            Unanswered::Unavailable
+        );
+        assert_eq!(
+            MemberFailure::from_request_error(Error::NoServerConfigured).kind,
+            Unanswered::Failed
+        );
     }
 }

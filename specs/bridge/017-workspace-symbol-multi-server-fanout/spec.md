@@ -226,29 +226,29 @@ Terms: the **eligible set** is the servers the router permits for the tool (FR-0
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | THE eligible set SHALL be derived from the router's declarations: a server is eligible WHEN it explicitly claims the workspace symbols tool OR it is a catch-all; a server whose `handles` list omits the tool SHALL NOT be eligible. [NEEDS CLARIFICATION: today an explicit claimer shadows every catch-all (two-tier resolution). Default for this spec: the eligible set is the union of explicit claimers and catch-alls, so a claimer no longer hides a catch-all for this tool. Confirm, or keep the shadowing and fan out only within the winning tier.] | must |
+| FR-001 | THE eligible set SHALL be derived from the router's declarations: a server is eligible WHEN it explicitly claims the workspace symbols tool OR it is a catch-all; a server whose `handles` list omits the tool SHALL NOT be eligible. Decided: the eligible set is the union of explicit claimers and catch-alls of every language, in config order, minus every server untrusted-workspace mode refused; a claimer no longer hides a catch-all for this tool (a behavior change, recorded in `CHANGELOG.md`). | must |
 | FR-002 | WHEN the eligible set holds at least two servers THE SYSTEM SHALL send the same `workspace/symbol` query to every member of the queried set, concurrently | must |
 | FR-003 | WHEN the eligible set holds exactly one server THE SYSTEM SHALL behave and serialize exactly as before this change, including every existing error | must |
 | FR-004 | THE eligible set SHALL be computed from the configured router, not only from the live one, so a configured server that failed to start or is not yet registered appears in the outcome list (FR-009) instead of vanishing and turning a polyglot setup into an apparent single-server setup | must |
 | FR-005 | WHEN an eligible server is not registered yet but is expected THE SYSTEM SHALL NOT wait for it, SHALL report it as `initializing`, and SHALL return the other servers' results | must |
-| FR-006 | WHEN an eligible server is dead or being respawned THE SYSTEM SHALL apply the existing respawn rule for that server within its own deadline, SHALL NOT delay any other server's request on it, and SHALL report the server as `unavailable` WHEN it could not answer in time. [NEEDS CLARIFICATION: whether a fan-out call should trigger a respawn of a dead server (today's single-server behavior) or only report it; default: trigger, as today, bounded by the deadline.] | must |
+| FR-006 | WHEN an eligible server is dead, failed to start or is being respawned THE SYSTEM SHALL NOT delay any other server's request on it and SHALL report it as `unavailable`. Decided: a fan-out never respawns; a dead registered server is reported `unavailable` at once (a branch that ends in `ServerTerminated` is `unavailable` too), and every queried branch is bounded by its own request deadline. A single eligible server keeps today's respawn. | must |
 | FR-007 | WHEN an eligible live server does not advertise `workspaceSymbolProvider` THE SYSTEM SHALL NOT send it the request and SHALL report it as `capability_not_advertised` | must |
 | FR-008 | WHEN no server of the eligible set produced an answer THE SYSTEM SHALL return an error, never a success-shaped empty result; the error SHALL be the one the single-server path returns for the same condition when the eligible set has one member, and a documented most-specific aggregate (all initializing, all failed to start, none capable) otherwise | must |
 | FR-009 | WHEN the eligible set holds at least two servers THE response SHALL carry a typed outcome list with one entry per eligible server: server id, a closed outcome enum (`answered`, `initializing`, `unavailable`, `timed_out`, `failed`, `capability_not_advertised`), and for `answered` the count of symbols the server returned before filtering | must |
 | FR-010 | WHEN the eligible set holds at least two servers THE SYSTEM SHALL tag every returned symbol with its producing server; WHEN it holds one server THE tag SHALL be absent, not `null` | must |
-| FR-011 | THE merged order SHALL be deterministic: servers in config declaration order, and within a server the order the server returned; it SHALL NOT depend on which server replied first. [NEEDS CLARIFICATION: concatenation lets the first server fill `limit` and starve later ones. Default: concatenation, with the per-server counts of FR-009 and `truncated` making the cut visible. Alternative: round-robin interleave across servers for fairness.] | must |
-| FR-012 | WHEN two answers hold a symbol with identical name, kind, container, URI and normalized range THE SYSTEM SHALL keep the first in merged order and drop the rest. [NEEDS CLARIFICATION: dropping loses the fact that a second server also reported it; default: drop, no multi-server tag list.] | should |
+| FR-011 | THE merged order SHALL be deterministic: servers in config declaration order, and within a server the order the server returned; it SHALL NOT depend on which server replied first. Decided: concatenation; the per-server counts of FR-009 and `truncated` make the cut visible. | must |
+| FR-012 | WHEN two answers hold a symbol with identical name, kind, container, URI and normalized range THE SYSTEM SHALL keep the first in merged order and drop the rest. Decided: duplicates are dropped per server after `kind_filter` and before the symbol counts towards the collection cap, so duplicates never push a later server's symbols out; the range compared is the raw LSP range, so the same symbol reported in two position encodings is kept twice, each with its own `server` tag. | should |
 | FR-013 | THE `kind_filter` SHALL apply to every server's answer and `limit` SHALL apply once to the merged, filtered, deduplicated set, clamped to `MAX_NORMALIZED_LOCATIONS`; `truncated` SHALL be set WHEN any merged symbol was dropped by `limit` or the clamp | must |
 | FR-014 | THE range normalization budget SHALL be bounded by `MAX_NORMALIZED_LOCATIONS` for the whole call, not per server | must |
-| FR-015 | EACH server's symbols SHALL be normalized with that server's own position-encoding context, and `out_of_workspace` SHALL be computed per server; `positions_degraded` of the merged result SHALL report degradation WHEN any contributing server's answer was degraded. [NEEDS CLARIFICATION: whether the merged field needs per-server detail; default: single merged value, per-symbol attribution available through the `server` tag.] | must |
+| FR-015 | EACH server's symbols SHALL be normalized with that server's own position-encoding context, and `out_of_workspace` SHALL be computed per server; `positions_degraded` of the merged result SHALL report degradation WHEN any contributing server's answer was degraded. Decided: a single merged value (the maximum over the answering servers), per-symbol attribution through the `server` tag. | must |
 | FR-016 | WHEN a server answered with no symbols itself THE outcome entry for that server SHALL carry the `index_coverage` note of [[bridge/015-empty-result-index-coverage-caveat/spec\|bridge/015]], and the top-level `index_coverage` SHALL be omitted whenever the outcome list is present | must |
-| FR-017 | WHEN a queried server is still loading its workspace index THE outcome entry for that server SHOULD say so, using the indexing state mcpls already holds, without an extra LSP request. [NEEDS CLARIFICATION: `workspace_symbol_search` discloses no indexing state today (#422); confirm adding it for the multi-server shape only, with the single-server shape unchanged for byte identity.] | should |
-| FR-018 | EACH server's request SHALL carry that server's existing request deadline (the `request_timeout_seconds` mechanism used by `budgeted`), so total call time is bounded by the slowest server's deadline, not their sum. [NEEDS CLARIFICATION: whether a shorter fan-out grace deadline after the first answer is wanted; default: no new timeout and no new config key.] | must |
-| FR-019 | THE number of concurrently outstanding requests of one call SHALL be bounded by a constant not smaller than the number of eligible servers permitted by configuration. [NEEDS CLARIFICATION: value of the cap and behavior beyond it; default: concurrency equals the queried-set size because the server count is config-bounded.] | must |
+| FR-017 | WHEN a queried server is still loading its workspace index THE outcome entry for that server SHOULD say so, using the indexing state mcpls already holds, without an extra LSP request. Decided: not added in this change (follow-up issue); the `index_coverage` note of FR-016 is the only coverage disclosure. | should |
+| FR-018 | EACH server's request SHALL carry that server's existing request deadline (the `request_timeout_seconds` mechanism used by `budgeted`), so total call time is bounded by the slowest server's deadline, not their sum. Decided: no grace deadline, no new timeout and no new config key. | must |
+| FR-019 | THE number of concurrently outstanding requests of one call SHALL be bounded by a constant not smaller than the number of eligible servers permitted by configuration. Decided: concurrency equals the eligible-set size, which the configuration bounds. | must |
 | FR-020 | WHEN the call is cancelled THE SYSTEM SHALL cancel each outstanding request on the server that holds it, send nothing to other servers, produce no partial result, and start no further request, per [[mcp/015-request-cancellation-propagation/spec\|mcp/015]] FR-017, FR-018 | must |
 | FR-021 | WHEN one server fails, times out or is restarted mid-call THE SYSTEM SHALL keep the other servers' requests and results unaffected | must |
-| FR-022 | THE queried set SHALL contain only servers present in the live registry; WHEN untrusted-workspace mode refused a server it SHALL NOT be started, contacted or listed as a symbol producer by this tool. [NEEDS CLARIFICATION: whether a refused server appears in the outcome list as `refused`; default: not listed, since startup failures and `get_tool_support` already report refusals.] | must |
-| FR-023 | `get_tool_support` for `workspace_symbol_search` SHALL report support per eligible server WHEN the eligible set holds at least two servers, and SHALL serialize as today WHEN it holds one; the `get_tool_support` parity tests SHALL keep `workspace_support` and the handler on the same decision functions | should |
+| FR-022 | THE queried set SHALL contain only servers present in the live registry; WHEN untrusted-workspace mode refused a server it SHALL NOT be started, contacted or listed as a symbol producer by this tool. Decided: a refused server is excluded from the eligible set (so it is not listed) by the one eligibility function the handler and `get_tool_support` share; with one admitted server left the output is byte-identical to a single-server setup. | must |
+| FR-023 | `get_tool_support` for `workspace_symbol_search` SHALL aggregate over the eligible set WHEN it holds at least two servers (`supported` naming the first supporting server in config order, else `initializing`, else the first capability gap, else `no_server`) with no change to the response shape, and SHALL serialize as today WHEN it holds one; per-server detail is a follow-up; the `get_tool_support` parity tests SHALL keep `workspace_support` and the handler on the same decision functions | should |
 | FR-024 | THE `tools/list` description and output schema of `workspace_symbol_search` SHALL document the `server` tag and the outcome list in one canonical sentence each | must |
 | FR-025 | THE user guide SHALL state that the search covers every capable eligible server, how the outcome list reads, and that a missing server in the list means its `handles` declaration excludes the tool | must |
 | FR-026 | THE `.local/testing/` playbooks SHALL gain a polyglot case (two real servers, query matching both; one server stopped; one server lacking the capability) and the coverage status SHALL be reset for the bridge subsystem | must |
@@ -259,9 +259,9 @@ Terms: the **eligible set** is the servers the router permits for the tool (FR-0
 |----|----------|-------------|
 | NFR-001 | Output compatibility | With one eligible server, the serialized response and the sequence of LSP messages are byte-identical to the pre-change build; new fields are omitted, never `null` |
 | NFR-002 | Latency | With N queried servers each answering in d ms, total call time is at most d plus a bounded overhead, not N times d; a hung server adds at most its own request deadline |
-| NFR-003 | Payload budget | The golden `tools/list` payload SHALL stay within the enforced budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (total 136,000 B, per tool 9,000 B, schema descriptions 35,000 B). At HEAD the total is 135,990 B, leaving 10 B of headroom, and `workspace_symbol_search` is 4,289 B; the addition therefore needs either trimmed unrelated schema text or an approved budget raise, decided before design |
+| NFR-003 | Payload budget | The golden `tools/list` payload SHALL stay within the enforced budgets of [[mcp/014-tools-list-payload-size/spec\|mcp/014]] (total 136,000 B, per tool 9,000 B, schema descriptions 35,000 B). At the start of the change the total was 135,990 B, leaving 10 B of headroom, and `workspace_symbol_search` was 4,289 B (measured after: total 138,583 B with the `get_completions` cap text, `workspace_symbol_search` 6,629 B, descriptions 30,229 B; the total budget is now 139,000 B); the addition therefore needs either trimmed unrelated schema text or an approved budget raise. Decided: the total budget is raised to the measured total rounded up to the next 500 B and recorded in [[mcp/014-tools-list-payload-size/spec|mcp/014]]; the per-tool and description budgets stay unchanged |
 | NFR-004 | Result bounds | The merged result never holds more than `MAX_NORMALIZED_LOCATIONS` symbols and never triggers more range normalizations than that across all servers; the outcome list holds at most one entry per eligible server and each entry has bounded size |
-| NFR-005 | Resource bounds | Collecting the raw answers of N servers stays bounded; a hostile or oversized answer from one server cannot exceed what a single-server call may already consume per server. [NEEDS CLARIFICATION: whether a per-server cap on collected raw symbols is needed, since the collection loop scans a full response today (#474).] |
+| NFR-005 | Resource bounds | Collecting the raw answers of N servers stays bounded; a hostile or oversized answer from one server cannot exceed what a single-server call may already consume per server. Decided: collection stops once `limit + 1` unique symbols are accepted overall, so one server cannot make the merge hold more than that; the raw answers themselves are bounded as for a single server. |
 | NFR-006 | Type safety | Outcomes are a closed enum, the producing server is a typed server id bounded by `MAX_SERVER_ID_BYTES`, counts are bounded integers; no stringly-typed state and no untyped map, per [[constitution]] and the project's type-safety rule |
 | NFR-007 | Determinism | Identical server answers yield an identical response regardless of reply timing, verified with reversed reply latencies |
 | NFR-008 | Concurrency | Registry and tracker locks follow the existing lock-ordering discipline and are never held across an await; one translator snapshot of router and registry is used for the whole call so a concurrent restart cannot split the eligible set |
@@ -289,7 +289,7 @@ Terms: the **eligible set** is the servers the router permits for the tool (FR-0
 |----------|-------------------|
 | Eligible set of one server | Byte-identical to today (FR-003, NFR-001) |
 | Two eligible servers, one still initializing | Call does not wait; that server reported `initializing`; the other's symbols returned (FR-005) |
-| One server dead, respawn in progress or backing off | Reported `unavailable` within its deadline; others unaffected (FR-006, FR-021) |
+| One server dead, respawn in progress or backing off | Reported `unavailable`, never respawned by this call; others unaffected (FR-006, FR-021) |
 | One server restarted by `restart_server` mid-call | Its pending request fails with the existing restart error; reported `unavailable`; others unaffected |
 | Server returns an LSP error | Reported `failed`; no retry beyond the existing content-modified retry ([[lsp/001-lsp-server-lifecycle-and-respawn/spec\|lsp/001]]); others unaffected |
 | Server never replies | Reported `timed_out` at its deadline; `$/cancelRequest` sent once per [[mcp/015-request-cancellation-propagation/spec\|mcp/015]] FR-006 |
@@ -358,24 +358,23 @@ Terms: the **eligible set** is the servers the router permits for the tool (FR-0
 - Add a server-name or language list to the bridge layer.
 - Change the gate or flag behavior of other tools or the `indexing_in_progress` channel.
 
-## 9. Open Questions
+## 9. Decisions
 
-> [!question] Open
-> The questions below are carried inline as `[NEEDS CLARIFICATION]` markers and must be resolved
-> before the plan. Defaults are stated in the requirement text.
+Open questions of the draft, resolved on 2026-11-01 (the user decided FR-001, FR-006, FR-011, FR-012 and NFR-003; the rest follow the defaults stated in the requirements):
 
-- [NEEDS CLARIFICATION: FR-001, does an explicit claimer stop shadowing catch-alls for this tool?]
-- [NEEDS CLARIFICATION: FR-006, does a fan-out call trigger respawn of a dead server or only report it?]
-- [NEEDS CLARIFICATION: FR-011, concatenation in config order or round-robin merge so one verbose server cannot fill `limit`?]
-- [NEEDS CLARIFICATION: FR-012, drop exact duplicates or keep both with their tags?]
-- [NEEDS CLARIFICATION: FR-015, is a single merged `positions_degraded` enough?]
-- [NEEDS CLARIFICATION: FR-017, disclose per-server indexing state in the multi-server shape (and does that argue for revisiting #422 for the single-server shape)?]
-- [NEEDS CLARIFICATION: FR-018, FR-019, is a dedicated fan-out grace deadline or concurrency cap wanted beyond the per-server request timeout?]
-- [NEEDS CLARIFICATION: FR-022, should a refused server appear in the outcome list?]
-- [NEEDS CLARIFICATION: NFR-003, trim unrelated schema text or raise the total budget to make room for the new fields?]
-- [NEEDS CLARIFICATION: NFR-005, is a per-server cap on collected raw symbols required?]
-- [NEEDS CLARIFICATION: shape of the multi-server `get_tool_support` entry (FR-023): a list per tool, or a per-server sub-object?]
-- [NEEDS CLARIFICATION: is the outcome list present whenever the eligible set has two or more members, or only when at least one outcome is not `answered`? Default: always present, because it also carries per-server counts and coverage notes.]
+- FR-001: union of explicit claimers and catch-alls, minus refused servers.
+- FR-006: no respawn in a fan-out; a dead server is `unavailable`.
+- FR-011: concatenation in config order.
+- FR-012: exact duplicates dropped before the per-server cut; collection stops at `limit + 1` unique symbols.
+- FR-015: one merged `positions_degraded`.
+- FR-017: not added; follow-up issue.
+- FR-018, FR-019: no new timeout or cap.
+- FR-022: refused servers are not listed.
+- NFR-003: raise the total tools/list budget.
+- NFR-005: bounded by the `limit + 1` stop.
+- `get_tool_support`: aggregate with no shape change; per-server detail is a follow-up.
+- The outcome list is present whenever the eligible set has two or more members.
+- No server answered: a server still `initializing` wins because it is the retryable answer (all of them give `WorkspaceServersInitializing`, a mix gives that server's `ServerInitializing`); else, when every member failed to start, `AllServersFailedToInit` lists every failure (#527); else the first breakage (`unavailable`, `timed_out`, `failed`) in config order gives its own error, else the first server's capability error.
 
 ## 10. See Also
 

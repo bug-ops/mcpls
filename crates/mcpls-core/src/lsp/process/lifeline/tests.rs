@@ -155,9 +155,7 @@ impl Fixture {
 }
 
 fn hanging_ps(dir: &Path) -> Options {
-    let ps = dir.join("hanging-ps");
-    std::fs::write(&ps, "#!/bin/sh\nexec sleep 12\n").unwrap();
-    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ps = crate::test_support::fake_executable(dir, "hanging-ps", "#!/bin/sh\nexec sleep 12\n");
     Options {
         ps: ps.into_os_string(),
         scan_timeout: Duration::from_millis(300),
@@ -618,13 +616,11 @@ fn test_awk_never_signals_mcpls_or_its_group() {
 }
 
 fn garbage_ps(dir: &Path) -> Options {
-    let ps = dir.join("garbage-ps");
-    std::fs::write(
-        &ps,
+    let ps = crate::test_support::fake_executable(
+        dir,
+        "garbage-ps",
         "#!/bin/sh\nprintf '\\n  \\nabc def ghi\\n1x 2 3\\n0 0 0\\n'\nexec ps -A -o pid= -o ppid= -o pgid=\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     Options {
         ps: ps.into_os_string(),
         ..Options::default()

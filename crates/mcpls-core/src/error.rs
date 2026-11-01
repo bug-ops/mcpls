@@ -22,6 +22,7 @@ use crate::config::{
 use crate::lsp::JsonRpcError;
 pub use crate::redaction::RedactedText;
 use crate::redaction::Redactions;
+use crate::spelling::spelled_enum;
 pub use crate::util::SizeExceeded;
 use crate::util::{
     MAX_ECHOED_NAME_BYTES, MAX_ECHOED_PATH_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES,
@@ -214,33 +215,13 @@ pub enum StartupFailure {
     RefusedUntrustedWorkspace(UntrustedRefusal),
 }
 
-/// An environment variable that names the user's home directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HomeVariable {
-    /// `HOME`.
-    Home,
-    /// `USERPROFILE`.
-    UserProfile,
-}
-
-impl HomeVariable {
-    /// Every home variable untrusted mode manages.
-    pub const ALL: [Self; 2] = [Self::Home, Self::UserProfile];
-
-    /// The variable's name in the environment.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Home => "HOME",
-            Self::UserProfile => "USERPROFILE",
-        }
-    }
-}
-
-impl fmt::Display for HomeVariable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+spelled_enum! {
+    /// An environment variable that names the user's home directory.
+    HomeVariable {
+        /// `HOME`.
+        Home => "HOME",
+        /// `USERPROFILE`.
+        UserProfile => "USERPROFILE",
     }
 }
 
@@ -452,45 +433,6 @@ impl fmt::Display for EchoedArgument {
         f.write_str(&self.0)
     }
 }
-
-/// Declares a closed enum of spellings: the variants, `ALL`, `as_str` and
-/// `Display`, so a spelling is written once.
-macro_rules! spelled_enum {
-    (
-        $(#[$meta:meta])*
-        $name:ident {
-            $($(#[$variant_meta:meta])* $variant:ident => $spelling:expr),+ $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[non_exhaustive]
-        pub enum $name {
-            $($(#[$variant_meta])* $variant),+
-        }
-
-        impl $name {
-            /// Every variant, in declaration order.
-            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
-
-            /// The spelling as written on the wire or a command line.
-            #[must_use]
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $spelling),+
-                }
-            }
-        }
-
-        impl ::std::fmt::Display for $name {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                f.write_str(self.as_str())
-            }
-        }
-    };
-}
-
-pub(crate) use spelled_enum;
 
 spelled_enum! {
     /// A subcommand of a runner that starts a program the workspace chooses.

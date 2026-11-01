@@ -177,15 +177,12 @@ mod tests {
 
     #[cfg(unix)]
     mod resolve {
-        use std::os::unix::fs::PermissionsExt as _;
-
         use super::super::*;
         use crate::config::ServerCommand;
 
         fn executable(path: &Path) {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let stem = path.file_name().unwrap().to_str().unwrap();
+            crate::test_support::fake_executable(path.parent().unwrap(), stem, "#!/bin/sh\n");
         }
 
         fn config(command: &str) -> LspServerConfig {

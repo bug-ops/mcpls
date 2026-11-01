@@ -110,15 +110,24 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   on-disk spelling, so opening a file through another spelling of its name does
   not change the result). Windows has no safe handle-to-path call, so every directory from the
   root to the file's parent is held open without delete sharing while the file
-  is opened and verified, a symlink or junction among them is refused, and the file is
-  compared with a no-follow open of the same entry. Residual on Windows:
+  is opened, a symlink or junction among them is refused, and the final entry is
+  opened once as itself (`FILE_FLAG_OPEN_REPARSE_POINT`, never its target), so a
+  symlink or junction there is refused without opening what it points to. A
+  final entry that is a reparse point but not a link (WOF compression, deduplication,
+  cloud placeholders) is pinned without delete sharing, opened again normally
+  and compared by file identity before and after. Residual on Windows:
   during that check (milliseconds) other tools cannot rename or remove an ancestor
   directory of the file, such as `git checkout` dropping a directory, an IDE
-  move or a rename of the root; with Developer Mode a file symlink needs no
-  privilege, and the pins plus the last-entry check (identity and not a
-  symlink) cover a swapped final entry; a hardlink there names a file that is
+  move or a rename of the root; the final entry itself may be renamed meanwhile,
+  which cannot lead outside because the handle already is the entry, except in
+  the reparse-point case above, where the pin blocks it. In that case the pin
+  does not stop the file's reparse data being rewritten in place (same file
+  id) into a symlink to an outside device or named pipe; the reopen then opens
+  that target before the identity check refuses it. It needs a workspace
+  writer and a tiny window, and affects only such files, not ordinary ones;
+  a hardlink there names a file that is
   already reachable and is admitted; SMB or FUSE volumes that report a zero
-  file index compare equal (fail-open), and ReFS 128-bit indexes are
+  file index compare equal (fail-open, only in the reparse-point case), and ReFS 128-bit indexes are
   truncated. On Linux the file is opened with `openat2` confined beneath the
   root (no symlink or magic link is followed, so an outside target is never
   opened), falling back to a per-component `O_NOFOLLOW` walk where `openat2`
@@ -131,9 +140,7 @@ Analyzing a workspace is not a safe operation for an untrusted workspace, and
   handle-path check then runs on the opened file. A directory on the path
   with search-only permission cannot be opened for the walk, and the open
   fails.
-  On Windows the last entry is opened before it is checked, so a file symlink
-  there that points outside the roots is opened (not read) before it is
-  refused. On Windows a directory below a root that is a junction or a volume
+  On Windows a directory below a root that is a junction or a volume
   mounted in a folder is a reparse point and is refused.
 
 - **Save notifications.** While a file of a server is subscribed, mcpls sends

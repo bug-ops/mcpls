@@ -47,6 +47,7 @@ mod hierarchy;
 mod highlights;
 mod kind_filter;
 mod navigation;
+pub use navigation::MAX_NORMALIZED_LOCATIONS;
 mod positioned;
 #[cfg(test)]
 mod prepare_range_tests;

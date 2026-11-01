@@ -26,7 +26,7 @@ use rmcp::model::{
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::error::spelled_enum;
+use crate::spelling::spelled_enum;
 use crate::util::{MAX_ECHOED_NAME_BYTES, MAX_ERROR_MESSAGE_CALLER_BYTES, escape_bounded};
 
 spelled_enum! {

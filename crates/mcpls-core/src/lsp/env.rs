@@ -56,8 +56,8 @@ impl ManagedEnvVar {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Path => "PATH",
-            Self::Home => HomeVariable::Home.name(),
-            Self::UserProfile => HomeVariable::UserProfile.name(),
+            Self::Home => HomeVariable::Home.as_str(),
+            Self::UserProfile => HomeVariable::UserProfile.as_str(),
             Self::NoDefaultCurrentDirectoryInExePath => "NoDefaultCurrentDirectoryInExePath",
         }
     }
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn managed_names_match_the_home_variables() {
         for variable in HomeVariable::ALL {
-            assert_eq!(ManagedEnvVar::from(variable).name(), variable.name());
+            assert_eq!(ManagedEnvVar::from(variable).name(), variable.as_str());
         }
     }
 

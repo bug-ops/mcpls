@@ -83,6 +83,7 @@ mod liveness;
 mod session_manager;
 mod shutdown;
 mod stdio;
+mod stdio_transport;
 #[cfg(test)]
 #[cfg(feature = "transport-http")]
 mod test_support;

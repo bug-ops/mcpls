@@ -92,7 +92,14 @@ Arguments: `query` (required), `limit` (default 100, capped by the server) and `
 { "query": "SessionManager", "kind_filter": "struct" }
 ```
 
-This tool has no document to route on. mcpls sends it to the first server that explicitly claims `workspace_symbols` in `handles`, otherwise to the first catch-all server.
+This tool has no document to route on, so mcpls asks every server that may answer it: each server that claims `workspace_symbols` in `handles`, plus every catch-all server (one that omits `handles`), whatever its language. A server whose `handles` omit the tool is never asked, and neither is one that untrusted-workspace mode refused. With a single such server the result is exactly as described above.
+
+With two or more servers the servers are queried concurrently, each within its own `request_timeout_seconds`, so one slow or dead server never delays or hides the others. The result then also carries:
+
+- `server` on every symbol: the server that produced it.
+- `servers`: one entry per asked server, in config order, with an `outcome` of `answered` (and `symbols`, the count it returned before `kind_filter` and `limit`), `initializing`, `unavailable` (failed to start, or its process died; the search never restarts it, so call `restart_server`), `timed_out`, `failed`, or `capability_not_advertised`. An `answered` entry with `symbols: 0` carries its own `index_coverage` note, and the top-level `index_coverage` is then omitted.
+
+Symbols are concatenated in config order, a symbol that two servers report identically is kept once, and `kind_filter` and `limit` apply to the merged set (`truncated: true` marks a cut). A server that answers early cannot reorder the result. If no server answers, the call fails with the most specific error instead of returning an empty list, so an empty `symbols` next to a non-`answered` outcome means "that server could not say", not "no such symbol".
 
 When the server itself answers with no symbols, the result carries the same `index_coverage` note as `get_references`. It is not added when `limit` or `kind_filter` emptied a non-empty server answer.
 
@@ -121,6 +128,8 @@ Returns completion candidates at a position. Add `trigger` (for example `.`, `:`
 ```
 
 Each item has a `label`, a numeric `kind` (2 method, 3 function, 5 field, 6 variable, 7 class, 9 module), a `detail`, optional `documentation` and `insertText`. Completion requests are capped at 10 seconds whatever `request_timeout_seconds` says.
+
+At most 100 items are returned, for every server. When a server returns more, mcpls ranks them by how well they match the identifier typed before the cursor (prefix matches first, then subsequence matches, each group ordered by the server's `sortText`, else by label) before cutting, and sets `truncated: true`; type more of the identifier to narrow the list. A server's own `isIncomplete` flag is not reflected in `truncated`.
 
 ## get_inlay_hints
 
