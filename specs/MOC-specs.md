@@ -33,6 +33,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery) |
 | 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | implemented | #665 |
 | 013 | [[lsp/013-diagnostics-publish-burst-drops/spec\|diagnostics-publish-burst-drops]] | bug | P2 | implemented (per-client publish mailbox, lost files read evicted) | #704 |
+| 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | draft | #863 |
 
 ## mcp
 
