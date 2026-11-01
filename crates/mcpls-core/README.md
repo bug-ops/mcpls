@@ -14,14 +14,14 @@ User documentation: <https://bug-ops.github.io/mcpls/>. API documentation: <http
 
 ```toml
 [dependencies]
-mcpls-core = "0.8"
+mcpls-core = "0.9"
 ```
 
 Enable the `transport-http` feature to serve over Streamable HTTP:
 
 ```toml
 [dependencies]
-mcpls-core = { version = "0.8", features = ["transport-http"] }
+mcpls-core = { version = "0.9", features = ["transport-http"] }
 ```
 
 ## Usage
@@ -47,7 +47,8 @@ async fn main() {
 - Lazy document tracking and a diagnostics cache for push-based notifications, refreshed from disk edits for subscribed resources
 - TOML configuration, server discovery by project markers, and trust controls (untrusted launcher, open-then-verify file access)
 - Cancellation of in-flight tool calls, forwarded to the language server as `$/cancelRequest`
-- stdio and optional HTTP transports
+- Fan-out workspace symbol search across all eligible servers, with per-server outcomes
+- stdio and optional HTTP transports; stdio requests over 4 MiB are rejected with `-32600`
 
 ## Learn more
 

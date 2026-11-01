@@ -72,6 +72,7 @@ stored in an error or returned, using the same secret set already applied to log
 | FR-015 | `Redactions::new` SHALL drop a candidate value that occurs inside any marker string of the set, so redaction is idempotent | must |
 | FR-016 | `is_secret_name` SHALL drop the name segments (split at `_`, `-`, `.` and camel-case boundaries) that are exactly `AUTHOR`, `AUTHORS`, `AUTHORITY`, `XAUTHORITY`, `KEYBOARD`, `KEYMAP` or `TOKENIZERS`, join the rest with no separator and substring-match the secret patterns, and SHALL treat `SSH_AUTH_SOCK` as benign, so `passWord`, `AUTHORIZATION` and `GIT_AUTHOR_TOKEN` stay secret while `GIT_AUTHOR_NAME` and `XAUTHORITY` are not redacted (#611) | must |
 | FR-011 | WHEN notification parameters fail to deserialize THE SYSTEM SHALL log the error category only, not serde's message, which can echo a value | must |
+| FR-017 | THE `Debug` output of `LspServerConfig` and `LspSettings` SHALL print `initialization_options` and `settings` as structure only (`JsonShape`): keys are kept, every string and number prints as `<redacted>`, a key containing `://` or `@` prints as `<redacted key>`, booleans and `null` are kept, and nesting beyond 8 levels prints `{..}`; `args` and `env` keep their own redacting `Debug` (#842) | must |
 
 ## 4. Non-Functional Requirements
 

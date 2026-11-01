@@ -11,7 +11,7 @@ tags:
   - clangd
   - truncation
 created: 2026-11-01
-status: approved
+status: implemented
 related:
   - "[[constitution]]"
   - "[[config/001-config-discovery-and-heuristics/spec|config/001-config-discovery-and-heuristics]]"
