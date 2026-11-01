@@ -114,6 +114,10 @@ pub(crate) use stdio::run_stdio;
 #[cfg(test)]
 pub(crate) use stdio::serve_until;
 
+/// Default cap on one incoming message: a stdio line and an HTTP request body.
+const DEFAULT_MESSAGE_BYTES: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(4 * 1024 * 1024).expect("the message limit must be non-zero");
+
 /// Longest delay a transport deadline may be pushed out to: 30 years, which
 /// no process outlives and `Instant` arithmetic still represents.
 #[cfg(feature = "transport-http")]

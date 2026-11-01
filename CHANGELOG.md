@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `get_tool_support` lists every server of a fanned-out `workspace_symbol_search` with its own status, adds the `unavailable` status and an optional `server` on `initializing` (#851, #859).
+- The `workspace_symbol_search` outcome list flags servers that answered while still indexing through `indexing_in_progress` (#852, #859).
+
+### Changed
+
+- **Breaking:** `RouteSupport::Unavailable` is added, `RouteSupport::Initializing` becomes a struct variant and `ServerStatus::Answered` gains `indexing_in_progress` (#851, #852, #859).
+- **Breaking:** `InboundMessage::UndecodableRequest` and `UndecodableResponse` carry a `reason` (new `UndecodableReason`) (#857, #859).
+- **Breaking:** `PositionEncoding` is `#[non_exhaustive]`, gains `Display`, and `to_lsp` is replaced by `as_str(self)` (#856, #859).
+- **Breaking:** `LspServerConfig.initialization_options` is `Option<InitializationOptions>` (#856, #859).
+- The default clangd launch passes `--rename-file-limit`, so `rename_symbol` is no longer refused above 50 files (#850, #859).
+- The `publish-registry` release job is enabled for stable tags (#853, #859).
+- Internal: workspace symbol search shares one request, limit and normalization path and a typed dedupe key; `get_completions` prefix ranking reuses `EncodingConverter`; spelling lookups share `Spelled::from_spelling`; log fields are structured; const `NonZero` limits use `expect` (#854, #855, #856, #859).
+
+### Fixed
+
+- Stdio requests nested past the JSON recursion limit, cut off after `method` and `id`, or skipped by the SDK are answered with `-32700` or `-32600` carrying the request id instead of being dropped (#857, #859).
+- An LSP frame between 10 and 256 MiB fails only its own request instead of closing the server connection; larger frames still close it (#857, #859).
+
 ## [0.9.0] - 2026-11-01
 
 ### Added

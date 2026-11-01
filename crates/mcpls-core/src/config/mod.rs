@@ -58,7 +58,7 @@ pub use server_env::{
     DuplicateEnvKey, EnvKey, EnvTooLarge, EnvValue, InvalidEnvKey, InvalidEnvValue,
     InvalidServerEnv, MAX_ENV_TOTAL_BYTES, ServerEnv,
 };
-pub use settings::{InvalidLspSettings, LspSettings};
+pub use settings::{InitializationOptions, InvalidLspSettings, LspSettings};
 use text_newtype::impl_text_newtype;
 pub(crate) use trust::login_home_dir;
 pub use trust::{ServerAllowlist, WorkspaceTrust};

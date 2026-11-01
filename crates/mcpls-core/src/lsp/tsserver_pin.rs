@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::WorkspaceRoots;
 use crate::config::{
-    BuiltinServer, CommandStem, HostOs, LaunchCommand, LspServerConfig, ServerArgs, ServerCommand,
-    ServerId,
+    BuiltinServer, CommandStem, HostOs, InitializationOptions, LaunchCommand, LspServerConfig,
+    ServerArgs, ServerCommand, ServerId,
 };
 use crate::error::{InitFailureHint, UntrustedRefusal};
 use crate::lsp::command_path::resolve_named;
@@ -61,10 +61,8 @@ const PNPM_GLOBAL_DIR: &str = "global";
 const MAX_PNPM_GLOBAL_ENTRIES: usize = 16;
 /// Upper bound for a `package.json` read from a directory that may be
 /// workspace-supplied.
-const MAX_MANIFEST_BYTES: NonZeroU64 = match NonZeroU64::new(64 * 1024) {
-    Some(max) => max,
-    None => panic!("the manifest limit must be non-zero"),
-};
+const MAX_MANIFEST_BYTES: NonZeroU64 =
+    NonZeroU64::new(64 * 1024).expect("the manifest limit must be non-zero");
 /// Method of the notification the server sends after `initialized`.
 const TYPESCRIPT_VERSION_METHOD: &str = "$/typescriptVersion";
 
@@ -739,7 +737,13 @@ pub fn select_typescript_server(
         return None;
     }
     let kept = |reason| Some(TypescriptServerChoice::Tsserver(reason));
-    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
+    if UserTsserverPath::of(
+        config
+            .initialization_options
+            .as_ref()
+            .map(InitializationOptions::as_value),
+    ) != UserTsserverPath::Absent
+    {
         return kept(TsserverKept::UserTsserverPath);
     }
     let resolved = inspect(config, &parent_env)?;
@@ -841,7 +845,13 @@ pub fn init_failure_hint(
     workspace_roots: &WorkspaceRoots,
     parent_env: impl ParentEnv,
 ) -> Option<InitFailureHint> {
-    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
+    if UserTsserverPath::of(
+        config
+            .initialization_options
+            .as_ref()
+            .map(InitializationOptions::as_value),
+    ) != UserTsserverPath::Absent
+    {
         return None;
     }
     let native = match resolve(config, parent_env)? {
@@ -927,7 +937,12 @@ pub struct TypescriptPlan {
 /// read as the child sees it.
 #[must_use]
 pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> TypescriptPlan {
-    let user = UserTsserverPath::of(config.initialization_options.as_ref());
+    let user = UserTsserverPath::of(
+        config
+            .initialization_options
+            .as_ref()
+            .map(InitializationOptions::as_value),
+    );
     let resolution = resolve(&config, parent_env).map(|resolution| match resolution {
         TsserverResolution::Pinned(tsserver) => dunce::canonicalize(&tsserver).map_or(
             TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer),
@@ -1050,7 +1065,7 @@ impl TypescriptPlan {
         .inspect_err(|err| tracing::warn!(%err, "tsserver pin could not be serialized"))
         .ok();
         let pinned = options.is_some().then_some(tsserver);
-        config.initialization_options = options;
+        config.initialization_options = options.map(InitializationOptions::from);
         (config, pinned)
     }
 }
@@ -1095,6 +1110,7 @@ fn pinned_initialization_options(
         .apply(roots)
         .0
         .initialization_options
+        .map(InitializationOptions::into_value)
 }
 
 /// The default TypeScript entry started through `command`, auto-selected only
@@ -1914,7 +1930,7 @@ mod tests {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
         let user = serde_json::json!({"tsserver": {"path": "/custom/tsserver.js"}});
-        config.initialization_options = Some(user.clone());
+        config.initialization_options = Some(user.clone().into());
         let options = pinned_initialization_options(
             &config,
             &WorkspaceRoots::default(),
@@ -1928,7 +1944,7 @@ mod tests {
         let layout = global_install(true);
         let mut config = config(SERVER_STEM);
         let user = serde_json::json!({"preferences": {}});
-        config.initialization_options = Some(user.clone());
+        config.initialization_options = Some(user.clone().into());
         let options = pinned_initialization_options(
             &config,
             &WorkspaceRoots::default(),
@@ -1951,7 +1967,7 @@ mod tests {
     #[test]
     fn test_other_server_options_untouched() {
         let mut config = LspServerConfig::rust_analyzer();
-        config.initialization_options = Some(serde_json::json!({"a": 1}));
+        config.initialization_options = Some(serde_json::json!({"a": 1}).into());
         let options = pinned_initialization_options(&config, &WorkspaceRoots::default(), |_| None);
         assert_eq!(options, Some(serde_json::json!({"a": 1})));
     }
@@ -2089,7 +2105,7 @@ mod tests {
         write_typescript(&layout.base.join("prefix/lib"), "7.0.2", false);
         let options = serde_json::json!({"tsserver": {"path": "/custom/tsserver.js"}});
         let mut pinned = config(SERVER_STEM);
-        pinned.initialization_options = Some(options);
+        pinned.initialization_options = Some(options.into());
         assert_eq!(
             init_failure_hint(
                 &pinned,
@@ -2435,14 +2451,14 @@ mod tests {
         native_install_next_to_server(&layout);
         let mut base = config(SERVER_STEM);
         base.initialization_options =
-            Some(serde_json::json!({"tsserver": {"path": "/opt/ts6/lib/tsserver.js"}}));
+            Some(serde_json::json!({"tsserver": {"path": "/opt/ts6/lib/tsserver.js"}}).into());
         assert_eq!(
             select(&layout, &base, &WorkspaceRoots::default()),
             Some(TypescriptServerChoice::Tsserver(
                 TsserverKept::UserTsserverPath
             ))
         );
-        base.initialization_options = Some(serde_json::json!({"preferences": {}}));
+        base.initialization_options = Some(serde_json::json!({"preferences": {}}).into());
         assert_matches!(
             select(&layout, &base, &WorkspaceRoots::default()),
             Some(TypescriptServerChoice::Native(_))
@@ -2523,7 +2539,7 @@ mod tests {
     fn test_invalid_tsserver_path_blocks_native_selection_and_pinning() {
         let layout = global_install(true);
         let mut auto = config(SERVER_STEM);
-        auto.initialization_options = Some(serde_json::json!({"tsserver": {"path": 42}}));
+        auto.initialization_options = Some(serde_json::json!({"tsserver": {"path": 42}}).into());
 
         let choice = select_typescript_server(
             &auto,
@@ -2542,7 +2558,11 @@ mod tests {
                 TsserverKept::UserTsserverPath
             ))
         );
-        assert_eq!(pinned, auto.initialization_options);
+        assert_eq!(
+            pinned,
+            auto.initialization_options
+                .map(InitializationOptions::into_value)
+        );
     }
 
     #[test]
@@ -2557,7 +2577,12 @@ mod tests {
 
         assert_eq!(pinned.as_deref(), Some(layout.tsserver.as_path()));
         assert_eq!(
-            configured_tsserver_path(applied.initialization_options.as_ref()),
+            configured_tsserver_path(
+                applied
+                    .initialization_options
+                    .as_ref()
+                    .map(InitializationOptions::as_value)
+            ),
             Some(layout.tsserver)
         );
     }

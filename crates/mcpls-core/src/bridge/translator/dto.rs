@@ -242,10 +242,9 @@ impl TabSize {
 
 impl Default for TabSize {
     fn default() -> Self {
-        const DEFAULT: TabSize = match NonZeroU32::new(DEFAULT_TAB_SIZE) {
-            Some(size) => TabSize(size),
-            None => panic!("the default tab size must be non-zero"),
-        };
+        const DEFAULT: TabSize = TabSize(
+            NonZeroU32::new(DEFAULT_TAB_SIZE).expect("the default tab size must be non-zero"),
+        );
         DEFAULT
     }
 }
@@ -790,6 +789,9 @@ pub enum ServerStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(with = "IndexCoverage")]
         index_coverage: Option<IndexCoverage>,
+        /// Set only while the server was indexing.
+        #[serde(default, skip_serializing_if = "is_false")]
+        indexing_in_progress: bool,
     },
     /// The server has not finished starting; retry later.
     Initializing,

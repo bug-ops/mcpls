@@ -389,10 +389,8 @@ macro_rules! non_zero_duration {
 
         impl $name {
             /// The default duration.
-            $vis const DEFAULT: Self = match Self::new($default) {
-                Some(duration) => duration,
-                None => panic!("the default duration must be non-zero"),
-            };
+            $vis const DEFAULT: Self =
+                Self::new($default).expect("the default duration must be non-zero");
 
             /// `None` for a zero duration.
             #[must_use]
@@ -666,7 +664,7 @@ non_zero_limit! {
     /// assert_eq!(RequestBodyLimit::new(usize::MAX).unwrap().get(), 64 * 1024 * 1024);
     /// ```
     RequestBodyLimit,
-    4 * 1024 * 1024,
+    super::DEFAULT_MESSAGE_BYTES.get(),
     "4 MiB, matching `rmcp`'s own default.",
     64 * 1024 * 1024,
     "64 MiB"

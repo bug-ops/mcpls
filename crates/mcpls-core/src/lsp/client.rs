@@ -14,10 +14,10 @@ use tracing::{debug, error, trace, warn};
 
 use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
-use crate::lsp::transport::{LspTransport, LspTransportReader};
+use crate::lsp::transport::{LspTransport, LspTransportReader, MAX_CONTENT_LENGTH};
 use crate::lsp::types::{
     InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome, JsonRpcReply,
-    JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LspNotification, RequestId,
+    JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LspNotification, RequestId, UndecodableReason,
 };
 use crate::lsp::{DropCounter, DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
@@ -1329,22 +1329,34 @@ impl LspClient {
             InboundMessage::Response(response) => {
                 Self::complete_pending(pending_requests, response, redactions);
             }
-            InboundMessage::UndecodableResponse { id } => {
+            InboundMessage::UndecodableResponse { id, reason } => {
                 warn!("Failed the request answered by an undecodable response: id={id:?}");
                 if let Resolution::Waiting(sender) = pending_requests.resolve(&id) {
-                    let _ = sender.send(Err(Error::LspProtocolError(RedactedText::fixed(
-                        "undecodable response",
-                    ))));
+                    let _ = sender.send(Err(match reason {
+                        UndecodableReason::Oversized { bytes } => {
+                            redactions.protocol_error(format_args!(
+                                "response of {bytes} bytes exceeds the {MAX_CONTENT_LENGTH}-byte LSP frame limit"
+                            ))
+                        }
+                        UndecodableReason::Malformed => Error::LspProtocolError(
+                            RedactedText::fixed("undecodable response"),
+                        ),
+                    }));
                 }
             }
-            InboundMessage::UndecodableRequest { id } => {
+            InboundMessage::UndecodableRequest { id, reason } => {
                 debug!("Answering an undecodable server request with an error: id={id:?}");
+                let message = match reason {
+                    UndecodableReason::Oversized { .. } => {
+                        "Invalid Request: the request exceeds the LSP frame limit"
+                    }
+                    UndecodableReason::Malformed => {
+                        "Invalid Request: the request could not be decoded"
+                    }
+                };
                 let reply = JsonRpcReply::new(
                     id,
-                    JsonRpcOutcome::Error(JsonRpcError::new(
-                        ErrorCodes::InvalidRequest,
-                        "Invalid Request: the request could not be decoded",
-                    )),
+                    JsonRpcOutcome::Error(JsonRpcError::new(ErrorCodes::InvalidRequest, message)),
                 );
                 transport.send(&serde_json::to_value(&reply)?).await?;
             }
@@ -2690,6 +2702,100 @@ mod tests {
             .await;
 
             assert_eq!(hover.await.unwrap().unwrap(), serde_json::json!("alive"));
+        }
+
+        fn oversized_text() -> String {
+            "x".repeat(MAX_CONTENT_LENGTH + 1)
+        }
+
+        #[tokio::test]
+        async fn test_oversized_response_fails_only_its_request() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            let first = spawn_hover(&client);
+            let first_request = read_framed_message(&mut reader).await;
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":"{}"}}"#,
+                    first_request["id"],
+                    oversized_text()
+                ),
+            )
+            .await;
+
+            assert_matches!(
+                first.await.unwrap(),
+                Err(Error::LspProtocolError(message)) if message.as_str().contains("exceeds the 10485760-byte LSP frame limit")
+            );
+
+            let second = spawn_hover(&client);
+            let second_request = read_framed_message(&mut reader).await;
+            write_response(
+                &mut server.read_half_stdin,
+                &second_request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+            assert_eq!(second.await.unwrap().unwrap(), serde_json::json!("alive"));
+            assert!(client.pending_requests.no_waiting());
+        }
+
+        #[tokio::test]
+        async fn test_oversized_notification_is_dropped_and_the_connection_stays_up() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+            let hover = spawn_hover(&client);
+            let request = read_framed_message(&mut reader).await;
+
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"window/logMessage","params":"{}"}}"#,
+                    oversized_text()
+                ),
+            )
+            .await;
+            write_response(
+                &mut server.read_half_stdin,
+                &request["id"],
+                serde_json::json!("alive"),
+            )
+            .await;
+
+            assert_eq!(hover.await.unwrap().unwrap(), serde_json::json!("alive"));
+        }
+
+        #[tokio::test]
+        async fn test_oversized_server_request_is_answered_with_an_error() {
+            use crate::test_lsp::write_raw_frame;
+
+            let (_client, mut server) = fake_lsp_client();
+            let mut reader = BufReader::new(&mut server.write_stdout);
+
+            write_raw_frame(
+                &mut server.read_half_stdin,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":"srv-1","method":"workspace/applyEdit","params":"{}"}}"#,
+                    oversized_text()
+                ),
+            )
+            .await;
+            let reply = read_framed_message(&mut reader).await;
+
+            assert_eq!(reply["id"], serde_json::json!("srv-1"));
+            assert_eq!(reply["error"]["code"], serde_json::json!(-32600));
+            assert!(
+                reply["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exceeds the LSP frame limit")
+            );
         }
 
         #[tokio::test]

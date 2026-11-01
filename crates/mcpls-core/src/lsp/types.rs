@@ -194,6 +194,32 @@ pub enum RequestId {
     String(String),
 }
 
+/// Why an inbound frame could not be decoded.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::lsp::UndecodableReason;
+///
+/// assert_ne!(
+///     UndecodableReason::Malformed,
+///     UndecodableReason::Oversized { bytes: 11 * 1024 * 1024 }
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UndecodableReason {
+    /// The body is not a decodable message: not JSON, nested too deeply, or
+    /// not shaped like a request, response or notification.
+    Malformed,
+    /// The frame announced more bytes than the transport buffers; it was
+    /// skipped in constant memory and only its envelope was read.
+    Oversized {
+        /// The announced `Content-Length`.
+        bytes: usize,
+    },
+}
+
 /// Inbound message from LSP server.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -211,6 +237,8 @@ pub enum InboundMessage {
     UndecodableResponse {
         /// Identifier of the request the response answers.
         id: RequestId,
+        /// Why the body was lost.
+        reason: UndecodableReason,
     },
     /// A server request whose body could not be decoded but whose framing
     /// and `id` were intact: it is answered with an error and the connection
@@ -218,6 +246,8 @@ pub enum InboundMessage {
     UndecodableRequest {
         /// Identifier of the request to answer.
         id: RequestId,
+        /// Why the body was lost.
+        reason: UndecodableReason,
     },
     /// A server notification that could not be decoded; it is dropped.
     UndecodableNotification,
@@ -232,9 +262,13 @@ impl InboundMessage {
     /// # Examples
     ///
     /// ```
-    /// use mcpls_core::lsp::{InboundMessage, RequestId};
+    /// use mcpls_core::lsp::{InboundMessage, RequestId, UndecodableReason};
     ///
-    /// assert!(InboundMessage::UndecodableResponse { id: RequestId::Number(1) }.is_undecodable());
+    /// let lost = InboundMessage::UndecodableResponse {
+    ///     id: RequestId::Number(1),
+    ///     reason: UndecodableReason::Malformed,
+    /// };
+    /// assert!(lost.is_undecodable());
     /// assert!(InboundMessage::UndecodableNotification.is_undecodable());
     /// ```
     #[must_use]

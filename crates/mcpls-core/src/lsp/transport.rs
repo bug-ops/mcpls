@@ -18,12 +18,19 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tracing::{Level, debug, trace, warn};
 
 use crate::error::{Error, RedactedText, Result};
-use crate::lsp::types::{InboundMessage, RequestId};
+use crate::json_envelope::{Envelope, EnvelopeScan, Shape};
+use crate::lsp::DropCounter;
+use crate::lsp::types::{InboundMessage, RequestId, UndecodableReason};
 use crate::redaction::Redactions;
 use crate::util::WarnLimiter;
 
-/// Maximum allowed Content-Length (10 MB)
-const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
+/// Largest frame that is buffered and decoded (10 MiB).
+pub const MAX_CONTENT_LENGTH: usize = 10 * 1024 * 1024;
+
+/// Largest frame that is skipped in constant memory when it exceeds
+/// [`MAX_CONTENT_LENGTH`]. A frame announced above this is implausible and stays
+/// fatal, so a server that streams forever is still torn down.
+const MAX_SKIPPED_CONTENT_LENGTH: usize = 256 * 1024 * 1024;
 
 /// Maximum length of a single header line, including its terminating `\n`
 /// (#457). Bounds `read_headers` against a spawned server that writes one
@@ -96,6 +103,7 @@ pub struct LspTransportReader {
     stdout: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     redactions: Arc<Redactions>,
     malformed_header_warn: WarnLimiter,
+    skipped_frames: DropCounter,
 }
 
 impl fmt::Debug for LspTransportReader {
@@ -138,6 +146,7 @@ impl LspTransport {
                 stdout: BufReader::new(Box::new(stdout)),
                 redactions,
                 malformed_header_warn: WarnLimiter::default(),
+                skipped_frames: DropCounter::new(),
             },
         )
     }
@@ -178,14 +187,16 @@ impl LspTransportReader {
     /// A frame whose body cannot be decoded (not JSON or not UTF-8, nested past
     /// the parser's limit, a malformed message) does not fail the stream: it is returned as
     /// one of the `Undecodable*` messages, which say what was lost so the
-    /// caller can fail one request or drop one notification and read on.
+    /// caller can fail one request or drop one notification and read on. A
+    /// frame larger than the buffering limit, up to 256 MiB, is skipped without
+    /// being buffered and reported the same way.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Reading headers fails
-    /// - Content-Length header is missing or invalid
-    /// - Reading message content fails
+    /// - Content-Length header is missing or invalid, or announces more than 256 MiB
+    /// - Reading message content fails, or the stream ends inside a frame
     /// - The stream ends
     pub async fn receive(&mut self) -> Result<InboundMessage> {
         loop {
@@ -202,10 +213,23 @@ impl LspTransportReader {
                         .protocol_error(format_args!("Invalid Content-Length: {e}"))
                 })?;
 
-            if content_length > MAX_CONTENT_LENGTH {
+            if content_length > MAX_SKIPPED_CONTENT_LENGTH {
                 return Err(self.redactions.protocol_error(format_args!(
-                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_CONTENT_LENGTH} bytes"
+                    "Content-Length {content_length} exceeds maximum allowed size of {MAX_SKIPPED_CONTENT_LENGTH} bytes"
                 )));
+            }
+
+            if content_length > MAX_CONTENT_LENGTH {
+                let envelope = self.skip_content(content_length).await?;
+                if let Some(suppressed) = self.skipped_frames.record(Instant::now()) {
+                    warn!(
+                        "Skipped an oversized LSP frame of {content_length} bytes \
+                         ({suppressed} others skipped since the last warning)"
+                    );
+                } else {
+                    debug!("Skipped an oversized LSP frame of {content_length} bytes");
+                }
+                return Ok(oversized_message(&envelope, content_length));
             }
 
             let content = self.read_content(content_length).await?;
@@ -322,6 +346,29 @@ impl LspTransportReader {
         self.stdout.read_exact(&mut buffer).await?;
         Ok(buffer)
     }
+
+    /// Consumes exactly `length` content bytes, scanning their envelope in
+    /// constant memory. Never reads past the frame, whatever the scan state:
+    /// the next frame may already sit in the same buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ServerTerminated`] when the stream ends inside the frame.
+    async fn skip_content(&mut self, length: usize) -> Result<Envelope> {
+        let mut scan = EnvelopeScan::default();
+        let mut remaining = length;
+        while remaining > 0 {
+            let available = self.stdout.fill_buf().await?;
+            if available.is_empty() {
+                return Err(Error::ServerTerminated);
+            }
+            let take = available.len().min(remaining);
+            scan.feed(available.get(..take).unwrap_or_default());
+            self.stdout.consume(take);
+            remaining = remaining.saturating_sub(take);
+        }
+        Ok(scan.finish())
+    }
 }
 
 /// Whether a key is present, whatever its value (`null` included), the way
@@ -432,15 +479,38 @@ fn undecodable_message(content: &[u8]) -> InboundMessage {
         outcome: envelope.result.0 || envelope.error.0,
     }
     .kind();
-    undecodable_of_kind(kind, envelope.id.id)
+    undecodable_of_kind(kind, envelope.id.id, UndecodableReason::Malformed)
 }
 
-fn undecodable_of_kind(kind: MessageKind, id: Option<RequestId>) -> InboundMessage {
+/// The message for a frame that was skipped for its size, from the envelope
+/// scanned while skipping it. Only a closed object says what it was.
+fn oversized_message(envelope: &Envelope, bytes: usize) -> InboundMessage {
+    if envelope.shape != Shape::Closed {
+        return InboundMessage::UndecodableFrame;
+    }
+    let kind = Keys {
+        method: envelope.method,
+        id: envelope.id.is_present(),
+        outcome: envelope.outcome,
+    }
+    .kind();
+    undecodable_of_kind(
+        kind,
+        envelope.id.decode(),
+        UndecodableReason::Oversized { bytes },
+    )
+}
+
+fn undecodable_of_kind(
+    kind: MessageKind,
+    id: Option<RequestId>,
+    reason: UndecodableReason,
+) -> InboundMessage {
     match (kind, id) {
-        (MessageKind::Request, Some(id)) => InboundMessage::UndecodableRequest { id },
+        (MessageKind::Request, Some(id)) => InboundMessage::UndecodableRequest { id, reason },
         (MessageKind::Notification, _) => InboundMessage::UndecodableNotification,
         (MessageKind::Response | MessageKind::IncompleteResponse, Some(id)) => {
-            InboundMessage::UndecodableResponse { id }
+            InboundMessage::UndecodableResponse { id, reason }
         }
         _ => InboundMessage::UndecodableFrame,
     }
@@ -471,7 +541,7 @@ fn parse_inbound_message(value: Value, redactions: &Redactions) -> InboundMessag
     };
     decoded.unwrap_or_else(|| {
         debug!("Dropping a message that is not a request, response or notification ({kind:?})");
-        undecodable_of_kind(kind, id)
+        undecodable_of_kind(kind, id, UndecodableReason::Malformed)
     })
 }
 
@@ -708,7 +778,8 @@ mod tests {
         assert_matches!(
             &received[0],
             Ok(InboundMessage::UndecodableResponse {
-                id: RequestId::Number(7)
+                id: RequestId::Number(7),
+                ..
             })
         );
         assert_matches!(&received[1], Ok(InboundMessage::Response(response)) if response.id == RequestId::Number(8));
@@ -723,7 +794,8 @@ mod tests {
         assert_matches!(
             &received[0],
             Ok(InboundMessage::UndecodableResponse {
-                id: RequestId::Number(9)
+                id: RequestId::Number(9),
+                ..
             })
         );
     }
@@ -743,7 +815,8 @@ mod tests {
         assert_matches!(
             reader.receive().await,
             Ok(InboundMessage::UndecodableResponse {
-                id: RequestId::Number(4)
+                id: RequestId::Number(4),
+                ..
             })
         );
         assert_matches!(
@@ -763,7 +836,7 @@ mod tests {
 
         assert_matches!(
             &received[0],
-            Ok(InboundMessage::UndecodableResponse { id: RequestId::String(id) }) if id == "abc"
+            Ok(InboundMessage::UndecodableResponse { id: RequestId::String(id), .. }) if id == "abc"
         );
     }
 
@@ -779,7 +852,7 @@ mod tests {
 
         assert_matches!(
             &received[0],
-            Ok(InboundMessage::UndecodableRequest { id: RequestId::String(id) }) if id == "r1"
+            Ok(InboundMessage::UndecodableRequest { id: RequestId::String(id), .. }) if id == "r1"
         );
         assert_matches!(&received[1], Ok(InboundMessage::Notification(_)));
     }
@@ -839,7 +912,7 @@ mod tests {
                 "request" => matches!(message, InboundMessage::UndecodableRequest { .. }),
                 "notification" => matches!(message, InboundMessage::UndecodableNotification),
                 "response" | "incomplete response" => {
-                    matches!(message, InboundMessage::UndecodableResponse { id } if *id == RequestId::Number(3))
+                    matches!(message, InboundMessage::UndecodableResponse { id, .. } if *id == RequestId::Number(3))
                 }
                 _ => matches!(message, InboundMessage::UndecodableFrame),
             };
@@ -934,7 +1007,8 @@ mod tests {
         assert_matches!(
             message,
             InboundMessage::UndecodableResponse {
-                id: RequestId::Number(1)
+                id: RequestId::Number(1),
+                ..
             }
         );
         let text = logs.messages().join("\n");
@@ -954,7 +1028,8 @@ mod tests {
         assert_matches!(
             message,
             InboundMessage::UndecodableResponse {
-                id: RequestId::Number(1)
+                id: RequestId::Number(1),
+                ..
             }
         );
     }
@@ -1107,6 +1182,129 @@ mod tests {
 
         let headers = reader.read_headers().await.unwrap();
         assert_eq!(headers.len(), MAX_HEADERS);
+    }
+
+    fn oversized_body(head: &str, tail: &str) -> String {
+        format!("{head}{}{tail}", "x".repeat(MAX_CONTENT_LENGTH + 1))
+    }
+
+    const OVERSIZED_RESULT: (&str, &str) = (r#"{"jsonrpc":"2.0","id":7,"result":""#, r#""}"#);
+
+    #[tokio::test]
+    async fn test_oversized_response_fails_only_its_request_and_the_next_frame_is_read() {
+        let body = oversized_body(OVERSIZED_RESULT.0, OVERSIZED_RESULT.1);
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{}{next}", frame(&body))).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableResponse {
+                id: RequestId::Number(7),
+                reason: UndecodableReason::Oversized { bytes },
+            }) if *bytes == body.len()
+        );
+        assert_matches!(&received[1], Ok(InboundMessage::Response(r)) if r.id == RequestId::Number(8));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_notification_is_dropped_and_the_next_frame_is_read() {
+        let body = oversized_body(r#"{"jsonrpc":"2.0","method":"m","params":""#, r#""}"#);
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{}{next}", frame(&body))).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::UndecodableNotification));
+        assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_server_request_is_attributed_to_its_id() {
+        let body = oversized_body(
+            r#"{"jsonrpc":"2.0","id":"r1","method":"m","params":""#,
+            r#""}"#,
+        );
+
+        let received = receive_all(frame(&body)).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableRequest {
+                id: RequestId::String(id),
+                reason: UndecodableReason::Oversized { .. },
+            }) if id == "r1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_frame_that_never_closes_its_object_identifies_nothing() {
+        let body = oversized_body(r#"{"jsonrpc":"2.0","id":7,"result":""#, "");
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{}{next}", frame(&body))).await;
+
+        assert_matches!(&received[0], Ok(InboundMessage::UndecodableFrame));
+        assert_matches!(&received[1], Ok(InboundMessage::Response(_)));
+    }
+
+    #[tokio::test]
+    async fn test_skip_consumes_exactly_the_announced_length_whatever_the_scan_state() {
+        let mut body = oversized_body(OVERSIZED_RESULT.0, OVERSIZED_RESULT.1);
+        body.push_str("  }{\"id\":99,\"result\":1}");
+        let next = frame(r#"{"jsonrpc":"2.0","id":8,"result":null}"#);
+
+        let received = receive_all(format!("{}{next}", frame(&body))).await;
+
+        assert_matches!(
+            &received[0],
+            Ok(InboundMessage::UndecodableResponse {
+                id: RequestId::Number(7),
+                ..
+            })
+        );
+        assert_matches!(&received[1], Ok(InboundMessage::Response(r)) if r.id == RequestId::Number(8));
+    }
+
+    #[tokio::test]
+    async fn test_frame_announced_above_the_skip_cap_stays_fatal() {
+        let inbound = format!("Content-Length: {}\r\n\r\n", MAX_SKIPPED_CONTENT_LENGTH + 1);
+
+        let received = receive_all(inbound).await;
+
+        assert_matches!(&received[0], Err(Error::LspProtocolError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_eof_inside_a_skipped_frame_ends_the_stream() {
+        let inbound = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            MAX_CONTENT_LENGTH + 1,
+            r#"{"jsonrpc":"2.0","id":7,"result":"#
+        );
+
+        let received = receive_all(inbound).await;
+
+        assert_matches!(&received[0], Err(Error::ServerTerminated));
+    }
+
+    #[tokio::test]
+    async fn test_skipped_oversized_frame_is_warned_with_its_size() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = crate::test_lsp::CapturedLogs::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let body = oversized_body(r#"{"jsonrpc":"2.0","method":"m","params":""#, r#""}"#);
+
+        receive_all(frame(&body)).await;
+
+        let warning = captured
+            .entries()
+            .into_iter()
+            .find(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, message)| message)
+            .unwrap_or_default();
+        assert!(warning.contains(&body.len().to_string()), "{warning}");
     }
 
     mod properties {

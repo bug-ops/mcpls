@@ -1412,7 +1412,7 @@ impl McplsServer {
 
     /// Report which tools are usable for which languages.
     #[tool(
-        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) that share a `status`: `supported`, `push_only` (no pull provider: `get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing` or `no_server`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a server advertising the capability, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
+        description = "Which tools are usable for which languages in this session, without making a failing call. Call it before using a tool on a new language. Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still initializing) or `always` (needs no language server); `routes` groups the languages (`languages`) sharing a `status`: `supported`, `push_only` (`get_diagnostics` answers from the push cache), `capability_not_advertised`, `initializing`, `unavailable` (failed to start or died) or `no_server`; a multi-server `workspace_symbol_search` lists one route per server, without `languages`. `file_path` restricts the report to that file's language. `supported` means the call will be dispatched to a capable server, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.",
         title = "Tool Support"
     )]
     async fn get_tool_support(
@@ -7218,7 +7218,7 @@ sleep 0.3
                 assert!(
                     !matches!(
                         reported,
-                        Some(RouteSupport::Initializing | RouteSupport::NoServer)
+                        Some(RouteSupport::Initializing { server: None } | RouteSupport::NoServer)
                     ),
                     "{} reported {reported:?} for a live server",
                     tool.name()

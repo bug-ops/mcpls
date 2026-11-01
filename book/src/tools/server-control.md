@@ -23,8 +23,24 @@ Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still init
 | `supported` | The call will be dispatched to a server that advertises the capability |
 | `push_only` | The server publishes diagnostics but has no pull provider, so `get_diagnostics` answers from the push cache |
 | `capability_not_advertised` | The server does not advertise the feature |
-| `initializing` | The server has not finished starting |
+| `initializing` | The server has not finished starting; in a per-server route (below) it also names the `server` |
+| `unavailable` | Only in a per-server route: the member failed to start or its process died; the check never restarts it, so call `restart_server` |
 | `no_server` | No server is routed for this tool |
+
+A tool that is sent to several servers at once, today `workspace_symbol_search` when two or more servers are eligible, lists one route per eligible server in config order instead of grouping by language. Each route names its `server` and has the status `supported`, `capability_not_advertised`, `initializing` or `unavailable`:
+
+```json
+{
+  "tool": "workspace_symbol_search",
+  "coverage": "some",
+  "routes": [
+    { "server": "rust-analyzer", "status": "supported" },
+    { "server": "pyright", "status": "unavailable" }
+  ]
+}
+```
+
+`coverage` is computed over the whole set, and an `unavailable` member counts as having no server. A server that untrusted-workspace mode refused is not listed. With a single eligible server the entry keeps its usual shape.
 
 `supported` means the call will be dispatched, not that it will succeed: indexing, push-only diagnostics and respawn backoff can still fail it.
 

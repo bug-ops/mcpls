@@ -25,7 +25,8 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{WorkspaceRoots, try_path_to_uri};
 use crate::config::{
-    LspServerConfig, LspSettings, PositionEncodings, ServerCommand, launch_defaults,
+    InitializationOptions, LspServerConfig, LspSettings, PositionEncodings, ServerCommand,
+    launch_defaults,
 };
 use crate::error::{
     BackgroundTask, Error, InitFailureHint, InitPhase, Result, ServerSpawnFailure, StartupFailure,
@@ -519,7 +520,12 @@ impl ServerInitConfig {
     /// The tsserver this config pins through `initialization_options.tsserver.path`.
     #[must_use]
     pub fn pinned_tsserver(&self) -> Option<PathBuf> {
-        tsserver_pin::configured_tsserver_path(self.server_config.initialization_options.as_ref())
+        tsserver_pin::configured_tsserver_path(
+            self.server_config
+                .initialization_options
+                .as_ref()
+                .map(InitializationOptions::as_value),
+        )
     }
 
     /// The config a respawn of this server spawns from.
@@ -880,27 +886,27 @@ impl LspServer {
     /// (redacted) only at `debug`.
     fn log_spawn(server_config: &LspServerConfig, redactions: &Redactions) {
         info!(
-            "Spawning LSP server: {} ({} arg(s))",
-            server_config.command,
-            server_config.args.len()
+            command = %server_config.command,
+            args = server_config.args.len(),
+            "spawning LSP server"
         );
         debug!(
-            "LSP server args: {:?}",
-            server_config
+            args = ?server_config
                 .args
                 .iter()
                 .map(|arg| redactions.apply(arg))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "LSP server args"
         );
         let appended = launch_defaults::appended(server_config);
         if !appended.is_empty() {
             debug!(
-                "LSP server launch options appended by mcpls: {}",
-                appended
+                options = %appended
                     .iter()
                     .map(|option| option.name().as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                "LSP server launch options appended by mcpls"
             );
         }
     }
@@ -1135,10 +1141,10 @@ impl LspServer {
             && config.server_config().settings.is_some()
         {
             warn!(
-                "server `{}` has both initialization_options and settings: servers that pull \
+                server = %config.server_config.command,
+                "server has both initialization_options and settings: servers that pull \
                  workspace/configuration (rust-analyzer, jdtls) may replace the options with \
-                 the settings",
-                config.server_config.command
+                 the settings"
             );
         }
 
@@ -1156,7 +1162,11 @@ impl LspServer {
                 reason = "`root_uri` is deprecated but the struct literal must still set it"
             )]
             root_uri: None,
-            initialization_options: config.server_config().initialization_options.clone(),
+            initialization_options: config
+                .server_config()
+                .initialization_options
+                .clone()
+                .map(InitializationOptions::into_value),
             capabilities: Self::client_capabilities(
                 &config.position_encodings,
                 config.server_config.settings.as_ref(),
@@ -1954,7 +1964,7 @@ mod tests {
         let config = ServerInitConfig::new(
             {
                 let mut c = LspServerConfig::rust_analyzer();
-                c.initialization_options = Some(serde_json::json!({"key": "value"}));
+                c.initialization_options = Some(serde_json::json!({"key": "value"}).into());
                 c
             },
             WorkspaceRoots::for_test(vec![PathBuf::from("/tmp/workspace")], vec![]),
@@ -2008,7 +2018,7 @@ mod tests {
                 args: crate::config::ServerArgs::try_from(vec!["--stdio".to_string()]).unwrap(),
                 env,
                 file_patterns: vec![FilePattern::from_static("**/*.py")],
-                initialization_options: Some(init_opts),
+                initialization_options: Some(init_opts.into()),
                 settings: None,
                 timeout_seconds: TimeoutSecs::new(10).unwrap(),
                 request_timeout_seconds: TimeoutSecs::new(10).unwrap(),
@@ -2495,8 +2505,8 @@ echo 'fatal: bad toolchain' >&2
             LspServer::log_spawn(&config, &redactions);
         });
 
-        let output = logs.messages().join("\n");
-        assert!(output.contains("(1 arg(s))"), "{output}");
+        let output = format!("{:?} {:?}", logs.messages(), logs.fields());
+        assert!(output.contains("args=1"), "{output}");
         assert!(!output.contains("SuperSecretArg456"), "{output}");
     }
 
@@ -3067,9 +3077,10 @@ sleep 5
         let argv = argv(&config);
 
         assert_eq!(argv[..2], ["--background-index", "--log=verbose"]);
-        assert_eq!(argv.len(), 4);
+        assert_eq!(argv.len(), 5);
         assert!(argv[2].starts_with("--limit-references="));
         assert!(argv[3].starts_with("--limit-results="));
+        assert!(argv[4].starts_with("--rename-file-limit="));
     }
 
     /// FR-004 and SC-007: an entry persisted with `args = []` gets the
@@ -3090,7 +3101,7 @@ args = []
         let restarted = argv(init.clone().for_respawn().await.unwrap().server_config());
         let respawned = argv(init.for_respawn().await.unwrap().server_config());
 
-        assert_eq!(started.len(), 3, "{started:?}");
+        assert_eq!(started.len(), 4, "{started:?}");
         assert_eq!(started, restarted);
         assert_eq!(started, respawned);
     }
@@ -3238,7 +3249,7 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123" }
     async fn test_for_respawn_keeps_the_config_and_pinned_tsserver() {
         let mut server_config = LspServerConfig::typescript();
         server_config.initialization_options =
-            Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}));
+            Some(serde_json::json!({"tsserver": {"path": "/pin/tsserver.js"}}).into());
         let config = ServerInitConfig::new(
             server_config,
             WorkspaceRoots::default(),
@@ -3264,7 +3275,7 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123" }
     async fn test_for_respawn_replans_an_auto_pinned_server_off_the_runtime() {
         let mut server_config = LspServerConfig::typescript();
         server_config.initialization_options =
-            Some(serde_json::json!({"tsserver": {"path": "/mcpls-test/stale/tsserver.js"}}));
+            Some(serde_json::json!({"tsserver": {"path": "/mcpls-test/stale/tsserver.js"}}).into());
         let config = ServerInitConfig::new(
             server_config,
             WorkspaceRoots::default(),

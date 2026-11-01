@@ -279,18 +279,26 @@ pub async fn write_raw_frame(writer: &mut DuplexStream, content: &str) {
 /// log line is or is not at `error!` severity, not just that it contains
 /// certain text) so it replaces all of them.
 #[derive(Clone, Default)]
-pub struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+pub struct CapturedLogs {
+    events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    fields: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
 
 impl CapturedLogs {
+    /// Every non-message field of every captured event, as `name=value`.
+    pub fn fields(&self) -> Vec<String> {
+        self.fields.lock().unwrap().clone()
+    }
+
     /// Snapshot of everything captured so far, as `(level, message)` pairs.
     pub fn entries(&self) -> Vec<(tracing::Level, String)> {
-        self.0.lock().unwrap().clone()
+        self.events.lock().unwrap().clone()
     }
 
     /// Snapshot of captured message text only, for callers that don't care
     /// about severity.
     pub fn messages(&self) -> Vec<String> {
-        self.0
+        self.events
             .lock()
             .unwrap()
             .iter()
@@ -305,20 +313,27 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        struct MessageVisitor(String);
-        impl tracing::field::Visit for MessageVisitor {
+        #[derive(Default)]
+        struct EventVisitor {
+            message: String,
+            fields: Vec<String>,
+        }
+        impl tracing::field::Visit for EventVisitor {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
-                    self.0 = format!("{value:?}");
+                    self.message = format!("{value:?}");
+                } else {
+                    self.fields.push(format!("{}={value:?}", field.name()));
                 }
             }
         }
-        let mut visitor = MessageVisitor(String::new());
+        let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
-        self.0
+        self.fields.lock().unwrap().extend(visitor.fields);
+        self.events
             .lock()
             .unwrap()
-            .push((*event.metadata().level(), visitor.0));
+            .push((*event.metadata().level(), visitor.message));
     }
 }
 

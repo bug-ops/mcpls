@@ -10,7 +10,7 @@ use super::dto::{
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::encoding::{LabelOffsets, PositionEncoding};
+use crate::bridge::encoding::{EncodingConverter, LabelOffsets, PositionEncoding};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -80,15 +80,9 @@ fn is_identifier_char(character: char) -> bool {
 /// The identifier characters directly before the cursor, where
 /// `utf16_column` is the 0-based cursor column in UTF-16 units.
 fn typed_prefix(line: &str, utf16_column: u32) -> &str {
-    let mut units = 0_u32;
-    let end = line
-        .char_indices()
-        .find(|(_, character)| {
-            let reached = units >= utf16_column;
-            units = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
-            reached
-        })
-        .map_or(line.len(), |(index, _)| index);
+    let end = EncodingConverter::new(PositionEncoding::Utf16)
+        .character_to_byte_offset(line, utf16_column)
+        .unwrap_or(line.len());
     let before = &line[..end];
     let start = before
         .char_indices()
@@ -182,7 +176,7 @@ fn signature_parameters(
                         tracing::warn!(
                             start,
                             end,
-                            encoding = encoding.to_lsp(),
+                            encoding = encoding.as_str(),
                             "signature parameter label offsets do not resolve within the \
                              signature label; omitting the label"
                         );
@@ -801,6 +795,20 @@ mod tests {
         let folded = fold_prefix(&prefix);
         assert!(folded.ends_with("getel"));
         assert_eq!(folded.chars().count(), MAX_PREFIX_CHARS);
+    }
+
+    #[test]
+    fn test_typed_prefix_counts_surrogate_pairs_as_two_units() {
+        assert_eq!(typed_prefix("\u{1D431}y", 3), "\u{1D431}y");
+        assert_eq!(typed_prefix("\u{1D431}y", 2), "\u{1D431}");
+        assert_eq!(typed_prefix("ab\u{1D11E}cd", 6), "cd");
+    }
+
+    #[test]
+    fn test_typed_prefix_column_inside_a_surrogate_pair_does_not_panic() {
+        assert_eq!(typed_prefix("\u{1D11E}ab", 1), "");
+        assert_eq!(typed_prefix("a\u{1D11E}", 2), "");
+        assert_eq!(typed_prefix("\u{1D431}y", 1), "\u{1D431}");
     }
 
     #[test]

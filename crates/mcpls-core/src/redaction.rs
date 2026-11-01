@@ -317,7 +317,7 @@ impl Redactions {
             );
             collect_secret_args(&config.args, &mut candidates);
             if let Some(options) = &config.initialization_options {
-                collect_secret_json(options, None, &mut candidates);
+                collect_secret_json(options.as_value(), None, &mut candidates);
             }
             if let Some(settings) = &config.settings {
                 collect_secret_json(&settings.to_value(), None, &mut candidates);
@@ -1123,11 +1123,14 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123", "yaml.schemas" = { "https://
     #[test]
     fn test_for_server_takes_string_leaves_under_secret_json_keys() {
         let mut config = server_config();
-        config.initialization_options = Some(serde_json::json!({
-            "server": {"name": "long-server-name", "apiToken": "init-token-value"},
-            "credentials": ["first-credential", {"inner": "second-credential"}],
-            "retries": 3
-        }));
+        config.initialization_options = Some(
+            serde_json::json!({
+                "server": {"name": "long-server-name", "apiToken": "init-token-value"},
+                "credentials": ["first-credential", {"inner": "second-credential"}],
+                "retries": 3
+            })
+            .into(),
+        );
 
         let set = Redactions::for_server(&config, []);
 

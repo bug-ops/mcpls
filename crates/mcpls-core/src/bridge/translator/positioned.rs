@@ -617,7 +617,7 @@ impl std::fmt::Debug for DisclosedDocument<'_> {
 impl Translator {
     /// Never waits: ungated tools disclose the indexing state rather than gate
     /// on it. Samples nothing for a translator without a notification cache.
-    async fn sample_indexing(&self, server_id: &ServerId) -> IndexingSignal {
+    pub(super) async fn sample_indexing(&self, server_id: &ServerId) -> IndexingSignal {
         match &self.notification_cache {
             Some(cache) => IndexingSignal::sample(&*cache.lock().await, Some(server_id)),
             None => IndexingSignal::default(),

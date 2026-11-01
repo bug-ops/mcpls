@@ -235,8 +235,10 @@ impl ToolCoverage {
                 RouteSupport::Supported { .. } | RouteSupport::PushOnly { .. } => {
                     supported = supported.saturating_add(1);
                 }
-                RouteSupport::Initializing => initializing = true,
-                RouteSupport::CapabilityNotAdvertised { .. } | RouteSupport::NoServer => {}
+                RouteSupport::Initializing { .. } => initializing = true,
+                RouteSupport::CapabilityNotAdvertised { .. }
+                | RouteSupport::Unavailable { .. }
+                | RouteSupport::NoServer => {}
             }
         }
         if total == 0 {
@@ -273,6 +275,9 @@ pub(super) enum ToolRoutes {
     Document(Vec<LanguageGroup>),
     /// Workspace-wide tool: its one route.
     Workspace(RouteSupport),
+    /// Workspace-wide tool asked of several servers: one route per server, in
+    /// config order.
+    FanOut(Vec<RouteSupport>),
 }
 
 impl ToolRoutes {
@@ -322,6 +327,7 @@ impl Serialize for ToolRoutes {
         match self {
             Self::Document(groups) => serializer.collect_seq(groups),
             Self::Workspace(support) => serializer.collect_seq(std::iter::once(support)),
+            Self::FanOut(members) => serializer.collect_seq(members),
         }
     }
 }
@@ -383,11 +389,14 @@ impl ToolSupportReport {
                     ToolBackend::Workspace(kind) => {
                         let support = snapshot.workspace_support(kind);
                         let coverage = ToolCoverage::from_routes(std::iter::once(&support));
-                        (
-                            coverage,
+                        let members = snapshot.workspace_members(kind);
+                        let routes = if members.is_empty() {
                             (coverage != ToolCoverage::All)
-                                .then_some(ToolRoutes::Workspace(support)),
-                        )
+                                .then_some(ToolRoutes::Workspace(support))
+                        } else {
+                            Some(ToolRoutes::FanOut(members))
+                        };
+                        (coverage, routes)
                     }
                 };
                 ToolEntry {
@@ -441,11 +450,15 @@ mod tests {
             ToolCoverage::Partial
         );
         assert_eq!(
-            ToolCoverage::from_routes([supported(), RouteSupport::Initializing].iter()),
+            ToolCoverage::from_routes(
+                [supported(), RouteSupport::Initializing { server: None }].iter()
+            ),
             ToolCoverage::Partial
         );
         assert_eq!(
-            ToolCoverage::from_routes([missing.clone(), RouteSupport::Initializing].iter()),
+            ToolCoverage::from_routes(
+                [missing.clone(), RouteSupport::Initializing { server: None }].iter()
+            ),
             ToolCoverage::Unknown
         );
         assert_eq!(
@@ -531,6 +544,46 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ToolRoutes::Workspace(RouteSupport::NoServer)).unwrap(),
             serde_json::json!([{"status": "no_server"}])
+        );
+    }
+
+    #[test]
+    fn fan_out_routes_serialize_one_entry_per_server_without_languages() {
+        let routes = ToolRoutes::FanOut(vec![
+            supported(),
+            RouteSupport::Initializing {
+                server: Some(ServerId::from_static("b")),
+            },
+            RouteSupport::Unavailable {
+                server: ServerId::from_static("c"),
+            },
+        ]);
+        assert_eq!(
+            serde_json::to_value(&routes).unwrap(),
+            serde_json::json!([
+                {"status": "supported", "server": "s"},
+                {"status": "initializing", "server": "b"},
+                {"status": "unavailable", "server": "c"},
+            ])
+        );
+    }
+
+    #[test]
+    fn an_anonymous_initializing_route_omits_the_server() {
+        assert_eq!(
+            serde_json::to_value(RouteSupport::Initializing { server: None }).unwrap(),
+            serde_json::json!({"status": "initializing"})
+        );
+    }
+
+    #[test]
+    fn an_unavailable_route_counts_as_unsupported_not_initializing() {
+        let unavailable = RouteSupport::Unavailable {
+            server: ServerId::from_static("c"),
+        };
+        assert_eq!(
+            ToolCoverage::from_routes([&unavailable].into_iter()),
+            ToolCoverage::Unsupported
         );
     }
 }

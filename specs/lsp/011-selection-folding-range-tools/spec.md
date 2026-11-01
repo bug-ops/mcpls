@@ -34,6 +34,7 @@ related:
 > - **Client capabilities:** `selectionRange` and `foldingRange` (columns on, `lineFoldingOnly: false`, the three standard kinds, `collapsedText: true`) are advertised at `initialize`.
 > - **Deep chains:** a response nested past the JSON recursion limit (about 125 levels) fails only its own request with `undecodable response`; the connection stays up (#642).
 > - **Undecodable server messages (#643):** a server request that cannot be decoded is answered with a `-32600` error and a notification or unrecognized frame is dropped, with at most one WARN a minute (carrying the count dropped since the last one; #681), and a frame whose bytes are not UTF-8 fails only its own request the same way, never decoded lossily; the connection stays up until `MAX_CONSECUTIVE_UNDECODABLE_FRAMES` (64) undecodable frames arrive in a row, a bound that stops a server emitting only garbage from being kept forever (it is torn down and respawned like any lost connection).
+> - **Oversized frames (#850):** a frame over 10 MiB (`MAX_CONTENT_LENGTH`), up to 256 MiB, is skipped in constant memory and fails only its own request (a server request is answered `-32600`, a notification is dropped); a frame announced above 256 MiB stays fatal, so a server that streams forever is still torn down. While a skipped frame is read the reader is blocked: a server that announces a large frame and stops writing leaves every request to it timing out, and only `restart_server` recovers it, as with a stalled frame under 10 MiB, over a 25 times wider window.
 > - **Live matrix (SC-002 to SC-004)** is recorded in the testing playbook, not here.
 
 > [!info] Metadata
@@ -224,6 +225,7 @@ EARS notation. Tool names are decided in the plan (see Open Questions); "the sel
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
+| FR-020 | WHEN a language server sends a frame larger than the 10 MiB LSP frame limit and at most 256 MiB THE SYSTEM SHALL skip it in constant memory and fail only the request it answers (a server request is answered `-32600`, a notification is dropped); the connection SHALL stay up and later frames SHALL be read; a frame announced above 256 MiB SHALL still end the connection | must |
 | FR-030 | THE SYSTEM SHALL make each tool routable per language through the existing per-tool routing configuration, as its own routable kind (selection range and folding range separately, since servers claim them independently) | must |
 | FR-031 | WHEN an existing configuration lists servers with explicit tool lists THE SYSTEM SHALL treat the new tools like any other unclaimed tool (the existing uncovered-tool warning applies) and SHALL NOT silently route them to a server that did not claim them | must |
 | FR-032 | THE SYSTEM SHALL include each new tool in the per-server tool-support report ([[mcp/005-tool-capability-discoverability/spec|mcp/005]]) with the existing three-way distinction and with the same decision logic as the per-call gate | must |
