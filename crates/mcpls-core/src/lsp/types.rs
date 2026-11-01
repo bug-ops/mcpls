@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 
+use lsp_types::Uri;
 // Re-export LSP notification types from lsp_types to avoid duplication.
 pub use lsp_types::{
     LogMessageParams, ProgressParams, PublishDiagnosticsParams, ShowMessageParams,
@@ -220,6 +221,67 @@ pub enum UndecodableReason {
     },
 }
 
+/// A `textDocument/publishDiagnostics` that never reached the cache because
+/// its frame could not be decoded, so the diagnostics cached before it are no
+/// longer known to be current.
+///
+/// # Examples
+///
+/// ```
+/// use lsp_types::Uri;
+/// use mcpls_core::lsp::LostPublish;
+///
+/// let lost = LostPublish::File(Uri::from("file:///workspace/main.rs".to_owned()));
+/// assert_ne!(lost, LostPublish::Unidentified);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LostPublish {
+    /// The publish named this file, exactly as the server spelled it.
+    File(Uri),
+    /// The file could not be read, so every file of the server is suspect.
+    Unidentified,
+}
+
+impl LostPublish {
+    /// The loss of a publish whose `params` were `params`; the file is taken
+    /// from `params.uri` when that is a string.
+    pub(crate) fn of_params(params: Option<&Value>) -> Self {
+        params
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str)
+            .map_or(Self::Unidentified, |uri| {
+                Self::File(Uri::from(uri.to_owned()))
+            })
+    }
+}
+
+/// What a dropped, undecodable notification was.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::lsp::{DroppedNotification, LostPublish};
+///
+/// let dropped = DroppedNotification::Publish(LostPublish::Unidentified);
+/// assert_ne!(dropped, DroppedNotification::Other);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DroppedNotification {
+    /// A `publishDiagnostics`, whose loss the diagnostics cache must show.
+    Publish(LostPublish),
+    /// Any other notification; nothing depends on it.
+    Other,
+}
+
+/// Whether `method` is `textDocument/publishDiagnostics`.
+pub fn is_publish_diagnostics(method: &str) -> bool {
+    matches!(
+        lsp_types::LspNotificationMethod::from(method),
+        lsp_types::LspNotificationMethod::TextDocumentPublishDiagnostics
+    )
+}
+
 /// Inbound message from LSP server.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -249,8 +311,8 @@ pub enum InboundMessage {
         /// Why the body was lost.
         reason: UndecodableReason,
     },
-    /// A server notification that could not be decoded; it is dropped.
-    UndecodableNotification,
+    /// A server notification that could not be decoded.
+    UndecodableNotification(DroppedNotification),
     /// A framed message that is not JSON, or that carries nothing to tell what
     /// it was or whom it addresses; it is dropped.
     UndecodableFrame,
@@ -262,14 +324,14 @@ impl InboundMessage {
     /// # Examples
     ///
     /// ```
-    /// use mcpls_core::lsp::{InboundMessage, RequestId, UndecodableReason};
+    /// use mcpls_core::lsp::{DroppedNotification, InboundMessage, RequestId, UndecodableReason};
     ///
     /// let lost = InboundMessage::UndecodableResponse {
     ///     id: RequestId::Number(1),
     ///     reason: UndecodableReason::Malformed,
     /// };
     /// assert!(lost.is_undecodable());
-    /// assert!(InboundMessage::UndecodableNotification.is_undecodable());
+    /// assert!(InboundMessage::UndecodableNotification(DroppedNotification::Other).is_undecodable());
     /// ```
     #[must_use]
     pub const fn is_undecodable(&self) -> bool {
@@ -277,7 +339,7 @@ impl InboundMessage {
             self,
             Self::UndecodableResponse { .. }
                 | Self::UndecodableRequest { .. }
-                | Self::UndecodableNotification
+                | Self::UndecodableNotification(_)
                 | Self::UndecodableFrame
         )
     }
@@ -290,6 +352,8 @@ impl InboundMessage {
 pub enum LspNotification {
     /// textDocument/publishDiagnostics
     PublishDiagnostics(PublishDiagnosticsParams),
+    /// A `textDocument/publishDiagnostics` whose params did not decode.
+    LostPublish(LostPublish),
     /// window/logMessage
     LogMessage(LogMessageParams),
     /// window/showMessage
@@ -303,6 +367,39 @@ pub enum LspNotification {
         /// Optional parameters.
         params: Option<serde_json::Value>,
     },
+}
+
+/// The members of `publishDiagnostics` params other than `uri`.
+#[derive(Deserialize)]
+struct PublishBody {
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    version: Option<i32>,
+}
+
+/// Decodes `publishDiagnostics` params without copying them: the `uri` is
+/// moved out first, so a body that fails to decode still names its file.
+fn decode_publish(params: Option<Value>) -> Result<PublishDiagnosticsParams, LostPublish> {
+    let Some(Value::Object(mut members)) = params else {
+        return Err(LostPublish::Unidentified);
+    };
+    let uri = members
+        .remove("uri")
+        .and_then(|uri| serde_json::from_value::<Uri>(uri).ok())
+        .ok_or(LostPublish::Unidentified)?;
+    match serde_json::from_value::<PublishBody>(Value::Object(members)) {
+        Ok(PublishBody {
+            diagnostics,
+            version,
+        }) => Ok(PublishDiagnosticsParams {
+            uri,
+            version,
+            diagnostics,
+        }),
+        Err(error) => {
+            debug!(error = ?error.classify(), "failed to parse publishDiagnostics params");
+            Err(LostPublish::File(uri))
+        }
+    }
 }
 
 /// A `$/progress` notification's `value.kind`, decoded from the raw JSON
@@ -367,7 +464,10 @@ impl LspNotification {
     pub fn parse(method: &str, params: Option<serde_json::Value>) -> Self {
         match lsp_types::LspNotificationMethod::from(method) {
             lsp_types::LspNotificationMethod::TextDocumentPublishDiagnostics => {
-                Self::typed(method, params, Self::PublishDiagnostics)
+                match decode_publish(params) {
+                    Ok(params) => Self::PublishDiagnostics(params),
+                    Err(lost) => Self::LostPublish(lost),
+                }
             }
             lsp_types::LspNotificationMethod::WindowLogMessage => {
                 Self::typed(method, params, Self::LogMessage)
@@ -759,13 +859,51 @@ mod tests {
             Some(malformed_params),
         );
 
-        match notification {
-            super::LspNotification::Other { method, params } => {
-                assert_eq!(method, "textDocument/publishDiagnostics");
-                assert!(params.is_none());
-            }
-            _ => panic!("Expected Other variant for malformed params"),
+        assert_matches!(
+            notification,
+            super::LspNotification::LostPublish(LostPublish::Unidentified)
+        );
+    }
+
+    #[test]
+    fn test_publish_with_an_undecodable_body_still_names_its_file() {
+        let notification = super::LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(json!({"uri": "file:///a.rs", "diagnostics": "not_an_array"})),
+        );
+
+        assert_matches!(
+            notification,
+            super::LspNotification::LostPublish(LostPublish::File(uri)) if uri.as_ref() == "file:///a.rs"
+        );
+    }
+
+    #[test]
+    fn test_publish_params_that_are_not_an_object_are_unidentified() {
+        for params in [json!([]), json!("s"), json!(null), json!(7)] {
+            let notification =
+                super::LspNotification::parse("textDocument/publishDiagnostics", Some(params));
+
+            assert_matches!(
+                notification,
+                super::LspNotification::LostPublish(LostPublish::Unidentified)
+            );
         }
+    }
+
+    #[test]
+    fn test_publish_decodes_all_fields_without_the_uri_member_in_the_body() {
+        let notification = super::LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(json!({"uri": "file:///a.rs", "version": 3, "diagnostics": []})),
+        );
+
+        let super::LspNotification::PublishDiagnostics(params) = notification else {
+            panic!("expected a decoded publish");
+        };
+        assert_eq!(params.uri.as_ref(), "file:///a.rs");
+        assert_eq!(params.version, Some(3));
+        assert_eq!(params.diagnostics, Vec::new());
     }
 
     #[test]
@@ -798,12 +936,9 @@ mod tests {
     fn test_publish_diagnostics_with_none_params() {
         let notification = super::LspNotification::parse("textDocument/publishDiagnostics", None);
 
-        match notification {
-            super::LspNotification::Other { method, params } => {
-                assert_eq!(method, "textDocument/publishDiagnostics");
-                assert!(params.is_none());
-            }
-            _ => panic!("Expected Other variant when params is None"),
-        }
+        assert_matches!(
+            notification,
+            super::LspNotification::LostPublish(LostPublish::Unidentified)
+        );
     }
 }

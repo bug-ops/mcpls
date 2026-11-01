@@ -737,13 +737,7 @@ pub fn select_typescript_server(
         return None;
     }
     let kept = |reason| Some(TypescriptServerChoice::Tsserver(reason));
-    if UserTsserverPath::of(
-        config
-            .initialization_options
-            .as_ref()
-            .map(InitializationOptions::as_value),
-    ) != UserTsserverPath::Absent
-    {
+    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
         return kept(TsserverKept::UserTsserverPath);
     }
     let resolved = inspect(config, &parent_env)?;
@@ -845,13 +839,7 @@ pub fn init_failure_hint(
     workspace_roots: &WorkspaceRoots,
     parent_env: impl ParentEnv,
 ) -> Option<InitFailureHint> {
-    if UserTsserverPath::of(
-        config
-            .initialization_options
-            .as_ref()
-            .map(InitializationOptions::as_value),
-    ) != UserTsserverPath::Absent
-    {
+    if UserTsserverPath::of(config.initialization_options.as_ref()) != UserTsserverPath::Absent {
         return None;
     }
     let native = match resolve(config, parent_env)? {
@@ -891,9 +879,9 @@ pub enum UserTsserverPath {
 impl UserTsserverPath {
     /// Reads `tsserver.path` out of `options`.
     #[must_use]
-    pub fn of(options: Option<&serde_json::Value>) -> Self {
+    pub fn of(options: Option<&InitializationOptions>) -> Self {
         options
-            .and_then(|options| options.pointer(TSSERVER_PATH_POINTER))
+            .and_then(|options| options.as_value().pointer(TSSERVER_PATH_POINTER))
             .map_or(Self::Absent, |value| {
                 value
                     .as_str()
@@ -913,7 +901,7 @@ impl UserTsserverPath {
 
 /// The `tsserver.path` configured in `options`, if any.
 #[must_use]
-pub fn configured_tsserver_path(options: Option<&serde_json::Value>) -> Option<PathBuf> {
+pub fn configured_tsserver_path(options: Option<&InitializationOptions>) -> Option<PathBuf> {
     UserTsserverPath::of(options).path().map(Path::to_path_buf)
 }
 
@@ -937,12 +925,7 @@ pub struct TypescriptPlan {
 /// read as the child sees it.
 #[must_use]
 pub fn plan_typescript(config: LspServerConfig, parent_env: impl ParentEnv) -> TypescriptPlan {
-    let user = UserTsserverPath::of(
-        config
-            .initialization_options
-            .as_ref()
-            .map(InitializationOptions::as_value),
-    );
+    let user = UserTsserverPath::of(config.initialization_options.as_ref());
     let resolution = resolve(&config, parent_env).map(|resolution| match resolution {
         TsserverResolution::Pinned(tsserver) => dunce::canonicalize(&tsserver).map_or(
             TsserverResolution::Unresolved(UnresolvedReason::NoTypescriptNextToServer),
@@ -1897,7 +1880,7 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            configured_tsserver_path(options.as_ref()),
+            configured_tsserver_path(options.map(InitializationOptions::from).as_ref()),
             Some(layout.tsserver)
         );
         assert!(
@@ -1920,7 +1903,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            configured_tsserver_path(Some(&options)),
+            configured_tsserver_path(Some(&InitializationOptions::from(options))),
             Some(layout.tsserver)
         );
     }
@@ -2521,7 +2504,9 @@ mod tests {
 
     #[test]
     fn test_user_tsserver_path_distinguishes_absent_path_and_invalid() {
-        let of = |value: serde_json::Value| UserTsserverPath::of(Some(&value));
+        let of = |value: serde_json::Value| {
+            UserTsserverPath::of(Some(&InitializationOptions::from(value)))
+        };
 
         assert_eq!(UserTsserverPath::of(None), UserTsserverPath::Absent);
         assert_eq!(of(serde_json::json!({})), UserTsserverPath::Absent);
@@ -2577,12 +2562,7 @@ mod tests {
 
         assert_eq!(pinned.as_deref(), Some(layout.tsserver.as_path()));
         assert_eq!(
-            configured_tsserver_path(
-                applied
-                    .initialization_options
-                    .as_ref()
-                    .map(InitializationOptions::as_value)
-            ),
+            configured_tsserver_path(applied.initialization_options.as_ref()),
             Some(layout.tsserver)
         );
     }

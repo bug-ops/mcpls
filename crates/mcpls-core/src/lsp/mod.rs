@@ -37,11 +37,11 @@ pub use process::LIFELINE_SWEEP_BUDGET;
 pub use publish_mailbox::{
     BoundedPublish, LostFiles, NotificationInbox, PublishDelivery, PublishReader, ServerMessage,
 };
-pub(crate) use publish_mailbox::{DropCounter, DropLog, Lane, NotificationSink};
+pub(crate) use publish_mailbox::{DropLog, Lane, NotificationSink};
 #[cfg(test)]
 pub(crate) use publish_mailbox::{MailboxLimits, PublishWriter, mailbox};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
-    InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LspNotification, RequestId, UndecodableReason,
+    DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, LostPublish, LspNotification, RequestId, UndecodableReason,
 };

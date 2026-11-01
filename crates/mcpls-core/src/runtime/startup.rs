@@ -679,7 +679,7 @@ mod startup_tests {
             wait_until("the fast server to register", || {
                 !matches!(
                     support(&startup.translator, &LanguageId::from_static("rust")),
-                    RouteSupport::Initializing { server: None }
+                    RouteSupport::Initializing
                 )
             })
             .await;
@@ -688,7 +688,7 @@ mod startup_tests {
                     &startup.translator,
                     &LanguageId::from_static("typescriptreact"),
                 ),
-                RouteSupport::Initializing { server: None },
+                RouteSupport::Initializing,
                 "slow_first: {slow_first}"
             );
 
@@ -699,7 +699,7 @@ mod startup_tests {
                         &startup.translator,
                         &LanguageId::from_static("typescriptreact"),
                     ),
-                    RouteSupport::Initializing { server: None }
+                    RouteSupport::Initializing
                 )
             })
             .await;
@@ -737,7 +737,7 @@ mod startup_tests {
                 &startup.translator,
                 &LanguageId::from_static("typescriptreact"),
             ),
-            RouteSupport::Initializing { server: None }
+            RouteSupport::Initializing
         );
         let failure = startup
             .translator

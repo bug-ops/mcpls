@@ -130,7 +130,8 @@ SO THAT one call cannot flood my context or the mcpls process
 | Stdio request line cut off after its `id` and `method` | `-32700` with the request id |
 | Stdio request line that breaks after its `method` and full `id` (cut off, missing comma, unquoted key) | `-32700` with the request id; a line end ends a number id, for LF and CRLF alike |
 | Stdio request cut off inside a string `id`, or an oversized line cut inside its `id` | No reply (the id cannot be trusted) |
-| Stdio request the SDK skips for compatibility (for example method `notifications/x` with an `id`) | `-32600` with the request id |
+| Stdio request with a `notifications/*` method and an `id`, whose full decode fails for another reason (for example `params` that is not an object) | `-32600` with the request id |
+| Stdio request with a `notifications/*` method and an `id`, with no `params` or object `params` | Decodes as a request; the SDK answers `-32601` with the request id |
 | Stdio notification, or a response with `result`/`error`, nested too deeply | No reply |
 | Stdio `{"jsonrpc":"2.0","id":1}` (an `id` and nothing else) | `-32600` without an id |
 | Stdio request whose `id` key is written with escapes (`"\u0069d"`) | No reply: an escaped key is never matched (known limit) |

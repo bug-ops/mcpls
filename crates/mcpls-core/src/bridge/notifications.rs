@@ -642,6 +642,7 @@ struct EvictionMarks {
 impl EvictionMarks {
     /// Marks `file`; returns whether that changed what a read of it says (it
     /// had no mark, or one with other content).
+    // TODO(#867): forgetting another owner's mark on overflow marks that server overflowed (FR-010 of lsp/014)
     fn record(&mut self, file: DiagnosticsKey, owner: ServerId, content: EvictedContent) -> bool {
         let previous = self.by_file.get(&file).map(|previous| previous.content);
         let content = match previous {
@@ -682,6 +683,18 @@ impl EvictionMarks {
         self.by_file.retain(|_, mark| &mark.owner != server);
         self.order.retain(|_, file| self.by_file.contains_key(file));
         self.overflowed.remove(server);
+    }
+
+    /// Turns `owner`'s clean marks into lost ones and returns their files.
+    fn lose_clean_marks(&mut self, owner: &ServerId) -> Vec<DiagnosticsKey> {
+        self.by_file
+            .iter_mut()
+            .filter(|(_, mark)| mark.owner == *owner && mark.content == EvictedContent::Clean)
+            .map(|(file, mark)| {
+                mark.content = EvictedContent::Lost;
+                file.clone()
+            })
+            .collect()
     }
 
     fn content(&self, file: &DiagnosticsKey) -> Option<EvictedContent> {
@@ -2382,32 +2395,64 @@ impl NotificationCache {
         let mut changed = BTreeSet::new();
         for publication in published {
             let file = self.lost_file(publication);
-            let stale: Vec<SlotKey> = self
-                .files
-                .get(&file)
-                .into_iter()
-                .flatten()
-                .filter(|key| {
-                    key.provenance == Provenance::Pushed
-                        && self
-                            .entries
-                            .get(key)
-                            .is_some_and(|entry| entry.owner == *owner)
-                })
-                .cloned()
-                .collect();
-            let evicted = !stale.is_empty();
-            for key in stale {
-                self.evict_entry(&key);
-            }
-            let marked = !self.has_diagnostics_for(&file)
-                && self
-                    .eviction_marks
-                    .record(file.clone(), owner.clone(), EvictedContent::Lost);
-            if evicted || marked {
+            if self.lose_file(&file, owner) {
                 changed.insert(file);
             }
         }
+        changed.into_iter().collect()
+    }
+
+    /// Removes `owner`'s pushed entries of `file` and marks the file lost
+    /// unless another entry still answers for it; returns whether a read of
+    /// the file changed.
+    fn lose_file(&mut self, file: &DiagnosticsKey, owner: &ServerId) -> bool {
+        let stale: Vec<SlotKey> = self
+            .files
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter(|key| {
+                key.provenance == Provenance::Pushed
+                    && self
+                        .entries
+                        .get(key)
+                        .is_some_and(|entry| entry.owner == *owner)
+            })
+            .cloned()
+            .collect();
+        let evicted = !stale.is_empty();
+        for key in stale {
+            self.evict_entry(&key);
+        }
+        let marked = !self.has_diagnostics_for(file)
+            && self
+                .eviction_marks
+                .record(file.clone(), owner.clone(), EvictedContent::Lost);
+        evicted || marked
+    }
+
+    /// Records that `owner` lost a publish whose file is unknown: every file
+    /// it pushed diagnostics for reads as lost until it publishes again, and
+    /// files it never published for read as evicted, as after
+    /// [`Self::record_unnamed_loss`].
+    ///
+    /// Returns the files whose view changed, each once, in key order.
+    pub(crate) fn record_unidentified_loss(&mut self, owner: &ServerId) -> Vec<DiagnosticsKey> {
+        let files: BTreeSet<DiagnosticsKey> = self
+            .order
+            .get(owner)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|key| key.provenance == Provenance::Pushed)
+            .filter_map(|key| self.entries.get(key).map(|entry| entry.file(key).clone()))
+            .collect();
+        let mut changed: BTreeSet<DiagnosticsKey> = self
+            .eviction_marks
+            .lose_clean_marks(owner)
+            .into_iter()
+            .collect();
+        changed.extend(files.into_iter().filter(|file| self.lose_file(file, owner)));
+        self.eviction_marks.restore_overflow(owner);
         changed.into_iter().collect()
     }
 
@@ -2532,6 +2577,7 @@ pub fn apply_lifecycle_notification(
             cache.observe_indexing_signal(server_id, &method, params.as_ref());
         }
         crate::lsp::LspNotification::PublishDiagnostics(_)
+        | crate::lsp::LspNotification::LostPublish(_)
         | crate::lsp::LspNotification::LogMessage(_)
         | crate::lsp::LspNotification::ShowMessage(_) => {}
     }
@@ -4354,6 +4400,89 @@ mod tests {
             .map(|n| DiagnosticsKey::of(&file_uri(&format!("f{n:04}.rs"))))
             .collect();
         assert_eq!(changed, expected);
+    }
+
+    /// lsp/014: a publish whose file is unknown makes every file the server
+    /// pushed read as lost, and the files it never published for as evicted;
+    /// another owner's entries stay.
+    #[test]
+    fn test_unidentified_loss_evicts_every_pushed_entry_of_the_owner_only() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let other = ServerId::from_static("other");
+        let (a, b, theirs, never) = (
+            file_uri("a.rs"),
+            file_uri("b.rs"),
+            file_uri("theirs.rs"),
+            file_uri("never.rs"),
+        );
+        cache.store_diagnostics(&server, &a, None, vec![diagnostic_at(1, "a")]);
+        cache.store_diagnostics(&server, &b, None, Vec::new());
+        cache.store_diagnostics(&other, &theirs, None, vec![diagnostic_at(1, "t")]);
+
+        let changed = cache.record_unidentified_loss(&server);
+
+        assert_eq!(changed, [DiagnosticsKey::of(&a), DiagnosticsKey::of(&b)]);
+        for uri in [&a, &b, &never] {
+            assert!(!cache.has_diagnostics(uri));
+            assert_eq!(
+                cache.availability(uri, Some(&server)),
+                DiagnosticsAvailability::Evicted,
+                "{}",
+                uri.as_ref()
+            );
+        }
+        assert!(cache.has_diagnostics(&theirs));
+        assert_eq!(
+            cache.availability(&never, Some(&other)),
+            DiagnosticsAvailability::Pending
+        );
+        assert_eq!(
+            cache.record_unidentified_loss(&server),
+            Vec::<DiagnosticsKey>::new()
+        );
+        cache.assert_consistent();
+    }
+
+    /// lsp/014 FR-003: a file whose clean entry was capacity-evicted must not
+    /// keep reading as published-clean after a publish that could not be read.
+    #[test]
+    fn test_unidentified_loss_turns_clean_capacity_marks_into_lost_ones() {
+        let mut cache = full_cache(true);
+        evict_one(&mut cache);
+        let server = test_server();
+        let evicted = first_uri();
+        assert_eq!(
+            cache.availability(&evicted, Some(&server)),
+            DiagnosticsAvailability::Published
+        );
+
+        let changed = cache.record_unidentified_loss(&server);
+
+        assert!(changed.contains(&DiagnosticsKey::of(&evicted)));
+        assert_eq!(
+            cache.availability(&evicted, Some(&server)),
+            DiagnosticsAvailability::Evicted
+        );
+        cache.assert_consistent();
+    }
+
+    /// lsp/014: the next accepted write of the server ends the loss for its file.
+    #[test]
+    fn test_publish_after_an_unidentified_loss_restores_the_file() {
+        let mut cache = NotificationCache::new();
+        let server = test_server();
+        let uri = file_uri("a.rs");
+        cache.store_diagnostics(&server, &uri, None, vec![diagnostic_at(1, "old")]);
+        cache.record_unidentified_loss(&server);
+
+        cache.store_diagnostics(&server, &uri, None, vec![diagnostic_at(2, "new")]);
+
+        assert_eq!(
+            cache.availability(&uri, Some(&server)),
+            DiagnosticsAvailability::Published
+        );
+        cache.assert_consistent();
     }
 
     /// #742: a file that already carries a lost mark, or that still shows

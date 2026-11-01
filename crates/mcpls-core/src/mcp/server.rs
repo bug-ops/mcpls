@@ -7218,7 +7218,7 @@ sleep 0.3
                 assert!(
                     !matches!(
                         reported,
-                        Some(RouteSupport::Initializing { server: None } | RouteSupport::NoServer)
+                        Some(RouteSupport::Initializing | RouteSupport::NoServer)
                     ),
                     "{} reported {reported:?} for a live server",
                     tool.name()

@@ -520,12 +520,7 @@ impl ServerInitConfig {
     /// The tsserver this config pins through `initialization_options.tsserver.path`.
     #[must_use]
     pub fn pinned_tsserver(&self) -> Option<PathBuf> {
-        tsserver_pin::configured_tsserver_path(
-            self.server_config
-                .initialization_options
-                .as_ref()
-                .map(InitializationOptions::as_value),
-        )
+        tsserver_pin::configured_tsserver_path(self.server_config.initialization_options.as_ref())
     }
 
     /// The config a respawn of this server spawns from.

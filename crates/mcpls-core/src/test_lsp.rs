@@ -469,6 +469,10 @@ impl PumpFeed {
                 self.publishes.publish(params);
                 Ok(())
             }
+            LspNotification::LostPublish(lost) => {
+                self.publishes.lose(lost);
+                Ok(())
+            }
             LspNotification::LogMessage(params) => {
                 self.messages.send(ServerMessage::Log(params)).await
             }

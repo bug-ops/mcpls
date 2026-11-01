@@ -40,7 +40,7 @@ Read the extra fields before you trust an empty list:
 
 | Field | Values and meaning |
 |-------|--------------------|
-| `availability` | `published`: the server reported on the file, so an empty list means clean. `pending`: nothing was published yet. `evicted`: a publish was dropped to bound the cache. An empty list next to `pending` or `evicted` is not a clean file |
+| `availability` | `published`: the server reported on the file, so an empty list means clean. `pending`: nothing was published yet. `evicted`: a publish was lost, either dropped to bound the cache or unreadable (oversized, malformed or undecodable). An empty list next to `pending` or `evicted` is not a clean file |
 | `origin` | `pull` when a `textDocument/diagnostic` request answered, `push_cache` when the server has no pull support and the cache alone answered, `cache_after_failed_pull` when the pull failed and the cache answered |
 | `indexing_in_progress` | `true` if the server was still indexing during the read, so early errors may be false and real ones may be missing |
 | `push_notifications_degraded` | `true` if the server crashed and restarted during this session, so push-only diagnostics may be missing until mcpls restarts |

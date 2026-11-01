@@ -67,7 +67,7 @@ THEN the first get_hover answers within about one second
 | FR-001 | WHEN `initialized` has been sent THE SYSTEM SHALL send exactly one `workspace/didChangeConfiguration` before the server is registered, with `params == {"settings": null}` when the server has no `settings` table | must |
 | FR-002 | WITHOUT a `settings` table THE settings SHALL be `null`, not `{}`: a server that rebuilds its preferences from an empty settings map (jdtls) would drop its `initialization_options`, while a non-map value is ignored; rust-analyzer skips both `null` and `{}` client configuration, so its `initialization_options` survive | must |
 | FR-003 | WHEN the notification cannot be written THE SYSTEM SHALL fail the handshake with `Error::LspInitFailed`, as for `initialized` | must |
-| FR-005 | `LspServerConfig.settings` SHALL be a non-empty `LspSettings` object; an empty table, a TOML datetime anywhere in it, and an empty key segment SHALL be rejected at load with a typed error | must |
+| FR-005 | `LspServerConfig.settings` SHALL be a non-empty `LspSettings` object; an empty table, a TOML datetime anywhere in it, and an empty key segment SHALL be rejected at load with a typed error. A TOML datetime anywhere in `initialization_options` SHALL be rejected at load too, with the same shared `TomlDatetime` error prefixed by `initialization_options` instead of `settings`, because JSON cannot represent it and the `toml` crate's internal encoding would otherwise reach the server | must |
 | FR-006 | THE SYSTEM SHALL expand dotted keys at the top level of `settings` only (`"python.analysis.typeCheckingMode"` becomes nested objects), rejecting a conflicting pair of settings with a typed error; keys inside a setting's value (gopls `"ui.semanticTokens"`, yaml-language-server URL keys) SHALL NOT be altered | must |
 | FR-007 | WHEN `settings` is configured THE SYSTEM SHALL push the whole expanded object in the notification of FR-001 | must |
 | FR-008 | WHEN `settings` is configured THE SYSTEM SHALL advertise `workspace.configuration` and answer `workspace/configuration` with one entry per item: the section found by walking the dotted `section` over the nested object, `null` when missing, the whole object when `section` is absent; `scopeUri` is never read, so an unparseable one does not fail the request; an item that cannot be interpreted (a non-string `section`, a non-object entry) SHALL get `null`; params without an `items` array SHALL be answered with `-32602` | must |
@@ -93,6 +93,7 @@ THEN the first get_hover answers within about one second
 | `settings = {}` | Rejected (FR-005) |
 | `workspace/configuration` item that is not an object (`"x"`, `7`, `null`) | `null` for that item (FR-008) |
 | `"" = 1` (empty top-level key) | Rejected as an empty segment (FR-005) |
+| A TOML datetime in `settings` or `initialization_options` | Config load error naming the dotted path, with the TOML line and column (FR-005) |
 
 ## 7. Success Criteria
 
