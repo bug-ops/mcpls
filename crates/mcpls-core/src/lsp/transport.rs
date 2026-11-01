@@ -21,8 +21,8 @@ use tracing::{Level, debug, trace, warn};
 use crate::error::{Error, RedactedText, Result};
 use crate::json_envelope::{Envelope, EnvelopeScan, Members, MessageKind, Shape};
 use crate::lsp::types::{
-    DroppedNotification, InboundMessage, JsonRpcNotification, JsonRpcVersion, LostPublish,
-    RequestId, UndecodableReason, is_publish_diagnostics,
+    BoundedUri, DroppedNotification, InboundMessage, JsonRpcNotification, JsonRpcVersion,
+    LostPublish, RequestId, UndecodableReason, is_publish_diagnostics,
 };
 use crate::redaction::Redactions;
 use crate::util::{DropCounter, WarnLimiter};
@@ -411,6 +411,7 @@ fn dropped_message(envelope: &Envelope, reason: UndecodableReason) -> InboundMes
         let lost = envelope
             .params_uri
             .decode::<Uri>()
+            .and_then(BoundedUri::new)
             .map_or(LostPublish::Unidentified, LostPublish::File);
         return InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost));
     }
@@ -1188,7 +1189,7 @@ mod tests {
     }
 
     fn file(uri: &str) -> LostPublish {
-        LostPublish::File(Uri::from(uri.to_owned()))
+        LostPublish::File(BoundedUri::new(Uri::from(uri.to_owned())).unwrap())
     }
 
     #[tokio::test]

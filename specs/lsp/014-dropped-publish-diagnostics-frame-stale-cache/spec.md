@@ -191,7 +191,7 @@ THEN each source of the loss logs at most one WARN per rate-limit interval, with
 | FR-016 | WHEN a `publishDiagnostics` has no `params`, or `params` is not an object, THE SYSTEM SHALL record an unidentified loss, as for every unreadable publish | must |
 | FR-017 | WHEN the list of lost files is full and another named loss arrives THE SYSTEM SHALL escalate to an unidentified loss (every pushed entry of the server is evicted, and its capacity-eviction `clean` marks become `lost`, so no file keeps reading published-clean) instead of only setting the overflow mark | must |
 | FR-018 | EVERY source of a lost publish (oversized, malformed, typed-decode failure) SHALL reach the mailbox through one entry point that owns the lost-publish WARN, which carries no URI and no frame content | must |
-| FR-019 | A `uri` longer than 16 KiB SHALL be treated as unidentified | must |
+| FR-019 | A `uri` longer than 16 KiB SHALL be treated as unidentified, whether it names a frame that could not be decoded, a decoded publish, or a publish the mailbox could not hold; no URI longer than 16 KiB is cached or remembered as lost | must |
 | FR-014 | THE testing playbooks under `.local/testing/` SHALL gain the oversized-publish case (fake server `--bigpub`, driver) and the coverage status for diagnostics SHALL be reset | must |
 
 ## 4. Non-Functional Requirements

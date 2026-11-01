@@ -1150,9 +1150,9 @@ impl LspClient {
         match route {
             Route::Mailbox(sink, params) => {
                 debug!(
-                    "Forwarding diagnostics for {}: {} items",
-                    params.uri.as_ref(),
-                    params.diagnostics.len()
+                    uri = params.uri.as_ref(),
+                    items = params.diagnostics.len(),
+                    "Forwarding diagnostics"
                 );
                 sink.publishes().publish(params);
                 Delivery::Delivered
@@ -1338,7 +1338,10 @@ impl LspClient {
                 Self::complete_pending(pending_requests, response, redactions);
             }
             InboundMessage::UndecodableResponse { id, reason } => {
-                warn!("Failed the request answered by an undecodable response: id={id:?}");
+                warn!(
+                    ?id,
+                    "Failed the request answered by an undecodable response"
+                );
                 if let Resolution::Waiting(sender) = pending_requests.resolve(&id) {
                     let _ = sender.send(Err(match reason {
                         UndecodableReason::Oversized { bytes } => {
@@ -1353,7 +1356,7 @@ impl LspClient {
                 }
             }
             InboundMessage::UndecodableRequest { id, reason } => {
-                debug!("Answering an undecodable server request with an error: id={id:?}");
+                debug!(?id, "Answering an undecodable server request with an error");
                 let message = match reason {
                     UndecodableReason::Oversized { .. } => {
                         "Invalid Request: the request exceeds the LSP frame limit"
@@ -1369,23 +1372,18 @@ impl LspClient {
                 transport.send(&serde_json::to_value(&reply)?).await?;
             }
             InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost)) => {
-                if let Some(lanes) = lanes {
-                    lanes.notifications.publishes().lose(lost);
-                }
+                Self::deliver(Self::route(LspNotification::LostPublish(lost), lanes));
             }
             InboundMessage::UndecodableNotification(DroppedNotification::Other)
             | InboundMessage::UndecodableFrame => {}
             InboundMessage::Request(request) => {
-                debug!(
-                    "Received server request: {} (id={:?})",
-                    request.method, request.id
-                );
+                debug!(method = %request.method, id = ?request.id, "Received server request");
                 let reply = Self::server_request_reply(request, settings);
                 let value = serde_json::to_value(&reply)?;
                 transport.send(&value).await?;
             }
             InboundMessage::Notification(notification) => {
-                debug!("Received notification: {}", notification.method);
+                debug!(method = %notification.method, "Received notification");
 
                 // Parse notification into typed variant
                 let mut typed = LspNotification::parse(&notification.method, notification.params);
@@ -1801,7 +1799,7 @@ mod tests {
                 .unwrap();
             match delivery {
                 Some(PublishDelivery::Lost(lost)) => {
-                    named.extend(lost.uris().iter().map(|uri| uri.as_ref().to_owned()));
+                    named.extend(lost.uris().iter().map(|uri| uri.uri().as_ref().to_owned()));
                 }
                 Some(PublishDelivery::LostUnidentified) => break,
                 other => panic!("unexpected delivery {other:?}"),

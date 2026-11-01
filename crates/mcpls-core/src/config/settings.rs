@@ -70,6 +70,7 @@ impl InitializationOptions {
 
 /// Reason a `settings` table was rejected at load time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum InvalidLspSettings {
     /// The table is empty; pushing `{}` makes some servers drop their
     /// initialization options.
@@ -101,6 +102,7 @@ pub enum InvalidLspSettings {
 /// Shared by `settings` and `initialization_options` so both reject a
 /// datetime with the same wording.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TomlDatetime {
     /// The whole value is a datetime.
     #[error("value is a TOML datetime, which is not supported")]

@@ -112,7 +112,7 @@ impl TryFrom<String> for GitUrl {
         }
         let segments = url
             .path_segments()
-            .map_or(0, |s| s.filter(|part| !part.is_empty()).count());
+            .map_or_default(|s| s.filter(|part| !part.is_empty()).count());
         if segments != 2 {
             return Err(reject(
                 "must have the form https://github.com/<owner>/<repo>",
