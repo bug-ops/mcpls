@@ -34,6 +34,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | implemented | #665 |
 | 013 | [[lsp/013-diagnostics-publish-burst-drops/spec\|diagnostics-publish-burst-drops]] | bug | P2 | implemented (per-client publish mailbox, lost files read evicted) | #704 |
 | 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | implemented (lost publish evicts its file or the server's files; marks bounded per server, #869; `BoundedUri` 16 KiB, #874) | #863; #868; #869; #874 |
+| 015 | [[lsp/015-workspace-did-change-watched-files/spec\|workspace-did-change-watched-files]] | enhancement (competitor-gap) | P3 | draft | #889 |
 
 ## mcp
 
