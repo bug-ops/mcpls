@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bump `rmcp` to 3.9 to fix RUSTSEC-2026-0462; tool `outputSchema` now marks always-serialized nullable fields as `required`.
+
 ## [0.9.1] - 2026-11-01
 
 ### Added
