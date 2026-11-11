@@ -354,7 +354,8 @@
           "required": [
             "range",
             "severity",
-            "message"
+            "message",
+            "code"
           ],
           "type": "object"
         },
@@ -610,7 +611,8 @@
             }
           },
           "required": [
-            "title"
+            "title",
+            "is_preferred"
           ],
           "type": "object"
         },
@@ -660,7 +662,8 @@
           "required": [
             "range",
             "severity",
-            "message"
+            "message",
+            "code"
           ],
           "type": "object"
         },
@@ -940,7 +943,10 @@
             }
           },
           "required": [
-            "label"
+            "label",
+            "kind",
+            "detail",
+            "documentation"
           ],
           "type": "object"
         },
@@ -1371,6 +1377,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -1522,7 +1529,8 @@
           "required": [
             "range",
             "severity",
-            "message"
+            "message",
+            "code"
           ],
           "type": "object"
         },
@@ -2487,6 +2495,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -2534,7 +2543,8 @@
         }
       },
       "required": [
-        "contents"
+        "contents",
+        "range"
       ],
       "type": "object"
     },
@@ -3638,6 +3648,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -4817,6 +4828,9 @@
               ]
             }
           },
+          "required": [
+            "languages"
+          ],
           "type": "object"
         },
         "ServerId": {
@@ -5623,6 +5637,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -6080,6 +6095,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -6398,6 +6414,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
@@ -7035,6 +7052,7 @@
           "required": [
             "name",
             "kind",
+            "container",
             "position",
             "position_source"
           ],
