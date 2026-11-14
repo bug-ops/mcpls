@@ -251,10 +251,19 @@ pub(super) fn spawn_bounded_close<E: std::fmt::Display + Send + 'static>(
         match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, close).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::debug!(session = %SessionFingerprint(&session), "{label} failed: {e}");
+                tracing::debug!(
+                    session = %SessionFingerprint(&session),
+                    operation = %label,
+                    error = %e,
+                    "session operation failed"
+                );
             }
             Err(_elapsed) => {
-                tracing::debug!(session = %SessionFingerprint(&session), "{label} timed out");
+                tracing::debug!(
+                    session = %SessionFingerprint(&session),
+                    operation = %label,
+                    "session operation timed out"
+                );
             }
         }
     })
@@ -427,7 +436,9 @@ async fn supervise<Fut: std::future::Future<Output = ()>>(
         if limiter.due(now.into_std(), delays.max) {
             tracing::error!(
                 error = %panicked,
-                "{what} panicked; restarting it in {delay:?}, it is not running until then"
+                operation = %what,
+                ?delay,
+                "task panicked; restarting it after the delay, it is not running until then"
             );
         }
         tokio::select! {
@@ -659,7 +670,7 @@ mod tests {
     /// once `max_sessions` sessions exist, the next `create_session` call
     /// fails with the capacity marker, and closing a session frees the
     /// slot back up for a subsequent `create_session` to succeed.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -691,7 +702,7 @@ mod tests {
     /// this spawns `N > max_sessions` calls at once and asserts exactly
     /// `max_sessions` succeed — the one test shape that actually
     /// distinguishes the atomic-semaphore design from a TOCTOU race.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -775,7 +786,7 @@ mod tests {
         assert!(activity.is_idle(tokio::time::Instant::now(), idle_secs(5)));
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -801,7 +812,7 @@ mod tests {
         assert!(manager.create_session().await.is_ok());
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -890,10 +901,6 @@ mod tests {
 
     /// #587: a response stream ends at its deadline, and only then does
     /// the session become reapable (after the idle timeout).
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_bounded_stream_ends_at_deadline_then_session_is_reaped() {
         use futures::StreamExt as _;
@@ -983,7 +990,7 @@ mod tests {
 
     /// #587 wiring: `create_stream` hands out a bounded stream. The tool
     /// call never completes, so only the deadline can end the stream.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1013,7 +1020,7 @@ mod tests {
 
     /// #687 / FR-023: closing a session stops its in-flight tool call, so the
     /// language server is told to cancel, within rmcp's drain plus one poll.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1050,7 +1057,7 @@ mod tests {
 
     /// #587 wiring: a request-wise `resume` (not the common channel) is
     /// bounded too.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1090,7 +1097,7 @@ mod tests {
             })
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1103,7 +1110,7 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1121,7 +1128,7 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1203,10 +1210,6 @@ mod tests {
 
     /// #573: rmcp's own `keep_alive` must not end a session whose client
     /// answers probes on an open GET stream.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_answering_get_listener_outlives_rmcp_keep_alive() {
         let (manager, id, serving) = probed_session().await;
@@ -1223,10 +1226,6 @@ mod tests {
 
     /// With probing off, an open GET stream no longer holds a session: a
     /// quiet peer that may have vanished expires within the idle timeout.
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_disabled_liveness_get_stream_does_not_block_reaping() {
         let manager =
@@ -1240,10 +1239,6 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_primary_timeout_closes_standalone_stream_and_clears_shadows() {
         let (manager, id, serving) = probed_session().await;
@@ -1265,10 +1260,6 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_shadow_timeout_leaves_primary_stream_open() {
         let (manager, id, serving) = probed_session().await;
@@ -1290,10 +1281,6 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_wedged_session_does_not_block_stream_end() {
         use futures::StreamExt as _;
@@ -1316,7 +1303,7 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1336,10 +1323,6 @@ mod tests {
         serving_b.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_probe_replies_are_consumed_and_other_messages_forwarded() {
         let manager = probing_manager(PROBE_STEP, PROBE_STEP * 2);
@@ -1373,7 +1356,7 @@ mod tests {
         );
     }
 
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
     )]
@@ -1393,10 +1376,6 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_request_wise_resume_is_not_tracked_as_standalone_stream() {
         let (manager, id, serving) = probed_session().await;
@@ -1410,10 +1389,6 @@ mod tests {
         serving.abort();
     }
 
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "the value lives to the end of the scope; the lint misreads its internal lock as an early-droppable temporary"
-    )]
     #[tokio::test(start_paused = true)]
     async fn test_probing_fails_closed_when_session_slot_is_gone() {
         let (manager, id, serving) = probed_session().await;

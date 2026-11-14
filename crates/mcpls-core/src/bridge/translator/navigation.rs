@@ -329,7 +329,6 @@ async fn goto_response_to_locations<R: GotoResponse>(
 /// support would silently discard hover text from those servers, so this
 /// (and `marked_string_to_string`) carry a narrow, scoped allow rather than
 /// rewriting to `MarkupContent`-only.
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
 fn extract_hover_contents(contents: lsp_types::Contents) -> String {
     match contents {
         lsp_types::Contents::MarkedString(marked_string) => marked_string_to_string(marked_string),
@@ -343,7 +342,7 @@ fn extract_hover_contents(contents: lsp_types::Contents) -> String {
 }
 
 /// Convert a marked string to a plain string.
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn marked_string_to_string(marked: lsp_types::MarkedString) -> String {
     match marked {
         lsp_types::MarkedString::String(s) => s,
@@ -411,7 +410,7 @@ impl Translator {
         };
 
         let start = Instant::now();
-        #[allow(
+        #[expect(
             clippy::arithmetic_side_effects,
             reason = "production passes the fixed INDEXING_READY_TIMEOUT"
         )]
@@ -685,7 +684,7 @@ impl Translator {
 }
 
 #[cfg(test)]
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;

@@ -269,6 +269,15 @@ pub async fn write_raw_frame(writer: &mut DuplexStream, content: &str) {
     writer.flush().await.unwrap();
 }
 
+/// One captured `tracing` event: its level, message and non-message fields
+/// (`name=value`), so an assertion can bind them to the same event.
+#[derive(Clone, Debug)]
+pub struct CapturedEvent {
+    pub level: tracing::Level,
+    pub message: String,
+    pub fields: Vec<String>,
+}
+
 /// Captures `(level, message)` pairs for `tracing` events emitted while a
 /// closure runs, as a `tracing_subscriber::Layer`.
 ///
@@ -280,30 +289,48 @@ pub async fn write_raw_frame(writer: &mut DuplexStream, content: &str) {
 /// certain text) so it replaces all of them.
 #[derive(Clone, Default)]
 pub struct CapturedLogs {
-    events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
-    fields: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl CapturedEvent {
+    /// Whether the event carries the `name=value` field `field`.
+    pub fn has_field(&self, field: &str) -> bool {
+        self.fields.iter().any(|f| f == field)
+    }
 }
 
 impl CapturedLogs {
+    /// Snapshot of every captured event, in emission order.
+    pub fn events(&self) -> Vec<CapturedEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
     /// Every non-message field of every captured event, as `name=value`.
     pub fn fields(&self) -> Vec<String> {
-        self.fields.lock().unwrap().clone()
+        self.events().into_iter().flat_map(|e| e.fields).collect()
+    }
+
+    /// Every non-message field of the events captured at `level`, as `name=value`.
+    pub fn fields_at(&self, level: tracing::Level) -> Vec<String> {
+        self.events()
+            .into_iter()
+            .filter(|e| e.level == level)
+            .flat_map(|e| e.fields)
+            .collect()
     }
 
     /// Snapshot of everything captured so far, as `(level, message)` pairs.
     pub fn entries(&self) -> Vec<(tracing::Level, String)> {
-        self.events.lock().unwrap().clone()
+        self.events()
+            .into_iter()
+            .map(|e| (e.level, e.message))
+            .collect()
     }
 
     /// Snapshot of captured message text only, for callers that don't care
     /// about severity.
     pub fn messages(&self) -> Vec<String> {
-        self.events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, message)| message.clone())
-            .collect()
+        self.events().into_iter().map(|e| e.message).collect()
     }
 }
 
@@ -329,11 +356,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
         }
         let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
-        self.fields.lock().unwrap().extend(visitor.fields);
-        self.events
-            .lock()
-            .unwrap()
-            .push((*event.metadata().level(), visitor.message));
+        self.events.lock().unwrap().push(CapturedEvent {
+            level: *event.metadata().level(),
+            message: visitor.message,
+            fields: visitor.fields,
+        });
     }
 }
 

@@ -695,7 +695,7 @@ impl<T: ServerText> ServerText for Addressed<T> {
 }
 
 #[cfg(test)]
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 mod tests {
     use super::*;
 

@@ -229,8 +229,8 @@ impl Redactions {
             let inside_marker = markers.iter().any(|marker| marker.contains(&secret.value));
             if inside_marker {
                 tracing::warn!(
-                    "secret {} is not redacted: its value occurs inside a redaction marker",
-                    secret.marker()
+                    secret = %secret.marker(),
+                    "secret is not redacted: its value occurs inside a redaction marker"
                 );
             }
             !inside_marker
@@ -266,8 +266,8 @@ impl Redactions {
         for secret in &self.0 {
             if secret.spellings().any(|spelling| text.contains(spelling)) {
                 tracing::debug!(
-                    "tool result payload holds configured secret {}; left unmodified",
-                    secret.marker()
+                    secret = %secret.marker(),
+                    "tool result payload holds configured secret; left unmodified"
                 );
             }
         }
@@ -724,7 +724,10 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123", "yaml.schemas" = { "https://
         assert_eq!(Redactions::union([&a]), a);
     }
 
-    fn captured(level: tracing_subscriber::filter::LevelFilter, run: impl FnOnce()) -> Vec<String> {
+    fn captured(
+        level: tracing_subscriber::filter::LevelFilter,
+        run: impl FnOnce(),
+    ) -> (Vec<String>, Vec<String>) {
         use tracing_subscriber::prelude::*;
 
         let logs = crate::test_lsp::CapturedLogs::default();
@@ -732,7 +735,7 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123", "yaml.schemas" = { "https://
             .with(level)
             .with(logs.clone());
         tracing::subscriber::with_default(subscriber, run);
-        logs.messages()
+        (logs.messages(), logs.fields())
     }
 
     #[test]
@@ -741,29 +744,30 @@ settings = { "tool.apiToken" = "SETTINGSSECRET123", "yaml.schemas" = { "https://
 
         let set = redactions(&[("API_TOKEN", SECRET)]);
 
-        let debug = captured(LevelFilter::DEBUG, || {
+        let (debug, debug_fields) = captured(LevelFilter::DEBUG, || {
             set.note_payload(&format!("let k = {SECRET};"));
             set.note_payload("clean text");
         });
         assert_eq!(debug.len(), 1, "{debug:?}");
-        assert!(debug[0].contains("[redacted:API_TOKEN]"), "{debug:?}");
+        assert_eq!(debug_fields, ["secret=[redacted:API_TOKEN]"]);
         assert!(!debug[0].contains(SECRET), "{debug:?}");
 
-        let info = captured(LevelFilter::INFO, || {
+        let (info, info_fields) = captured(LevelFilter::INFO, || {
             set.note_payload(&format!("let k = {SECRET};"));
         });
         assert!(info.is_empty(), "{info:?}");
+        assert!(info_fields.is_empty(), "{info_fields:?}");
     }
 
     #[test]
     fn test_new_warns_with_label_only_when_a_value_is_dropped() {
         use tracing_subscriber::filter::LevelFilter;
 
-        let warnings = captured(LevelFilter::WARN, || {
+        let (warnings, fields) = captured(LevelFilter::WARN, || {
             let _ = redactions(&[("API_TOKEN", "redacted:API_TOKEN")]);
         });
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("[redacted:API_TOKEN]"), "{warnings:?}");
+        assert_eq!(fields, ["secret=[redacted:API_TOKEN]"]);
     }
 
     #[test]

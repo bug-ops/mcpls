@@ -60,7 +60,8 @@ impl ShutdownSignal {
                 Ok(sigterm) => Some(sigterm),
                 Err(e) => {
                     tracing::warn!(
-                        "SIGTERM handler registration failed ({e}), SIGTERM will not be caught"
+                        error = %e,
+                        "SIGTERM handler registration failed, SIGTERM will not be caught"
                     );
                     None
                 }
@@ -69,7 +70,8 @@ impl ShutdownSignal {
                 Ok(sigint) => Some(sigint),
                 Err(e) => {
                     tracing::warn!(
-                        "SIGINT handler registration failed ({e}), SIGINT will not be caught"
+                        error = %e,
+                        "SIGINT handler registration failed, SIGINT will not be caught"
                     );
                     None
                 }
@@ -81,7 +83,7 @@ impl ShutdownSignal {
             let ctrl_c = match tokio::signal::windows::ctrl_c() {
                 Ok(ctrl_c) => Some(ctrl_c),
                 Err(e) => {
-                    tracing::warn!("Ctrl-C handler registration failed ({e})");
+                    tracing::warn!(error = %e, "Ctrl-C handler registration failed");
                     None
                 }
             };

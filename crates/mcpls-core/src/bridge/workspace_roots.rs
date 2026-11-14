@@ -300,8 +300,9 @@ impl ResolvedRoot {
     fn from_absolute(root: &Path) -> Self {
         let canonical = dunce::canonicalize(root).unwrap_or_else(|source| {
             warn!(
-                "Failed to canonicalize absolute workspace root {}: {source}, using non-canonical path",
-                root.display()
+                path = %root.display(),
+                error = %source,
+                "Failed to canonicalize absolute workspace root, using non-canonical path"
             );
             canonicalize_existing_prefix(root, &canonicalize_on_disk)
                 .unwrap_or_else(|_| root.to_path_buf())
@@ -327,14 +328,15 @@ impl ResolvedRoot {
     fn from_cwd(cwd: &ProcessCwd) -> Self {
         let canonical = dunce::canonicalize(&cwd.physical).unwrap_or_else(|e| {
             warn!(
-                "Failed to canonicalize workspace base directory {}: {e}, using non-canonical absolute path",
-                cwd.physical.display()
+                path = %cwd.physical.display(),
+                error = %e,
+                "Failed to canonicalize workspace base directory, using non-canonical absolute path"
             );
             cwd.physical.clone()
         });
         info!(
-            "Using workspace base directory as root: {}",
-            canonical.display()
+            path = %canonical.display(),
+            "Using workspace base directory as root"
         );
         let mut aliases = vec![cwd.physical.clone()];
         aliases.extend(cwd.logical.clone());
@@ -354,9 +356,9 @@ impl ResolvedRoot {
                 Some(form)
             } else {
                 debug!(
-                    "dropping workspace root alias {} that does not resolve to {}",
-                    form.display(),
-                    self.canonical.display()
+                    alias = %form.display(),
+                    canonical = %self.canonical.display(),
+                    "dropping workspace root alias that does not resolve to the root"
                 );
                 None
             }

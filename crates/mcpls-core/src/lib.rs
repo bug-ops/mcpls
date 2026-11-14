@@ -235,8 +235,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
     let (applicable_configs, refused, refusals) = plan.into_parts();
 
     info!(
-        "Attempting to spawn {} applicable LSP server(s)...",
-        applicable_configs.len()
+        count = applicable_configs.len(),
+        "Attempting to spawn applicable LSP server(s)..."
     );
 
     // Built over the applicable (post-heuristics) configs only: this is where
@@ -317,8 +317,8 @@ pub async fn serve_with(config: ServerConfig, transport: Transport) -> Result<()
         None
     } else {
         info!(
-            "Spawning {} LSP server(s) in the background...",
-            applicable_configs.len()
+            count = applicable_configs.len(),
+            "Spawning LSP server(s) in the background..."
         );
         Some(spawn_lsp_servers_background(
             applicable_configs,

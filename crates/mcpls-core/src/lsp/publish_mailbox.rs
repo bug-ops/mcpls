@@ -623,12 +623,13 @@ impl DropLog {
     pub fn record(&self, method: &str) {
         let lane = self.lane.name();
         let method = escape_bounded(method, MAX_LOG_STRING_BYTES);
-        debug!("dropping notification: lane={lane}, method={method}");
+        debug!(%lane, %method, "dropping notification");
         let warn_due = lock_std(&self.drops).record(Instant::now());
         if let Some(suppressed) = warn_due {
             warn!(
-                "dropped a notification on the {lane} lane ({suppressed} others since the last \
-                 warning; channel full or closed)"
+                %lane,
+                suppressed,
+                "dropped a notification (others since the last warning; channel full or closed)"
             );
         }
     }
@@ -682,11 +683,18 @@ mod tests {
         DropLog::of(Lane::Notification).record(&format!("evil\nFORGED{}", "x".repeat(10_000)));
         drop(guard);
 
+        assert!(
+            captured
+                .messages()
+                .iter()
+                .any(|message| message == "dropping notification"),
+            "the drop is logged at debug"
+        );
         let line = captured
-            .messages()
+            .fields()
             .into_iter()
-            .find(|message| message.contains("dropping notification"))
-            .expect("the drop is logged at debug");
+            .find(|field| field.starts_with("method="))
+            .expect("the method is a field of the drop event");
         assert!(!line.contains('\n'), "{line:.80}");
         assert!(line.contains("evil\\nFORGED"), "{line:.80}");
         assert!(line.len() < 2 * MAX_LOG_STRING_BYTES, "{}", line.len());

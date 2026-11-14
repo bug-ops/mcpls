@@ -103,8 +103,8 @@ async fn run_init_supervised(
 ) -> InitOutcome {
     if let Err(panicked) = catch_panic(body).await {
         error!(
-            "Background LSP initialization task panicked: {}",
-            panicked.message()
+            panic = %panicked.message(),
+            "Background LSP initialization task panicked"
         );
         translator.settle_after_init_panic(configs).await;
         InitOutcome::Panicked
@@ -120,9 +120,9 @@ type StartStream<'a> = Pin<Box<dyn Stream<Item = ServerStartOutcome> + Send + 'a
 fn start_servers(configs: &[ServerInitConfig], limit: ServerStartConcurrency) -> StartStream<'_> {
     if configs.len() > limit.get() {
         info!(
-            "Starting {} LSP server(s), at most {} at a time",
-            configs.len(),
-            limit.get()
+            count = configs.len(),
+            limit = limit.get(),
+            "Starting LSP server(s), limited concurrency"
         );
     }
     Box::pin(
@@ -242,13 +242,13 @@ impl StartupTally {
     fn log_summary(self) {
         let Self { registered, failed } = self;
         if registered == 0 {
-            error!("All {failed} configured LSP server(s) failed to initialize");
+            error!(failed, "All configured LSP server(s) failed to initialize");
             return;
         }
         if failed > 0 {
-            warn!("Partial server initialization: {registered} succeeded, {failed} failed");
+            warn!(registered, failed, "Partial server initialization");
         }
-        info!("Proceeding with {registered} LSP server(s)");
+        info!(registered, "Proceeding with LSP server(s)");
     }
 }
 
@@ -331,7 +331,7 @@ impl StartupSettler<'_> {
 
     /// Records the failure, re-evaluates roles, notifies failed routes.
     async fn settle_failed(&mut self, failure: ServerSpawnFailure) {
-        error!("Server initialization failed: {failure}");
+        error!(%failure, "Server initialization failed");
         self.translator.settle_failed(&failure);
         self.tally.failed = self.tally.failed.saturating_add(1);
         self.recompute_roles().await;
@@ -779,11 +779,14 @@ mod startup_tests {
 
         assert_eq!(startup.translator.startup_failures().len(), 3);
         assert!(
-            logs.messages()
-                .iter()
-                .any(|m| m.contains("All 3 configured LSP server(s) failed")),
+            logs.events().iter().any(|event| {
+                event
+                    .message
+                    .contains("All configured LSP server(s) failed")
+                    && event.has_field("failed=3")
+            }),
             "{:?}",
-            logs.messages()
+            logs.events()
         );
     }
 

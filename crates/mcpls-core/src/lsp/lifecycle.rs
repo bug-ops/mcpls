@@ -742,9 +742,9 @@ impl LspServer {
             base.saturating_add(windows)
         };
         debug!(
-            "Effective LSP server env: {passthrough_present} allowlisted key(s) present, \
-             {} configured override(s) applied",
-            config.server_config.env.len()
+            passthrough_present,
+            overrides = config.server_config.env.len(),
+            "Effective LSP server env: allowlisted keys present, configured overrides applied"
         );
 
         let mut child = ServerProcess::spawn(command)
@@ -872,7 +872,7 @@ impl LspServer {
         })
         .await;
         hint.unwrap_or_else(|error| {
-            debug!("Dropped the init failure hint: {error}");
+            debug!(%error, "Dropped the init failure hint");
             None
         })
     }
@@ -1152,7 +1152,7 @@ impl LspServer {
 
         let params = InitializeParams {
             process_id,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "`root_uri` is deprecated but the struct literal must still set it"
             )]
@@ -1207,8 +1207,8 @@ impl LspServer {
             .unwrap_or(PositionEncodingKind::UTF16);
 
         debug!(
-            "Server capabilities received, encoding: {:?}",
-            position_encoding
+            encoding = ?position_encoding,
+            "Server capabilities received"
         );
 
         notify_handshake::<InitializedNotification>(
@@ -1337,7 +1337,7 @@ impl LspServer {
     /// including [`Error::ShutdownTimeout`] when `budget` elapsed. The
     /// process tree is still torn down regardless of whether this returns
     /// `Ok` or `Err`.
-    #[allow(
+    #[expect(
         clippy::arithmetic_side_effects,
         reason = "SHUTDOWN_TIMEOUT and CHILD_EXIT_GRACE are small constants"
     )]
@@ -1445,30 +1445,30 @@ async fn contain(
     let reason = match crate::util::catch_panic(start).await {
         Ok(Ok(spawned)) => {
             info!(
-                "Successfully spawned LSP server: {} ({}) in {:?}",
-                server_id,
-                command,
-                started.elapsed()
+                %server_id,
+                %command,
+                elapsed = ?started.elapsed(),
+                "Successfully spawned LSP server"
             );
             return ServerStartOutcome::Started(Box::new(spawned));
         }
         Ok(Err(e)) => {
             tracing::error!(
-                "Failed to spawn LSP server: {} ({}) after {:?}: {}",
-                server_id,
-                command,
-                started.elapsed(),
-                e
+                %server_id,
+                %command,
+                elapsed = ?started.elapsed(),
+                error = %e,
+                "Failed to spawn LSP server"
             );
             StartupFailure::Spawn(Arc::new(e))
         }
         Err(panicked) => {
             tracing::error!(
-                "Starting LSP server {} ({}) panicked after {:?}: {}",
-                server_id,
-                command,
-                started.elapsed(),
-                panicked.message()
+                %server_id,
+                %command,
+                elapsed = ?started.elapsed(),
+                panic = %panicked.message(),
+                "Starting LSP server panicked"
             );
             StartupFailure::InitTaskPanicked
         }
@@ -1967,7 +1967,7 @@ mod tests {
             std::sync::Arc::default(),
         );
 
-        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
+        #[expect(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = config.clone();
         assert_eq!(cloned.server_config().language_id, "rust");
         assert_eq!(cloned.workspace_roots().canonical().len(), 1);

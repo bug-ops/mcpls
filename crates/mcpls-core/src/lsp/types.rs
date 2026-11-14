@@ -92,7 +92,10 @@ impl<'de> Deserialize<'de> for JsonRpcResponse {
         } = Raw::deserialize(deserializer)?;
         let outcome = match (result, error) {
             (Some(_), Some(error)) => {
-                debug!("Response id={id:?} carries both result and error; keeping the error");
+                debug!(
+                    ?id,
+                    "Response carries both result and error; keeping the error"
+                );
                 JsonRpcOutcome::Error(error)
             }
             (Some(result), None) => JsonRpcOutcome::Result(result),

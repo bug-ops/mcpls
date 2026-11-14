@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#884).
+- Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#886).
+
+### Fixed
+
+- Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#886).
+
 ### Security
 
 - Bump `rmcp` to 3.9 to fix RUSTSEC-2026-0462; tool `outputSchema` now marks always-serialized nullable fields as `required` (#900).

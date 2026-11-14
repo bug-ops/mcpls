@@ -497,8 +497,9 @@ impl ToolRouter {
                     .collect();
                 if !uncovered.is_empty() {
                     tracing::warn!(
-                        "language '{language}' has no catch-all server and does not claim: {}",
-                        uncovered.join(", ")
+                        %language,
+                        uncovered = %uncovered.join(", "),
+                        "language has no catch-all server and does not claim these tools"
                     );
                 }
             }

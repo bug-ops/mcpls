@@ -315,7 +315,7 @@ impl Capability {
     }
 
     /// Whether `caps` advertises support for this capability.
-    #[allow(clippy::too_many_lines, reason = "one match arm per capability")]
+    #[expect(clippy::too_many_lines, reason = "one match arm per capability")]
     pub(crate) const fn is_supported(self, caps: &lsp_types::ServerCapabilities) -> bool {
         match self {
             Self::Completions => caps.completion_provider.is_some(),
@@ -864,8 +864,9 @@ impl Translator {
                 server_id,
             } => {
                 tracing::error!(
-                    "router route names server '{server_id}' for tool '{tool}' that is neither \
-                     registered nor expected"
+                    %server_id,
+                    %tool,
+                    "router route names a server that is neither registered nor expected"
                 );
                 Err(Error::NoServerForTool {
                     language_id: language,
@@ -952,8 +953,8 @@ impl Translator {
             RouteLookup::Failed(failure) => DiagnosticsRoute::FailedToStart(failure),
             RouteLookup::Dangling { server_id, .. } => {
                 tracing::error!(
-                    "router diagnostics route names server '{server_id}' that is neither \
-                     registered nor expected"
+                    %server_id,
+                    "router diagnostics route names a server that is neither registered nor expected"
                 );
                 DiagnosticsRoute::Unrouted
             }
