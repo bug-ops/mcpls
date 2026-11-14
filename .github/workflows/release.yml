@@ -41,6 +41,20 @@ jobs:
       - name: Check registry manifest version
         run: scripts/check-server-json-version.sh
 
+      # Pinned together: cargo-semver-checks reads rustdoc JSON, whose format is tied to the toolchain
+      - name: Install Rust (semver gate)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # dtolnay/rust-toolchain stable
+        with:
+          toolchain: 1.100.0
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check mcpls-core version bump against crates.io
+        run: cargo semver-checks check-release -p mcpls-core
+
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
