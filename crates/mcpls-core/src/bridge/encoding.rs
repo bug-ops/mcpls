@@ -207,22 +207,14 @@ fn convert_column(
             .byte_offset_to_character(text, text.len())
             .ok()
     };
-    // Code units never outnumber bytes, so `column > text.len()` is past the end in any encoding.
-    let past_end =
-        || column as usize > text.len() || line_len_in(from).is_some_and(|len| column > len);
 
-    let exact = (column as usize <= text.len())
-        .then(|| exact_byte_offset(text, column, from))
-        .flatten()
-        .and_then(|byte_offset| {
-            EncodingConverter::new(to)
-                .byte_offset_to_character(text, byte_offset)
-                .ok()
-        });
-    if let Some(converted) = exact {
+    let located = EncodingConverter::new(from).character_to_byte_offset(text, column);
+    if let Ok(byte_offset) = located
+        && let Some(converted) = exact_character(text, byte_offset, column, from, to)
+    {
         return Converted::exact(converted);
     }
-    if past_end()
+    if matches!(located, Err(OffsetError::PastEnd { .. }))
         && let Some(clamped) = line_len_in(to)
     {
         // A server column past its own line end means its text differs from ours.
@@ -238,28 +230,30 @@ fn convert_column(
     Converted::passed_through(column)
 }
 
-/// Resolve `character_offset` (in `encoding`'s units) to a byte offset in
-/// `text`, requiring the mapping to be exact.
+/// Re-express `byte_offset` in `to` units, requiring that `column` in `from`
+/// units named exactly that offset.
 ///
 /// `EncodingConverter::character_to_byte_offset` finds the byte boundary at
-/// or after the requested offset, so an offset that lands inside a
-/// multi-unit character (e.g. a UTF-16 surrogate pair) silently resolves to
-/// the *next* character boundary instead of erroring. Round-tripping the
-/// result back through `byte_offset_to_character` detects that case: if it
-/// doesn't reproduce `character_offset` exactly, the offset wasn't
-/// representable, and `None` signals the caller to fall back to the raw
-/// value rather than use a rounded-forward position.
-fn exact_byte_offset(
+/// or after the requested offset, so a column inside a multi-unit character
+/// (e.g. a UTF-16 surrogate pair) resolves to the *next* boundary instead of
+/// erroring. Round-tripping through `from` detects that case, and `None`
+/// tells the caller to fall back rather than use a rounded-forward position.
+fn exact_character(
     text: &str,
-    character_offset: u32,
-    encoding: PositionEncoding,
-) -> Option<usize> {
-    let converter = EncodingConverter::new(encoding);
-    let byte_offset = converter
-        .character_to_byte_offset(text, character_offset)
+    byte_offset: usize,
+    column: u32,
+    from: PositionEncoding,
+    to: PositionEncoding,
+) -> Option<u32> {
+    let round_trip = EncodingConverter::new(from)
+        .byte_offset_to_character(text, byte_offset)
         .ok()?;
-    let round_trip = converter.byte_offset_to_character(text, byte_offset).ok()?;
-    (round_trip == character_offset).then_some(byte_offset)
+    if round_trip != column {
+        return None;
+    }
+    EncodingConverter::new(to)
+        .byte_offset_to_character(text, byte_offset)
+        .ok()
 }
 
 /// Byte offsets for a chosen set of code-unit offsets into one label,
@@ -339,6 +333,27 @@ impl<'a> LabelOffsets<'a> {
     }
 }
 
+/// Why an offset has no counterpart in the other unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum OffsetError {
+    /// The offset is beyond the end of the text; `len` is the text length in
+    /// the unit of the failed conversion's input.
+    #[error("offset {offset} is past the end ({len})")]
+    PastEnd {
+        /// The requested offset.
+        offset: usize,
+        /// The text length in the same unit as `offset`.
+        len: usize,
+    },
+    /// The byte offset is not on a character boundary.
+    #[error("offset {0} is inside a character")]
+    InsideCharacter(usize),
+    /// The converted offset does not fit in `u32`.
+    #[error("line longer than u32::MAX code units")]
+    TooLong,
+}
+
 /// Position encoding converter for handling UTF-8/UTF-16/UTF-32 conversions.
 ///
 /// Different LSP servers may use different character encodings. This converter
@@ -360,112 +375,96 @@ impl EncodingConverter {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The byte offset is not on a character boundary
-    /// - The encoding is unsupported
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "LSP positions are u32; truncation is acceptable"
-    )]
-    pub fn byte_offset_to_character(&self, text: &str, byte_offset: usize) -> Result<u32, String> {
+    /// Returns [`OffsetError::PastEnd`] if `byte_offset` exceeds `text.len()`,
+    /// [`OffsetError::InsideCharacter`] if it is not on a character boundary,
+    /// and [`OffsetError::TooLong`] if the result does not fit in `u32`.
+    pub fn byte_offset_to_character(
+        &self,
+        text: &str,
+        byte_offset: usize,
+    ) -> Result<u32, OffsetError> {
         if byte_offset > text.len() {
-            let text_len = text.len();
-            return Err(format!(
-                "Byte offset {byte_offset} exceeds text length {text_len}"
-            ));
+            return Err(OffsetError::PastEnd {
+                offset: byte_offset,
+                len: text.len(),
+            });
         }
         // `text[..byte_offset]` below panics if `byte_offset` lands mid-character. A
         // server-reported offset should always be on a boundary, but this is
         // untrusted external input, so it is checked rather than trusted.
-        if !text.is_char_boundary(byte_offset) {
-            return Err(format!(
-                "Byte offset {byte_offset} is not on a character boundary"
-            ));
-        }
+        let Some(prefix) = text.get(..byte_offset) else {
+            return Err(OffsetError::InsideCharacter(byte_offset));
+        };
 
-        match self.encoding {
-            PositionEncoding::Utf8 => Ok(byte_offset as u32),
-            PositionEncoding::Utf16 => {
-                let utf16_units = text[..byte_offset].encode_utf16().count();
-                Ok(utf16_units as u32)
-            }
-            PositionEncoding::Utf32 => {
-                let code_points = text[..byte_offset].chars().count();
-                Ok(code_points as u32)
-            }
-        }
+        let units = match self.encoding {
+            PositionEncoding::Utf8 => byte_offset,
+            PositionEncoding::Utf16 => prefix.encode_utf16().count(),
+            PositionEncoding::Utf32 => prefix.chars().count(),
+        };
+        u32::try_from(units).map_err(|_| OffsetError::TooLong)
     }
 
     /// Convert character offset to byte offset in the configured encoding.
     ///
+    /// For UTF-16 and UTF-32, an offset inside a multi-unit character resolves
+    /// to the next character boundary.
+    ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The character offset is out of bounds
-    /// - The encoding is unsupported
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "LSP positions are u32; truncation is acceptable"
-    )]
+    /// Returns [`OffsetError::PastEnd`] (with `len` in the configured
+    /// encoding's units) if the offset is beyond the end of `text`, and
+    /// [`OffsetError::InsideCharacter`] for a UTF-8 offset that is not on a
+    /// character boundary.
     pub fn character_to_byte_offset(
         &self,
         text: &str,
         character_offset: u32,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, OffsetError> {
+        let wanted = character_offset as usize;
         match self.encoding {
             PositionEncoding::Utf8 => {
-                let byte_offset = character_offset as usize;
-                if byte_offset > text.len() {
-                    let text_len = text.len();
-                    return Err(format!(
-                        "Character offset {character_offset} exceeds text length {text_len}"
-                    ));
+                if wanted > text.len() {
+                    return Err(OffsetError::PastEnd {
+                        offset: wanted,
+                        len: text.len(),
+                    });
                 }
                 // A UTF-8 "character offset" *is* a byte offset, taken
                 // directly from untrusted input (an LSP position from the
                 // server, or a re-derived offset from another encoding). It
                 // must land on a boundary before any caller slices `text`
                 // with it -- see `byte_offset_to_character`'s matching guard.
-                if !text.is_char_boundary(byte_offset) {
-                    return Err(format!(
-                        "Character offset {character_offset} is not on a character boundary"
-                    ));
+                if !text.is_char_boundary(wanted) {
+                    return Err(OffsetError::InsideCharacter(wanted));
                 }
-                Ok(byte_offset)
+                Ok(wanted)
             }
-            PositionEncoding::Utf16 => {
-                let mut utf16_count = 0u32;
-                for (byte_idx, ch) in text.char_indices() {
-                    if utf16_count >= character_offset {
-                        return Ok(byte_idx);
-                    }
-                    utf16_count = utf16_count.saturating_add(ch.len_utf16() as u32);
-                }
-                if utf16_count == character_offset {
-                    Ok(text.len())
-                } else {
-                    Err(format!(
-                        "Character offset {character_offset} out of bounds (max UTF-16 units: {utf16_count})"
-                    ))
-                }
+            PositionEncoding::Utf16 => Self::scan_units(text, wanted, char::len_utf16),
+            PositionEncoding::Utf32 => Self::scan_units(text, wanted, |_| 1),
+        }
+    }
+
+    /// Walks `text` once, returning the first boundary at or after `wanted`
+    /// units, or `text.len()` when `wanted` equals the total unit count.
+    fn scan_units(
+        text: &str,
+        wanted: usize,
+        units_of: impl Fn(char) -> usize,
+    ) -> Result<usize, OffsetError> {
+        let mut units = 0usize;
+        for (byte_idx, ch) in text.char_indices() {
+            if units >= wanted {
+                return Ok(byte_idx);
             }
-            PositionEncoding::Utf32 => text
-                .char_indices()
-                .nth(character_offset as usize)
-                .map(|(byte_idx, _)| byte_idx)
-                .or_else(|| {
-                    if character_offset == text.chars().count() as u32 {
-                        Some(text.len())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| {
-                    let max_code_points = text.chars().count();
-                    format!(
-                        "Character offset {character_offset} out of bounds (max code points: {max_code_points})"
-                    )
-                }),
+            units = units.saturating_add(units_of(ch));
+        }
+        if units == wanted {
+            Ok(text.len())
+        } else {
+            Err(OffsetError::PastEnd {
+                offset: wanted,
+                len: units,
+            })
         }
     }
 }
@@ -894,5 +893,35 @@ mod tests {
         let (mcp_line, mcp_char) = mcp_at(u32::MAX, u32::MAX, None, PositionEncoding::Utf16).value;
         assert_eq!(mcp_line, u32::MAX);
         assert_eq!(mcp_char, u32::MAX);
+    }
+
+    #[test]
+    fn test_offset_errors_are_typed() {
+        let utf8 = EncodingConverter::new(PositionEncoding::Utf8);
+        assert_eq!(
+            utf8.byte_offset_to_character("test", 100),
+            Err(OffsetError::PastEnd {
+                offset: 100,
+                len: 4
+            })
+        );
+        assert_eq!(
+            utf8.byte_offset_to_character("a\u{1F600}", 2),
+            Err(OffsetError::InsideCharacter(2))
+        );
+        assert_eq!(
+            utf8.character_to_byte_offset("a\u{1F600}", 2),
+            Err(OffsetError::InsideCharacter(2))
+        );
+        let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
+        assert_eq!(
+            utf16.character_to_byte_offset("a\u{1F600}", 9),
+            Err(OffsetError::PastEnd { offset: 9, len: 3 })
+        );
+        let utf32 = EncodingConverter::new(PositionEncoding::Utf32);
+        assert_eq!(
+            utf32.character_to_byte_offset("a\u{1F600}", 3),
+            Err(OffsetError::PastEnd { offset: 3, len: 2 })
+        );
     }
 }
