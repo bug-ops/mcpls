@@ -14,7 +14,7 @@ use super::config::{ResponseStreamDeadline, SessionLimit, StreamLiveness, non_ze
 use super::liveness::{
     ProbeId, SESSION_CLOSE_TIMEOUT, SessionLiveness, StreamProbe, is_common_channel_event_id,
 };
-use crate::util::{catch_panic, lock_std};
+use crate::util::{RestartBackoff, RestartDelays, catch_panic, lock_std};
 
 /// Log-safe correlation handle for a session: eight hex digits of a hash of
 /// the id, so log lines can be matched without disclosing the bearer secret.
@@ -392,49 +392,28 @@ pub(super) async fn supervise_idle_reaper(
     .await;
 }
 
-/// How long [`supervise`] waits before rerunning a task that panicked.
-#[derive(Debug, Clone, Copy)]
-struct RestartDelays {
-    /// Delay after the first panic; it doubles with each further one.
-    first: std::time::Duration,
-    /// Largest delay, also the period of the panic log line and the run time
-    /// after which the delay starts over.
-    max: std::time::Duration,
-}
-
-/// Runs `run` to completion, rerunning it each time it panics after a delay
-/// that doubles from `delays.first` up to `delays.max` (and starts over after a
-/// run that lasted `delays.max`), and stops once it returns or `cancel` fires
-/// during the delay. A panic is logged at error level at most once per
-/// `delays.max`, so a task that panics at once does not flood the log.
+/// Runs `run` to completion, rerunning it each time it panics after the
+/// [`RestartBackoff`] delay, and stops once it returns or `cancel` fires during
+/// the delay.
 async fn supervise<Fut: std::future::Future<Output = ()>>(
     what: crate::error::BackgroundTask,
     mut run: impl FnMut() -> Fut,
     cancel: &tokio_util::sync::CancellationToken,
     delays: RestartDelays,
 ) {
-    let mut delay = delays.first;
-    let mut limiter = crate::util::WarnLimiter::default();
+    let mut backoff = RestartBackoff::new(delays);
     loop {
         let started = tokio::time::Instant::now();
         let Err(panicked) = catch_panic(run()).await else {
             return;
         };
-        let now = tokio::time::Instant::now();
-        if now.saturating_duration_since(started) >= delays.max {
-            delay = delays.first;
+        if backoff
+            .after_panic(what, &panicked, started, cancel)
+            .await
+            .is_break()
+        {
+            return;
         }
-        if limiter.due(now.into_std(), delays.max) {
-            tracing::error!(
-                error = %panicked,
-                "{what} panicked; restarting it in {delay:?}, it is not running until then"
-            );
-        }
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(delay) => {}
-        }
-        delay = delay.saturating_mul(2).min(delays.max);
     }
 }
 

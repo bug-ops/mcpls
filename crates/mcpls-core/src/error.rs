@@ -1614,6 +1614,8 @@ pub enum BackgroundTask {
     ServerPlanning,
     /// The reaper that expires idle HTTP sessions.
     IdleSessionReaper,
+    /// The task that delivers `resources/updated` notifications to one session.
+    SessionDelivery,
 }
 
 impl fmt::Display for BackgroundTask {
@@ -1626,6 +1628,7 @@ impl fmt::Display for BackgroundTask {
             Self::FileOpen => "file open",
             Self::ServerPlanning => "server start planning",
             Self::IdleSessionReaper => "idle HTTP session reaper",
+            Self::SessionDelivery => "resources/updated delivery",
         })
     }
 }
