@@ -625,7 +625,7 @@ impl RestartBackoff {
         }
         if self.limiter.due(now.into_std(), self.delays.max) {
             tracing::error!(
-                error = %panicked,
+                error = %escape_bounded(panicked.message(), MAX_LOG_STRING_BYTES),
                 operation = %what,
                 delay = ?self.delay,
                 "task panicked; restarting it after the delay, it is not running until then"
@@ -638,6 +638,49 @@ impl RestartBackoff {
         self.delay = self.delay.saturating_mul(2).min(self.delays.max);
         ControlFlow::Continue(())
     }
+}
+
+/// Runs `run` to completion, rerunning it each time it panics after the
+/// [`RestartBackoff`] delay, and stops once it returns or `cancel` fires during
+/// the delay.
+pub async fn supervise<Fut: Future<Output = ()>>(
+    what: crate::error::BackgroundTask,
+    mut run: impl FnMut() -> Fut,
+    cancel: &tokio_util::sync::CancellationToken,
+    delays: RestartDelays,
+) {
+    let mut backoff = RestartBackoff::new(delays);
+    loop {
+        let started = tokio::time::Instant::now();
+        let Err(panicked) = catch_panic(run()).await else {
+            return;
+        };
+        if backoff
+            .after_panic(what, &panicked, started, cancel)
+            .await
+            .is_break()
+        {
+            return;
+        }
+    }
+}
+
+/// The serialized JSON length of `value`, measured without allocating the
+/// text; `None` if serialization fails.
+pub fn json_len(value: &impl serde::Serialize) -> Option<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
 }
 
 /// Counts dropped frames and says when one is worth a warning: at most once
@@ -688,9 +731,59 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn after_panic_escapes_the_panic_payload_in_the_log() {
+        use tracing_subscriber::prelude::*;
+
+        let logs = crate::test_lsp::CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let panicked = catch_panic(async { panic!("ok\nERROR forged") })
+            .await
+            .unwrap_err();
+        let mut backoff = RestartBackoff::new(RestartDelays {
+            first: Duration::from_secs(1),
+            max: Duration::from_secs(8),
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let flow = backoff
+            .after_panic(
+                crate::error::BackgroundTask::SessionDelivery,
+                &panicked,
+                tokio::time::Instant::now(),
+                &cancel,
+            )
+            .await;
+        assert!(flow.is_break());
+        let fields = logs.fields_at(tracing::Level::ERROR);
+        let error = fields
+            .iter()
+            .find(|f| f.starts_with("error="))
+            .expect("error field");
+        assert!(!error.contains('\n'), "{error}");
+        assert!(error.contains("ok\\nERROR forged"), "{error}");
+    }
+
+    #[test]
+    fn json_len_matches_the_serialized_length() {
+        let value = serde_json::json!({"a": [1, "é\n", null]});
+        assert_eq!(
+            json_len(&value),
+            Some(serde_json::to_vec(&value).unwrap().len())
+        );
+    }
+
+    #[test]
+    fn json_len_is_none_when_serialization_fails() {
+        use std::collections::HashMap;
+        let unserializable: HashMap<(u8, u8), u8> = HashMap::from([((1, 2), 3)]);
+        assert_eq!(json_len(&unserializable), None);
+    }
+
     #[test]
     fn warn_limiter_is_due_at_first_and_then_once_per_interval() {
-        let every = Duration::from_secs(60);
+        let every = Duration::from_mins(1);
         let start = Instant::now();
         let mut limiter = WarnLimiter::default();
         assert!(limiter.due(start, every));

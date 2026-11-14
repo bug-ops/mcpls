@@ -1415,7 +1415,7 @@ mod tests {
                     return start.elapsed();
                 }
             }
-            assert!(start.elapsed() < Duration::from_secs(60), "never pulled");
+            assert!(start.elapsed() < Duration::from_mins(1), "never pulled");
         }
     }
 

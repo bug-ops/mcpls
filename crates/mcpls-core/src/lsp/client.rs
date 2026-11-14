@@ -217,8 +217,7 @@ impl UndecodableRun {
         if let Some(suppressed) = self.drops.record(now) {
             warn!(
                 suppressed,
-                "Dropped an undecodable LSP message (others dropped since the last \
-                 warning); further ones are logged at debug for a minute"
+                "Dropped an undecodable LSP message; further ones are logged at debug for a minute"
             );
         } else {
             debug!(
@@ -2169,6 +2168,46 @@ mod tests {
             LspClient::workspace_configuration_result(Some(&params), Some(&settings)).unwrap_err();
 
         assert_eq!(error.code, -32603);
+    }
+
+    fn configuration_reply_for_value_of_len(
+        value_len: usize,
+        item: &Value,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        let settings: LspSettings =
+            serde_json::from_value(serde_json::json!({ "k": "x".repeat(value_len) })).unwrap();
+        let params = serde_json::json!({ "items": [item] });
+        LspClient::workspace_configuration_result(Some(&params), Some(&settings))
+    }
+
+    #[test]
+    fn test_workspace_configuration_reply_size_boundary_for_whole_settings() {
+        // `{"k":"<n x>"}` serializes to n + 8 bytes.
+        let at_cap = configuration_reply_for_value_of_len(
+            MAX_CONFIGURATION_REPLY_BYTES - 8,
+            &serde_json::json!({}),
+        );
+        assert!(at_cap.is_ok());
+
+        let over_cap = configuration_reply_for_value_of_len(
+            MAX_CONFIGURATION_REPLY_BYTES - 7,
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(over_cap.code, -32603);
+    }
+
+    #[test]
+    fn test_workspace_configuration_reply_size_boundary_for_sections() {
+        // A string section serializes to n + 2 bytes.
+        let item = serde_json::json!({ "section": "k" });
+        let at_cap = configuration_reply_for_value_of_len(MAX_CONFIGURATION_REPLY_BYTES - 2, &item);
+        assert!(at_cap.is_ok());
+
+        let over_cap =
+            configuration_reply_for_value_of_len(MAX_CONFIGURATION_REPLY_BYTES - 1, &item)
+                .unwrap_err();
+        assert_eq!(over_cap.code, -32603);
     }
 
     /// P1: without this, no spec-compliant LSP server may ever initiate

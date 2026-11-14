@@ -12,9 +12,10 @@
 //! - Results come back in input order, so a clear (an empty publish) can never
 //!   be reordered behind or dropped in favour of an earlier publish.
 //! - Only definitive results are memoized. A path that does not exist falls
-//!   back to its nearest existing ancestor (and is cached); any other error
-//!   (`ESTALE`, `EIO`, `EACCES`) is transient and is retried on the next
-//!   publish.
+//!   back to its nearest existing ancestor (and is cached); a transient error
+//!   (`ESTALE`, `EIO`) is retried on the next publish. A permanent one (a name
+//!   the filesystem rejects, a symlink loop, `EACCES`) is neither retried,
+//!   cached nor held off; the next publish of the same path tries again.
 //! - At most [`RESOLVE_CONCURRENCY`] canonicalizations run at once. They run
 //!   on tokio's blocking pool and cannot be interrupted: when the caller drops
 //!   the batch future (pump cancellation) a call stuck on a hung filesystem
@@ -102,6 +103,9 @@ pub struct Publication<'a> {
 enum Resolution {
     Canonical(PathBuf),
     Transient,
+    /// A permanent refusal that can still change later (symlink loop,
+    /// `EACCES`): no retry, hold-off or memo, but a clear is still placed.
+    Unwalkable,
 }
 
 /// Memo of resolved published paths with a TTL and a size bound.
@@ -214,7 +218,9 @@ impl PublishedPathResolver {
     /// marked [`CanonicalForm::Fallback`] (a clear only ever empties an entry,
     /// and dropping it would leave the client with stale errors), while any
     /// other publication is dropped until the next one. A path that failed
-    /// transiently is left alone for [`TRANSIENT_HOLDOFF`]. Cache misses are
+    /// transiently is left alone for [`TRANSIENT_HOLDOFF`]. An unwalkable path
+    /// (symlink loop, `EACCES`) is not retried or held off, but a clear or
+    /// lost publication is placed the same way. Cache misses are
     /// canonicalized on the blocking pool with at most [`RESOLVE_CONCURRENCY`]
     /// in flight; dropping the returned future abandons the calls still
     /// running.
@@ -248,13 +254,15 @@ impl PublishedPathResolver {
             .zip(publications)
             .map(|(source, publication)| {
                 let source = source?;
-                let transient = matches!(fresh.get(&source), Some(Resolution::Transient))
-                    || self.memo.recently_failed(&source, now);
+                let placeable_on_failure = matches!(
+                    fresh.get(&source),
+                    Some(Resolution::Transient | Resolution::Unwalkable)
+                ) || self.memo.recently_failed(&source, now);
                 let (canonical, form) = if let Some(hit) = self.memo.get(&source, now) {
                     (hit.to_path_buf(), CanonicalForm::Resolved)
                 } else if let Some(Resolution::Canonical(path)) = fresh.get(&source) {
                     (path.clone(), CanonicalForm::Resolved)
-                } else if transient && publication.kind.never_dropped() {
+                } else if placeable_on_failure && publication.kind.never_dropped() {
                     self.memo.last_known(&source).map_or_else(
                         || (lexically_normalize(&source), CanonicalForm::Fallback),
                         |known| (known.to_path_buf(), CanonicalForm::Resolved),
@@ -322,6 +330,14 @@ impl PublishedPathResolver {
                         "transient error resolving published path"
                     );
                     fresh.insert(source, Resolution::Transient);
+                }
+                Err(e @ Unresolved::Unwalkable(_)) => {
+                    debug!(
+                        path = %source.display(),
+                        error = %ErrorChain(&e),
+                        "published path cannot be walked"
+                    );
+                    fresh.insert(source, Resolution::Unwalkable);
                 }
                 Err(e) => debug!(
                     path = %source.display(),
@@ -472,13 +488,127 @@ mod tests {
 
     #[test]
     fn test_canonicalize_existing_prefix_other_errors_are_transient() {
-        let canon = |_: &Path| -> io::Result<PathBuf> {
-            Err(io::Error::from(io::ErrorKind::PermissionDenied))
-        };
+        let canon =
+            |_: &Path| -> io::Result<PathBuf> { Err(io::Error::from(io::ErrorKind::TimedOut)) };
         assert_matches!(
             canonicalize_existing_prefix(Path::new("/a/b.rs"), &canon),
             Err(Unresolved::Transient(_))
         );
+    }
+
+    #[test]
+    fn test_canonicalize_existing_prefix_classifies_permanent_kinds() {
+        let invalid_input =
+            |_: &Path| -> io::Result<PathBuf> { Err(io::Error::from(io::ErrorKind::InvalidInput)) };
+        let permission_denied = |_: &Path| -> io::Result<PathBuf> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        };
+        assert_matches!(
+            canonicalize_existing_prefix(Path::new("/a/b.rs"), &invalid_input),
+            Err(Unresolved::InvalidName(_))
+        );
+        assert_matches!(
+            canonicalize_existing_prefix(Path::new("/a/b.rs"), &permission_denied),
+            Err(Unresolved::Unwalkable(_))
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_existing_prefix_refuses_nul_before_any_syscall() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let canon = counting(&calls, |_, _| None);
+        assert_matches!(
+            canonicalize_existing_prefix(Path::new("/a/b\0c.rs"), canon.as_ref()),
+            Err(Unresolved::InvalidName(_))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_input_is_dropped_without_retry_or_holdoff() {
+        let (_dir, root) = root();
+        let file = uri(&root.join("a.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| {
+            Some(io::ErrorKind::InvalidInput)
+        }));
+        let roots = roots_of(&root);
+        let clear = Publication {
+            uri: &file,
+            kind: PublicationKind::Clear,
+        };
+
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+        assert!(resolver.resolve_batch(&[clear], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no hold-off");
+        assert!(resolver.memo.entries.is_empty());
+        assert!(resolver.memo.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unwalkable_path_is_not_retried_or_held_off_but_clear_and_lost_are_placed() {
+        let (_dir, root) = root();
+        let file = uri(&root.join("a.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| {
+            Some(io::ErrorKind::PermissionDenied)
+        }));
+        let roots = roots_of(&root);
+
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+        for (n, kind) in [PublicationKind::Clear, PublicationKind::Lost]
+            .into_iter()
+            .enumerate()
+        {
+            let publication = Publication { uri: &file, kind };
+            let out = resolver.resolve_batch(&[publication], &roots).await;
+            assert!(out[0].is_some(), "{kind:?} must still be placed");
+            assert_eq!(calls.load(Ordering::SeqCst), n + 2, "no hold-off");
+        }
+        assert!(resolver.memo.entries.is_empty());
+        assert!(resolver.memo.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_under_unwalkable_path_uses_last_known_canonical() {
+        let (_dir, root) = root();
+        let link = uri(&root.join("link.rs"));
+        let real = uri(&root.join("real.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| {
+            Some(io::ErrorKind::PermissionDenied)
+        }));
+        let stale = Instant::now().checked_sub(MEMO_TTL * 2).unwrap();
+        resolver
+            .memo
+            .insert(root.join("link.rs"), root.join("real.rs"), stale);
+        let clear = Publication {
+            uri: &link,
+            kind: PublicationKind::Clear,
+        };
+
+        let out = resolver.resolve_batch(&[clear], &roots_of(&root)).await;
+
+        let published = out[0].as_ref().unwrap();
+        assert_eq!(published.canonical(), real.uri());
+        assert_eq!(published.source(), link.uri());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlink_loop_is_dropped_without_retry_or_holdoff() {
+        let (_dir, root) = root();
+        std::os::unix::fs::symlink(root.join("loop"), root.join("loop")).unwrap();
+        let file = uri(&root.join("loop/x.rs"));
+        let mut resolver = PublishedPathResolver::new();
+        let roots = roots_of(&root);
+
+        let started = Instant::now();
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert!(started.elapsed() < TRANSIENT_RETRY_BACKOFF[0]);
+        assert!(resolver.memo.failed.is_empty());
     }
 
     #[test]

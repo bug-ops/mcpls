@@ -688,10 +688,17 @@ pub struct RenameResult {
 /// rename" apart from "some of the rename was withheld" -- this makes that
 /// distinction visible in the result itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
 pub struct DroppedEdits {
-    /// Entries referencing a URI outside every configured workspace root.
+    /// Entries refused as outside the workspace: a URI outside every
+    /// configured root, or one that could not be resolved to a path inside a
+    /// root (symlink loop, permission denied, transient filesystem error).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub out_of_workspace: usize,
+    /// Entries whose URI path carries a name the filesystem rejects (for
+    /// example a component over the name-length limit, or a NUL byte).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub invalid_path: usize,
     /// `CreateFile`/`RenameFile`/`DeleteFile` document changes, which mcpls
     /// does not translate into MCP DTOs.
     #[serde(default, skip_serializing_if = "is_zero")]

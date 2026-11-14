@@ -1625,7 +1625,7 @@ mod pump_tests {
             "textDocument/publishDiagnostics",
             Some(serde_json::json!({"uri": AsRef::<str>::as_ref(&over), "diagnostics": []})),
         );
-        assert!(matches!(decoded, LspNotification::LostPublish(_)));
+        assert_matches!(decoded, LspNotification::LostPublish(_));
         feed.send(decoded).await.unwrap();
         assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
         let guard = cache.lock().await;
@@ -2915,7 +2915,7 @@ mod burst_tests {
             ),
             PublishedPathResolver::with_canonicalizer(failing),
         ));
-        tokio::time::timeout(Duration::from_secs(60), pump)
+        tokio::time::timeout(Duration::from_mins(1), pump)
             .await
             .expect("the pump must end once the mailbox is drained and closed")
             .unwrap();
@@ -2970,7 +2970,7 @@ mod burst_tests {
                     WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
                 ),
             ));
-            tokio::time::timeout(Duration::from_secs(60), pump)
+            tokio::time::timeout(Duration::from_mins(1), pump)
                 .await
                 .expect("the pump must end once the mailbox is drained and closed")
                 .unwrap();
@@ -3050,7 +3050,7 @@ mod burst_tests {
             .expect("the resolver signals once");
         role_tx.send(DiagnosticsRole::Secondary).unwrap();
         drop(release);
-        tokio::time::timeout(Duration::from_secs(60), pump)
+        tokio::time::timeout(Duration::from_mins(1), pump)
             .await
             .expect("the pump must end once the mailbox is drained and closed")
             .unwrap();

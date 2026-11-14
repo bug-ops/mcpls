@@ -3,11 +3,10 @@
 //! These tests require rust-analyzer to be installed and available in PATH.
 //! Run with: cargo nextest run -- --ignored
 
-#![allow(
+#![expect(
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::uninlined_format_args,
-    clippy::unnecessary_unwrap,
     reason = "test code; a panic is the failure signal"
 )]
 

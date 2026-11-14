@@ -4,6 +4,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+use crate::util::json_len;
+
 /// Key under which the `toml` crate encodes a datetime when deserializing
 /// into a self-describing format such as [`serde_json::Value`].
 const TOML_DATETIME_KEY: &str = "$__toml_private_datetime";
@@ -249,25 +251,13 @@ impl From<SectionRef<'_>> for Value {
 impl SectionRef<'_> {
     /// The serialized JSON length, measured without allocating the text.
     pub(crate) fn serialized_len(self) -> usize {
-        struct Counter(usize);
-        impl std::io::Write for Counter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(buf.len());
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut counter = Counter(0);
-        let result = match self {
-            Self::Whole(map) => serde_json::to_writer(&mut counter, map),
-            Self::Found(value) => serde_json::to_writer(&mut counter, value),
-            Self::Missing => serde_json::to_writer(&mut counter, &Value::Null),
+        let measured = match self {
+            Self::Whole(map) => json_len(map),
+            Self::Found(value) => json_len(value),
+            Self::Missing => json_len(&Value::Null),
         };
-        // Serializing a `Value` into an infallible writer cannot fail.
-        debug_assert!(result.is_ok());
-        counter.0
+        // Serializing a `Value` cannot fail; saturate rather than undercount if it ever does.
+        measured.unwrap_or(usize::MAX)
     }
 }
 
