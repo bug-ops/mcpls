@@ -595,6 +595,12 @@ pub struct RestartBackoff {
 }
 
 impl RestartBackoff {
+    /// A backoff whose first restart waits `delays.first` and whose first
+    /// panic is logged at once.
+    ///
+    /// One backoff belongs to one supervised task, so its delay and log
+    /// throttle carry over between that task's restarts.
+    #[must_use]
     pub const fn new(delays: RestartDelays) -> Self {
         Self {
             delays,

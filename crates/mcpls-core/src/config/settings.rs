@@ -222,10 +222,16 @@ impl LspSettings {
 
 /// A borrowed configuration section: the whole settings object, a subtree,
 /// or nothing (serialized as `null`).
+///
+/// Lets a caller measure and bound a `workspace/configuration` reply before
+/// paying for a deep clone of each section; convert with `Value::from`.
 #[derive(Debug, Clone, Copy)]
 pub enum SectionRef<'a> {
+    /// The whole settings object, selected by an item without a `section`.
     Whole(&'a Map<String, Value>),
+    /// The subtree found by walking a dotted `section`.
     Found(&'a Value),
+    /// An unknown section or an item that cannot be interpreted.
     Missing,
 }
 
