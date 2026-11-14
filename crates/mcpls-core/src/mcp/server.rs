@@ -4350,14 +4350,8 @@ mod tests {
             .structured_result(Ok(FormatDocumentResult {
                 edits: vec![TextEdit {
                     range: Range {
-                        start: Position2D {
-                            line: 1,
-                            character: 1,
-                        },
-                        end: Position2D {
-                            line: 1,
-                            character: 2,
-                        },
+                        start: Position2D::from_mcp(1, 1),
+                        end: Position2D::from_mcp(1, 2),
                     },
                     new_text: "SuperSecretValue123".to_owned(),
                 }],
@@ -6960,7 +6954,7 @@ sleep 0.3
         };
         let type_item = || {
             let uri = url::Url::from_file_path(file).unwrap().to_string();
-            let at = |character| crate::bridge::Position2D { line: 1, character };
+            let at = |character| crate::bridge::Position2D::from_mcp(1, character);
             TypeHierarchyWalkParams {
                 item: crate::bridge::HierarchyItem {
                     name: "T".to_string(),

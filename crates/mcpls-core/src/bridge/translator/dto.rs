@@ -28,9 +28,9 @@ pub(super) fn lsp_kind_to_u32<T: Into<u32>>(kind: T) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Position2D {
     /// Line number (1-based).
-    pub line: u32,
+    line: u32,
     /// Character offset (1-based).
-    pub character: u32,
+    character: u32,
 }
 
 impl Position2D {
