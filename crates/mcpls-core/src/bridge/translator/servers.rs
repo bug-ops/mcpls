@@ -29,7 +29,7 @@ use crate::lsp::{ConnectionId, LspClient, LspServer};
 #[derive(Debug)]
 #[cfg_attr(
     test,
-    allow(
+    expect(
         clippy::large_enum_variant,
         reason = "the test-only ClientOnly variant holds just a client"
     )
@@ -60,9 +60,12 @@ impl Backend {
     }
 
     /// The server, when there is one.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "the test-only ClientOnly variant has no server"
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the test-only ClientOnly variant has no server"
+        )
     )]
     pub(super) const fn server(&self) -> Option<&LspServer> {
         match self {
@@ -75,9 +78,12 @@ impl Backend {
     }
 
     /// The server, mutably, when there is one.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "the test-only ClientOnly variant has no server"
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the test-only ClientOnly variant has no server"
+        )
     )]
     pub(super) const fn server_mut(&mut self) -> Option<&mut LspServer> {
         match self {
@@ -92,7 +98,7 @@ impl Backend {
 
 /// Where one server stands.
 #[derive(Debug)]
-#[allow(
+#[expect(
     clippy::large_enum_variant,
     reason = "one value per configured server; boxing the backend buys nothing"
 )]

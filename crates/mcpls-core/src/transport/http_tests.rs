@@ -2214,7 +2214,7 @@ async fn test_enforce_session_cap_leaves_unrelated_500_untouched() {
 /// update left queued by the repeated pull would sit ahead of the second
 /// sentinel and fail the comparison.
 #[tokio::test]
-#[allow(clippy::too_many_lines, reason = "one end-to-end scenario")]
+#[expect(clippy::too_many_lines, reason = "one end-to-end scenario")]
 async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
     use std::sync::Arc;
 

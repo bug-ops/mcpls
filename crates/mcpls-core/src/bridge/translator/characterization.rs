@@ -19,16 +19,17 @@
 // deliberately-superseded-but-still-live LSP fields/types (`MarkedString`,
 // `SymbolInformation.deprecated`/`DocumentSymbol.deprecated`) -- servers may
 // still send them, so mcpls must still round-trip them correctly.
-#![allow(deprecated, reason = "LSP servers still send this deprecated field")]
 
 use lsp_types::{
     CodeAction, CodeActionResponse, Command, CompletionItem, CompletionList, CompletionResponse,
     Contents, Diagnostic, DiagnosticSeverity, DocumentChange, DocumentSymbol,
-    DocumentSymbolResponse, Documentation, Hover, Location, LocationLink, MarkedString,
-    MarkedStringWithLanguage, MarkupContent, MarkupKind, Position, Range, RenameFile,
-    SymbolInformation, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentContentChangeWholeDocument, TextDocumentEdit, TextEdit, Uri,
+    DocumentSymbolResponse, Documentation, Hover, Location, LocationLink, MarkupContent,
+    MarkupKind, Position, Range, RenameFile, SymbolInformation, SymbolKind,
+    TextDocumentContentChangeEvent, TextDocumentContentChangeWholeDocument, TextDocumentEdit,
+    TextEdit, Uri,
 };
+#[expect(deprecated, reason = "LSP servers still send this deprecated type")]
+use lsp_types::{MarkedString, MarkedStringWithLanguage};
 use serde_json::json;
 
 fn pos(line: u32, character: u32) -> Position {
@@ -270,7 +271,7 @@ fn test_document_changes_operations_shape_is_flat_array_with_kind_discriminant()
 // ---------------------------------------------------------------------
 
 #[test]
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn test_hover_contents_scalar_string_is_plain_json_string() {
     let hover = Hover {
         contents: Contents::MarkedString(MarkedString::String("plain".to_string())),
@@ -281,7 +282,7 @@ fn test_hover_contents_scalar_string_is_plain_json_string() {
 }
 
 #[test]
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn test_hover_contents_scalar_language_string_json_shape() {
     let hover = Hover {
         contents: Contents::MarkedString(MarkedString::MarkedStringWithLanguage(
@@ -299,7 +300,7 @@ fn test_hover_contents_scalar_language_string_json_shape() {
 }
 
 #[test]
-#[allow(deprecated, reason = "LSP servers still send this deprecated field")]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn test_hover_contents_array_json_is_flat_array() {
     let hover = Hover {
         contents: Contents::MarkedStringList(vec![
@@ -451,6 +452,7 @@ fn test_document_diagnostic_report_unchanged_json_has_kind_unchanged() {
 // ---------------------------------------------------------------------
 
 #[test]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn test_document_symbol_response_flat_json_is_array_of_symbol_information() {
     let symbol = SymbolInformation {
         deprecated: None,
@@ -477,6 +479,7 @@ fn test_document_symbol_response_flat_json_is_array_of_symbol_information() {
 }
 
 #[test]
+#[expect(deprecated, reason = "LSP servers still send this deprecated field")]
 fn test_document_symbol_response_nested_json_is_array_of_document_symbol() {
     let symbol = DocumentSymbol {
         name: "foo".to_string(),

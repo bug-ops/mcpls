@@ -96,7 +96,7 @@ pub fn spawn_disk_sweep(
 pub async fn stop_disk_sweep(handle: DiskSweepHandle) {
     handle.stop.cancel();
     match handle.task.await {
-        Err(error) if error.is_panic() => warn!("disk sweep panicked: {error}"),
+        Err(error) if error.is_panic() => warn!(%error, "disk sweep panicked"),
         Ok(()) | Err(_) => {}
     }
 }
@@ -202,7 +202,7 @@ impl DiskSweep {
                 Err(error) => {
                     self.running.remove(&error.id());
                     if error.is_panic() {
-                        warn!("disk sweep job panicked: {error}");
+                        warn!(%error, "disk sweep job panicked");
                     }
                 }
             }

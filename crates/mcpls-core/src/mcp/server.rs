@@ -1605,7 +1605,7 @@ async fn contain_panic<T>(
     match crate::util::catch_panic(handler).await {
         Ok(result) => result,
         Err(panicked) => {
-            tracing::error!("{operation} handler panicked: {}", panicked.message());
+            tracing::error!(%operation, panic = %panicked.message(), "handler panicked");
             Err(McpError::internal_error(
                 format!("{operation} handler panicked"),
                 None,
@@ -1790,8 +1790,9 @@ impl ServerHandler for McplsServer {
                         let uri = make_uri(path)
                             .inspect_err(|e| {
                                 tracing::warn!(
-                                    "Skipping path in list_resources (make_uri failed): {}: {e}",
-                                    path.display()
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Skipping path in list_resources (make_uri failed)"
                                 );
                             })
                             .ok()?;
@@ -1884,7 +1885,8 @@ impl ServerHandler for McplsServer {
                     .map_err(|e| self.render_error(e.into()))?;
                 if !newly_subscribed {
                     tracing::debug!(
-                        "client re-subscribed to already-subscribed resource {canonical_uri}"
+                        %canonical_uri,
+                        "client re-subscribed to already-subscribed resource"
                     );
                 }
 
@@ -1928,7 +1930,11 @@ impl ServerHandler for McplsServer {
                         ))
                         .await
                 {
-                    tracing::warn!("Failed to replay cached diagnostics for {canonical_uri}: {e}");
+                    tracing::warn!(
+                        %canonical_uri,
+                        error = %e,
+                        "Failed to replay cached diagnostics"
+                    );
                 }
 
                 Ok(())
@@ -1956,8 +1962,8 @@ impl ServerHandler for McplsServer {
 
                 if !session.unsubscribe(canonical.as_ref(), &request.uri).await {
                     tracing::debug!(
-                        "client unsubscribed from resource with no matching subscription: {}",
-                        request.uri
+                        uri = %request.uri,
+                        "client unsubscribed from resource with no matching subscription"
                     );
                 }
                 Ok(())
@@ -6926,7 +6932,7 @@ sleep 0.3
     /// Calls the real handler for `tool` with canned params against `file`,
     /// discarding the payload. The exhaustive match makes a new `McpTool`
     /// variant fail to compile until it is wired into the parity matrix.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one arm per tool; splitting would only scatter the exhaustive match"
     )]

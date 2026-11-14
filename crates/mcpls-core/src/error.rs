@@ -954,7 +954,7 @@ pub enum UntrustedRefusal {
 }
 
 impl fmt::Display for UntrustedRefusal {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one message per refusal, and the refusals are the table"
     )]

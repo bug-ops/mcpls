@@ -518,20 +518,19 @@ fn start_anchor(stderr_hold: &PipeReader) -> Option<Anchor> {
     match Anchor::start(stderr_hold) {
         Ok(anchor) => Some(anchor),
         Err(e) => {
-            warn_once(
-                &ANCHOR_WARNED,
-                &e,
-                "failed to start the LSP child anchor; server is spawned unbound",
-            );
+            if first_warning(&ANCHOR_WARNED) {
+                warn!(
+                    error = %e,
+                    "failed to start the LSP child anchor; server is spawned unbound"
+                );
+            }
             None
         }
     }
 }
 
-fn warn_once(flag: &AtomicBool, error: &io::Error, message: &str) {
-    if !flag.swap(true, Ordering::Relaxed) {
-        warn!(error = %error, "{message}");
-    }
+fn first_warning(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
 }
 
 /// Spawns the server into the anchor's group, retrying once with a fresh
@@ -587,11 +586,12 @@ fn bind(anchor: Anchor, child: &Child, options: &Options) -> Lifeline {
     let watchdog = match watchdog {
         Ok(watchdog) => Some(watchdog),
         Err(e) => {
-            warn_once(
-                &WATCHDOG_WARNED,
-                &e,
-                "failed to start the LSP child watchdog; escaped descendants will not be swept",
-            );
+            if first_warning(&WATCHDOG_WARNED) {
+                warn!(
+                    error = %e,
+                    "failed to start the LSP child watchdog; escaped descendants will not be swept"
+                );
+            }
             None
         }
     };

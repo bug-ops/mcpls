@@ -61,7 +61,7 @@ async fn await_lsp_init_handle_within(
 ) {
     match tokio::time::timeout(timeout, &mut handle).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => error!("Background LSP initialization task failed: {err}"),
+        Ok(Err(err)) => error!(error = %err, "Background LSP initialization task failed"),
         Err(_) => {
             warn!("Timed out waiting for background LSP initialization task to stop");
             handle.abort();

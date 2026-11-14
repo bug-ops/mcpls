@@ -2,6 +2,10 @@
 //!
 //! This module provides a synchronous MCP client that spawns the mcpls binary
 //! and communicates via stdio using the JSON-RPC 2.0 protocol.
+#![allow(
+    dead_code,
+    reason = "shared by integration_tests and ra_e2e; each calls a subset"
+)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -130,10 +134,6 @@ impl McpClient {
     /// Notifications have no JSON-RPC `id` and may arrive interleaved with
     /// request/response traffic on the same stdout stream; `send_request` queues
     /// them here instead of misinterpreting them as the response it is waiting for.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn take_notifications(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.pending_notifications)
     }
@@ -181,10 +181,6 @@ impl McpClient {
     /// - The request cannot be sent
     /// - The response cannot be read or parsed
     /// - The server returns an error response
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn list_tools(&mut self) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -230,10 +226,6 @@ impl McpClient {
     /// # Errors
     ///
     /// Returns an error if the request cannot be sent or the server returns an error.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn list_resources(&mut self) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -249,10 +241,6 @@ impl McpClient {
     /// # Errors
     ///
     /// Returns an error if the request cannot be sent or the server returns an error.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -268,10 +256,6 @@ impl McpClient {
     /// # Errors
     ///
     /// Returns an error if the request cannot be sent or the server returns an error.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -287,10 +271,6 @@ impl McpClient {
     /// # Errors
     ///
     /// Returns an error if the request cannot be sent or the server returns an error.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value> {
         let request = json!({
             "jsonrpc": "2.0",
@@ -381,10 +361,6 @@ impl McpClient {
     }
 
     /// Return the OS process ID of the spawned mcpls process.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub(crate) fn pid(&self) -> u32 {
         self.process.id()
     }
@@ -394,10 +370,6 @@ impl McpClient {
     /// # Errors
     ///
     /// Returns an error if the OS query for the process status fails.
-    #[allow(
-        dead_code,
-        reason = "shared e2e helper; not every test binary calls it"
-    )]
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.process.try_wait()
     }

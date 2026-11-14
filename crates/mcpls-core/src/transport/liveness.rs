@@ -223,8 +223,8 @@ impl StreamProbe {
         tokio::spawn(async move {
             if let Err(panicked) = catch_panic(self.run(token, inner, tx, guard)).await {
                 tracing::error!(
-                    "the SSE liveness forwarding task panicked: {}",
-                    panicked.message()
+                    panic = %panicked.message(),
+                    "the SSE liveness forwarding task panicked"
                 );
             }
         });
@@ -392,9 +392,16 @@ mod tests {
             entries
                 .iter()
                 .any(|(level, message)| *level == tracing::Level::ERROR
-                    && message.contains("liveness forwarding task panicked")
-                    && message.contains("inner stream failure")),
+                    && message.contains("liveness forwarding task panicked")),
             "{entries:?}"
+        );
+        assert!(
+            captured
+                .fields()
+                .iter()
+                .any(|field| field.contains("inner stream failure")),
+            "{:?}",
+            captured.fields()
         );
     }
 

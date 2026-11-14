@@ -106,8 +106,8 @@ impl WorkspaceEditConverter<'_> {
         if !in_workspace {
             tracing::warn!(
                 uri = uri.as_ref(),
-                "dropping out-of-workspace {}",
-                self.edit_kind
+                edit_kind = %self.edit_kind,
+                "dropping out-of-workspace edit"
             );
             self.dropped.out_of_workspace = self.dropped.out_of_workspace.saturating_add(1);
         }
@@ -229,8 +229,8 @@ impl WorkspaceEditConverter<'_> {
                     if !mirrored.contains(uri) {
                         tracing::warn!(
                             uri = uri.as_ref(),
-                            "ignoring documentChanges entry shadowed by a non-empty changes map in {}",
-                            self.edit_kind
+                            edit_kind = %self.edit_kind,
+                            "ignoring documentChanges entry shadowed by a non-empty changes map"
                         );
                         self.dropped.shadowed_by_changes =
                             self.dropped.shadowed_by_changes.saturating_add(1);
@@ -478,11 +478,11 @@ fn prepare_rename_rejection(
     drop(err.handled());
     if code == lsp_types::ErrorCodes::UnknownErrorCode {
         tracing::warn!(
-            "prepareRename failed with the catch-all UnknownErrorCode; reported as not_renameable: {}",
-            crate::util::truncate_str(
+            error = %crate::util::truncate_str(
                 &redactions.apply(&message),
                 crate::util::MAX_LOG_STRING_BYTES
-            )
+            ),
+            "prepareRename failed with the catch-all UnknownErrorCode; reported as not_renameable"
         );
     }
     Ok(PrepareRenameOutcome::NotRenameable {
@@ -794,7 +794,7 @@ mod tests {
     /// ordinary replacement text -- `handle_rename` is the one tool that
     /// rewrites the user's files.
     #[tokio::test]
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "LSP snippet placeholders, not format arguments"
     )]
@@ -1152,7 +1152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one scenario covering every severity"
     )]
@@ -1273,10 +1273,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_code_action_with_workspace_edit() {
         use std::collections::HashMap;
 
@@ -1545,10 +1541,6 @@ mod tests {
     /// tallied as shadowed -- matching the precedence `convert_workspace_edit`
     /// already applies for `handle_rename`.
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_code_action_changes_takes_precedence_over_document_changes() {
         use std::collections::HashMap;
 
@@ -1813,10 +1805,6 @@ mod tests {
     /// resulting `changes` list is empty just like "nothing to rename" would
     /// be -- `dropped` is what makes the two cases distinguishable.
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_workspace_edit_everything_dropped_is_distinguishable_from_no_edits() {
         use std::collections::HashMap;
 
@@ -1886,10 +1874,6 @@ mod tests {
     /// twice -- `changes` takes precedence, and a `documentChanges` entry
     /// mirroring one of its URIs is not tallied again.
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_workspace_edit_changes_precedence_avoids_double_counting_drops() {
         use std::collections::HashMap;
 
@@ -1969,10 +1953,6 @@ mod tests {
     /// genuinely withheld. `changes` being present must keep its own drop
     /// count intact regardless of what `documentChanges` separately contains.
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_workspace_edit_changes_precedence_keeps_drops_when_document_changes_would_succeed()
      {
         use std::collections::HashMap;
@@ -2075,10 +2055,6 @@ mod tests {
     /// `documentChanges` and returning a result indistinguishable from
     /// "nothing to rename".
     #[tokio::test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "`lsp_types::Uri` keys are never mutated"
-    )]
     async fn test_convert_workspace_edit_falls_back_to_document_changes_when_changes_map_is_present_but_empty()
      {
         use std::collections::HashMap;

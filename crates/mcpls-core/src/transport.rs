@@ -41,9 +41,12 @@
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "fires only with `transport-http`; one `Transport` is built per process, and boxing the variant would break `Transport::Http(cfg)`"
+#[cfg_attr(
+    feature = "transport-http",
+    expect(
+        clippy::large_enum_variant,
+        reason = "fires only with `transport-http`; one `Transport` is built per process, and boxing the variant would break `Transport::Http(cfg)`"
+    )
 )]
 pub enum Transport {
     /// Standard I/O transport (default).
