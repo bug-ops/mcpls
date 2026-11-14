@@ -518,6 +518,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_name_is_dropped_once_without_memo_or_holdoff() {
+        let (_dir, root) = root();
+        let file = uri(&root.join("a.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| {
+            Some(io::ErrorKind::InvalidFilename)
+        }));
+        let roots = roots_of(&root);
+        let clear = Publication {
+            uri: &file,
+            kind: PublicationKind::Clear,
+        };
+
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+        assert!(resolver.resolve_batch(&[clear], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no hold-off");
+        assert!(resolver.memo.entries.is_empty());
+        assert!(resolver.memo.failed.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_transient_failure_is_held_off_not_cached_as_success() {
         let (_dir, root) = root();
         let file = uri(&root.join("a.rs"));
