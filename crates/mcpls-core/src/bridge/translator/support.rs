@@ -265,8 +265,7 @@ impl ToolSupportSnapshot {
     /// order, each naming its server; empty when the tool is not fanned out.
     pub(crate) fn workspace_members(&self, tool: ToolKind) -> Vec<MemberSupport> {
         self.fan_out_members(tool)
-            .map(|members| self.member_supports(tool, &members))
-            .unwrap_or_default()
+            .map_or_default(|members| self.member_supports(tool, &members))
     }
 
     fn fan_out_members(&self, tool: ToolKind) -> Option<FanOutMembers> {

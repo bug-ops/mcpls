@@ -73,7 +73,7 @@ enum DocumentDiagnosticReportResult {
 /// `textDocument/diagnostic` with [`DocumentDiagnosticReportResult`] as its
 /// result, so it can go through `LspClient::request_typed_classified` and the
 /// caller decides how an error response is logged.
-enum PullDiagnosticRequest {}
+struct PullDiagnosticRequest(std::convert::Infallible);
 
 impl lsp_types::Request for PullDiagnosticRequest {
     type Params = DocumentDiagnosticParams;

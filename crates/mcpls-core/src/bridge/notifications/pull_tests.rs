@@ -85,14 +85,12 @@ fn merged(cache: &NotificationCache) -> Option<DiagnosticInfo> {
 }
 
 fn messages(cache: &NotificationCache) -> Vec<String> {
-    merged(cache)
-        .map(|info| {
-            info.diagnostics
-                .iter()
-                .map(|d| message_as_str(&d.message).to_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+    merged(cache).map_or_default(|info| {
+        info.diagnostics
+            .iter()
+            .map(|d| message_as_str(&d.message).to_owned())
+            .collect()
+    })
 }
 
 /// What a read of the file returns after `write`, computed as the translator does.
