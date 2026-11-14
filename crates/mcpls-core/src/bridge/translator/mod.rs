@@ -279,7 +279,7 @@ impl Translator {
 
     /// Mark the set of servers that are expected (configured + applicable)
     /// but may still be initializing in the background.
-    #[allow(
+    #[expect(
         clippy::needless_pass_by_value,
         reason = "public API: callers hand over the set they built"
     )]
@@ -435,7 +435,7 @@ impl Translator {
         let registered = lock_std(&self.servers).register(id.clone(), Backend::Process(server));
         drop(registered.displaced);
         if !registered.was_expected {
-            tracing::error!("LSP server '{id}' settled twice or was never expected");
+            tracing::error!(%id, "LSP server settled twice or was never expected");
         }
         self.rebind_router_to_settled();
         (id, language)
@@ -450,7 +450,7 @@ impl Translator {
         self.rebind_router_to_settled();
         let was_expected = lock_std(&self.servers).record_failure(failure);
         if !was_expected {
-            tracing::error!("LSP server '{id}' settled twice or was never expected");
+            tracing::error!(%id, "LSP server settled twice or was never expected");
         }
         self.warn_failed_routes(&id, &RouteLoss::FailedToStart);
     }
@@ -477,8 +477,10 @@ impl Translator {
             })
             .collect();
         tracing::warn!(
-            "server '{id}' {loss}; routes of [{}] are rebound or dropped",
-            catch_all_states.join(", ")
+            %id,
+            %loss,
+            routes = %catch_all_states.join(", "),
+            "server lost; its routes are rebound or dropped"
         );
     }
 

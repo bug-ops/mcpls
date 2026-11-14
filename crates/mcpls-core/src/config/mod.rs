@@ -1008,10 +1008,10 @@ impl ServerConfig {
                             .map_or_else(|_| local_config.clone(), |cwd| cwd.join(&local_config))
                     });
                     tracing::warn!(
-                        "ignoring untrusted project-local config at {}; pass \
+                        path = %display_path.display(),
+                        "ignoring untrusted project-local config; pass \
                          --trust-project-config (or set MCPLS_TRUST_PROJECT_CONFIG=true) to \
-                         load it",
-                        display_path.display()
+                         load it"
                     );
                 }
             }
@@ -1037,12 +1037,12 @@ impl ServerConfig {
             if create == CreateDefault::Yes {
                 if let Err(e) = Self::create_default_config_file(&user_config) {
                     tracing::warn!(
-                        "Failed to create default config at {}: {}. Using in-memory defaults.",
-                        user_config.display(),
-                        e
+                        path = %user_config.display(),
+                        error = %e,
+                        "Failed to create default config. Using in-memory defaults."
                     );
                 } else {
-                    tracing::info!("Created default config at {}", user_config.display());
+                    tracing::info!(path = %user_config.display(), "Created default config");
                 }
             }
         }

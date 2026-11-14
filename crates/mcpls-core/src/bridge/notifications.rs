@@ -581,9 +581,10 @@ impl EvictionRecord {
     fn warn_overflow(&mut self, now: std::time::Instant) {
         if self.overflow_warn.due(now, EVICTION_REPLAY_WINDOW) {
             warn!(
-                "more than {MAX_RECENT_EVICTIONS} diagnostics clears evicted within {}s, \
-                 forgetting the oldest; a re-attaching listen may miss them",
-                EVICTION_REPLAY_WINDOW.as_secs()
+                max = MAX_RECENT_EVICTIONS,
+                window_secs = EVICTION_REPLAY_WINDOW.as_secs(),
+                "too many diagnostics clears evicted within the replay window, \
+                 forgetting the oldest; a re-attaching listen may miss them"
             );
         }
     }
@@ -1428,9 +1429,10 @@ impl NotificationCache {
                 .flatten();
             let Some(oldest_alias) = alias_to_evict else {
                 debug!(
-                    "dropping diagnostics for {}: {MAX_SOURCES_PER_FILE} published URIs already cached for {}",
-                    published.source().as_ref(),
-                    published.canonical().as_ref()
+                    source = %published.source().as_ref(),
+                    canonical = %published.canonical().as_ref(),
+                    max = MAX_SOURCES_PER_FILE,
+                    "dropping diagnostics: published URIs already cached for the file"
                 );
                 return PushWrite::Dropped {
                     evicted: Vec::new(),
@@ -1451,8 +1453,8 @@ impl NotificationCache {
             Ok(evicted) => evicted,
             Err(NoRoom { evicted }) => {
                 debug!(
-                    "dropping diagnostics for {}: no entry could be evicted to make room",
-                    published.source().as_ref()
+                    source = %published.source().as_ref(),
+                    "dropping diagnostics: no entry could be evicted to make room"
                 );
                 return PushWrite::Dropped { evicted };
             }
@@ -1540,9 +1542,11 @@ impl NotificationCache {
         let sync = self.document_sync(&owner, canonical);
         if pull_is_superseded(pulled, pushed_version, sync) {
             debug!(
-                "dropping the pulled diagnostics of {}: superseded by a push \
-                 (pulled {pulled:?}, pushed {pushed_version:?}, {sync:?})",
-                canonical.as_ref()
+                uri = %canonical.as_ref(),
+                ?pulled,
+                ?pushed_version,
+                ?sync,
+                "dropping the pulled diagnostics: superseded by a push"
             );
             drop(self.take_entry(&slot));
         }
@@ -2889,12 +2893,12 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(1), diagnostics);
         drop(guard);
 
-        let messages = captured.messages();
+        let events = captured.events();
         assert!(
-            messages
-                .iter()
-                .any(|m| m.contains("highest-severity") && m.contains("file:///test.rs")),
-            "expected a truncation warning naming the URI, got: {messages:?}"
+            events.iter().any(|event| {
+                event.message.contains("highest-severity") && event.has_field("uri=file:///test.rs")
+            }),
+            "expected a truncation warning naming the URI, got: {events:?}"
         );
     }
 
@@ -2918,10 +2922,13 @@ mod tests {
         cache.store_diagnostics(&test_server(), &uri, Some(1), vec![diagnostic]);
         drop(guard);
 
-        let messages = captured.messages();
+        let events = captured.events();
         assert!(
-            messages.iter().any(|m| m.contains("code-action")),
-            "expected a warning noting the code-action quick-fix impact, got: {messages:?}"
+            events.iter().any(|event| {
+                event.message.contains("dropped its data")
+                    && event.has_field("quick_fix_may_not_resolve=true")
+            }),
+            "expected a warning noting the code-action quick-fix impact, got: {events:?}"
         );
     }
 

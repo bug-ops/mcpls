@@ -1898,7 +1898,7 @@ impl DocumentTracker {
 /// rather than returning a line the cap may have cut. A `\r` ending a skipped
 /// line at a chunk boundary is remembered, so a `\n` opening the next chunk
 /// still counts as part of the same `\r\n` terminator.
-#[allow(
+#[expect(
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
     reason = "every index derives from `position()` over the same chunk and stays within `chunk.len()`"
@@ -2979,7 +2979,6 @@ mod tests {
             last_accessed: Instant::now(),
         };
 
-        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = state.clone();
         assert_eq!(cloned.uri(), state.uri());
         assert_eq!(cloned.language_id(), state.language_id());
@@ -3056,7 +3055,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "a table of extension mappings; splitting would scatter it"
     )]

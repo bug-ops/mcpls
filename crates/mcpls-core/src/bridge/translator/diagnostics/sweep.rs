@@ -1176,7 +1176,7 @@ impl SweepContext {
     fn spawn_contained(&self, task: SweepTask, work: impl Future<Output = ()> + Send + 'static) {
         self.pulls.spawn(async move {
             if let Err(panicked) = catch_panic(work).await {
-                warn!(?task, "disk sweep task panicked: {}", panicked.message());
+                warn!(?task, panic = %panicked.message(), "disk sweep task panicked");
             }
         });
     }

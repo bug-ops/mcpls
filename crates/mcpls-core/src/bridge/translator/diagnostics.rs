@@ -61,13 +61,7 @@ enum DocumentDiagnosticReportResult {
     // all (rather than failing to deserialize) is the only thing that
     // matters, so today's behavior of degrading to an empty diagnostics list
     // is preserved.
-    Partial(
-        #[allow(
-            dead_code,
-            reason = "the partial-result payload is only deserialized, never read"
-        )]
-        lsp_types::DocumentDiagnosticReportPartialResult,
-    ),
+    Partial(lsp_types::DocumentDiagnosticReportPartialResult),
 }
 
 /// `textDocument/diagnostic` with [`DocumentDiagnosticReportResult`] as its
@@ -473,7 +467,7 @@ impl Translator {
             if !notices.is_empty()
                 && let Err(error) = run_detached(notices.deliver(wiring)).await
             {
-                debug!("diagnostics notifications were cancelled: {error}");
+                debug!(%error, "diagnostics notifications were cancelled");
             }
         }
 
@@ -655,8 +649,9 @@ impl Translator {
                 items,
             } => {
                 debug!(
-                    "discarding the pulled diagnostics of {}: {reason:?}",
-                    uri.as_ref()
+                    uri = %uri.as_ref(),
+                    ?reason,
+                    "discarding the pulled diagnostics"
                 );
                 PullSettlement {
                     evicted,
@@ -922,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one scenario covering every severity"
     )]

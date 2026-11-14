@@ -145,10 +145,10 @@ async fn drain<R: AsyncRead + Unpin>(
             Err(e) => {
                 consecutive_errors = consecutive_errors.saturating_add(1);
                 if consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS {
-                    warn!("giving up on LSP server stderr after repeated read errors: {e}");
+                    warn!(error = %e, "giving up on LSP server stderr after repeated read errors");
                     break;
                 }
-                debug!("LSP server stderr read failed, retrying: {e}");
+                debug!(error = %e, "LSP server stderr read failed, retrying");
                 sleep(READ_RETRY_DELAY).await;
             }
         }

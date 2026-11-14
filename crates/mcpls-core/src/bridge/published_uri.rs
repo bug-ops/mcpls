@@ -317,13 +317,17 @@ impl PublishedPathResolver {
                 Err(e @ Unresolved::Transient(_)) => {
                     self.memo.note_failure(source.clone(), now);
                     debug!(
-                        "transient error resolving published path {}: {}",
-                        source.display(),
-                        ErrorChain(&e)
+                        path = %source.display(),
+                        error = %ErrorChain(&e),
+                        "transient error resolving published path"
                     );
                     fresh.insert(source, Resolution::Transient);
                 }
-                Err(e) => debug!("not resolving published path {}: {e}", source.display()),
+                Err(e) => debug!(
+                    path = %source.display(),
+                    error = %e,
+                    "not resolving published path"
+                ),
             }
         }
         fresh
@@ -342,9 +346,9 @@ async fn canonicalize_blocking(
         let outcome = canonicalize_existing_prefix(&path, canonicalize.as_ref());
         if started.elapsed() > SLOW_CANONICALIZE && !slow_logged.swap(true, Ordering::Relaxed) {
             warn!(
-                "canonicalizing a published diagnostics path took {:?} (> {SLOW_CANONICALIZE:?}); \
-                 the filesystem is slow",
-                started.elapsed()
+                elapsed = ?started.elapsed(),
+                threshold = ?SLOW_CANONICALIZE,
+                "canonicalizing a published diagnostics path was slow; the filesystem is slow"
             );
         }
         outcome

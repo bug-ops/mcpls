@@ -247,7 +247,7 @@ impl Target {
                 .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri.as_str()))
                 .await
                 .map_err(|e| {
-                    debug!("peer closed while delivering resources/updated: {e}");
+                    debug!(error = %e, "peer closed while delivering resources/updated");
                     TargetClosed
                 }),
             Self::Sink { sink, uris } => {
@@ -256,10 +256,10 @@ impl Target {
                     match sink.notify_resource_updated(raw).await {
                         Ok(()) => {}
                         Err(rmcp::service::SubscriptionSendError::NotificationNotAccepted(_)) => {
-                            warn!("listen sink rejected {raw}: not in its accepted set");
+                            warn!(%raw, "listen sink rejected a resource: not in its accepted set");
                         }
                         Err(e) => {
-                            debug!("listen stream closed while delivering resources/updated: {e}");
+                            debug!(error = %e, "listen stream closed while delivering resources/updated");
                             return Err(TargetClosed);
                         }
                     }
@@ -467,7 +467,7 @@ impl SessionState {
             return;
         }
         let Some(delivery) = self.delivery.get() else {
-            debug!("subscribed session has no bound delivery, dropping update for {uri}");
+            debug!(%uri, "subscribed session has no bound delivery, dropping update");
             return;
         };
         if delivery.doorbell.is_closed() {
@@ -479,10 +479,12 @@ impl SessionState {
             if !pending.contains(uri) {
                 if pending.len() >= MAX_SUBSCRIPTIONS {
                     if delivery.cap_warned.swap(true, Ordering::Relaxed) {
-                        debug!("pending resource updates at cap, dropping {uri}");
+                        debug!(%uri, "pending resource updates at cap, dropping update");
                     } else {
                         warn!(
-                            "pending resource updates reached {MAX_SUBSCRIPTIONS}, dropping {uri} \
+                            max = MAX_SUBSCRIPTIONS,
+                            %uri,
+                            "pending resource updates reached the cap, dropping update \
                              (further drops for this session are logged at debug)"
                         );
                     }
@@ -606,7 +608,10 @@ impl ListenUris {
                 .insert(raw.clone());
         }
         if dropped > 0 {
-            debug!("subscriptions/listen dropped {dropped} URIs that no longer resolve");
+            debug!(
+                dropped,
+                "subscriptions/listen dropped URIs that no longer resolve"
+            );
         }
         Self(map)
     }
@@ -1218,10 +1223,10 @@ mod tests {
         assert_eq!(lock_std(&delivery.pending).len(), MAX_SUBSCRIPTIONS);
         assert!(!lock_std(&delivery.pending).contains(&x));
         assert!(
-            captured
-                .messages()
-                .iter()
-                .any(|m| m.contains("dropping lsp-diagnostics:///x.rs")),
+            captured.events().iter().any(|event| {
+                event.message.contains("dropping update")
+                    && event.has_field("uri=lsp-diagnostics:///x.rs")
+            }),
             "dropping at the pending cap must be logged"
         );
     }

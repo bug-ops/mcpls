@@ -1,7 +1,7 @@
 use mcpls_core::bridge::{Translator, WorkspaceRoots};
 use mcpls_core::config::{ServerConfig, ServerId, ToolKind, ToolRouter};
 
-#[allow(unused, reason = "shared helpers; not every test uses all of them")]
+#[expect(unused, reason = "shared helpers; not every test uses all of them")]
 use crate::common::test_utils::{
     config_fixture_path, rust_analyzer_available, rust_workspace_path,
 };

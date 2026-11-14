@@ -264,7 +264,7 @@ impl Translator {
 
         self.reconcile_respawn_stability(id);
 
-        tracing::warn!("LSP server '{id}' has crashed, respawning");
+        tracing::warn!(%id, "LSP server has crashed, respawning");
         self.respawn_locked(
             id,
             RespawnConfig::Unvetted(config),
@@ -306,7 +306,7 @@ impl Translator {
     ///
     /// [`Error::ServerUnavailable`] when backoff is honoured and active, or
     /// the spawn error of the replacement.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the cache guard must be held up to the commit, which takes it by value; the lint cannot see the move"
     )]
@@ -321,8 +321,9 @@ impl Translator {
             && let Some(remaining) = self.respawn_backoff_remaining(id)
         {
             tracing::warn!(
-                "LSP server '{id}' is crash-looping, backing off for {remaining:?} \
-                 before the next respawn attempt"
+                %id,
+                ?remaining,
+                "LSP server is crash-looping, backing off before the next respawn attempt"
             );
             return Err(Error::ServerUnavailable {
                 server_id: id.clone(),
@@ -366,10 +367,10 @@ impl Translator {
             }
         });
         if finish.await.is_err() {
-            tracing::debug!("runtime shut down before the respawn of '{id}' was announced");
+            tracing::debug!(%id, "runtime shut down before the respawn was announced");
         }
 
-        tracing::info!("LSP server '{id}' respawned successfully");
+        tracing::info!(%id, "LSP server respawned successfully");
         Ok(())
     }
 
@@ -459,7 +460,8 @@ impl Translator {
             Ok(old) => old.as_ref().map(|old| old.client().clone()),
             Err(refused) => {
                 tracing::warn!(
-                    "LSP server '{id}' was shut down while it respawned; dropping the replacement"
+                    %id,
+                    "LSP server was shut down while it respawned; dropping the replacement"
                 );
                 consumer.abort();
                 drop(refused);

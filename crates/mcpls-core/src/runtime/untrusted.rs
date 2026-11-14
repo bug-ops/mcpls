@@ -390,8 +390,9 @@ pub fn plan_server_starts(
     for lsp_config in &config.lsp_servers {
         if !markers.applies_to(lsp_config) {
             info!(
-                "Skipping LSP server '{}' ({}): no project markers found",
-                lsp_config.language_id, lsp_config.command
+                server = %lsp_config.language_id,
+                command = %lsp_config.command,
+                "Skipping LSP server: no project markers found"
             );
             continue;
         }

@@ -216,13 +216,14 @@ impl UndecodableRun {
         }
         if let Some(suppressed) = self.drops.record(now) {
             warn!(
-                "Dropped an undecodable LSP message ({suppressed} others dropped since the last \
+                suppressed,
+                "Dropped an undecodable LSP message (others dropped since the last \
                  warning); further ones are logged at debug for a minute"
             );
         } else {
             debug!(
-                "Dropped an undecodable LSP message ({} in a row)",
-                self.in_a_row
+                in_a_row = self.in_a_row,
+                "Dropped an undecodable LSP message"
             );
         }
         Ok(message)
@@ -722,8 +723,11 @@ impl LspClient {
         for attempt in 0..=SERVER_CANCELLED_MAX_RETRIES {
             if attempt > 0 {
                 debug!(
-                    "Retrying {} (attempt {}/{}), backoff={}ms",
-                    method, attempt, SERVER_CANCELLED_MAX_RETRIES, delay_ms
+                    %method,
+                    attempt,
+                    max_attempts = SERVER_CANCELLED_MAX_RETRIES,
+                    backoff_ms = delay_ms,
+                    "Retrying"
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 delay_ms = delay_ms.saturating_mul(2);
@@ -738,7 +742,7 @@ impl LspClient {
                 params: params_value.clone(),
             };
 
-            debug!("Sending request: {} (id={:?})", method, id);
+            debug!(%method, ?id, "Sending request");
 
             let in_flight = self
                 .register_and_send_request(&id, request, response_tx)
@@ -771,25 +775,25 @@ impl LspClient {
                 }
                 Err(Error::LspServerError(response)) if Self::retries(&response, method) => {
                     if attempt == SERVER_CANCELLED_MAX_RETRIES {
-                        // Same "LSP error response: ..." prefix as the
+                        // Same "LSP error response" message prefix as the
                         // non-retryable branch below -- a log-grep alert on
                         // that prefix must catch every error actually
                         // surfaced to the caller, retry exhaustion included.
                         error!(
-                            "LSP error response: {} (code {}) on '{}' (id={:?}), retries exhausted",
-                            Self::truncate_error_message_for_log(&response.message),
-                            response.code,
-                            method,
-                            id
+                            error = %Self::truncate_error_message_for_log(&response.message),
+                            code = response.code,
+                            %method,
+                            ?id,
+                            "LSP error response, retries exhausted"
                         );
                         return Err(UnclassifiedError::logged(Error::LspServerError(response)));
                     }
                     warn!(
-                        "LSP error response: {} (code {}) on '{}' (id={:?}), will retry",
-                        Self::truncate_error_message_for_log(&response.message),
-                        response.code,
-                        method,
-                        id
+                        error = %Self::truncate_error_message_for_log(&response.message),
+                        code = response.code,
+                        %method,
+                        ?id,
+                        "LSP error response, will retry"
                     );
                     // continue loop for next attempt
                 }
@@ -934,7 +938,7 @@ impl LspClient {
     {
         let notification = OutboundNotification::new(method, params)?;
 
-        debug!("Sending notification: {}", method);
+        debug!(%method, "Sending notification");
 
         self.send_notification(notification).await
     }
@@ -965,7 +969,7 @@ impl LspClient {
     /// Returns [`Error::ShutdownTimeout`] if the loop did not stop in time (it is then
     /// aborted and every pending request fails with [`Error::ServerTerminated`]), or
     /// another error if the background task failed.
-    #[allow(
+    #[expect(
         clippy::arithmetic_side_effects,
         reason = "SHUTDOWN_TIMEOUT is a small constant"
     )]
@@ -1017,10 +1021,6 @@ impl LspClient {
     /// - Outbound requests and notifications
     /// - Inbound responses and server notifications
     /// - Matching responses to pending requests
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one-to-one with the spawned loop's channels and shared state"
-    )]
     async fn message_loop(
         transport: (LspTransport, LspTransportReader),
         mut command_rx: mpsc::Receiver<ClientCommand>,
@@ -1060,7 +1060,7 @@ impl LspClient {
         // requests with no answer get failed here (#458).
         Self::drain_and_fail_pending(&pending_requests, &pending_failure);
         if let Err(ref e) = result {
-            error!("Message loop exiting with error: {}", e);
+            error!(error = %e, "Message loop exiting with error");
         } else {
             debug!("Message loop exiting normally");
         }
@@ -1172,11 +1172,6 @@ impl LspClient {
         }
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        clippy::too_many_arguments,
-        reason = "one select loop over the transport, channels and shared state"
-    )]
     async fn message_loop_inner(
         transport: &mut LspTransport,
         msg_rx: &mut mpsc::Receiver<Result<InboundMessage>>,
@@ -1221,7 +1216,7 @@ impl LspClient {
                                         .await?;
                                     }
                                     Err(e) => {
-                                        error!("Transport receive error while draining on shutdown: {}", e);
+                                        error!(error = %e, "Transport receive error while draining on shutdown");
                                         break;
                                     }
                                 }
@@ -1236,7 +1231,7 @@ impl LspClient {
                     let message = match message {
                         Some(Ok(m)) => m,
                         Some(Err(e)) => {
-                            error!("Transport receive error: {}", e);
+                            error!(error = %e, "Transport receive error");
                             return Err(e);
                         }
                         None => {
@@ -1267,7 +1262,7 @@ impl LspClient {
         response: JsonRpcResponse,
         redactions: &Redactions,
     ) {
-        trace!("Received response: id={:?}", response.id);
+        trace!(id = ?response.id, "Received response");
 
         match pending_requests.resolve(&response.id) {
             Resolution::Waiting(sender) => match response.outcome {
@@ -1284,9 +1279,9 @@ impl LspClient {
                     // the response id is already traced above.
                     let message = redactions.apply(&error.message);
                     trace!(
-                        "LSP error response: {} (code {})",
-                        Self::truncate_error_message_for_log(&message),
-                        error.code
+                        error = %Self::truncate_error_message_for_log(&message),
+                        code = error.code,
+                        "LSP error response"
                     );
                     // Truncated separately from the log line, to the larger
                     // MAX_ERROR_MESSAGE_CALLER_BYTES -- the raw message is
@@ -1307,15 +1302,13 @@ impl LspClient {
             },
             Resolution::Cancelled(cause) => {
                 trace!(
-                    "Dropped the reply to a request mcpls cancelled ({cause:?}): id={:?}",
-                    response.id
+                    ?cause,
+                    id = ?response.id,
+                    "Dropped the reply to a request mcpls cancelled"
                 );
             }
             Resolution::Unknown => {
-                warn!(
-                    "Received response for unknown request ID: {:?}",
-                    response.id
-                );
+                warn!(id = ?response.id, "Received response for unknown request ID");
             }
         }
     }
@@ -1398,8 +1391,8 @@ impl LspClient {
                     };
                     if let Some(payload) = forwarded {
                         trace!(
-                            "Forwarding notification: {}",
-                            redactions.apply(&format!("{payload:?}"))
+                            payload = %redactions.apply(&format!("{payload:?}")),
+                            "Forwarding notification"
                         );
                     }
                 }
@@ -1539,11 +1532,11 @@ impl LspClient {
 /// log-grep alert watches for.
 fn log_surfaced_error(method: &str, id: &RequestId, code: i32, message: &str) {
     error!(
-        "LSP error response: {} (code {}) on '{}' (id={:?})",
-        LspClient::truncate_error_message_for_log(message),
+        error = %LspClient::truncate_error_message_for_log(message),
         code,
-        method,
-        id
+        %method,
+        ?id,
+        "LSP error response"
     );
 }
 
@@ -1585,11 +1578,11 @@ impl Unclassified {
 
 fn log_handled_error(method: &str, id: &RequestId, code: i32, message: &str) {
     debug!(
-        "LSP error response handled by the caller: {} (code {}) on '{}' (id={:?})",
-        LspClient::truncate_error_message_for_log(message),
+        error = %LspClient::truncate_error_message_for_log(message),
         code,
-        method,
-        id
+        %method,
+        ?id,
+        "LSP error response handled by the caller"
     );
 }
 
@@ -1754,9 +1747,27 @@ mod tests {
         .unwrap();
 
         assert!(lifecycle_rx.recv().await.is_some());
-        let output = logs.messages().join("\n");
-        assert!(output.contains("Forwarding notification"), "{output}");
-        assert!(!output.contains("SuperSecretValue123"), "{output}");
+        let events = logs.events();
+        let forwarded = events
+            .iter()
+            .find(|event| event.message == "Forwarding notification")
+            .unwrap_or_else(|| panic!("no forwarding event in {events:?}"));
+        assert!(
+            forwarded.fields.iter().any(
+                |field| field.starts_with("payload=") && field.contains("[redacted:API_TOKEN]")
+            ),
+            "{forwarded:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.message.contains("SuperSecretValue123")
+                    && event
+                        .fields
+                        .iter()
+                        .all(|field| !field.contains("SuperSecretValue123"))),
+            "{events:?}"
+        );
     }
 
     fn secret_diagnostics_params() -> Value {
@@ -1887,7 +1898,7 @@ mod tests {
         let config = LspServerConfig::rust_analyzer();
         let client = LspClient::new(config);
 
-        #[allow(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
+        #[expect(clippy::redundant_clone, reason = "the test exercises `Clone` itself")]
         let cloned = client.clone();
         assert_eq!(cloned.language_id(), "rust");
 
@@ -2754,8 +2765,12 @@ mod tests {
                 .map(|(_, message)| message)
                 .collect();
             assert_eq!(warnings.len(), 2, "{warnings:?}");
-            assert!(warnings[0].contains("(0 others"), "{warnings:?}");
-            assert!(warnings[1].contains("(3 others"), "{warnings:?}");
+            let suppressed: Vec<_> = captured
+                .fields()
+                .into_iter()
+                .filter(|field| field.starts_with("suppressed="))
+                .collect();
+            assert_eq!(suppressed, ["suppressed=0", "suppressed=3"]);
         }
 
         #[tokio::test]
@@ -3749,10 +3764,15 @@ mod tests {
             assert!(
                 logs.iter()
                     .any(|(level, msg)| *level == tracing::Level::ERROR
-                        && msg.contains("LSP error response")
-                        && msg.contains("content modified")),
+                        && msg.starts_with("LSP error response")),
                 "a non-retryable error must still surface an ERROR log sharing the \
                  'LSP error response' prefix, got: {logs:?}"
+            );
+            assert!(
+                captured
+                    .fields()
+                    .contains(&"error=content modified".to_string()),
+                "the server message is a field of the error event"
             );
         }
     }

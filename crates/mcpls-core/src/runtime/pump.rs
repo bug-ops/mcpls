@@ -544,8 +544,8 @@ async fn apply_publish(
     let (uri, version, diagnostics) = publish.into_parts();
     let Some(published) = published else {
         debug!(
-            "dropping diagnostics for URI outside the workspace or unresolvable: {}",
-            uri.uri().as_ref()
+            uri = %uri.uri().as_ref(),
+            "dropping diagnostics for URI outside the workspace or unresolvable"
         );
         return;
     };
@@ -637,8 +637,9 @@ async fn contain_pump_panic(
 ) {
     if let Err(panicked) = catch_panic(pump).await {
         error!(
-            "Diagnostics pump for LSP server '{server_id}' panicked: {}",
-            panicked.message()
+            %server_id,
+            panic = %panicked.message(),
+            "Diagnostics pump for LSP server panicked"
         );
         degrade_after_pump_panic(cache, server_id).await;
     }

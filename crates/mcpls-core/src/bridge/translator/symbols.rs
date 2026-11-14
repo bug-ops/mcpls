@@ -907,7 +907,7 @@ mod tests {
             detail: None,
             kind: lsp_types::SymbolKind::EnumMember,
             tags: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "`deprecated` is a deprecated field of the LSP struct literal"
             )]

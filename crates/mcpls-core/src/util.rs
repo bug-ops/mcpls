@@ -626,8 +626,9 @@ impl RestartBackoff {
         if self.limiter.due(now.into_std(), self.delays.max) {
             tracing::error!(
                 error = %panicked,
-                "{what} panicked; restarting it in {:?}, it is not running until then",
-                self.delay
+                operation = %what,
+                delay = ?self.delay,
+                "task panicked; restarting it after the delay, it is not running until then"
             );
         }
         tokio::select! {
