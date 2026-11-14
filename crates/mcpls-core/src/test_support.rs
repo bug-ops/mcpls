@@ -10,6 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+/// A `file:` URI of exactly `bytes` bytes, for probing [`crate::lsp::BoundedUri`].
+pub fn uri_of_len(bytes: usize) -> lsp_types::Uri {
+    let prefix = "file:///";
+    lsp_types::Uri::from(format!("{prefix}{}", "u".repeat(bytes - prefix.len())))
+}
+
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard that serializes CWD-mutating tests behind [`CWD_LOCK`] and

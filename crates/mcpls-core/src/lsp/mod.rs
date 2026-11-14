@@ -44,4 +44,5 @@ pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
     BoundedUri, DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, LostPublish, LspNotification, RequestId, UndecodableReason,
+    UriTooLong,
 };

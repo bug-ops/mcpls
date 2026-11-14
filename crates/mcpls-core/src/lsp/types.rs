@@ -10,6 +10,7 @@ pub use lsp_types::{
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
+use thiserror::Error as ThisError;
 use tracing::debug;
 
 /// JSON-RPC protocol version carried by every message.
@@ -236,10 +237,11 @@ pub enum UndecodableReason {
 /// use mcpls_core::lsp::BoundedUri;
 ///
 /// let short = Uri::from("file:///workspace/main.rs".to_owned());
-/// assert!(BoundedUri::new(short).is_some());
+/// assert!(BoundedUri::try_from(short).is_ok());
 ///
 /// let long = Uri::from(format!("file:///{}", "u".repeat(BoundedUri::MAX_BYTES)));
-/// assert!(BoundedUri::new(long).is_none());
+/// let err = BoundedUri::try_from(long).unwrap_err();
+/// assert!(err.bytes > BoundedUri::MAX_BYTES);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedUri(Uri);
@@ -248,12 +250,6 @@ impl BoundedUri {
     /// Longest URI kept, in bytes; far above any real path (`PATH_MAX` is 1-4
     /// KiB).
     pub const MAX_BYTES: usize = 16 * 1024;
-
-    /// `uri` if it is at most [`Self::MAX_BYTES`] bytes long.
-    #[must_use]
-    pub fn new(uri: Uri) -> Option<Self> {
-        (uri.as_ref().len() <= Self::MAX_BYTES).then_some(Self(uri))
-    }
 
     /// The URI.
     #[must_use]
@@ -273,7 +269,40 @@ impl BoundedUri {
     fn of_value(value: Value) -> Option<Self> {
         serde_json::from_value::<Uri>(value)
             .ok()
-            .and_then(Self::new)
+            .and_then(|uri| Self::try_from(uri).ok())
+    }
+
+    /// As [`Self::of_value`] for a borrowed member: the bound is checked on the
+    /// string before anything is copied.
+    fn of_value_ref(value: &Value) -> Option<Self> {
+        if value.as_str()?.len() > Self::MAX_BYTES {
+            return None;
+        }
+        Uri::deserialize(value)
+            .ok()
+            .and_then(|uri| Self::try_from(uri).ok())
+    }
+}
+
+/// A URI past [`BoundedUri::MAX_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+#[error("URI of {bytes} bytes exceeds the {max} byte bound", max = BoundedUri::MAX_BYTES)]
+pub struct UriTooLong {
+    /// The length of the rejected URI in bytes.
+    pub bytes: usize,
+}
+
+impl TryFrom<Uri> for BoundedUri {
+    type Error = UriTooLong;
+
+    /// `uri` if it is at most [`Self::MAX_BYTES`] bytes long.
+    fn try_from(uri: Uri) -> Result<Self, UriTooLong> {
+        let bytes = uri.as_ref().len();
+        if bytes <= Self::MAX_BYTES {
+            Ok(Self(uri))
+        } else {
+            Err(UriTooLong { bytes })
+        }
     }
 }
 
@@ -289,7 +318,7 @@ impl BoundedUri {
 /// use lsp_types::Uri;
 /// use mcpls_core::lsp::{BoundedUri, LostPublish};
 ///
-/// let uri = BoundedUri::new(Uri::from("file:///workspace/main.rs".to_owned())).unwrap();
+/// let uri = BoundedUri::try_from(Uri::from("file:///workspace/main.rs".to_owned())).unwrap();
 /// assert_ne!(LostPublish::File(uri), LostPublish::Unidentified);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,12 +337,7 @@ impl LostPublish {
     pub(crate) fn of_params(params: Option<&Value>) -> Self {
         params
             .and_then(|params| params.get("uri"))
-            .filter(|uri| {
-                uri.as_str()
-                    .is_none_or(|uri| uri.len() <= BoundedUri::MAX_BYTES)
-            })
-            .cloned()
-            .and_then(BoundedUri::of_value)
+            .and_then(BoundedUri::of_value_ref)
             .map_or(Self::Unidentified, Self::File)
     }
 }
@@ -580,6 +604,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::uri_of_len;
 
     #[test]
     fn test_reply_carries_exactly_one_of_result_and_error() {
@@ -944,8 +969,8 @@ mod tests {
     }
 
     fn publish_params_with_uri_of(bytes: usize) -> Value {
-        let prefix = "file:///";
-        json!({"uri": format!("{prefix}{}", "u".repeat(bytes - prefix.len())), "diagnostics": []})
+        let uri = uri_of_len(bytes);
+        json!({"uri": AsRef::<str>::as_ref(&uri), "diagnostics": []})
     }
 
     #[test]
@@ -983,13 +1008,6 @@ mod tests {
                 Err(expected) => assert_eq!(lost, expected),
             }
         }
-    }
-
-    #[test]
-    fn test_bounded_uri_accepts_exactly_the_bound() {
-        let uri = |bytes: usize| Uri::from(format!("file:///{}", "u".repeat(bytes - 8)));
-        assert!(BoundedUri::new(uri(BoundedUri::MAX_BYTES)).is_some());
-        assert!(BoundedUri::new(uri(BoundedUri::MAX_BYTES + 1)).is_none());
     }
 
     #[test]

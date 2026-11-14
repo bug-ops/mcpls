@@ -395,7 +395,8 @@ impl Pump {
         let items: Vec<BatchItem> = batch
             .into_iter()
             .map(|publish| {
-                if publication_admitted(publish.uri(), admission_role, &self.workspace_roots) {
+                if publication_admitted(publish.uri().uri(), admission_role, &self.workspace_roots)
+                {
                     BatchItem::Resolve(publish)
                 } else {
                     BatchItem::Skip(publish)
@@ -407,7 +408,7 @@ impl Pump {
             .filter(|item| matches!(item, BatchItem::Resolve(_)))
             .map(BatchItem::publish)
             .map(|publish| Publication {
-                uri: publish.uri(),
+                uri: publish.uri().uri(),
                 kind: if publish.diagnostics().as_slice().is_empty() {
                     PublicationKind::Clear
                 } else {
@@ -1518,7 +1519,7 @@ mod pump_tests {
 
         let server = ServerId::from_static("rust");
         for lost in [
-            LostPublish::File(crate::lsp::BoundedUri::new(test_uri("a.rs")).unwrap()),
+            LostPublish::File(crate::lsp::BoundedUri::try_from(test_uri("a.rs")).unwrap()),
             LostPublish::Unidentified,
         ] {
             let subs = make_subs();
@@ -1584,6 +1585,7 @@ mod pump_tests {
         use crate::bridge::DiagnosticsAvailability::{Evicted, Published};
         use crate::lsp::BoundedUri;
         use crate::mcp::{SessionHandle, Target};
+        use crate::test_support::uri_of_len;
 
         let server = ServerId::from_static("rust");
         let subs = make_subs();
@@ -1607,11 +1609,6 @@ mod pump_tests {
                 version: None,
             })
         };
-        let sized = |len: usize| {
-            let base = test_uri("a.rs");
-            let base: &str = base.as_ref();
-            Uri::from(format!("{base}{}", "u".repeat(len - base.len())).as_str())
-        };
 
         feed.send(publish_for(test_uri("a.rs"))).await.unwrap();
         assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
@@ -1623,7 +1620,7 @@ mod pump_tests {
             Published
         );
 
-        feed.send(publish_for(sized(BoundedUri::MAX_BYTES + 1)))
+        feed.send(publish_for(uri_of_len(BoundedUri::MAX_BYTES + 1)))
             .await
             .unwrap();
         assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
@@ -1632,7 +1629,7 @@ mod pump_tests {
             guard.availability(&test_uri("a.rs"), Some(&server)),
             Evicted
         );
-        assert!(!guard.has_diagnostics(&sized(BoundedUri::MAX_BYTES + 1)));
+        assert!(!guard.has_diagnostics(&uri_of_len(BoundedUri::MAX_BYTES + 1)));
         drop(guard);
     }
 

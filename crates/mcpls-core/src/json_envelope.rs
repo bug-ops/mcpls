@@ -20,8 +20,6 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::lsp::BoundedUri;
-
 const MAX_ID_BYTES: usize = 128;
 const MAX_METHOD_BYTES: usize = 128;
 const QUOTES: usize = 2;
@@ -398,7 +396,10 @@ enum EnvelopeSlot {
 #[derive(Debug)]
 enum ParamsUri {
     Off,
-    Absent,
+    /// No `params` seen yet; its `uri` is kept up to the limit.
+    Absent {
+        uri_limit_bytes: usize,
+    },
     Active(Box<ObjectScan<UriLayout>>),
     /// `params` appeared twice.
     Unusable,
@@ -433,8 +434,10 @@ impl Layout for EnvelopeLayout {
             EnvelopeSlot::Result | EnvelopeSlot::Error => self.outcome = true,
             EnvelopeSlot::Params => match self.params {
                 ParamsUri::Off => {}
-                ParamsUri::Absent => {
-                    self.params = ParamsUri::Active(Box::new(ObjectScan::new(UriLayout::new())));
+                ParamsUri::Absent { uri_limit_bytes } => {
+                    self.params = ParamsUri::Active(Box::new(ObjectScan::new(UriLayout::new(
+                        uri_limit_bytes,
+                    ))));
                 }
                 ParamsUri::Active(_) | ParamsUri::Unusable => self.params = ParamsUri::Unusable,
             },
@@ -472,9 +475,9 @@ struct UriLayout {
 }
 
 impl UriLayout {
-    const fn new() -> Self {
+    const fn new(uri_limit_bytes: usize) -> Self {
         Self {
-            uri: Capture::new(BoundedUri::MAX_BYTES + QUOTES),
+            uri: Capture::new(uri_limit_bytes.saturating_add(QUOTES)),
         }
     }
 }
@@ -584,9 +587,10 @@ impl Default for EnvelopeScan {
 }
 
 impl EnvelopeScan {
-    /// A scan that also reads the `uri` of an object-valued `params`.
-    pub(crate) const fn with_params_uri() -> Self {
-        Self::with_params(ParamsUri::Absent)
+    /// A scan that also reads the `uri` of an object-valued `params`, keeping
+    /// at most `uri_limit_bytes` bytes of it.
+    pub(crate) const fn with_params_uri(uri_limit_bytes: usize) -> Self {
+        Self::with_params(ParamsUri::Absent { uri_limit_bytes })
     }
 
     const fn with_params(params: ParamsUri) -> Self {
@@ -607,7 +611,7 @@ impl EnvelopeScan {
     pub(crate) fn finish(&self) -> Envelope {
         let layout = &self.0.layout;
         let params_uri = match &layout.params {
-            ParamsUri::Off | ParamsUri::Absent => Token::Absent,
+            ParamsUri::Off | ParamsUri::Absent { .. } => Token::Absent,
             ParamsUri::Unusable => Token::Unusable,
             ParamsUri::Active(inner) => inner.layout.uri.token(),
         };
@@ -873,8 +877,8 @@ mod tests {
 
     #[test]
     fn test_params_uri_over_its_bound_is_unusable_and_a_cut_one_is_never_complete() {
-        let at_bound = "u".repeat(BoundedUri::MAX_BYTES);
-        let over_bound = "u".repeat(BoundedUri::MAX_BYTES + 1);
+        let at_bound = "u".repeat(URI_LIMIT);
+        let over_bound = "u".repeat(URI_LIMIT + 1);
         let line = |uri: &str| format!(r#"{{"method":"m","params":{{"uri":"{uri}"}}}}"#);
         assert_eq!(
             scan_with_params_uri(line(&at_bound).as_bytes())
@@ -943,8 +947,10 @@ mod tests {
         ]
     }
 
+    const URI_LIMIT: usize = 16 * 1024;
+
     fn scan_with_params_uri(line: &[u8]) -> Envelope {
-        let mut scan = EnvelopeScan::with_params_uri();
+        let mut scan = EnvelopeScan::with_params_uri(URI_LIMIT);
         scan.feed(line);
         scan.finish()
     }
@@ -1029,7 +1035,7 @@ mod tests {
             chunked.feed(head);
             chunked.feed(tail);
             proptest::prop_assert_eq!(chunked.finish(), envelope);
-            let mut chunked = EnvelopeScan::with_params_uri();
+            let mut chunked = EnvelopeScan::with_params_uri(URI_LIMIT);
             chunked.feed(head);
             chunked.feed(tail);
             proptest::prop_assert_eq!(chunked.finish(), with_uri);
@@ -1046,7 +1052,7 @@ mod tests {
             let line = serde_json::to_string(&object).unwrap();
             let full = expected_params_uri(&object);
 
-            let mut scan = EnvelopeScan::with_params_uri();
+            let mut scan = EnvelopeScan::with_params_uri(URI_LIMIT);
             for byte in line.bytes() {
                 if let Token::Complete(raw) = scan.finish().params_uri {
                     proptest::prop_assert_eq!(&Token::Complete(raw), &full);

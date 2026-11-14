@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams, Uri};
+use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
@@ -73,7 +73,7 @@ impl BoundedPublish {
             diagnostics,
             version,
         } = params;
-        let uri = BoundedUri::new(uri)?;
+        let uri = BoundedUri::try_from(uri).ok()?;
         let diagnostics = BoundedDiagnostics::new(uri.uri(), diagnostics);
         let bytes = diagnostics
             .buffered_bytes()
@@ -90,8 +90,8 @@ impl BoundedPublish {
 
     /// The file the server published for, exactly as it spelled it.
     #[must_use]
-    pub const fn uri(&self) -> &Uri {
-        self.uri.uri()
+    pub const fn uri(&self) -> &BoundedUri {
+        &self.uri
     }
 
     /// The document version the diagnostics are for, if the server said.
@@ -349,12 +349,12 @@ impl PublishWriter {
             self.lose(LostPublish::Unidentified);
             return;
         };
-        let key = DiagnosticsKey::of(publish.uri());
+        let key = DiagnosticsKey::of(publish.uri().uri());
         let limits = self.shared.limits;
         let mut state = lock_std(&self.shared.state);
         if state.reader_gone {
             debug!(
-                uri = publish.uri().as_ref(),
+                uri = publish.uri().uri().as_ref(),
                 "dropping a publish: nobody reads the mailbox"
             );
             return;
@@ -638,21 +638,17 @@ impl DropLog {
 mod tests {
     use std::assert_matches;
 
-    use lsp_types::Diagnostic;
+    use lsp_types::{Diagnostic, Uri};
 
     use super::*;
+    use crate::test_support::uri_of_len;
 
     fn uri(n: usize) -> Uri {
         Uri::from(format!("file:///ws/f{n}.rs"))
     }
 
     fn bounded(n: usize) -> BoundedUri {
-        BoundedUri::new(uri(n)).unwrap()
-    }
-
-    fn long_uri(bytes: usize) -> Uri {
-        let prefix = "file:///";
-        Uri::from(format!("{prefix}{}", "u".repeat(bytes - prefix.len())))
+        BoundedUri::try_from(uri(n)).unwrap()
     }
 
     fn publish_of(n: usize, message: &str) -> PublishDiagnosticsParams {
@@ -720,8 +716,8 @@ mod tests {
             panic!("expected the lost file first");
         };
         assert_eq!(lost.uris(), [bounded(1)]);
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(2));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(1));
         assert!(reader.recv().await.is_none());
     }
 
@@ -748,7 +744,7 @@ mod tests {
         drop(writer);
 
         for n in 0..10 {
-            assert_eq!(next_publish(&mut reader).await.uri(), &uri(n));
+            assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(n));
         }
         assert!(reader.recv().await.is_none());
     }
@@ -784,8 +780,8 @@ mod tests {
             panic!("the loss must be handed over first");
         };
         assert_eq!(lost.uris(), [bounded(2), bounded(3)]);
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(0));
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(1));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(0));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(1));
     }
 
     /// A replacement that does not fit withdraws the older pending publish
@@ -837,7 +833,7 @@ mod tests {
             }
         }
         let delivered = delivered.expect("the replaced publish must reach the reader");
-        assert_eq!(delivered.uri(), &uri(100));
+        assert_eq!(delivered.uri().uri(), &uri(100));
         assert_eq!(
             delivered
                 .diagnostics()
@@ -927,7 +923,7 @@ mod tests {
             panic!("expected the lost file first");
         };
         assert_eq!(lost.uris(), [bounded(1)]);
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(2));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(2));
         assert!(reader.recv().await.is_none());
     }
 
@@ -942,7 +938,7 @@ mod tests {
         drop(writer);
 
         assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
-        assert_eq!(next_publish(&mut reader).await.uri(), &uri(3));
+        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(3));
         assert!(reader.recv().await.is_none());
     }
 
@@ -966,7 +962,7 @@ mod tests {
         let (writer, mut reader) = mailbox(MailboxLimits::default());
         writer.publish(publish_of(1, "old"));
         let mut over = publish_of(2, "e");
-        over.uri = long_uri(BoundedUri::MAX_BYTES + 1);
+        over.uri = uri_of_len(BoundedUri::MAX_BYTES + 1);
 
         writer.publish(over);
         drop(writer);
@@ -979,13 +975,13 @@ mod tests {
     async fn a_publish_with_a_uri_at_the_bound_is_buffered() {
         let (writer, mut reader) = mailbox(MailboxLimits::default());
         let mut at = publish_of(2, "e");
-        at.uri = long_uri(BoundedUri::MAX_BYTES);
+        at.uri = uri_of_len(BoundedUri::MAX_BYTES);
 
         writer.publish(at);
         drop(writer);
 
         assert_eq!(
-            next_publish(&mut reader).await.uri().as_ref().len(),
+            next_publish(&mut reader).await.uri().uri().as_ref().len(),
             BoundedUri::MAX_BYTES
         );
     }
@@ -994,7 +990,7 @@ mod tests {
     async fn a_capacity_drop_never_stores_a_uri_past_the_bound() {
         let (writer, mut reader) = mailbox(small(0, usize::MAX));
         let mut over = publish_of(1, "e");
-        over.uri = long_uri(BoundedUri::MAX_BYTES + 1);
+        over.uri = uri_of_len(BoundedUri::MAX_BYTES + 1);
 
         writer.publish(over);
         writer.publish(publish_of(2, "e"));
