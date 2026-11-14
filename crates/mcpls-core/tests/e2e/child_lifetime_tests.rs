@@ -154,11 +154,27 @@ fn wait_for_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Process table snapshot for failure messages: `kill -0` also succeeds on
+/// zombies, so the `stat` column tells a live survivor from an unreaped one.
+fn process_table() -> String {
+    std::process::Command::new("ps")
+        .args(["-A", "-o", "pid,ppid,pgid,stat,args"])
+        .output()
+        .map_or_else(
+            |error| format!("ps failed: {error}"),
+            |out| String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+}
+
 fn assert_all_gone(pids: &[u32], what: &str) -> Result<()> {
     let deadline = Instant::now() + POLL_CEILING;
     for pid in pids {
         while pid_alive(*pid)? {
-            assert!(Instant::now() < deadline, "pid {pid} survived {what}");
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} survived {what} (recorded pids: {pids:?})\nprocess table:\n{}",
+                process_table()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
