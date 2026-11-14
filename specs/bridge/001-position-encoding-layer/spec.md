@@ -149,7 +149,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
 | `PositionEncoding` | The three LSP-negotiable character-counting conventions | `Utf8`, `Utf16` (default), `Utf32` |
-| `EncodingConverter` | Stateless converter bound to one `PositionEncoding`, converting between byte offsets and character offsets in a given line of text | `byte_offset_to_character(text, byte_offset) -> Result<u32, String>`, `character_to_byte_offset(text, character_offset) -> Result<usize, String>` |
+| `EncodingConverter` | Stateless converter bound to one `PositionEncoding`, converting between byte offsets and character offsets in a given line of text | `byte_offset_to_character(text, byte_offset) -> Result<u32, OffsetError>`, `character_to_byte_offset(text, character_offset) -> Result<usize, OffsetError>` |
 | MCP position | 1-based `(line, character)`, character always in UTF-16 units | `line: u32`, `character: u32` |
 | LSP `Position` (`lsp_types::Position`) | 0-based `(line, character)`, character in the negotiated encoding's units | `line: u32`, `character: u32` |
 
@@ -178,7 +178,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and test(encoding)'` | All existing unit tests in `bridge/encoding.rs` pass |
-| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D { line: l, character: c }` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
+| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D::from_mcp(l, c)` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
 | SC-003 | No panic on any fuzzed/adversarial byte offset within `0..=text.len()` | Every offset either succeeds or returns `Err`, never panics |
 
 ## 8. Agent Boundaries

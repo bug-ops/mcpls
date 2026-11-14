@@ -51,8 +51,8 @@ fn file_path(repo: &Path, file: &RepoPath) -> String {
 fn position_args(repo: &Path, file: &RepoPath, at: &Position2D) -> PositionArgs {
     PositionArgs {
         file_path: file_path(repo, file),
-        line: at.line,
-        character: at.character,
+        line: at.line(),
+        character: at.character(),
     }
 }
 
@@ -269,10 +269,7 @@ mod tests {
     fn hover_probe(contains: &str) -> Probe {
         Probe::Hover {
             file: RepoPath::try_from("src/lib.rs".to_owned()).unwrap(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             contains: contains.to_owned(),
             symbol: None,
         }
@@ -291,10 +288,7 @@ mod tests {
     fn structured_content_is_preferred() {
         let probe = Probe::References {
             file: RepoPath::try_from("src/lib.rs".to_owned()).unwrap(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             min_count: 1,
             symbol: None,
         };

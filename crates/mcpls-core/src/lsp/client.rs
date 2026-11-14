@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{ErrorCodes, LspErrorCodes, LspRequestMethod, PublishDiagnosticsParams};
+use lsp_types::{ErrorCodes, LspErrorCodes, LspRequestMethod};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -16,9 +16,9 @@ use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader, MAX_CONTENT_LENGTH};
 use crate::lsp::types::{
-    DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome,
-    JsonRpcReply, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LostPublish, LspNotification,
-    RequestId, UndecodableReason,
+    DecodedPublish, DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification,
+    JsonRpcOutcome, JsonRpcReply, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LostPublish,
+    LspNotification, RequestId, UndecodableReason,
 };
 use crate::lsp::{DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
@@ -349,7 +349,7 @@ struct Lanes {
 #[derive(Debug)]
 enum Route<'a> {
     /// The diagnostics mailbox.
-    Mailbox(&'a NotificationSink, PublishDiagnosticsParams),
+    Mailbox(&'a NotificationSink, DecodedPublish),
     /// The diagnostics mailbox, told that a publish was lost.
     Lost(&'a NotificationSink, LostPublish),
     /// The log and `showMessage` lane.
@@ -1109,8 +1109,8 @@ impl LspClient {
             return Route::Floor;
         };
         match notification {
-            LspNotification::PublishDiagnostics(params) => {
-                Route::Mailbox(&lanes.notifications, params)
+            LspNotification::PublishDiagnostics(publish) => {
+                Route::Mailbox(&lanes.notifications, publish)
             }
             LspNotification::LostPublish(lost) => Route::Lost(&lanes.notifications, lost),
             LspNotification::LogMessage(params) => {
@@ -1148,13 +1148,13 @@ impl LspClient {
             }
         };
         match route {
-            Route::Mailbox(sink, params) => {
+            Route::Mailbox(sink, publish) => {
                 debug!(
-                    uri = params.uri.as_ref(),
-                    items = params.diagnostics.len(),
+                    uri = publish.uri().uri().as_ref(),
+                    items = publish.diagnostics().len(),
                     "Forwarding diagnostics"
                 );
-                sink.publishes().publish(params);
+                sink.publishes().publish(publish);
                 Delivery::Delivered
             }
             Route::Lost(sink, lost) => {
@@ -1420,8 +1420,8 @@ impl LspClient {
             LspNotification::ShowMessage(params) => {
                 redactions.redact_in_place(&mut params.message);
             }
-            LspNotification::PublishDiagnostics(params) => {
-                for diagnostic in &mut params.diagnostics {
+            LspNotification::PublishDiagnostics(publish) => {
+                for diagnostic in publish.diagnostics_mut() {
                     redactions.redact_diagnostic(diagnostic);
                 }
             }
@@ -1471,8 +1471,12 @@ impl LspClient {
     /// when `items` is absent (the reply before settings existed). With
     /// settings an item gets its section (the whole object when `section` is
     /// absent, `Null` when it is unknown, not a string, or the item is not an
-    /// object); only a missing
-    /// `items` list is answered with `-32602`. `scopeUri` is never read.
+    /// object); only a missing `items` list is answered with `-32602`.
+    /// `scopeUri` is never read.
+    ///
+    /// More than [`MAX_CONFIGURATION_ITEMS`] items are answered with `-32602`
+    /// and a reply that would serialize past [`MAX_CONFIGURATION_REPLY_BYTES`]
+    /// with `-32603`, both before any section is copied.
     fn workspace_configuration_result(
         params: Option<&Value>,
         settings: Option<&LspSettings>,
@@ -1480,6 +1484,12 @@ impl LspClient {
         let items = params
             .and_then(|params| params.get("items"))
             .and_then(Value::as_array);
+        if items.is_some_and(|items| items.len() > MAX_CONFIGURATION_ITEMS) {
+            return Err(JsonRpcError::new(
+                ErrorCodes::InvalidParams,
+                format!("workspace/configuration over {MAX_CONFIGURATION_ITEMS} items"),
+            ));
+        }
         let Some(settings) = settings else {
             return Ok(Value::Array(vec![
                 Value::Null;
@@ -1492,15 +1502,29 @@ impl LspClient {
                 "Invalid params for workspace/configuration",
             )
         })?;
-        let sections = items
+        let sections: Vec<_> = items
             .iter()
             .map(|item| match ConfigurationItem::parse(item) {
-                ConfigurationItem::Whole => settings.section(None),
-                ConfigurationItem::Section(section) => settings.section(Some(section)),
-                ConfigurationItem::Uninterpretable => Value::Null,
+                ConfigurationItem::Whole => settings.section_ref(None),
+                ConfigurationItem::Section(section) => settings.section_ref(Some(section)),
+                ConfigurationItem::Uninterpretable => LspSettings::missing_section(),
             })
             .collect();
-        Ok(Value::Array(sections))
+        let mut total = 0usize;
+        for section in &sections {
+            total = total.saturating_add(section.serialized_len());
+            if total > MAX_CONFIGURATION_REPLY_BYTES {
+                return Err(JsonRpcError::new(
+                    ErrorCodes::InternalError,
+                    format!(
+                        "workspace/configuration reply over {MAX_CONFIGURATION_REPLY_BYTES} bytes"
+                    ),
+                ));
+            }
+        }
+        Ok(Value::Array(
+            sections.into_iter().map(Value::from).collect(),
+        ))
     }
 }
 
@@ -1618,6 +1642,13 @@ impl Drop for UnclassifiedError {
         drop(inner.finish(log_surfaced_error));
     }
 }
+
+/// Most items a `workspace/configuration` request may carry; real servers ask
+/// for a handful of sections.
+const MAX_CONFIGURATION_ITEMS: usize = 256;
+
+/// Largest serialized `workspace/configuration` reply mcpls will build.
+const MAX_CONFIGURATION_REPLY_BYTES: usize = 4 * 1024 * 1024;
 
 /// How one `workspace/configuration` item selects part of the settings.
 enum ConfigurationItem<'a> {
@@ -2110,6 +2141,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_workspace_configuration_rejects_too_many_items() {
+        let items = vec![serde_json::json!({}); MAX_CONFIGURATION_ITEMS + 1];
+        let params = serde_json::json!({ "items": items });
+        for settings in [None, Some(&sample_settings())] {
+            let error =
+                LspClient::workspace_configuration_result(Some(&params), settings).unwrap_err();
+            assert_eq!(error.code, -32602);
+        }
+        let at_cap = serde_json::json!({
+            "items": vec![serde_json::json!({}); MAX_CONFIGURATION_ITEMS]
+        });
+        assert!(LspClient::workspace_configuration_result(Some(&at_cap), None).is_ok());
+    }
+
+    #[test]
+    fn test_workspace_configuration_rejects_oversized_reply() {
+        let big = "x".repeat(32 * 1024);
+        let settings: LspSettings =
+            serde_json::from_value(serde_json::json!({ "k": big })).unwrap();
+        let params = serde_json::json!({
+            "items": vec![serde_json::json!({}); MAX_CONFIGURATION_ITEMS]
+        });
+
+        let error =
+            LspClient::workspace_configuration_result(Some(&params), Some(&settings)).unwrap_err();
+
+        assert_eq!(error.code, -32603);
+    }
+
     /// P1: without this, no spec-compliant LSP server may ever initiate
     /// `$/progress` at all (per LSP 3.17, a server needs a successful
     /// `window/workDoneProgress/create` response before it may report
@@ -2207,7 +2268,7 @@ mod tests {
     #[test]
     fn test_route_covers_every_notification_shape() {
         let publish = || {
-            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+            LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: lsp_types::Uri::from("file:///a.rs".to_owned()),
                 diagnostics: Vec::new(),
                 version: None,

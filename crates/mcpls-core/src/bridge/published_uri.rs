@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+#[cfg(test)]
 use lsp_types::Uri;
 use tracing::{debug, warn};
 
@@ -41,6 +42,7 @@ use super::resources::{CanonicalForm, PublishedDiagnosticsUri};
 use super::workspace_roots::{CanonicalizeFn, Unresolved, canonicalize_existing_prefix};
 use super::{WorkspaceRoots, lexically_normalize, uri_to_path};
 use crate::error::ErrorChain;
+use crate::lsp::BoundedUri;
 
 /// Maximum canonicalizations running concurrently for one resolver.
 pub const RESOLVE_CONCURRENCY: usize = 8;
@@ -90,7 +92,7 @@ impl PublicationKind {
 #[derive(Debug, Clone, Copy)]
 pub struct Publication<'a> {
     /// The URI exactly as the server published it.
-    pub uri: &'a Uri,
+    pub uri: &'a BoundedUri,
     /// Whether it carries diagnostics or clears them.
     pub kind: PublicationKind,
 }
@@ -223,7 +225,7 @@ impl PublishedPathResolver {
     ) -> Vec<Option<PublishedDiagnosticsUri>> {
         let sources: Vec<Option<PathBuf>> = publications
             .iter()
-            .map(|publication| uri_to_path(publication.uri))
+            .map(|publication| uri_to_path(publication.uri.uri()))
             .collect();
         let now = Instant::now();
 
@@ -357,7 +359,7 @@ async fn canonicalize_blocking(
 
 /// A diagnostics-bearing [`Publication`] for `uri`.
 #[cfg(test)]
-pub const fn diagnostics(uri: &Uri) -> Publication<'_> {
+pub const fn diagnostics(uri: &BoundedUri) -> Publication<'_> {
     Publication {
         uri,
         kind: PublicationKind::Diagnostics,
@@ -367,8 +369,9 @@ pub const fn diagnostics(uri: &Uri) -> Publication<'_> {
 /// Resolves a single URI with a throwaway resolver.
 #[cfg(test)]
 pub async fn resolve_one(uri: &Uri, roots: &WorkspaceRoots) -> Option<PublishedDiagnosticsUri> {
+    let uri = BoundedUri::try_from(uri.clone()).expect("test URI is within the bound");
     PublishedPathResolver::new()
-        .resolve_batch(&[diagnostics(uri)], roots)
+        .resolve_batch(&[diagnostics(&uri)], roots)
         .await
         .pop()
         .flatten()
@@ -393,8 +396,8 @@ mod tests {
         WorkspaceRoots::from_paths(&[root.to_path_buf()]).unwrap()
     }
 
-    fn uri(path: &Path) -> Uri {
-        path_to_uri(path).unwrap()
+    fn uri(path: &Path) -> BoundedUri {
+        BoundedUri::try_from(path_to_uri(path).unwrap()).unwrap()
     }
 
     /// Identity canonicalizer that counts calls and fails per `fail`.
@@ -519,6 +522,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_invalid_name_is_dropped_once_without_memo_or_holdoff() {
+        let (_dir, root) = root();
+        let file = uri(&root.join("a.rs"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = PublishedPathResolver::with_canonicalizer(counting(&calls, |_, _| {
+            Some(io::ErrorKind::InvalidFilename)
+        }));
+        let roots = roots_of(&root);
+        let clear = Publication {
+            uri: &file,
+            kind: PublicationKind::Clear,
+        };
+
+        assert!(resolver.resolve_batch(&[diagnostics(&file)], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+        assert!(resolver.resolve_batch(&[clear], &roots).await[0].is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no hold-off");
+        assert!(resolver.memo.entries.is_empty());
+        assert!(resolver.memo.failed.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_transient_failure_is_held_off_not_cached_as_success() {
         let (_dir, root) = root();
         let file = uri(&root.join("a.rs"));
@@ -563,8 +588,8 @@ mod tests {
         let out = resolver.resolve_batch(&[clear], &roots_of(&root)).await;
 
         let published = out[0].as_ref().unwrap();
-        assert_eq!(published.canonical(), &real);
-        assert_eq!(published.source(), &link);
+        assert_eq!(published.canonical(), real.uri());
+        assert_eq!(published.source(), link.uri());
         assert!(!published.is_canonical());
     }
 
@@ -606,7 +631,7 @@ mod tests {
             .await;
 
         assert!(out[0].is_none());
-        assert_eq!(out[1].as_ref().unwrap().canonical(), &file);
+        assert_eq!(out[1].as_ref().unwrap().canonical(), file.uri());
         assert!(!out[1].as_ref().unwrap().is_canonical());
     }
 
@@ -626,7 +651,7 @@ mod tests {
         let holdoff = resolver.resolve_batch(&[lost], &roots_of(&root)).await;
 
         for out in [first, holdoff] {
-            assert_eq!(out[0].as_ref().unwrap().canonical(), &file);
+            assert_eq!(out[0].as_ref().unwrap().canonical(), file.uri());
         }
     }
 
@@ -650,7 +675,7 @@ mod tests {
         let out = resolver.resolve_batch(&batch, &roots_of(&root)).await;
 
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0].as_ref().unwrap().source(), &a);
+        assert_eq!(out[0].as_ref().unwrap().source(), a.uri());
         assert!(out[1].is_none());
         assert!(out[2].is_none());
     }
@@ -673,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn test_cold_burst_of_5000_uris_resolves_all_in_order() {
         let (_dir, root) = root();
-        let uris: Vec<Uri> = (0..5000)
+        let uris: Vec<BoundedUri> = (0..5000)
             .map(|i| uri(&root.join(format!("dir{}/f{i}.rs", i % 50))))
             .collect();
         let refs: Vec<Publication<'_>> = uris.iter().map(diagnostics).collect();
@@ -684,14 +709,14 @@ mod tests {
 
         assert_eq!(out.len(), 5000);
         for (input, resolved) in uris.iter().zip(&out) {
-            assert_eq!(resolved.as_ref().unwrap().canonical(), input);
+            assert_eq!(resolved.as_ref().unwrap().canonical(), input.uri());
         }
     }
 
     #[tokio::test]
     async fn test_slow_canonicalizer_loses_nothing_and_keeps_order() {
         let (_dir, root) = root();
-        let uris: Vec<Uri> = (0..40)
+        let uris: Vec<BoundedUri> = (0..40)
             .map(|i| uri(&root.join(format!("f{i}.rs"))))
             .collect();
         let refs: Vec<Publication<'_>> = uris.iter().map(diagnostics).collect();
@@ -717,7 +742,7 @@ mod tests {
 
         assert_eq!(out.len(), 40);
         for (input, resolved) in uris.iter().zip(&out) {
-            assert_eq!(resolved.as_ref().unwrap().source(), input);
+            assert_eq!(resolved.as_ref().unwrap().source(), input.uri());
         }
         assert!(peak.load(Ordering::SeqCst) <= RESOLVE_CONCURRENCY);
         assert!(peak.load(Ordering::SeqCst) > 1);

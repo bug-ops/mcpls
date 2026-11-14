@@ -177,7 +177,7 @@ mod tests {
         let spans: Vec<_> = result
             .ranges
             .iter()
-            .map(|r| (r.start.character, r.end.character))
+            .map(|r| (r.start.character(), r.end.character()))
             .collect();
         assert_eq!(spans, [(3, 4), (3, 8), (1, 9), (1, 10)]);
         assert!(!result.truncated);
@@ -213,9 +213,9 @@ mod tests {
 
         assert_eq!(result.ranges.len(), MAX_SELECTION_CHAIN);
         assert!(result.truncated);
-        assert_eq!(result.ranges[0].end.character, 61);
+        assert_eq!(result.ranges[0].end.character(), 61);
         assert_eq!(
-            result.ranges[MAX_SELECTION_CHAIN - 1].end.character,
+            result.ranges[MAX_SELECTION_CHAIN - 1].end.character(),
             60 + u32::try_from(MAX_SELECTION_CHAIN).unwrap()
         );
         assert_eq!(serde_json::to_value(&result).unwrap()["truncated"], true);
@@ -258,8 +258,8 @@ mod tests {
         )
         .await;
         assert_eq!(request["params"]["positions"][0]["character"], 5);
-        assert_eq!(result.ranges[0].start.character, 5);
-        assert_eq!(result.ranges[0].end.character, 6);
+        assert_eq!(result.ranges[0].start.character(), 5);
+        assert_eq!(result.ranges[0].end.character(), 6);
         assert_eq!(result.positions_degraded, None);
     }
 

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
 use super::kind_filter::{self, KindFilter};
+use crate::bridge::encoding::{LspLine, lsp_column, mcp_column};
 use crate::bridge::notifications::ReportedSeverity;
 use crate::config::text_newtype::impl_text_newtype;
 use crate::config::{BoundedText, InvalidBoundedText, ServerId};
@@ -27,9 +28,60 @@ pub(super) fn lsp_kind_to_u32<T: Into<u32>>(kind: T) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Position2D {
     /// Line number (1-based).
-    pub line: u32,
+    line: u32,
     /// Character offset (1-based).
-    pub character: u32,
+    character: u32,
+}
+
+impl Position2D {
+    /// Builds a position from 1-based MCP numbers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mcpls_core::bridge::Position2D;
+    ///
+    /// let position = Position2D::from_mcp(3, 5);
+    /// assert_eq!((position.line(), position.character()), (3, 5));
+    /// assert_eq!((position.lsp_line().get(), position.lsp_character()), (2, 4));
+    /// ```
+    #[must_use]
+    pub const fn from_mcp(line: u32, character: u32) -> Self {
+        Self { line, character }
+    }
+
+    /// Builds a position from a 0-based LSP line and a 0-based UTF-16 column.
+    #[must_use]
+    pub(crate) const fn from_lsp(line: LspLine, utf16_column: u32) -> Self {
+        Self {
+            line: line.to_mcp(),
+            character: mcp_column(utf16_column),
+        }
+    }
+
+    /// Line number (1-based).
+    #[must_use]
+    pub const fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Character offset (1-based).
+    #[must_use]
+    pub const fn character(&self) -> u32 {
+        self.character
+    }
+
+    /// The 0-based LSP line.
+    #[must_use]
+    pub const fn lsp_line(&self) -> LspLine {
+        LspLine::from_mcp(self.line)
+    }
+
+    /// The 0-based character offset, still in UTF-16 units.
+    #[must_use]
+    pub const fn lsp_character(&self) -> u32 {
+        lsp_column(self.character)
+    }
 }
 
 /// Largest line or character value a client may supply.
@@ -355,14 +407,14 @@ impl Position {
 
     /// Zero-based LSP line.
     #[must_use]
-    pub const fn lsp_line(self) -> u32 {
-        self.line.get().saturating_sub(1)
+    pub const fn lsp_line(self) -> LspLine {
+        LspLine::from_mcp(self.line.get())
     }
 
     /// Zero-based character offset, still in UTF-16 units.
     #[must_use]
     pub const fn lsp_character(self) -> u32 {
-        self.character.get().saturating_sub(1)
+        lsp_column(self.character.get())
     }
 
     /// Reuses a position taken from server output, which is already 1-based
@@ -2096,14 +2148,8 @@ mod tests {
 
     fn range() -> Range {
         Range {
-            start: Position2D {
-                line: 1,
-                character: 1,
-            },
-            end: Position2D {
-                line: 1,
-                character: 2,
-            },
+            start: Position2D::from_mcp(1, 1),
+            end: Position2D::from_mcp(1, 2),
         }
     }
 
@@ -2198,10 +2244,7 @@ mod tests {
     fn test_server_text_redacts_inlay_label_and_tooltip() {
         let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
         let mut hint = InlayHintEntry {
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             label: format!(": {SECRET}"),
             kind: None,
             padding_left: None,
@@ -2412,20 +2455,18 @@ mod tests {
             Err(InvalidPosition::TooLarge)
         );
         let max = Position::from_client(MAX_POSITION_VALUE, MAX_POSITION_VALUE).unwrap();
-        assert_eq!((max.lsp_line(), max.lsp_character()), (999_999, 999_999));
+        assert_eq!(
+            (max.lsp_line().get(), max.lsp_character()),
+            (999_999, 999_999)
+        );
     }
 
     #[test]
     fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
-        let big = Position::from_server_output(&Position2D {
-            line: MAX_POSITION_VALUE + 7,
-            character: 2_000_000,
-        });
+        let big =
+            Position::from_server_output(&Position2D::from_mcp(MAX_POSITION_VALUE + 7, 2_000_000));
         assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
-        let clamped = Position::from_server_output(&Position2D {
-            line: 0,
-            character: 0,
-        });
+        let clamped = Position::from_server_output(&Position2D::from_mcp(0, 0));
         assert_eq!((clamped.line().get(), clamped.character().get()), (1, 1));
     }
 

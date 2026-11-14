@@ -4356,14 +4356,8 @@ mod tests {
             .structured_result(Ok(FormatDocumentResult {
                 edits: vec![TextEdit {
                     range: Range {
-                        start: Position2D {
-                            line: 1,
-                            character: 1,
-                        },
-                        end: Position2D {
-                            line: 1,
-                            character: 2,
-                        },
+                        start: Position2D::from_mcp(1, 1),
+                        end: Position2D::from_mcp(1, 2),
                     },
                     new_text: "SuperSecretValue123".to_owned(),
                 }],
@@ -4424,16 +4418,17 @@ mod tests {
             &mut notification,
             &Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]),
         );
-        let LspNotification::PublishDiagnostics(params) = notification else {
+        let LspNotification::PublishDiagnostics(publish) = notification else {
             panic!("expected publishDiagnostics");
         };
+        let (uri, _, diagnostics) = publish.into_parts();
         {
             let mut cache = server.context.notification_cache.lock().await;
             cache.store_diagnostics(
                 &crate::config::ServerId::from_static("rust"),
-                &params.uri,
+                uri.uri(),
                 None,
-                params.diagnostics,
+                diagnostics,
             );
         }
 
@@ -6965,7 +6960,7 @@ sleep 0.3
         };
         let type_item = || {
             let uri = url::Url::from_file_path(file).unwrap().to_string();
-            let at = |character| crate::bridge::Position2D { line: 1, character };
+            let at = |character| crate::bridge::Position2D::from_mcp(1, character);
             TypeHierarchyWalkParams {
                 item: crate::bridge::HierarchyItem {
                     name: "T".to_string(),

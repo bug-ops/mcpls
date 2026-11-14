@@ -24,7 +24,7 @@ use crate::config::{DocumentLimit, ServerId};
 use crate::test_lsp::client_path;
 
 fn at(line: u32, character: u32) -> Position2D {
-    Position2D { line, character }
+    Position2D::from_mcp(line, character)
 }
 
 fn range(start: (u32, u32), end: (u32, u32)) -> Range {
@@ -294,7 +294,7 @@ async fn test_references_enclosing_symbol_one_request_per_file() {
     };
     assert_eq!(first.name_path, ["S", "a"]);
     assert_eq!(first.fidelity, SymbolFidelity::Hierarchical);
-    assert_eq!(first.range.start.line, 2);
+    assert_eq!(first.range.start.line(), 2);
     let EnclosingSymbolOutcome::Resolved(second) = outcome(&result, 1) else {
         panic!("expected a resolved symbol");
     };

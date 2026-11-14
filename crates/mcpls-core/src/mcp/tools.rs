@@ -737,10 +737,7 @@ struct HierarchyItemInput {
 
 impl From<Position2DInput> for Position2D {
     fn from(position: Position2DInput) -> Self {
-        Self {
-            line: position.line,
-            character: position.character,
-        }
+        Self::from_mcp(position.line, position.character)
     }
 }
 
@@ -1415,7 +1412,7 @@ mod tests {
     /// item must come back unchanged when a client passes it to a walking tool.
     #[test]
     fn hierarchy_item_input_round_trips_a_full_output_item() {
-        let at = |line, character| Position2D { line, character };
+        let at = |line, character| Position2D::from_mcp(line, character);
         let item = HierarchyItem {
             name: "Base".into(),
             kind: 5,

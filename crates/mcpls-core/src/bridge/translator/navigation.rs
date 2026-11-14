@@ -1887,7 +1887,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.locations.len(), 1);
-        assert_eq!(result.locations[0].range.start.character, 8);
+        assert_eq!(result.locations[0].range.start.character(), 8);
     }
 
     /// An empty declaration answer is an empty result, not an error (FR-003).
@@ -2033,7 +2033,7 @@ mod tests {
 
         assert_eq!(result.locations.len(), 1);
         assert_eq!(result.locations[0].uri, target_uri);
-        assert_eq!(result.locations[0].range.start.character, 8);
+        assert_eq!(result.locations[0].range.start.character(), 8);
     }
 
     // -----------------------------------------------------------------
@@ -2080,7 +2080,10 @@ mod tests {
         assert_eq!(result.locations.len(), 300);
         assert!(!result.truncated);
         assert!(
-            result.locations.iter().all(|l| l.range.end.character == 4),
+            result
+                .locations
+                .iter()
+                .all(|l| l.range.end.character() == 4),
             "MCP columns are 1-based, so LSP byte offset 3 in all-ASCII \"hello\" must convert \
              to 4"
         );

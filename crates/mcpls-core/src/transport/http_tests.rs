@@ -1509,7 +1509,7 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
         crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::from_paths(&[root]).unwrap());
     let publish = |file: &std::path::Path| {
         let notification =
-            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+            crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: crate::bridge::path_to_uri(file).unwrap(),
                 diagnostics: vec![],
                 version: None,
@@ -1527,6 +1527,40 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
     assert_eq!(stream_a.next_resource_update().await, uri_y);
 
     server_task.abort();
+}
+
+/// rmcp #1427: a stateful session with an open GET stream and a subscription
+/// must end with the server on shutdown, not linger until `keep_alive`.
+/// Unix-only: the shutdown signal is a real self-sent `SIGTERM`, which is
+/// safe only under nextest's one-process-per-test model.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http_shutdown_ends_stateful_sessions_within_the_graceful_timeout() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(workspace.path()).unwrap();
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}").unwrap();
+    let uri = crate::bridge::resources::make_uri(&file).unwrap();
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
+    let registry = server.subscription_registry();
+    let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
+    let (session, _stream) = establish_session(addr).await;
+    subscribe_in_session(addr, &session, &uri).await;
+    assert!(!registry.live_sessions().is_empty());
+
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    tokio::time::timeout(HTTP_GRACEFUL_SHUTDOWN_TIMEOUT, server_task)
+        .await
+        .expect("serve_http must return within the graceful shutdown timeout")
+        .unwrap()
+        .unwrap();
+    assert_registry_empties(&registry).await;
 }
 
 /// A probe reaches the GET stream, a reply sent by POST keeps it open, and a
@@ -1588,7 +1622,7 @@ async fn spawn_idle_test_server(
 }
 
 fn publish_notification(file: &std::path::Path) -> crate::lsp::LspNotification {
-    crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+    crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
         uri: crate::bridge::path_to_uri(file).unwrap(),
         diagnostics: vec![],
         version: None,
@@ -2316,7 +2350,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
         crate::test_lsp::spawn_test_pump_with_cache(registry, roots, Arc::clone(&cache));
     let publish = |file: &std::path::Path| {
         let notification =
-            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+            crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: crate::bridge::path_to_uri(file).unwrap(),
                 diagnostics: vec![],
                 version: None,

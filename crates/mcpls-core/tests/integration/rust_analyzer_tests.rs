@@ -436,9 +436,9 @@ async fn test_definition_user_struct() {
             .locations
             .iter()
             .any(|loc| loc.uri.ends_with("lib.rs")
-                && loc.range.start.line == 18
-                && loc.range.start.character == 12
-                && loc.range.end.character == 16),
+                && loc.range.start.line() == 18
+                && loc.range.start.character() == 12
+                && loc.range.end.character() == 16),
         "Definition should reference User struct in lib.rs, got: {:?}",
         def_json.locations
     );

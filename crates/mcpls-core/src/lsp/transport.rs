@@ -368,7 +368,7 @@ impl LspTransportReader {
     ///
     /// [`Error::ServerTerminated`] when the stream ends inside the frame.
     async fn skip_content(&mut self, length: usize) -> Result<Envelope> {
-        let mut scan = EnvelopeScan::with_params_uri();
+        let mut scan = EnvelopeScan::with_params_uri(BoundedUri::MAX_BYTES);
         let mut remaining = length;
         while remaining > 0 {
             let available = self.stdout.fill_buf().await?;
@@ -390,7 +390,7 @@ impl LspTransportReader {
 /// (nesting past the parser's recursion limit, a lone surrogate escape, an
 /// out-of-range number) does not stop it.
 fn undecodable_message(content: &[u8]) -> InboundMessage {
-    let mut scan = EnvelopeScan::with_params_uri();
+    let mut scan = EnvelopeScan::with_params_uri(BoundedUri::MAX_BYTES);
     scan.feed(content);
     dropped_message(&scan.finish(), UndecodableReason::Malformed)
 }
@@ -415,7 +415,13 @@ fn dropped_message(envelope: &Envelope, reason: UndecodableReason) -> InboundMes
         let lost = envelope
             .params_uri
             .decode::<Uri>()
-            .and_then(BoundedUri::new)
+            .and_then(|uri| {
+                BoundedUri::try_from(uri)
+                    .inspect_err(
+                        |e| debug!(error = %e, "dropped publish names an unretainable URI"),
+                    )
+                    .ok()
+            })
             .map_or(LostPublish::Unidentified, LostPublish::File);
         return InboundMessage::UndecodableNotification(DroppedNotification::Publish(lost));
     }
@@ -1200,7 +1206,7 @@ mod tests {
     }
 
     fn file(uri: &str) -> LostPublish {
-        LostPublish::File(BoundedUri::new(Uri::from(uri.to_owned())).unwrap())
+        LostPublish::File(BoundedUri::try_from(Uri::from(uri.to_owned())).unwrap())
     }
 
     #[tokio::test]

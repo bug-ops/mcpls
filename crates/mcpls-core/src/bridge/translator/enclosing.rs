@@ -206,7 +206,7 @@ enum Containment {
 }
 
 const fn key(position: &Position2D) -> (u32, u32) {
-    (position.line, position.character)
+    (position.line(), position.character())
 }
 
 impl Containment {
@@ -600,14 +600,8 @@ mod server_text_tests {
             name_path: vec![format!("mod_{secret}"), "f".to_owned()],
             kind: 12,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 2,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 2),
             },
             fidelity: SymbolFidelity::Hierarchical,
         });

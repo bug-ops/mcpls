@@ -259,24 +259,12 @@ mod tests {
             detail: None,
             uri: uri.to_string(),
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,
@@ -564,24 +552,12 @@ mod tests {
             detail: None,
             uri: queried_uri,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,
@@ -663,24 +639,12 @@ mod tests {
             detail: None,
             uri: queried_uri,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,
@@ -734,7 +698,8 @@ mod tests {
         assert_eq!(result.calls.len(), 1);
         let from_range = &result.calls[0].from_ranges[0];
         assert_eq!(
-            from_range.end.character, 3,
+            from_range.end.character(),
+            3,
             "fromRanges must convert against the caller's own file (\"aöb\"), not the queried \
              item's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in the \
              latter"
@@ -777,24 +742,12 @@ mod tests {
             detail: None,
             uri: queried_uri,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,
@@ -852,7 +805,8 @@ mod tests {
         assert_eq!(result.calls.len(), 1);
         let from_range = &result.calls[0].from_ranges[0];
         assert_eq!(
-            from_range.end.character, 3,
+            from_range.end.character(),
+            3,
             "fromRanges must convert against the queried item's own file (\"aöb\"), not the \
              callee's (\"abc\") -- a byte offset of 3 is UTF-16 column 3 in the former, 4 in \
              the latter"
@@ -887,24 +841,12 @@ mod tests {
             detail: None,
             uri: queried_uri,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,
@@ -995,24 +937,12 @@ mod tests {
             detail: None,
             uri: queried_uri,
             range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             selection_range: Range {
-                start: Position2D {
-                    line: 1,
-                    character: 1,
-                },
-                end: Position2D {
-                    line: 1,
-                    character: 4,
-                },
+                start: Position2D::from_mcp(1, 1),
+                end: Position2D::from_mcp(1, 4),
             },
             data: None,
             out_of_workspace: false,

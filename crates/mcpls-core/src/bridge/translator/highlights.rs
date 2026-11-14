@@ -172,7 +172,7 @@ mod tests {
                 DocumentHighlightKind::Text,
             ]
         );
-        assert_eq!(result.highlights[0].range.start.character, 5);
+        assert_eq!(result.highlights[0].range.start.character(), 5);
         let wire = serde_json::to_value(&result).unwrap();
         assert_eq!(wire["highlights"][0]["kind"], "write");
         assert!(wire.get("truncated").is_none());
@@ -194,8 +194,8 @@ mod tests {
             Some(lsp_types::PositionEncodingKind::UTF8),
         )
         .await;
-        assert_eq!(result.highlights[0].range.start.character, 5);
-        assert_eq!(result.highlights[0].range.end.character, 6);
+        assert_eq!(result.highlights[0].range.start.character(), 5);
+        assert_eq!(result.highlights[0].range.end.character(), 6);
         assert_eq!(result.positions_degraded, None);
     }
 

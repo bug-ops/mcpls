@@ -11,7 +11,7 @@ use crate::bridge::encoding::{
     ColumnFidelity, PositionEncoding, lsp_to_mcp_position, mcp_to_lsp_position,
 };
 use crate::bridge::state::{ResourceLimits, uri_to_path};
-use crate::bridge::{DocumentTracker, WorkspaceRoots};
+use crate::bridge::{DocumentTracker, LspLine, WorkspaceRoots};
 use crate::config::SizeLimit;
 use crate::util::lock_std;
 
@@ -176,9 +176,9 @@ pub(super) struct EncodingCtx {
 /// requested line rather than the whole file (see #474) -- gated by the
 /// per-response byte budget so that no single response can rack up
 /// unbounded disk I/O by naming enough distinct lines.
-async fn read_line_text(uri: &lsp_types::Uri, line: u32, ctx: &EncodingCtx) -> Option<String> {
+async fn read_line_text(uri: &lsp_types::Uri, line: LspLine, ctx: &EncodingCtx) -> Option<String> {
     let path = uri_to_path(uri)?;
-    let key = (path.clone(), line);
+    let key = (path.clone(), line.get());
 
     if let Some(cached) = lock_std(&ctx.line_cache).entries.get(&key) {
         return cached.clone();
@@ -187,7 +187,7 @@ async fn read_line_text(uri: &lsp_types::Uri, line: u32, ctx: &EncodingCtx) -> O
     let text = if let Some(text) = ctx.tracker.line_text(&path, line) {
         Some(text)
     } else {
-        disk_read_line_budgeted(&path, line, ctx).await
+        disk_read_line_budgeted(&path, line.get(), ctx).await
     };
 
     lock_std(&ctx.line_cache).entries.insert(key, text.clone());
@@ -360,7 +360,7 @@ impl EncodingCtx {
             && pos.character != 0
             && pos.character != u32::MAX;
         let line_text = if needs_text {
-            read_line_text(uri, pos.line, self).await
+            read_line_text(uri, LspLine::new(pos.line), self).await
         } else {
             None
         };
@@ -511,10 +511,10 @@ mod tests {
         };
 
         let mcp_range = test_ctx().normalize_range(&test_uri(), lsp_range).await;
-        assert_eq!(mcp_range.start.line, 1);
-        assert_eq!(mcp_range.start.character, 1);
-        assert_eq!(mcp_range.end.line, 3);
-        assert_eq!(mcp_range.end.character, 6);
+        assert_eq!(mcp_range.start.line(), 1);
+        assert_eq!(mcp_range.start.character(), 1);
+        assert_eq!(mcp_range.end.line(), 3);
+        assert_eq!(mcp_range.end.character(), 6);
     }
 
     /// End-to-end proof that a non-UTF-16 `EncodingCtx` is actually wired to
@@ -562,7 +562,7 @@ mod tests {
             WorkspaceRoots::default(),
         );
         assert!(
-            read_line_text(&uri, 0, &ctx).await.is_none(),
+            read_line_text(&uri, LspLine::new(0), &ctx).await.is_none(),
             "must refuse to return content from a file over max_file_size"
         );
     }
@@ -631,11 +631,13 @@ mod tests {
         let range_b = ctx.normalize_range(&uri_b, lsp_range).await;
 
         assert_eq!(
-            range_a.end.character, 3,
+            range_a.end.character(),
+            3,
             "must convert against a.rs's own content"
         );
         assert_eq!(
-            range_b.end.character, 4,
+            range_b.end.character(),
+            4,
             "must convert against b.rs's own content"
         );
     }
@@ -656,13 +658,13 @@ mod tests {
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
         assert_eq!(
-            read_line_text(&uri, 0, &ctx).await.as_deref(),
+            read_line_text(&uri, LspLine::new(0), &ctx).await.as_deref(),
             Some("hello")
         );
 
         fs::write(&path, "héllo").unwrap();
         assert_eq!(
-            read_line_text(&uri, 0, &ctx).await.as_deref(),
+            read_line_text(&uri, LspLine::new(0), &ctx).await.as_deref(),
             Some("hello"),
             "must reuse the first lookup's cached result instead of re-reading disk"
         );
@@ -690,13 +692,15 @@ mod tests {
         lock_std(&ctx.line_cache).bytes_remaining = 6;
 
         assert_eq!(
-            read_line_text(&uri_a, 0, &ctx).await.as_deref(),
+            read_line_text(&uri_a, LspLine::new(0), &ctx)
+                .await
+                .as_deref(),
             Some("hello")
         );
         assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, 0);
 
         // A second, distinct (path, line) lookup must now be refused.
-        assert_eq!(read_line_text(&uri_b, 0, &ctx).await, None);
+        assert_eq!(read_line_text(&uri_b, LspLine::new(0), &ctx).await, None);
     }
 
     /// Regression for the S1 budget-bypass fix: a read whose remaining
@@ -716,7 +720,7 @@ mod tests {
         lock_std(&ctx.line_cache).bytes_remaining = 10;
 
         assert_eq!(
-            read_line_text(&uri, 0, &ctx).await,
+            read_line_text(&uri, LspLine::new(0), &ctx).await,
             None,
             "a line far longer than the remaining budget must not be returned"
         );
@@ -804,7 +808,7 @@ mod tests {
         let before = lock_std(&ctx.line_cache).bytes_remaining;
 
         assert_eq!(ctx.to_lsp(&uri, pos(3, 1)).await.character, 0);
-        assert_eq!(ctx.to_mcp(&uri, lsp_position(2, 0)).await.character, 1);
+        assert_eq!(ctx.to_mcp(&uri, lsp_position(2, 0)).await.character(), 1);
 
         assert_eq!(ctx.positions_degraded(), None);
         assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, before);
@@ -892,7 +896,9 @@ mod tests {
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
         assert_eq!(
-            ctx.to_mcp(&uri, lsp_position(0, u32::MAX)).await.character,
+            ctx.to_mcp(&uri, lsp_position(0, u32::MAX))
+                .await
+                .character(),
             u32::MAX
         );
         assert_eq!(ctx.positions_degraded(), None);
@@ -916,7 +922,7 @@ mod tests {
         let uri = path_to_uri(&path).unwrap();
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
-        assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
+        assert_eq!(read_line_text(&uri, LspLine::new(0), &ctx).await, None);
         assert_eq!(
             lock_std(&ctx.line_cache).bytes_remaining,
             line_read_budget(ResourceLimits::default()) - content.len() as u64,
@@ -939,7 +945,7 @@ mod tests {
         let uri = path_to_uri(&path).unwrap();
 
         let ctx = test_ctx_with(PositionEncoding::Utf8);
-        assert_eq!(read_line_text(&uri, 0, &ctx).await, None);
+        assert_eq!(read_line_text(&uri, LspLine::new(0), &ctx).await, None);
         assert_eq!(
             lock_std(&ctx.line_cache).bytes_remaining,
             line_read_budget(ResourceLimits::default())

@@ -912,8 +912,8 @@ mod tests {
         assert_eq!(diags.diagnostics[0].message, "test error");
         assert_eq!(diags.diagnostics[0].code, Some("E001".to_string()));
         assert_matches!(diags.diagnostics[0].severity, ReportedSeverity::Error);
-        assert_eq!(diags.diagnostics[0].range.start.line, 1);
-        assert_eq!(diags.diagnostics[0].range.start.character, 1);
+        assert_eq!(diags.diagnostics[0].range.start.line(), 1);
+        assert_eq!(diags.diagnostics[0].range.start.character(), 1);
     }
 
     #[tokio::test]

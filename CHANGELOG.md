@@ -11,10 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#904).
 - Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#904).
+- **Breaking:** `BoundedUri::new` is replaced by `TryFrom<Uri>` (error `UriTooLong`), and `BoundedPublish::uri()` returns `&BoundedUri` (#885, 908).
+- **Breaking:** `LspNotification::PublishDiagnostics` carries `DecodedPublish` (URI bounded at decode) instead of `PublishDiagnosticsParams`, and `BoundedUri::into_uri` is removed (#881, 908).
+- **Breaking:** `Position2D` fields are private (use `Position2D::from_mcp` and the `line()` / `character()` getters), `Position::lsp_line()` returns `LspLine`, and `DocumentTracker::line_text` takes `LspLine` (#882, 908).
+- Internal: `EncodingConverter` conversions fail with a typed `OffsetError` instead of a `String` and no longer truncate silently (#883, 908).
+- The release workflow runs `cargo semver-checks` against crates.io before publishing (#879, 908).
 
 ### Fixed
 
 - Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#904).
+- `get_tool_support` omits `languages` on workspace routes consistently with its output schema (#888, 908).
+- The `resources/updated` delivery task of a session is restarted after a panic, and a closed doorbell logs one warning per session (#880, 908).
+- `workspace/configuration` replies are capped at 256 items and 4 MiB (#887, 908).
+- Published-URI resolution treats an invalid filename (e.g. `ENAMETOOLONG`) as a permanent refusal: resolved once, never retried or cached, publish dropped (#890, 908).
 
 ### Security
 

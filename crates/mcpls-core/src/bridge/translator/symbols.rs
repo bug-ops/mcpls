@@ -1212,7 +1212,8 @@ mod tests {
 
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(
-            result.symbols[0].range.end.character, 3,
+            result.symbols[0].range.end.character(),
+            3,
             "must convert against the queried document's own content (\"aöb\"), not fail to \
              read the entry's own (nonexistent, out-of-workspace) location.uri and fall back to \
              the raw byte offset"

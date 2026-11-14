@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::io::Read as _;
 use std::num::NonZeroU64;
+use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::string::FromUtf8Error;
@@ -569,6 +570,73 @@ impl WarnLimiter {
             self.last = Some(now);
         }
         due
+    }
+}
+
+/// How long a supervisor waits before rerunning a task that panicked.
+#[derive(Debug, Clone, Copy)]
+pub struct RestartDelays {
+    /// Delay after the first panic; it doubles with each further one.
+    pub first: Duration,
+    /// Largest delay, also the period of the panic log line and the run time
+    /// after which the delay starts over.
+    pub max: Duration,
+}
+
+/// Restart pacing shared by every supervised task: the delay doubles from
+/// [`RestartDelays::first`] up to [`RestartDelays::max`] (and starts over after
+/// a run that lasted `max`), and a panic is logged at error level at most once
+/// per `max`, so a task that panics at once does not flood the log.
+#[derive(Debug)]
+pub struct RestartBackoff {
+    delays: RestartDelays,
+    delay: Duration,
+    limiter: WarnLimiter,
+}
+
+impl RestartBackoff {
+    /// A backoff whose first restart waits `delays.first` and whose first
+    /// panic is logged at once.
+    ///
+    /// One backoff belongs to one supervised task, so its delay and log
+    /// throttle carry over between that task's restarts.
+    #[must_use]
+    pub const fn new(delays: RestartDelays) -> Self {
+        Self {
+            delays,
+            delay: delays.first,
+            limiter: WarnLimiter::new(),
+        }
+    }
+
+    /// Logs the panic of a run that began at `started`, then waits out the
+    /// restart delay. [`ControlFlow::Break`] when `cancel` fired meanwhile and
+    /// the task must not run again.
+    pub async fn after_panic(
+        &mut self,
+        what: crate::error::BackgroundTask,
+        panicked: &TaskPanicked,
+        started: tokio::time::Instant,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> ControlFlow<()> {
+        let now = tokio::time::Instant::now();
+        if now.saturating_duration_since(started) >= self.delays.max {
+            self.delay = self.delays.first;
+        }
+        if self.limiter.due(now.into_std(), self.delays.max) {
+            tracing::error!(
+                error = %panicked,
+                operation = %what,
+                delay = ?self.delay,
+                "task panicked; restarting it after the delay, it is not running until then"
+            );
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return ControlFlow::Break(()),
+            () = tokio::time::sleep(self.delay) => {}
+        }
+        self.delay = self.delay.saturating_mul(2).min(self.delays.max);
+        ControlFlow::Continue(())
     }
 }
 

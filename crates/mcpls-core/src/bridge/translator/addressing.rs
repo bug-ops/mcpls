@@ -17,7 +17,7 @@ use super::dto::{Position, Position2D};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::Capability;
 use crate::bridge::ClientPath;
-use crate::bridge::encoding::{EncodingConverter, PositionEncoding};
+use crate::bridge::encoding::{EncodingConverter, LspLine, PositionEncoding};
 use crate::bridge::state::uri_to_path;
 use crate::config::text_newtype::impl_text_newtype;
 use crate::config::{BoundedText, InvalidBoundedText};
@@ -427,9 +427,9 @@ enum IdentifierPosition {
 }
 
 /// Whether the document text spells `word` at the MCP `position`.
-fn spells_at(line_text: &str, character: u32, word: &str) -> bool {
+fn spells_at(line_text: &str, position: &Position2D, word: &str) -> bool {
     let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
-    let Ok(byte) = utf16.character_to_byte_offset(line_text, character.saturating_sub(1)) else {
+    let Ok(byte) = utf16.character_to_byte_offset(line_text, position.lsp_character()) else {
         return false;
     };
     whole_word_occurrences(line_text, word).contains(&byte)
@@ -450,8 +450,8 @@ async fn locate_identifier(
     if let Some(selection) = entry.selection_range {
         let position = ctx.to_mcp(uri, selection.start).await;
         let spelled = tracker
-            .line_text(&path, position.line.saturating_sub(1))
-            .is_some_and(|text| spells_at(&text, position.character, &simple));
+            .line_text(&path, position.lsp_line())
+            .is_some_and(|text| spells_at(&text, &position, &simple));
         if spelled {
             return IdentifierPosition::Verified(position, PositionSource::SelectionRange);
         }
@@ -459,26 +459,29 @@ async fn locate_identifier(
 
     let start = ctx.to_mcp(uri, entry.range.start).await;
     let end = ctx.to_mcp(uri, entry.range.end).await;
+    let first_line = start.lsp_line();
     let last_line = end
-        .line
-        .min(start.line.saturating_add(MAX_WINDOW_LINES - 1));
+        .lsp_line()
+        .get()
+        .min(first_line.get().saturating_add(MAX_WINDOW_LINES - 1));
     let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
-    let window = usize::try_from(last_line.saturating_sub(start.line).saturating_add(1))
+    let window = usize::try_from(last_line.saturating_sub(first_line.get()).saturating_add(1))
         .unwrap_or(usize::MAX);
     let text = tracker
-        .line_window(&path, start.line.saturating_sub(1), window)
+        .line_window(&path, first_line, window)
         .unwrap_or_default();
     let mut found = Vec::new();
-    for (line, text) in (start.line..).zip(text.split('\n')) {
+    for (line, text) in (first_line.get()..).map(LspLine::new).zip(text.split('\n')) {
         for byte in whole_word_occurrences(text, &simple) {
             let Ok(column) = utf16.byte_offset_to_character(text, byte) else {
                 continue;
             };
-            let character = column.saturating_add(1);
-            let after_start = (line, character) >= (start.line, start.character);
-            let before_end = (line, character) < (end.line, end.character);
+            let at = Position2D::from_lsp(line, column);
+            let key = (at.line(), at.character());
+            let after_start = key >= (start.line(), start.character());
+            let before_end = key < (end.line(), end.character());
             if after_start && before_end {
-                found.push(Position2D { line, character });
+                found.push(at);
             }
         }
         if found.len() > 1 {
@@ -497,8 +500,8 @@ fn candidate(entry: &SymbolEntry, position: &Position2D) -> SymbolCandidate {
         kind: u32::from(entry.kind),
         kind_name: format!("{:?}", entry.kind),
         container: entry.container.clone(),
-        line: position.line,
-        character: position.character,
+        line: position.line(),
+        character: position.character(),
     }
 }
 
@@ -634,7 +637,7 @@ impl Translator {
             return false;
         };
         self.document_tracker()
-            .line_window(&path, 0, MAX_SCAN_LINES)
+            .line_window(&path, LspLine::new(0), MAX_SCAN_LINES)
             .is_some_and(|text| {
                 text.split('\n')
                     .any(|line| !whole_word_occurrences(line, word).is_empty())
@@ -927,9 +930,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(spells_at(line, col + 1, "foo"));
-        assert!(!spells_at(line, col, "foo"));
-        assert!(!spells_at(line, 999, "foo"));
+        assert!(spells_at(line, &Position2D::from_mcp(1, col + 1), "foo"));
+        assert!(!spells_at(line, &Position2D::from_mcp(1, col), "foo"));
+        assert!(!spells_at(line, &Position2D::from_mcp(1, 999), "foo"));
     }
 }
 
@@ -1453,10 +1456,7 @@ mod server_text_tests {
                 name: format!("sym_{SECRET}"),
                 kind: 12,
                 container: Some(format!("c_{SECRET}")),
-                position: Position2D {
-                    line: 1,
-                    character: 1,
-                },
+                position: Position2D::from_mcp(1, 1),
                 position_source: PositionSource::SelectionRange,
             }),
         };

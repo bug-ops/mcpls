@@ -395,7 +395,8 @@ impl Pump {
         let items: Vec<BatchItem> = batch
             .into_iter()
             .map(|publish| {
-                if publication_admitted(publish.uri(), admission_role, &self.workspace_roots) {
+                if publication_admitted(publish.uri().uri(), admission_role, &self.workspace_roots)
+                {
                     BatchItem::Resolve(publish)
                 } else {
                     BatchItem::Skip(publish)
@@ -452,11 +453,10 @@ impl Pump {
         if !self.role_rx.borrow().caches() {
             return Flow::Continue;
         }
-        let uris: Vec<&lsp_types::Uri> = lost
+        let uris: Vec<&crate::lsp::BoundedUri> = lost
             .uris()
             .iter()
-            .map(crate::lsp::BoundedUri::uri)
-            .filter(|uri| self.workspace_roots.admits_uri(uri))
+            .filter(|uri| self.workspace_roots.admits_uri(uri.uri()))
             .collect();
         let publications: Vec<Publication<'_>> = uris
             .iter()
@@ -814,7 +814,7 @@ mod pump_tests {
         ));
 
         let uri: Uri = test_uri("main.rs");
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: uri.clone(),
                 diagnostics: vec![],
@@ -890,7 +890,7 @@ mod pump_tests {
         let outside_uri: Uri = Uri::from(outside_uri_str);
         let inside_uri: Uri = Uri::from(inside_uri_str);
 
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: outside_uri.clone(),
                 diagnostics: vec![],
@@ -899,7 +899,7 @@ mod pump_tests {
         ))
         .await
         .unwrap();
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: inside_uri.clone(),
                 diagnostics: vec![],
@@ -1072,7 +1072,7 @@ mod pump_tests {
         ));
 
         let uri: Uri = test_uri("locked.rs");
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: uri.clone(),
                 diagnostics: vec![],
@@ -1234,7 +1234,7 @@ mod pump_tests {
 
         // Fill the notification lane to capacity before the pump drains it, forcing a backlog.
         for _ in 0..2 {
-            tx.send(LspNotification::PublishDiagnostics(
+            tx.send(LspNotification::publish_for_test(
                 PublishDiagnosticsParams {
                     uri: test_uri("saturate.rs"),
                     diagnostics: vec![],
@@ -1296,7 +1296,7 @@ mod pump_tests {
     }
 
     fn publish(file: &str) -> LspNotification {
-        LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+        LspNotification::publish_for_test(PublishDiagnosticsParams {
             uri: test_uri(file),
             diagnostics: vec![],
             version: None,
@@ -1519,7 +1519,7 @@ mod pump_tests {
 
         let server = ServerId::from_static("rust");
         for lost in [
-            LostPublish::File(crate::lsp::BoundedUri::new(test_uri("a.rs")).unwrap()),
+            LostPublish::File(crate::lsp::BoundedUri::try_from(test_uri("a.rs")).unwrap()),
             LostPublish::Unidentified,
         ] {
             let subs = make_subs();
@@ -1534,7 +1534,7 @@ mod pump_tests {
             let (feed, _cancel) =
                 spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
             let with_error = |message: &str| {
-                LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+                LspNotification::publish_for_test(PublishDiagnosticsParams {
                     uri: test_uri("a.rs"),
                     diagnostics: vec![lsp_types::Diagnostic {
                         message: message.to_owned().into(),
@@ -1585,6 +1585,7 @@ mod pump_tests {
         use crate::bridge::DiagnosticsAvailability::{Evicted, Published};
         use crate::lsp::BoundedUri;
         use crate::mcp::{SessionHandle, Target};
+        use crate::test_support::uri_of_len;
 
         let server = ServerId::from_static("rust");
         let subs = make_subs();
@@ -1599,7 +1600,7 @@ mod pump_tests {
         let (feed, _cancel) =
             spawn_test_pump_with_cache(subs, test_workspace_roots(), Arc::clone(&cache));
         let publish_for = |uri: Uri| {
-            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+            LspNotification::publish_for_test(PublishDiagnosticsParams {
                 uri,
                 diagnostics: vec![lsp_types::Diagnostic {
                     message: "e".to_owned().into(),
@@ -1607,11 +1608,6 @@ mod pump_tests {
                 }],
                 version: None,
             })
-        };
-        let sized = |len: usize| {
-            let base = test_uri("a.rs");
-            let base: &str = base.as_ref();
-            Uri::from(format!("{base}{}", "u".repeat(len - base.len())).as_str())
         };
 
         feed.send(publish_for(test_uri("a.rs"))).await.unwrap();
@@ -1624,16 +1620,20 @@ mod pump_tests {
             Published
         );
 
-        feed.send(publish_for(sized(BoundedUri::MAX_BYTES + 1)))
-            .await
-            .unwrap();
+        let over = uri_of_len(BoundedUri::MAX_BYTES + 1);
+        let decoded = LspNotification::parse(
+            "textDocument/publishDiagnostics",
+            Some(serde_json::json!({"uri": AsRef::<str>::as_ref(&over), "diagnostics": []})),
+        );
+        assert!(matches!(decoded, LspNotification::LostPublish(_)));
+        feed.send(decoded).await.unwrap();
         assert_eq!(recv_within(&mut rx_sub).await, resource.as_str());
         let guard = cache.lock().await;
         assert_eq!(
             guard.availability(&test_uri("a.rs"), Some(&server)),
             Evicted
         );
-        assert!(!guard.has_diagnostics(&sized(BoundedUri::MAX_BYTES + 1)));
+        assert!(!guard.has_diagnostics(&over));
         drop(guard);
     }
 
@@ -1806,7 +1806,7 @@ mod pump_tests {
             ..Default::default()
         };
         for (path, diagnostics) in [(&escape, vec![error.clone()]), (&link, vec![error])] {
-            tx.send(LspNotification::PublishDiagnostics(
+            tx.send(LspNotification::publish_for_test(
                 PublishDiagnosticsParams {
                     uri: bridge::path_to_uri(path).unwrap(),
                     diagnostics,
@@ -1861,7 +1861,7 @@ mod pump_tests {
             PublishedPathResolver::with_canonicalizer(failing),
         ));
         let uri = bridge::path_to_uri(&root.join("a.rs")).unwrap();
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: uri.clone(),
                 diagnostics: vec![],
@@ -1912,7 +1912,7 @@ mod pump_tests {
             },
             PublishedPathResolver::with_canonicalizer(slow),
         ));
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&root.join("a.rs")).unwrap(),
                 diagnostics: vec![],
@@ -1978,7 +1978,7 @@ mod pump_tests {
             },
             PublishedPathResolver::with_canonicalizer(slow),
         ));
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&root.join("a.ts")).unwrap(),
                 diagnostics: vec![],
@@ -2077,7 +2077,7 @@ mod pump_tests {
             message: "boom".to_owned().into(),
             ..Default::default()
         };
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: uri.clone(),
                 diagnostics: vec![error],
@@ -2137,7 +2137,7 @@ mod pump_tests {
             },
             PublishedPathResolver::with_canonicalizer(hung),
         ));
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&root.join("a.rs")).unwrap(),
                 diagnostics: vec![],
@@ -2175,7 +2175,7 @@ mod pump_tests {
             ..Default::default()
         };
         let publish = |name: String, diagnostics: Vec<lsp_types::Diagnostic>| {
-            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+            LspNotification::publish_for_test(PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&root.join(name)).unwrap(),
                 diagnostics,
                 version: None,
@@ -2247,7 +2247,7 @@ mod pump_tests {
             message: "boom".to_owned().into(),
             ..Default::default()
         };
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&link.join("main.rs")).unwrap(),
                 diagnostics: vec![error],
@@ -2309,7 +2309,7 @@ mod pump_tests {
         };
         let publishes = [(&link, vec![error]), (&file, vec![]), (&link, vec![])];
         for (path, diagnostics) in publishes {
-            tx.send(LspNotification::PublishDiagnostics(
+            tx.send(LspNotification::publish_for_test(
                 PublishDiagnosticsParams {
                     uri: bridge::path_to_uri(path).unwrap(),
                     diagnostics,
@@ -2370,7 +2370,7 @@ mod pump_tests {
         let publish = |path: PathBuf| {
             let tx = &tx;
             async move {
-                tx.send(LspNotification::PublishDiagnostics(
+                tx.send(LspNotification::publish_for_test(
                     PublishDiagnosticsParams {
                         uri: bridge::path_to_uri(&path).unwrap(),
                         diagnostics: vec![lsp_types::Diagnostic {
@@ -2528,7 +2528,7 @@ mod pump_tests {
         );
 
         let (tx, _cancel_tx) = spawn_test_pump(subs, WorkspaceRoots::from_paths(&[root]).unwrap());
-        tx.send(LspNotification::PublishDiagnostics(
+        tx.send(LspNotification::publish_for_test(
             PublishDiagnosticsParams {
                 uri: bridge::path_to_uri(&file).unwrap(),
                 diagnostics: vec![],
@@ -2747,7 +2747,7 @@ mod burst_tests {
 
     use super::*;
     use crate::bridge::DiagnosticsAvailability;
-    use crate::lsp::{MailboxLimits, NotificationSink};
+    use crate::lsp::{DecodedPublish, MailboxLimits, NotificationSink};
     use crate::test_lsp::CapturedLogs;
 
     fn make_cache() -> Arc<Mutex<NotificationCache>> {
@@ -2804,14 +2804,17 @@ mod burst_tests {
             },
         );
         for n in 0..FILES {
-            sink.publishes().publish(PublishDiagnosticsParams {
-                uri: uri(n),
-                diagnostics: vec![Diagnostic {
-                    message: format!("error {n}").into(),
-                    ..Diagnostic::default()
-                }],
-                version: None,
-            });
+            sink.publishes().publish(
+                DecodedPublish::try_from(PublishDiagnosticsParams {
+                    uri: uri(n),
+                    diagnostics: vec![Diagnostic {
+                        message: format!("error {n}").into(),
+                        ..Diagnostic::default()
+                    }],
+                    version: None,
+                })
+                .unwrap(),
+            );
         }
         drop(sink);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(4);
@@ -2882,14 +2885,17 @@ mod burst_tests {
             },
         );
         for uri in [&published, &lost] {
-            sink.publishes().publish(PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics: vec![Diagnostic {
-                    message: "error".to_owned().into(),
-                    ..Diagnostic::default()
-                }],
-                version: None,
-            });
+            sink.publishes().publish(
+                DecodedPublish::try_from(PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![Diagnostic {
+                        message: "error".to_owned().into(),
+                        ..Diagnostic::default()
+                    }],
+                    version: None,
+                })
+                .unwrap(),
+            );
         }
         drop(sink);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);
@@ -3007,14 +3013,17 @@ mod burst_tests {
             },
         );
         for uri in [&kept, &lost] {
-            sink.publishes().publish(PublishDiagnosticsParams {
-                uri: uri.clone(),
-                diagnostics: vec![Diagnostic {
-                    message: "error".to_owned().into(),
-                    ..Diagnostic::default()
-                }],
-                version: None,
-            });
+            sink.publishes().publish(
+                DecodedPublish::try_from(PublishDiagnosticsParams {
+                    uri: uri.clone(),
+                    diagnostics: vec![Diagnostic {
+                        message: "error".to_owned().into(),
+                        ..Diagnostic::default()
+                    }],
+                    version: None,
+                })
+                .unwrap(),
+            );
         }
         drop(sink);
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(1);

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use serde::Deserialize;
 use serde_json::Value;
@@ -137,22 +137,23 @@ impl ProbeContext<'_> {
     fn fill(&self, placeholder: Placeholder) -> Result<Option<Value>> {
         let file = self.probe.file();
         let position = self.probe.position();
-        let zero_based = |one_based: u32, what: &str| {
-            one_based
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("{what} is 1-based and cannot be 0"))
-        };
         Ok(match placeholder {
             Placeholder::Repo => Some(path_value(self.repo)),
             Placeholder::File => Some(path_value(&file.in_repo(self.repo))),
             Placeholder::RelativeFile => Some(Value::from(file.as_str())),
-            Placeholder::Line1 => position.map(|p| Value::from(p.line)),
+            Placeholder::Line1 => position.map(|p| Value::from(p.line())),
             Placeholder::Line0 => position
-                .map(|p| zero_based(p.line, "line").map(Value::from))
+                .map(|p| {
+                    ensure_one_based(p.line(), "line")?;
+                    Ok::<_, anyhow::Error>(Value::from(p.lsp_line().get()))
+                })
                 .transpose()?,
-            Placeholder::Character1 => position.map(|p| Value::from(p.character)),
+            Placeholder::Character1 => position.map(|p| Value::from(p.character())),
             Placeholder::Character0 => position
-                .map(|p| zero_based(p.character, "character").map(Value::from))
+                .map(|p| {
+                    ensure_one_based(p.character(), "character")?;
+                    Ok::<_, anyhow::Error>(Value::from(p.lsp_character()))
+                })
                 .transpose()?,
             Placeholder::Symbol => self.probe.symbol().map(Value::from),
         })
@@ -166,6 +167,13 @@ impl ProbeContext<'_> {
             ArgValue::Placeholder(placeholder) => self.fill(*placeholder),
         }
     }
+}
+
+fn ensure_one_based(value: u32, what: &str) -> Result<()> {
+    if value == 0 {
+        bail!("{what} is 1-based and cannot be 0");
+    }
+    Ok(())
 }
 
 fn path_value(path: &Path) -> Value {
@@ -364,12 +372,10 @@ impl ExternalTarget {
         let context = ProbeContext { repo, probe };
         let mut arguments = JsonObject::new();
         for (name, value) in &binding.arguments {
-            match context.resolve(value)? {
-                Some(value) => {
-                    arguments.insert(name.clone(), value);
-                }
-                None => return Ok(None),
-            }
+            let Some(value) = context.resolve(value)? else {
+                return Ok(None);
+            };
+            arguments.insert(name.clone(), value);
         }
         Ok(Some(
             CallToolRequestParams::new(binding.tool.clone()).with_arguments(arguments),
@@ -512,10 +518,7 @@ mod tests {
     fn definition(symbol: Option<&str>) -> Probe {
         Probe::Definition {
             file: file(),
-            position: Position2D {
-                line: 5,
-                character: 10,
-            },
+            position: Position2D::from_mcp(5, 10),
             uri_suffix: "src/utils/deepEqual.ts".to_owned(),
             symbol: symbol.map(str::to_owned),
         }
@@ -564,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn zero_based_placeholders_shift_and_refuse_a_zero_position() {
+        let at = |line, character| Probe::Hover {
+            file: file(),
+            position: Position2D::from_mcp(line, character),
+            contains: "x".to_owned(),
+            symbol: None,
+        };
+        let fill = |probe: &Probe, placeholder| {
+            ProbeContext {
+                repo: Path::new("/r"),
+                probe,
+            }
+            .fill(placeholder)
+        };
+
+        let probe = at(5, 10);
+        assert_eq!(
+            fill(&probe, Placeholder::Line0).unwrap(),
+            Some(Value::from(4))
+        );
+        assert_eq!(
+            fill(&probe, Placeholder::Character0).unwrap(),
+            Some(Value::from(9))
+        );
+        assert!(fill(&at(0, 1), Placeholder::Line0).is_err());
+        assert!(fill(&at(1, 0), Placeholder::Character0).is_err());
+        assert_eq!(
+            fill(&at(0, 0), Placeholder::Line1).unwrap(),
+            Some(Value::from(0))
+        );
+    }
+
+    #[test]
     fn a_probe_without_what_a_placeholder_needs_is_unsupported() {
         let target = Target::External(Box::new(ExternalTarget::parse(LSMCP).unwrap()));
         assert_matches!(
@@ -577,10 +613,7 @@ mod tests {
         let target = Target::External(Box::new(ExternalTarget::parse(SERENA).unwrap()));
         let hover = Probe::Hover {
             file: file(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             contains: "x".to_owned(),
             symbol: Some("x".to_owned()),
         };
@@ -637,10 +670,7 @@ mod tests {
 
         let references = Probe::References {
             file: file(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             min_count: 2,
             symbol: None,
         };

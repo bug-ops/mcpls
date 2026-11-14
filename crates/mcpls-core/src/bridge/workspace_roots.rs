@@ -115,6 +115,10 @@ pub enum Unresolved {
     /// The filesystem failed in a way that may not repeat; never cached.
     #[error("transient filesystem error")]
     Transient(#[source] io::Error),
+    /// The filesystem rejects a name on the path (`InvalidFilename`, for
+    /// example `ENAMETOOLONG`); permanent, so never retried or cached.
+    #[error("path contains a name the filesystem rejects")]
+    InvalidName(#[source] io::Error),
     /// Not even the root of the path could be canonicalized.
     #[error("no ancestor of the path exists")]
     NoExistingAncestor,
@@ -143,11 +147,14 @@ fn canonicalize_on_disk(path: &Path) -> io::Result<PathBuf> {
 ///
 /// The single canonicalization policy of the bridge. Falls back to the next
 /// ancestor only on [`io::ErrorKind::NotFound`] and
-/// [`io::ErrorKind::NotADirectory`]; every other error is
-/// [`Unresolved::Transient`]. A path with a `..` component is
-/// [`Unresolved::ParentComponent`]: a legitimate server publishes canonical
-/// paths, and the lexical join of the missing tail would otherwise bypass
-/// symlinks that `..` should have followed.
+/// [`io::ErrorKind::NotADirectory`]. A path with a `..` component is
+/// [`Unresolved::ParentComponent`] and an [`io::ErrorKind::InvalidFilename`]
+/// from any ancestor is [`Unresolved::InvalidName`]: both are permanent
+/// refusals. A legitimate server publishes canonical paths, so the lexical
+/// join of a missing tail would bypass symlinks that `..` should have
+/// followed; a name the kernel rejects can neither exist nor be walked past
+/// safely, since a symlink may sit deeper than the failing component. Every
+/// other error is [`Unresolved::Transient`].
 pub fn canonicalize_existing_prefix(
     path: &Path,
     canonicalize: &CanonicalizeFn,
@@ -168,6 +175,9 @@ pub fn canonicalize_existing_prefix(
                     e.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                 ) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidFilename => {
+                return Err(Unresolved::InvalidName(e));
+            }
             Err(e) => return Err(Unresolved::Transient(e)),
         }
     }
@@ -973,6 +983,89 @@ mod tests {
             canonicalize_existing_prefix(&dir.path().join("gone/x.rs"), &canonicalize_on_disk)
                 .unwrap();
         assert_eq!(result, canonical.join("gone/x.rs"));
+    }
+
+    fn invalid_filename_from(
+        failing: usize,
+    ) -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn(&Path) -> io::Result<PathBuf>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let canon = move |p: &Path| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match n.cmp(&failing) {
+                std::cmp::Ordering::Less => Err(io::Error::from(io::ErrorKind::NotFound)),
+                std::cmp::Ordering::Equal => Err(io::Error::from(io::ErrorKind::InvalidFilename)),
+                std::cmp::Ordering::Greater => Ok(p.to_path_buf()),
+            }
+        };
+        (calls, canon)
+    }
+
+    #[test]
+    fn test_canonicalize_existing_prefix_stops_at_an_invalid_name_on_the_leaf() {
+        let (calls, canon) = invalid_filename_from(0);
+        assert_matches!(
+            canonicalize_existing_prefix(Path::new("/a/b/c.rs"), &canon),
+            Err(Unresolved::InvalidName(_))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_canonicalize_existing_prefix_stops_at_an_invalid_name_on_an_ancestor() {
+        let (calls, canon) = invalid_filename_from(1);
+        assert_matches!(
+            canonicalize_existing_prefix(Path::new("/a/b/c.rs"), &canon),
+            Err(Unresolved::InvalidName(_))
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "no ancestor above the failing one is asked"
+        );
+    }
+
+    /// Security F1: a symlink below the failing ancestor must not be walked
+    /// past and joined lexically into the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn test_path_overflow_above_a_deeper_symlink_is_refused() {
+        let (_dir, base) = canonical_tempdir();
+        let outside = tempfile::tempdir().unwrap();
+        let deep = base.join("d".repeat(200));
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink(outside.path(), deep.join("link")).unwrap();
+        let limit = deep.as_os_str().len();
+        let overflowing = move |p: &Path| {
+            if p.as_os_str().len() > limit {
+                Err(io::Error::from(io::ErrorKind::InvalidFilename))
+            } else {
+                dunce::canonicalize(p)
+            }
+        };
+
+        let result = canonicalize_existing_prefix(&deep.join("link/secret"), &overflowing);
+
+        assert_matches!(result, Err(Unresolved::InvalidName(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_300_byte_component_is_invalid_name_and_not_admitted() {
+        let (_dir, base) = canonical_tempdir();
+        let path = base.join("a".repeat(300)).join("x.rs");
+
+        assert_matches!(
+            canonicalize_existing_prefix(&path, &canonicalize_on_disk),
+            Err(Unresolved::InvalidName(_))
+        );
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
+        let uri = Uri::from(format!("file://{}", path.display()).as_str());
+        assert!(!roots.admits_edit_uri(&uri).await);
+        assert!(roots.contains_resolved_prefix(&path));
     }
 
     #[test]

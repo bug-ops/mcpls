@@ -42,6 +42,7 @@ pub(crate) use publish_mailbox::{DropLog, Lane, NotificationSink};
 pub(crate) use publish_mailbox::{MailboxLimits, PublishWriter, mailbox};
 pub use transport::{LspTransport, LspTransportReader};
 pub use types::{
-    BoundedUri, DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, LostPublish, LspNotification, RequestId, UndecodableReason,
+    BoundedUri, DecodedPublish, DroppedNotification, InboundMessage, JsonRpcError,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LostPublish, LspNotification, RequestId,
+    UndecodableReason, UriTooLong,
 };

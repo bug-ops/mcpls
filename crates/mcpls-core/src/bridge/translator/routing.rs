@@ -1113,7 +1113,7 @@ impl Translator {
         let line = position.line();
         match self
             .document_tracker
-            .line_presence(doc.path(), line.get().saturating_sub(1))
+            .line_presence(doc.path(), position.lsp_line())
         {
             LinePresence::Present => Ok(()),
             LinePresence::Beyond { last_line } => {
