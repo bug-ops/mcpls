@@ -391,7 +391,7 @@ async fn test_sweep_detaches_a_pull_that_does_not_answer() {
     fx.edit("fn main() { let x: i32 = \"s\"; }");
 
     let step = timeout(
-        Duration::from_secs(3600),
+        Duration::from_hours(1),
         fx.spawn_sweep(&SweepMemo::default()),
     )
     .await

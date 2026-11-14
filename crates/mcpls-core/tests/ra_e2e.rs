@@ -1,4 +1,4 @@
-//! End-to-end test suite exercising all 16 MCP tools against a real rust-analyzer.
+//! End-to-end test suite exercising the MCP tools against a real rust-analyzer.
 //!
 //! # Process model
 //!
@@ -18,12 +18,8 @@
 //!
 //! Set `MCPLS_RA_FILTER=<substring>` to run only matching sub-cases locally.
 
-#![allow(
+#![expect(
     clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_docs_in_private_items,
-    missing_docs,
     reason = "test code; a panic is the failure signal"
 )]
 

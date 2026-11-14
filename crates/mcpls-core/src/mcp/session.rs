@@ -35,7 +35,7 @@ use crate::bridge::resources::{
     SubscriptionError, parse_uri,
 };
 use crate::error::BackgroundTask;
-use crate::util::{RestartBackoff, RestartDelays, catch_panic, lock_std};
+use crate::util::{RestartDelays, lock_std, supervise};
 
 /// Whether `meta` carries rmcp's discover-lifecycle keys -- the same test
 /// `tower.rs::is_legacy_request` uses to route a request through its
@@ -378,25 +378,23 @@ async fn run_delivery(
     state: Weak<SessionState>,
     cancel: CancellationToken,
 ) {
-    let mut gate = Gate {
+    let gate = Gate {
         pacer: target.is_paced().then(ListenPacer::new),
         doorbell,
         state,
     };
-    let mut backoff = RestartBackoff::new(DELIVERY_RESTART_DELAYS);
-    loop {
-        let started = Instant::now();
-        let Err(panicked) = catch_panic(deliver(&target, &pending, &mut gate)).await else {
-            return;
-        };
-        if backoff
-            .after_panic(BackgroundTask::SessionDelivery, &panicked, started, &cancel)
-            .await
-            .is_break()
-        {
-            return;
-        }
-    }
+    let target = Arc::new(target);
+    let gate = Arc::new(tokio::sync::Mutex::new(gate));
+    supervise(
+        BackgroundTask::SessionDelivery,
+        || {
+            let (target, pending, gate) = (target.clone(), pending.clone(), gate.clone());
+            async move { deliver(&target, &pending, &mut *gate.lock().await).await }
+        },
+        &cancel,
+        DELIVERY_RESTART_DELAYS,
+    )
+    .await;
 }
 
 /// One run of the delivery loop. Drains `pending` before waiting for a ring,

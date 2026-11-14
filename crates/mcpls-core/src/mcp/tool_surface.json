@@ -719,6 +719,11 @@
               "minimum": 0,
               "type": "integer"
             },
+            "invalid_path": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "out_of_workspace": {
               "format": "uint",
               "minimum": 0,
@@ -6931,6 +6936,11 @@
         "DroppedEdits": {
           "properties": {
             "exceeds_item_cap": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "invalid_path": {
               "format": "uint",
               "minimum": 0,
               "type": "integer"

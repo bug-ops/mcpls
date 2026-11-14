@@ -57,7 +57,7 @@ Arguments: `file_path`, `new_name`, and either `line` with `character` or `symbo
 }
 ```
 
-Check for `dropped` before applying anything. When some edits were withheld, because they point outside every workspace root, use an edit shape mcpls does not translate, or exceed the per-file cap (`exceeds_item_cap`), the result carries a per-reason count:
+Check for `dropped` before applying anything. When some edits were withheld, because they point outside every workspace root (`out_of_workspace`), name a path the filesystem rejects such as an over-long component (`invalid_path`), use an edit shape mcpls does not translate, or exceed the per-file cap (`exceeds_item_cap`), the result carries a per-reason count:
 
 ```json
 { "changes": [], "dropped": { "out_of_workspace": 1 } }

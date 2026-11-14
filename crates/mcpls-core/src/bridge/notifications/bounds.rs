@@ -5,7 +5,7 @@ use lsp_types::{Diagnostic as LspDiagnostic, Uri};
 use tracing::warn;
 
 use super::{ReportedSeverity, message_as_str};
-use crate::util::{truncate_str, truncate_string};
+use crate::util::{json_len, truncate_str, truncate_string};
 
 /// Maximum size, in bytes, of a single cached log message, server message,
 /// or a single diagnostic's free-form `message` text.
@@ -206,9 +206,7 @@ fn cheap_size_estimate(diagnostics: &[LspDiagnostic]) -> Option<usize> {
 
 /// The serialized length of `diagnostics`, or `None` if serialization fails.
 fn serialized_len(diagnostics: &[LspDiagnostic]) -> Option<usize> {
-    serde_json::to_vec(diagnostics)
-        .ok()
-        .map(|bytes| bytes.len())
+    json_len(&diagnostics)
 }
 
 /// Bounds `diagnostics`' serialized size to at most

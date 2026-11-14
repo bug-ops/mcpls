@@ -51,7 +51,7 @@ in the canonical list and was the only constructor the test fixtures exercised.
 ### Goal
 
 `WorkspaceRoots` owns both concerns: a single fallible production constructor, and one set of URI
-predicates: a lexical pre-filter (`admits_uri`) and a strict write gate (`admits_edit_uri`).
+predicates: a lexical pre-filter (`admits_uri`) and a strict write gate (`edit_uri_verdict`).
 
 ### Out of Scope
 
@@ -68,11 +68,11 @@ predicates: a lexical pre-filter (`admits_uri`) and a strict write gate (`admits
 | FR-002 | `from_configured` SHALL resolve relative entries against the process working directory, treat an empty list as the working directory, fail with `InvalidConfig` for a relative root that cannot be canonicalized, and read the working directory only when a root needs it (#348) | must |
 | FR-003 | THE SYSTEM SHALL record an alias (configured, working-directory or logical `$PWD` spelling) only when its stored form resolves, on the existing prefix, to the canonical path of its own root; a dropped alias SHALL be logged at debug level | must |
 | FR-004 | `WorkspaceRoots::admits_uri` SHALL be the only lexical URI predicate and is a pre-filter, never a trust boundary: it accepts an absolute `file:` path without `.`/`..` components that lies under a canonical root or an alias with the platform case rule, never touches the filesystem, and rejects everything when no root is configured | must |
-| FR-005 | THE diagnostics pump (followed by `PublishedDiagnosticsUri::resolve`'s canonical check) and `EncodingCtx::is_out_of_workspace` (advisory) SHALL call `admits_uri`, the edit converter SHALL call `admits_edit_uri`, and all SHALL hold a `WorkspaceRoots`, not a path slice | must |
+| FR-005 | THE diagnostics pump (followed by `PublishedDiagnosticsUri::resolve`'s canonical check) and `EncodingCtx::is_out_of_workspace` (advisory) SHALL call `admits_uri`, the edit converter SHALL call `edit_uri_verdict`, and all SHALL hold a `WorkspaceRoots`, not a path slice | must |
 | FR-006 | `PublishedDiagnosticsUri::resolve` SHALL take `&WorkspaceRoots` and decide containment on the canonical path with `contains_canonical` | must |
 | FR-007 | Test fixtures SHALL build roots through `from_configured` for real directories, and through a `cfg(test)` constructor (`for_test`) for pure-lexical unit tests that name literal paths | must |
-| FR-008 | WHEN a server supplies a URI that mcpls would write through (rename and code-action edits) THE SYSTEM SHALL use `WorkspaceRoots::admits_edit_uri`: exact component comparison against the canonical roots and aliases (no case folding) AND a canonical form of the path (longest existing prefix resolved) under a canonical root. Aliases are then only a spelling aid | must |
-| FR-009 | THE SYSTEM SHALL canonicalize a path through one routine, `canonicalize_existing_prefix`, which falls through to the next ancestor only on `NotFound` and `NotADirectory`, reports `InvalidFilename` as `Unresolved::InvalidName` (permanent, never retried or cached) and every other error as `Unresolved::Transient`, and refuses `..` components; `admits_edit_uri` SHALL treat any `Unresolved` as not admitted | must |
+| FR-008 | WHEN a server supplies a URI that mcpls would write through (rename and code-action edits) THE SYSTEM SHALL use `WorkspaceRoots::edit_uri_verdict`: exact component comparison against the canonical roots and aliases (no case folding) AND a canonical form of the path (longest existing prefix resolved) under a canonical root. Aliases are then only a spelling aid | must |
+| FR-009 | THE SYSTEM SHALL canonicalize a path through one routine, `canonicalize_existing_prefix`, which falls through to the next ancestor only on `NotFound` and `NotADirectory`, reports `InvalidFilename`, `InvalidInput` and a NUL byte in the path (refused before any syscall) as `Unresolved::InvalidName`, a symlink loop (`ELOOP`) and `PermissionDenied` as `Unresolved::Unwalkable` (both permanent: never retried, cached or held off; a later publish of the same path tries again; a clear or lost publication for an `Unwalkable` path is still placed under its last known canonical form or its lexical spelling, as for `Transient`), every other error as `Unresolved::Transient`, and refuses `..` components; `edit_uri_verdict` SHALL treat any `Unresolved` as not admitted, and report `InvalidName` as `EditUriVerdict::InvalidPath` (tallied as `dropped.invalid_path`, not `out_of_workspace`) | must |
 | FR-010 | THE SYSTEM SHALL validate client paths only through `WorkspaceRoots::validate` (async, canonicalization on the blocking pool) or `validate_blocking`, which return a `WorkspacePath`; a handler validates a request path once and passes the `WorkspacePath` on | must |
 | FR-011 | THE tsserver pin SHALL decide whether the pinned tsserver lies inside the workspace with `WorkspaceRoots::contains_canonical` on the canonicalized tsserver path | must |
 | FR-012 | `resources::make_uri` SHALL encode through the same `file_url` as `try_path_to_uri`, so every path the bridge can open has a resource URI on Windows | must |
@@ -139,9 +139,9 @@ predicates: a lexical pre-filter (`admits_uri`) and a strict write gate (`admits
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | Containment predicates over URIs | Two, with distinct roles: `admits_uri` (lexical pre-filter and advisory flag) and `admits_edit_uri` (write gate); no other copy of either rule |
+| SC-001 | Containment predicates over URIs | Two, with distinct roles: `admits_uri` (lexical pre-filter and advisory flag) and `edit_uri_verdict` (write gate); no other copy of either rule |
 | SC-002 | Production and test constructors | Test fixtures for real directories go through `from_configured` |
-| SC-003 | `tool_surface.json` diff | Only the five `out_of_workspace` descriptions |
+| SC-003 | `tool_surface.json` diff | The five `out_of_workspace` descriptions, plus (#916) a new `dropped.invalid_path` count in the two `DroppedEdits` schemas |
 
 ## 7. See Also
 

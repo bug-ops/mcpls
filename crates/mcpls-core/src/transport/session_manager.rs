@@ -14,7 +14,7 @@ use super::config::{ResponseStreamDeadline, SessionLimit, StreamLiveness, non_ze
 use super::liveness::{
     ProbeId, SESSION_CLOSE_TIMEOUT, SessionLiveness, StreamProbe, is_common_channel_event_id,
 };
-use crate::util::{RestartBackoff, RestartDelays, catch_panic, lock_std};
+use crate::util::{RestartDelays, lock_std, supervise};
 
 /// Log-safe correlation handle for a session: eight hex digits of a hash of
 /// the id, so log lines can be matched without disclosing the bearer secret.
@@ -399,31 +399,6 @@ pub(super) async fn supervise_idle_reaper(
         },
     )
     .await;
-}
-
-/// Runs `run` to completion, rerunning it each time it panics after the
-/// [`RestartBackoff`] delay, and stops once it returns or `cancel` fires during
-/// the delay.
-async fn supervise<Fut: std::future::Future<Output = ()>>(
-    what: crate::error::BackgroundTask,
-    mut run: impl FnMut() -> Fut,
-    cancel: &tokio_util::sync::CancellationToken,
-    delays: RestartDelays,
-) {
-    let mut backoff = RestartBackoff::new(delays);
-    loop {
-        let started = tokio::time::Instant::now();
-        let Err(panicked) = catch_panic(run()).await else {
-            return;
-        };
-        if backoff
-            .after_panic(what, &panicked, started, cancel)
-            .await
-            .is_break()
-        {
-            return;
-        }
-    }
 }
 
 /// Marker embedded in [`CappedSessionManagerError::CapReached`]'s rendered

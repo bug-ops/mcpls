@@ -38,6 +38,7 @@ jobs:
               - 'Cargo.lock'
               - 'fuzz/**'
               - 'scripts/check-tracing-messages.py'
+              - 'scripts/test-check-tracing-messages.sh'
               - 'server.json'
               - 'README.md'
               - 'book/src/getting-started/installation.md'
@@ -100,6 +101,8 @@ jobs:
         run: cargo clippy --all-targets --all-features --workspace -- -D warnings
       - name: Check tracing messages are constant
         run: python3 scripts/check-tracing-messages.py
+      - name: Check the tracing message checker against a synthetic tree
+        run: scripts/test-check-tracing-messages.sh
       - name: Check mcpls with the committed lockfile
         run: cargo check -p mcpls --locked
 
@@ -313,7 +316,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Shellcheck scripts
-        run: shellcheck --shell=sh scripts/install.sh scripts/check-server-json-version.sh scripts/test-check-server-json-version.sh
+        run: shellcheck --shell=sh scripts/install.sh scripts/check-server-json-version.sh scripts/test-check-server-json-version.sh scripts/test-check-tracing-messages.sh
 
   server-json:
     name: Registry Manifest

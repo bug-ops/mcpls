@@ -1,7 +1,5 @@
 //! Integration tests for the mcpls CLI binary.
 
-#![allow(deprecated, reason = "`assert_cmd::Command::cargo_bin` is deprecated")]
-
 use std::fs;
 use std::process::Command;
 use std::time::Duration;

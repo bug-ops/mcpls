@@ -17,7 +17,7 @@ use super::kind_filter::CodeActionKindFilter;
 use super::navigation::ItemBudget;
 use super::positioned::{Positioned, budgeted, document_request};
 use super::routing::{Capability, FileLocalCapability, IndexingGate};
-use crate::bridge::{ClientPath, WorkspaceRoots};
+use crate::bridge::{ClientPath, EditUriVerdict, WorkspaceRoots};
 use crate::config::ServerId;
 use crate::error::{ErrorChain, Result, is_invalid_offset};
 use crate::escape_control;
@@ -50,7 +50,7 @@ use crate::redaction::Redactions;
 /// `changes` does not already name counts as `shadowed_by_changes`. A URI
 /// present in both is a mirror, not a drop. An entry outside
 /// `workspace_roots` is dropped rather than rewritten into the response --
-/// see [`WorkspaceRoots::admits_edit_uri`]. Edits beyond
+/// see [`WorkspaceRoots::edit_uri_verdict`]. Edits beyond
 /// `MAX_NORMALIZED_LOCATIONS` are counted in `exceeds_item_cap` (#487): each
 /// file's edit list is admitted whole or not at all, files in URI order, from
 /// the caller's `budget`, which the caller shares across every edit of one
@@ -98,20 +98,31 @@ struct WorkspaceEditConverter<'a> {
 
 impl WorkspaceEditConverter<'_> {
     /// Whether `uri` may be written through (see
-    /// [`WorkspaceRoots::admits_edit_uri`]: exact-case lexical containment plus
-    /// canonical containment); an outside URI is logged and tallied in
-    /// `dropped.out_of_workspace` as a side effect.
+    /// [`WorkspaceRoots::edit_uri_verdict`]: exact-case lexical containment
+    /// plus canonical containment); a refused URI is logged and tallied in
+    /// `dropped.out_of_workspace`, or in `dropped.invalid_path` when its path
+    /// carries a name the filesystem rejects, as a side effect.
     async fn check_in_workspace(&mut self, uri: &lsp_types::Uri) -> bool {
-        let in_workspace = self.workspace_roots.admits_edit_uri(uri).await;
-        if !in_workspace {
-            tracing::warn!(
-                uri = uri.as_ref(),
-                edit_kind = %self.edit_kind,
-                "dropping out-of-workspace edit"
-            );
-            self.dropped.out_of_workspace = self.dropped.out_of_workspace.saturating_add(1);
+        match self.workspace_roots.edit_uri_verdict(uri).await {
+            EditUriVerdict::Admitted => true,
+            EditUriVerdict::OutOfWorkspace => {
+                tracing::warn!(
+                    uri = uri.as_ref(),
+                    edit_kind = %self.edit_kind,
+                    "dropping out-of-workspace edit"
+                );
+                self.dropped.out_of_workspace = self.dropped.out_of_workspace.saturating_add(1);
+                false
+            }
+            EditUriVerdict::InvalidPath => {
+                tracing::warn!(
+                    edit_kind = %self.edit_kind,
+                    "dropping edit whose path the filesystem rejects"
+                );
+                self.dropped.invalid_path = self.dropped.invalid_path.saturating_add(1);
+                false
+            }
         }
-        in_workspace
     }
 
     /// Admits one file's whole edit list against the budget, or tallies all
@@ -381,7 +392,7 @@ async fn resolve_deferred_code_actions(
 /// document's own URI, used for the action's `diagnostics` (always scoped to
 /// the requested document); `edit`'s per-file URIs (from either `changes` or
 /// `documentChanges`) are each checked against `workspace_roots` before being
-/// trusted -- see [`WorkspaceRoots::admits_edit_uri`].
+/// trusted -- see [`WorkspaceRoots::edit_uri_verdict`].
 async fn convert_code_action(
     action: lsp_types::CodeAction,
     ctx: &EncodingCtx,
@@ -1427,6 +1438,40 @@ mod tests {
         )
         .await;
         (changes.len(), dropped.out_of_workspace)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_edit_with_an_overlong_component_is_tallied_as_invalid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&base)).unwrap();
+        let overlong = base.join("a".repeat(300)).join("x.rs");
+
+        let uri = crate::bridge::path_to_uri(&overlong).unwrap();
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri,
+                vec![lsp_types::TextEdit {
+                    range: lsp_types::Range::default(),
+                    new_text: "x".to_string(),
+                }],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        let (changes, dropped) = convert_workspace_edit(
+            edit,
+            &test_ctx(),
+            &roots,
+            "rename edit",
+            &mut ItemBudget::new(),
+        )
+        .await;
+
+        assert!(changes.is_empty());
+        assert_eq!(dropped.invalid_path, 1);
+        assert_eq!(dropped.out_of_workspace, 0);
     }
 
     /// Aliases are only a spelling aid: a symlink inside the workspace that

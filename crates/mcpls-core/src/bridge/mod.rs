@@ -76,5 +76,7 @@ pub(crate) use translator::{
 };
 #[cfg(test)]
 pub(crate) use workspace_roots::{CanonicalizeFn, ProcessCwd};
+pub(crate) use workspace_roots::{
+    EditUriVerdict, join_relative_root, lexically_normalize, probe_root,
+};
 pub use workspace_roots::{WorkspacePath, WorkspaceRoots};
-pub(crate) use workspace_roots::{join_relative_root, lexically_normalize, probe_root};
