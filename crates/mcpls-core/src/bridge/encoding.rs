@@ -127,6 +127,58 @@ impl<T> Converted<T> {
     }
 }
 
+/// A 0-based line number, the LSP base.
+///
+/// A distinct type from the 1-based line of [`Position2D`] and
+/// [`Position`], so the two bases cannot be mixed up. This module is the only
+/// place that shifts between them.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::LspLine;
+///
+/// assert_eq!(LspLine::new(0).get(), 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LspLine(u32);
+
+impl LspLine {
+    /// Wraps a 0-based line number.
+    #[must_use]
+    pub const fn new(line: u32) -> Self {
+        Self(line)
+    }
+
+    /// The 0-based line number.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The line named by a 1-based MCP line; a zero clamps to line 0.
+    #[must_use]
+    pub(crate) const fn from_mcp(line: u32) -> Self {
+        Self(line.saturating_sub(1))
+    }
+
+    /// The 1-based MCP line number.
+    #[must_use]
+    pub(crate) const fn to_mcp(self) -> u32 {
+        self.0.saturating_add(1)
+    }
+}
+
+/// 0-based UTF-16 column of a 1-based MCP `character`; a zero clamps to 0.
+pub const fn lsp_column(character: u32) -> u32 {
+    character.saturating_sub(1)
+}
+
+/// 1-based MCP `character` of a 0-based UTF-16 column.
+pub const fn mcp_column(utf16_column: u32) -> u32 {
+    utf16_column.saturating_add(1)
+}
+
 /// Convert MCP position (1-based) to LSP position (0-based), translating the
 /// character column into `encoding`'s units.
 ///
@@ -154,7 +206,7 @@ pub fn mcp_to_lsp_position(
     );
     Converted {
         value: lsp_types::Position {
-            line: position.lsp_line(),
+            line: position.lsp_line().get(),
             character: column.value,
         },
         fidelity: column.fidelity,
@@ -179,10 +231,7 @@ pub fn lsp_to_mcp_position(
     };
 
     Converted {
-        value: Position2D {
-            line: pos.line.saturating_add(1),
-            character: column.value.saturating_add(1),
-        },
+        value: Position2D::from_lsp(LspLine::new(pos.line), column.value),
         fidelity: column.fidelity,
     }
 }
@@ -550,7 +599,7 @@ mod tests {
         let converted =
             lsp_to_mcp_position(lsp_types::Position { line, character }, line_text, encoding);
         Converted {
-            value: (converted.value.line, converted.value.character),
+            value: (converted.value.line(), converted.value.character()),
             fidelity: converted.fidelity,
         }
     }
@@ -582,12 +631,8 @@ mod tests {
         for line in 1..100 {
             for char in 1..100 {
                 let lsp_pos = lsp_at(line, char, None, PositionEncoding::Utf16).value;
-                let Position2D {
-                    line: mcp_line,
-                    character: mcp_char,
-                } = lsp_to_mcp_position(lsp_pos, None, PositionEncoding::Utf16).value;
-                assert_eq!(line, mcp_line);
-                assert_eq!(char, mcp_char);
+                let mcp = lsp_to_mcp_position(lsp_pos, None, PositionEncoding::Utf16).value;
+                assert_eq!(mcp, Position2D::from_mcp(line, char));
             }
         }
     }

@@ -4,7 +4,9 @@
 //! do their MCP-facing DTOs, so both families convert through one pair of
 //! functions instead of two copies.
 
-use super::dto::{CheckedHierarchyItem, HierarchyItem, MAX_POSITION_VALUE, Range, lsp_kind_to_u32};
+use super::dto::{
+    CheckedHierarchyItem, HierarchyItem, MAX_POSITION_VALUE, Position2D, Range, lsp_kind_to_u32,
+};
 use super::encoding_ctx::EncodingCtx;
 
 /// The fields common to an LSP call or type hierarchy item, in the routed
@@ -82,8 +84,10 @@ impl From<LspHierarchyItem> for lsp_types::TypeHierarchyItem {
 /// walking tools, which reject larger values.
 fn clamp_to_input_limit(mut range: Range) -> Range {
     for position in [&mut range.start, &mut range.end] {
-        position.line = position.line.min(MAX_POSITION_VALUE);
-        position.character = position.character.min(MAX_POSITION_VALUE);
+        *position = Position2D::from_mcp(
+            position.line().min(MAX_POSITION_VALUE),
+            position.character().min(MAX_POSITION_VALUE),
+        );
     }
     range
 }
@@ -178,8 +182,8 @@ mod tests {
         item.selection_range.end.character = 2_147_483_647;
 
         let dto: HierarchyItem = hierarchy_item_to_mcp(item, &ctx).await;
-        assert_eq!(dto.range.end.character, MAX_POSITION_VALUE);
-        assert_eq!(dto.selection_range.end.character, MAX_POSITION_VALUE);
+        assert_eq!(dto.range.end.character(), MAX_POSITION_VALUE);
+        assert_eq!(dto.selection_range.end.character(), MAX_POSITION_VALUE);
         assert!(CheckedHierarchyItem::from_client(dto).is_ok());
     }
 
@@ -191,13 +195,7 @@ mod tests {
 
         let dto: HierarchyItem = hierarchy_item_to_mcp(original.clone(), &ctx).await;
         assert_eq!(dto.kind, 5);
-        assert_eq!(
-            dto.range.start,
-            Position2D {
-                line: 3,
-                character: 5
-            }
-        );
+        assert_eq!(dto.range.start, Position2D::from_mcp(3, 5));
 
         let back: lsp_types::TypeHierarchyItem =
             hierarchy_item_to_lsp(CheckedHierarchyItem::from_client(dto).unwrap(), uri, &ctx).await;

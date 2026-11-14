@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::notifications::DocumentStamp;
-use super::{WorkspacePath, WorkspaceRoots};
+use super::{LspLine, WorkspacePath, WorkspaceRoots};
 use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
@@ -877,7 +877,7 @@ impl DocumentTracker {
         lock_std(&self.documents).get(path).cloned()
     }
 
-    /// Text of the 0-based `line`'th line of `path`'s currently tracked
+    /// Text of the 0-based `line` of `path`'s currently tracked
     /// content, or `None` if the document is not open or has no such line.
     ///
     /// Reads the in-memory content mcpls already sent the server via
@@ -885,9 +885,13 @@ impl DocumentTracker {
     /// re-scanning the whole file) and more correct when disk and server
     /// state have diverged (e.g. an edit not yet flushed to disk).
     #[must_use]
-    pub fn line_text(&self, path: &Path, line: u32) -> Option<String> {
+    pub fn line_text(&self, path: &Path, line: LspLine) -> Option<String> {
         let documents = lock_std(&self.documents);
-        documents.get(path)?.text.line(line).map(str::to_string)
+        documents
+            .get(path)?
+            .text
+            .line(line.get())
+            .map(str::to_string)
     }
 
     /// The content of `path` as last sent to a server, or `None` if the
@@ -903,10 +907,10 @@ impl DocumentTracker {
     ///
     /// Checked under the documents lock without copying any text.
     #[must_use]
-    pub(crate) fn line_presence(&self, path: &Path, line: u32) -> LinePresence {
+    pub(crate) fn line_presence(&self, path: &Path, line: LspLine) -> LinePresence {
         match lock_std(&self.documents).get(path) {
             None => LinePresence::Untracked,
-            Some(document) if document.text.line(line).is_some() => LinePresence::Present,
+            Some(document) if document.text.line(line.get()).is_some() => LinePresence::Present,
             Some(document) => LinePresence::Beyond {
                 last_line: document.text.last_line(),
             },
@@ -922,14 +926,14 @@ impl DocumentTracker {
     pub(crate) fn line_window(
         &self,
         path: &Path,
-        start_line: u32,
+        start_line: LspLine,
         max_lines: usize,
     ) -> Option<String> {
         let documents = lock_std(&self.documents);
         let mut lines = documents
             .get(path)?
             .text
-            .lines_from(start_line)
+            .lines_from(start_line.get())
             .take(max_lines);
         let mut window = lines.next()?.to_string();
         for line in lines {
@@ -2987,23 +2991,38 @@ mod tests {
     fn test_line_presence_distinguishes_untracked_present_and_beyond() {
         let tracker = DocumentTracker::new(ResourceLimits::default(), HashMap::new());
         let path = PathBuf::from("/test/lines.rs");
-        assert_eq!(tracker.line_presence(&path, 0), LinePresence::Untracked);
+        assert_eq!(
+            tracker.line_presence(&path, LspLine::new(0)),
+            LinePresence::Untracked
+        );
 
         tracker.open(path.clone(), "a\r\nb\n".to_string()).unwrap();
-        assert_eq!(tracker.line_presence(&path, 0), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&path, 1), LinePresence::Present);
-        assert_eq!(tracker.line_presence(&path, 2), LinePresence::Present);
+        assert_eq!(
+            tracker.line_presence(&path, LspLine::new(0)),
+            LinePresence::Present
+        );
+        assert_eq!(
+            tracker.line_presence(&path, LspLine::new(1)),
+            LinePresence::Present
+        );
+        assert_eq!(
+            tracker.line_presence(&path, LspLine::new(2)),
+            LinePresence::Present
+        );
         let beyond = LinePresence::Beyond {
             last_line: NonZeroU32::new(3).unwrap(),
         };
-        assert_eq!(tracker.line_presence(&path, 3), beyond);
-        assert_eq!(tracker.line_presence(&path, u32::MAX), beyond);
+        assert_eq!(tracker.line_presence(&path, LspLine::new(3)), beyond);
+        assert_eq!(tracker.line_presence(&path, LspLine::new(u32::MAX)), beyond);
 
         let empty = PathBuf::from("/test/empty.rs");
         tracker.open(empty.clone(), String::new()).unwrap();
-        assert_eq!(tracker.line_presence(&empty, 0), LinePresence::Present);
         assert_eq!(
-            tracker.line_presence(&empty, 1),
+            tracker.line_presence(&empty, LspLine::new(0)),
+            LinePresence::Present
+        );
+        assert_eq!(
+            tracker.line_presence(&empty, LspLine::new(1)),
             LinePresence::Beyond {
                 last_line: NonZeroU32::MIN
             }
@@ -4804,7 +4823,7 @@ mod tests {
                     .unwrap()
                     .text;
                 assert_eq!(
-                    tracker.line_text(&path, line),
+                    tracker.line_text(&path, LspLine::new(line)),
                     disk,
                     "content {content:?}, line {line}"
                 );
@@ -4820,16 +4839,31 @@ mod tests {
             .open(path.clone(), "ab\r\ncd\r\r\n".to_string())
             .unwrap();
 
-        assert_eq!(tracker.line_text(&path, 0).as_deref(), Some("ab"));
-        assert_eq!(tracker.line_text(&path, 1).as_deref(), Some("cd"));
-        assert_eq!(tracker.line_text(&path, 2).as_deref(), Some(""));
-        assert_eq!(tracker.line_text(&path, 3).as_deref(), Some(""));
-        assert_eq!(tracker.line_text(&path, 4), None);
+        assert_eq!(
+            tracker.line_text(&path, LspLine::new(0)).as_deref(),
+            Some("ab")
+        );
+        assert_eq!(
+            tracker.line_text(&path, LspLine::new(1)).as_deref(),
+            Some("cd")
+        );
+        assert_eq!(
+            tracker.line_text(&path, LspLine::new(2)).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            tracker.line_text(&path, LspLine::new(3)).as_deref(),
+            Some("")
+        );
+        assert_eq!(tracker.line_text(&path, LspLine::new(4)), None);
 
         let empty = PathBuf::from("/test/empty.rs");
         tracker.open(empty.clone(), String::new()).unwrap();
-        assert_eq!(tracker.line_text(&empty, 0).as_deref(), Some(""));
-        assert_eq!(tracker.line_text(&empty, 1), None);
+        assert_eq!(
+            tracker.line_text(&empty, LspLine::new(0)).as_deref(),
+            Some("")
+        );
+        assert_eq!(tracker.line_text(&empty, LspLine::new(1)), None);
     }
 
     /// Regression for the `SizeLimit::read_cap` off-by-one: a file whose size

@@ -757,13 +757,7 @@ async fn format_range_sends_zero_based_range_and_options() {
     assert_eq!(params["options"]["tabSize"], 2);
     assert_eq!(params["options"]["insertSpaces"], false);
     assert_eq!(result.edits.len(), 1);
-    assert_eq!(
-        result.edits[0].range.start,
-        Position2D {
-            line: 2,
-            character: 2
-        }
-    );
+    assert_eq!(result.edits[0].range.start, Position2D::from_mcp(2, 2));
 }
 
 #[tokio::test]
@@ -781,7 +775,7 @@ async fn format_range_converts_utf8_edit_columns() {
         }]),
     )
     .await;
-    assert_eq!(result.edits[0].range.start.character, 3);
+    assert_eq!(result.edits[0].range.start.character(), 3);
     assert_eq!(result.positions_degraded, None);
 }
 

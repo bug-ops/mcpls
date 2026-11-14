@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use serde::Deserialize;
 use serde_json::Value;
@@ -134,35 +134,26 @@ struct ProbeContext<'a> {
 
 impl ProbeContext<'_> {
     /// `None` when the probe has nothing for the placeholder (no position, no symbol).
-    fn fill(&self, placeholder: Placeholder) -> Result<Option<Value>> {
+    fn fill(&self, placeholder: Placeholder) -> Option<Value> {
         let file = self.probe.file();
         let position = self.probe.position();
-        let zero_based = |one_based: u32, what: &str| {
-            one_based
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("{what} is 1-based and cannot be 0"))
-        };
-        Ok(match placeholder {
+        match placeholder {
             Placeholder::Repo => Some(path_value(self.repo)),
             Placeholder::File => Some(path_value(&file.in_repo(self.repo))),
             Placeholder::RelativeFile => Some(Value::from(file.as_str())),
-            Placeholder::Line1 => position.map(|p| Value::from(p.line)),
-            Placeholder::Line0 => position
-                .map(|p| zero_based(p.line, "line").map(Value::from))
-                .transpose()?,
-            Placeholder::Character1 => position.map(|p| Value::from(p.character)),
-            Placeholder::Character0 => position
-                .map(|p| zero_based(p.character, "character").map(Value::from))
-                .transpose()?,
+            Placeholder::Line1 => position.map(|p| Value::from(p.line())),
+            Placeholder::Line0 => position.map(|p| Value::from(p.lsp_line().get())),
+            Placeholder::Character1 => position.map(|p| Value::from(p.character())),
+            Placeholder::Character0 => position.map(|p| Value::from(p.lsp_character())),
             Placeholder::Symbol => self.probe.symbol().map(Value::from),
-        })
+        }
     }
 
-    fn resolve(&self, value: &ArgValue) -> Result<Option<Value>> {
+    fn resolve(&self, value: &ArgValue) -> Option<Value> {
         match value {
-            ArgValue::Text(text) => Ok(Some(Value::from(text.as_str()))),
-            ArgValue::Number(number) => Ok(Some(Value::from(*number))),
-            ArgValue::Flag(flag) => Ok(Some(Value::from(*flag))),
+            ArgValue::Text(text) => Some(Value::from(text.as_str())),
+            ArgValue::Number(number) => Some(Value::from(*number)),
+            ArgValue::Flag(flag) => Some(Value::from(*flag)),
             ArgValue::Placeholder(placeholder) => self.fill(*placeholder),
         }
     }
@@ -357,23 +348,14 @@ impl ExternalTarget {
 
     /// The call for `probe`, or `None` when the target has no tool for it or the
     /// probe lacks something a placeholder needs.
-    fn request(&self, probe: &Probe, repo: &Path) -> Result<Option<CallToolRequestParams>> {
-        let Some(binding) = self.tools.for_probe(probe) else {
-            return Ok(None);
-        };
+    fn request(&self, probe: &Probe, repo: &Path) -> Option<CallToolRequestParams> {
+        let binding = self.tools.for_probe(probe)?;
         let context = ProbeContext { repo, probe };
         let mut arguments = JsonObject::new();
         for (name, value) in &binding.arguments {
-            match context.resolve(value)? {
-                Some(value) => {
-                    arguments.insert(name.clone(), value);
-                }
-                None => return Ok(None),
-            }
+            arguments.insert(name.clone(), context.resolve(value)?);
         }
-        Ok(Some(
-            CallToolRequestParams::new(binding.tool.clone()).with_arguments(arguments),
-        ))
+        Some(CallToolRequestParams::new(binding.tool.clone()).with_arguments(arguments))
     }
 
     fn verdict(&self, probe: &Probe, result: &CallToolResult) -> Result<(), Incorrect> {
@@ -474,7 +456,7 @@ impl Target {
         match self {
             Self::Mcpls { .. } => probe.request(repo).map(ProbeCall::Call),
             Self::External(target) => Ok(target
-                .request(probe, repo)?
+                .request(probe, repo)
                 .map_or(ProbeCall::Unsupported, ProbeCall::Call)),
         }
     }
@@ -512,10 +494,7 @@ mod tests {
     fn definition(symbol: Option<&str>) -> Probe {
         Probe::Definition {
             file: file(),
-            position: Position2D {
-                line: 5,
-                character: 10,
-            },
+            position: Position2D::from_mcp(5, 10),
             uri_suffix: "src/utils/deepEqual.ts".to_owned(),
             symbol: symbol.map(str::to_owned),
         }
@@ -577,10 +556,7 @@ mod tests {
         let target = Target::External(Box::new(ExternalTarget::parse(SERENA).unwrap()));
         let hover = Probe::Hover {
             file: file(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             contains: "x".to_owned(),
             symbol: Some("x".to_owned()),
         };
@@ -637,10 +613,7 @@ mod tests {
 
         let references = Probe::References {
             file: file(),
-            position: Position2D {
-                line: 1,
-                character: 1,
-            },
+            position: Position2D::from_mcp(1, 1),
             min_count: 2,
             symbol: None,
         };

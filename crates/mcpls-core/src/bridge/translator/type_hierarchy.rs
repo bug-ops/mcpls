@@ -164,7 +164,7 @@ mod tests {
     }
 
     fn item_dto(uri: &str) -> HierarchyItem {
-        let at = |line, character| Position2D { line, character };
+        let at = |line, character| Position2D::from_mcp(line, character);
         HierarchyItem {
             name: "Derived".to_string(),
             kind: 5,
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].name, "Base");
         assert_eq!(result.items[0].kind, 5);
-        assert_eq!(result.items[0].range.end.character, 5);
+        assert_eq!(result.items[0].range.end.character(), 5);
         assert!(!result.truncated);
     }
 
