@@ -178,7 +178,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and test(encoding)'` | All existing unit tests in `bridge/encoding.rs` pass |
-| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D { line: l, character: c }` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
+| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D::from_mcp(l, c)` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
 | SC-003 | No panic on any fuzzed/adversarial byte offset within `0..=text.len()` | Every offset either succeeds or returns `Err`, never panics |
 
 ## 8. Agent Boundaries

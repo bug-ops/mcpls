@@ -225,8 +225,8 @@ impl PublishedDiagnosticsUri {
     /// the result against `roots`.
     ///
     /// Returns `None` for a canonical path that cannot be encoded as a URI
-    /// within [`BoundedUri::MAX_BYTES`] or that lies outside every root (for example a symlink pointing out of
-    /// the workspace). Resolving the path is
+    /// within [`BoundedUri::MAX_BYTES`] or that lies outside every root (for
+    /// example a symlink pointing out of the workspace). Resolving the path is
     /// [`PublishedPathResolver`](super::PublishedPathResolver)'s job.
     pub(super) fn from_canonical_path(
         published: &BoundedUri,
