@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#884).
-- Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#886).
+- Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#904).
+- Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#904).
 
 ### Fixed
 
-- Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#886).
+- Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#904).
 
 ### Security
 
