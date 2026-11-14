@@ -1529,6 +1529,40 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
     server_task.abort();
 }
 
+/// rmcp #1427: a stateful session with an open GET stream and a subscription
+/// must end with the server on shutdown, not linger until `keep_alive`.
+/// Unix-only: the shutdown signal is a real self-sent `SIGTERM`, which is
+/// safe only under nextest's one-process-per-test model.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http_shutdown_ends_stateful_sessions_within_the_graceful_timeout() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let root = dunce::canonicalize(workspace.path()).unwrap();
+    let file = root.join("main.rs");
+    std::fs::write(&file, "fn main() {}").unwrap();
+    let uri = crate::bridge::resources::make_uri(&file).unwrap();
+    let server =
+        test_server_with_roots(WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap());
+    let registry = server.subscription_registry();
+    let (addr, server_task) = spawn_http_server(server, |cfg| cfg).await;
+    let (session, _stream) = establish_session(addr).await;
+    subscribe_in_session(addr, &session, &uri).await;
+    assert!(!registry.live_sessions().is_empty());
+
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    tokio::time::timeout(HTTP_GRACEFUL_SHUTDOWN_TIMEOUT, server_task)
+        .await
+        .expect("serve_http must return within the graceful shutdown timeout")
+        .unwrap()
+        .unwrap();
+    assert_registry_empties(&registry).await;
+}
+
 /// A probe reaches the GET stream, a reply sent by POST keeps it open, and a
 /// client that goes silent has the stream closed. Real time with
 /// sub-second settings.

@@ -4828,9 +4828,6 @@
               ]
             }
           },
-          "required": [
-            "languages"
-          ],
           "type": "object"
         },
         "ServerId": {

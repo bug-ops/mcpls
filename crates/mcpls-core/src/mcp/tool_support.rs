@@ -383,6 +383,7 @@ impl ToolRoutes {
     reason = "describes the wire shape for schema generation only"
 )]
 struct RouteShape {
+    #[serde(skip_serializing_if = "Option::is_none")]
     languages: Option<Vec<LanguageId>>,
     #[serde(flatten)]
     support: RouteStatus,
@@ -611,6 +612,82 @@ mod tests {
             ToolCoverage::from_routes([&push_only].into_iter()),
             ToolCoverage::All
         );
+    }
+
+    fn conforms(
+        root: &serde_json::Value,
+        schema: &serde_json::Value,
+        value: &serde_json::Value,
+    ) -> bool {
+        if let Some(target) = schema["$ref"].as_str() {
+            let name = target.trim_start_matches("#/$defs/");
+            return conforms(root, &root["$defs"][name], value);
+        }
+        if schema["type"] == "null" && !value.is_null() {
+            return false;
+        }
+        for keyword in ["oneOf", "anyOf"] {
+            if let Some(branches) = schema[keyword].as_array()
+                && !branches.iter().any(|branch| conforms(root, branch, value))
+            {
+                return false;
+            }
+        }
+        if let (Some(object), Some(required)) = (value.as_object(), schema["required"].as_array())
+            && !required
+                .iter()
+                .all(|key| key.as_str().is_some_and(|key| object.contains_key(key)))
+        {
+            return false;
+        }
+        if let (Some(object), Some(properties)) =
+            (value.as_object(), schema["properties"].as_object())
+            && !properties.iter().all(|(key, property)| {
+                object
+                    .get(key)
+                    .is_none_or(|child| conforms(root, property, child))
+            })
+        {
+            return false;
+        }
+        match (value.as_array(), schema.get("items")) {
+            (Some(items), Some(item_schema)) => {
+                items.iter().all(|item| conforms(root, item_schema, item))
+            }
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn serialized_report_conforms_to_the_published_output_schema() {
+        let tool = crate::mcp::server::McplsServer::build_tool_router(None)
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "get_tool_support")
+            .unwrap();
+        let schema = serde_json::Value::Object((*tool.output_schema.unwrap()).clone());
+        let entry = |name: &str, routes| ToolEntry {
+            name: name.to_owned(),
+            coverage: ToolCoverage::Partial,
+            routes: Some(routes),
+        };
+        let member = MemberSupport::new(ServerId::from_static("s"), MemberStatus::Supported);
+        let report = ToolSupportReport {
+            languages: vec![LanguageId::from_static("rust")],
+            tools: vec![
+                entry(
+                    "document",
+                    ToolRoutes::Document(vec![LanguageGroup {
+                        languages: vec![LanguageId::from_static("rust")],
+                        support: RouteStatus::from(&RouteSupport::NoServer),
+                    }]),
+                ),
+                entry("workspace", ToolRoutes::Workspace(RouteSupport::NoServer)),
+                entry("fan_out", ToolRoutes::FanOut(vec![member])),
+            ],
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        assert!(conforms(&schema, &schema, &value), "{value}\n{schema}");
     }
 
     #[test]
