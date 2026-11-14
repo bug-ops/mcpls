@@ -188,24 +188,80 @@ impl LspSettings {
     /// object when `section` is `None`. Missing sections yield `Null`.
     #[must_use]
     pub fn section(&self, section: Option<&str>) -> Value {
+        self.section_ref(section).into()
+    }
+
+    /// Borrows the section without cloning it, so a caller can bound the
+    /// reply size before paying for a copy.
+    pub(crate) fn section_ref(&self, section: Option<&str>) -> SectionRef<'_> {
         let Some(section) = section else {
-            return self.to_value();
+            return SectionRef::Whole(&self.0);
         };
         let mut segments = section.split('.');
         let Some(first) = segments.next() else {
-            return Value::Null;
+            return SectionRef::Missing;
         };
         let mut current = self.0.get(first);
         for segment in segments {
             current = current.and_then(|value| value.get(segment));
         }
-        current.cloned().unwrap_or(Value::Null)
+        current.map_or(SectionRef::Missing, SectionRef::Found)
+    }
+
+    /// The section of an item that selects nothing; serializes as `null`.
+    pub(crate) const fn missing_section() -> SectionRef<'static> {
+        SectionRef::Missing
     }
 
     /// Returns the whole settings object as a JSON value.
     #[must_use]
     pub fn to_value(&self) -> Value {
         Value::Object(self.0.clone())
+    }
+}
+
+/// A borrowed configuration section: the whole settings object, a subtree,
+/// or nothing (serialized as `null`).
+#[derive(Debug, Clone, Copy)]
+pub enum SectionRef<'a> {
+    Whole(&'a Map<String, Value>),
+    Found(&'a Value),
+    Missing,
+}
+
+/// Deep-clones the section into an owned JSON value.
+impl From<SectionRef<'_>> for Value {
+    fn from(section: SectionRef<'_>) -> Self {
+        match section {
+            SectionRef::Whole(map) => Self::Object(map.clone()),
+            SectionRef::Found(value) => value.clone(),
+            SectionRef::Missing => Self::Null,
+        }
+    }
+}
+
+impl SectionRef<'_> {
+    /// The serialized JSON length, measured without allocating the text.
+    pub(crate) fn serialized_len(self) -> usize {
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = Counter(0);
+        let result = match self {
+            Self::Whole(map) => serde_json::to_writer(&mut counter, map),
+            Self::Found(value) => serde_json::to_writer(&mut counter, value),
+            Self::Missing => serde_json::to_writer(&mut counter, &Value::Null),
+        };
+        // Serializing a `Value` into an infallible writer cannot fail.
+        debug_assert!(result.is_ok());
+        counter.0
     }
 }
 
