@@ -11,9 +11,36 @@ env:
 permissions: {}
 
 jobs:
+  # Runs third-party build code (crates.io baseline), so it gets a read-only token
+  semver-check:
+    name: Semver Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned together: cargo-semver-checks reads rustdoc JSON, whose format is tied to the toolchain
+      - name: Install Rust (semver gate)
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # dtolnay/rust-toolchain stable
+        with:
+          toolchain: 1.100.0
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check mcpls-core version bump against crates.io
+        run: cargo semver-checks check-release -p mcpls-core
+
   # Create GitHub Release
   create-release:
     name: Create Release
+    needs: semver-check
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,20 +67,6 @@ jobs:
 
       - name: Check registry manifest version
         run: scripts/check-server-json-version.sh
-
-      # Pinned together: cargo-semver-checks reads rustdoc JSON, whose format is tied to the toolchain
-      - name: Install Rust (semver gate)
-        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # dtolnay/rust-toolchain stable
-        with:
-          toolchain: 1.100.0
-
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-semver-checks@0.50.0
-
-      - name: Check mcpls-core version bump against crates.io
-        run: cargo semver-checks check-release -p mcpls-core
 
       - name: Create Release
         id: create_release
