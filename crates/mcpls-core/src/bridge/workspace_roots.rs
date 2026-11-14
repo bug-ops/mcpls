@@ -166,7 +166,9 @@ pub fn canonicalize_existing_prefix(
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::InvalidFilename
                 ) => {}
             Err(e) => return Err(Unresolved::Transient(e)),
         }
@@ -971,6 +973,23 @@ mod tests {
             canonicalize_existing_prefix(&dir.path().join("gone/x.rs"), &canonicalize_on_disk)
                 .unwrap();
         assert_eq!(result, canonical.join("gone/x.rs"));
+    }
+
+    #[test]
+    fn test_canonicalize_existing_prefix_treats_invalid_filename_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        let canon = |p: &Path| -> io::Result<PathBuf> {
+            if p.file_name().is_some_and(|name| name.len() > 255) {
+                Err(io::Error::from(io::ErrorKind::InvalidFilename))
+            } else {
+                dunce::canonicalize(p)
+            }
+        };
+        let long = "a".repeat(256);
+        let result =
+            canonicalize_existing_prefix(&dir.path().join(&long).join("x.rs"), &canon).unwrap();
+        assert_eq!(result, canonical.join(&long).join("x.rs"));
     }
 
     #[test]
