@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use lsp_types::{ErrorCodes, LspErrorCodes, LspRequestMethod, PublishDiagnosticsParams};
+use lsp_types::{ErrorCodes, LspErrorCodes, LspRequestMethod};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -16,9 +16,9 @@ use crate::config::{LanguageId, LspServerConfig, LspSettings, ServerId};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::transport::{LspTransport, LspTransportReader, MAX_CONTENT_LENGTH};
 use crate::lsp::types::{
-    DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification, JsonRpcOutcome,
-    JsonRpcReply, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LostPublish, LspNotification,
-    RequestId, UndecodableReason,
+    DecodedPublish, DroppedNotification, InboundMessage, JsonRpcError, JsonRpcNotification,
+    JsonRpcOutcome, JsonRpcReply, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, LostPublish,
+    LspNotification, RequestId, UndecodableReason,
 };
 use crate::lsp::{DropLog, Lane, NotificationSink, ServerMessage};
 use crate::redaction::{RedactedText, Redactions};
@@ -348,7 +348,7 @@ struct Lanes {
 #[derive(Debug)]
 enum Route<'a> {
     /// The diagnostics mailbox.
-    Mailbox(&'a NotificationSink, PublishDiagnosticsParams),
+    Mailbox(&'a NotificationSink, DecodedPublish),
     /// The diagnostics mailbox, told that a publish was lost.
     Lost(&'a NotificationSink, LostPublish),
     /// The log and `showMessage` lane.
@@ -1109,8 +1109,8 @@ impl LspClient {
             return Route::Floor;
         };
         match notification {
-            LspNotification::PublishDiagnostics(params) => {
-                Route::Mailbox(&lanes.notifications, params)
+            LspNotification::PublishDiagnostics(publish) => {
+                Route::Mailbox(&lanes.notifications, publish)
             }
             LspNotification::LostPublish(lost) => Route::Lost(&lanes.notifications, lost),
             LspNotification::LogMessage(params) => {
@@ -1148,13 +1148,13 @@ impl LspClient {
             }
         };
         match route {
-            Route::Mailbox(sink, params) => {
+            Route::Mailbox(sink, publish) => {
                 debug!(
-                    uri = params.uri.as_ref(),
-                    items = params.diagnostics.len(),
+                    uri = publish.uri().uri().as_ref(),
+                    items = publish.diagnostics().len(),
                     "Forwarding diagnostics"
                 );
-                sink.publishes().publish(params);
+                sink.publishes().publish(publish);
                 Delivery::Delivered
             }
             Route::Lost(sink, lost) => {
@@ -1427,8 +1427,8 @@ impl LspClient {
             LspNotification::ShowMessage(params) => {
                 redactions.redact_in_place(&mut params.message);
             }
-            LspNotification::PublishDiagnostics(params) => {
-                for diagnostic in &mut params.diagnostics {
+            LspNotification::PublishDiagnostics(publish) => {
+                for diagnostic in publish.diagnostics_mut() {
                     redactions.redact_diagnostic(diagnostic);
                 }
             }
@@ -2257,7 +2257,7 @@ mod tests {
     #[test]
     fn test_route_covers_every_notification_shape() {
         let publish = || {
-            LspNotification::PublishDiagnostics(PublishDiagnosticsParams {
+            LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: lsp_types::Uri::from("file:///a.rs".to_owned()),
                 diagnostics: Vec::new(),
                 version: None,

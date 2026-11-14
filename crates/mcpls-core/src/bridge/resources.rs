@@ -15,6 +15,7 @@ use url::Url;
 
 use super::state::{encode_rfc3986_path_chars, file_url, uri_to_path};
 use super::{ClientPath, InvalidClientPath, WorkspaceRoots};
+use crate::lsp::BoundedUri;
 use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded};
 
 /// URI scheme used for diagnostic resources.
@@ -197,8 +198,8 @@ pub(crate) struct DiagnosticsResourceUri(String);
 /// without being canonicalized and workspace-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishedDiagnosticsUri {
-    source: lsp_types::Uri,
-    canonical: lsp_types::Uri,
+    source: BoundedUri,
+    canonical: BoundedUri,
     /// Whether the server spelled the path canonically, decided on the paths
     /// rather than the URI text so percent-encoding and drive-letter case
     /// cannot make a canonical spelling look like an alias.
@@ -223,18 +224,18 @@ impl PublishedDiagnosticsUri {
     /// Pairs `published` with its already-resolved `canonical_path`, checking
     /// the result against `roots`.
     ///
-    /// Returns `None` for a canonical path that cannot be encoded as a URI or
-    /// that lies outside every root (for example a symlink pointing out of
+    /// Returns `None` for a canonical path that cannot be encoded as a URI
+    /// within [`BoundedUri::MAX_BYTES`] or that lies outside every root (for example a symlink pointing out of
     /// the workspace). Resolving the path is
     /// [`PublishedPathResolver`](super::PublishedPathResolver)'s job.
     pub(super) fn from_canonical_path(
-        published: &lsp_types::Uri,
+        published: &BoundedUri,
         published_path: &Path,
         canonical_path: &Path,
         form: CanonicalForm,
         roots: &WorkspaceRoots,
     ) -> Option<Self> {
-        let canonical = super::try_path_to_uri(canonical_path)?;
+        let canonical = BoundedUri::try_from(super::try_path_to_uri(canonical_path)?).ok()?;
         roots.contains_canonical(canonical_path).then(|| Self {
             source: published.clone(),
             canonical,
@@ -256,9 +257,10 @@ impl PublishedDiagnosticsUri {
         form: CanonicalForm,
     ) -> Self {
         let is_canonical = source == canonical && form == CanonicalForm::Resolved;
+        let bounded = |uri| BoundedUri::try_from(uri).expect("test URI is within the bound");
         Self {
-            source,
-            canonical,
+            source: bounded(source),
+            canonical: bounded(canonical),
             is_canonical,
             form,
         }
@@ -276,12 +278,12 @@ impl PublishedDiagnosticsUri {
 
     /// The URI exactly as the server published it.
     pub(crate) const fn source(&self) -> &lsp_types::Uri {
-        &self.source
+        self.source.uri()
     }
 
     /// The canonical URI of the published file.
     pub(crate) const fn canonical(&self) -> &lsp_types::Uri {
-        &self.canonical
+        self.canonical.uri()
     }
 }
 
@@ -336,7 +338,7 @@ impl DiagnosticsResourceUri {
     /// diagnostics for: the canonical form, so it matches the key
     /// [`Self::resolve`] derives from a client URI for the same file.
     pub(crate) fn for_published(published: &PublishedDiagnosticsUri) -> Option<Self> {
-        Self::for_canonical_file(&published.canonical)
+        Self::for_canonical_file(published.canonical())
     }
 
     /// The key for a file the tracker holds, given its canonical LSP URI.
@@ -783,6 +785,24 @@ mod tests {
             DiagnosticsResourceUri::for_published(&published),
             Some(resolved.uri)
         );
+    }
+
+    #[test]
+    fn test_from_canonical_path_refuses_a_canonical_uri_past_the_bound() {
+        let (_dir, root, file) = workspace();
+        let roots = WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap();
+        let published = BoundedUri::try_from(crate::bridge::path_to_uri(&file).unwrap()).unwrap();
+        let long = (0..=BoundedUri::MAX_BYTES / 100).fold(root, |dir, _| dir.join("d".repeat(99)));
+
+        let result = PublishedDiagnosticsUri::from_canonical_path(
+            &published,
+            &file,
+            &long,
+            CanonicalForm::Fallback,
+            &roots,
+        );
+
+        assert_eq!(result, None);
     }
 
     #[tokio::test]

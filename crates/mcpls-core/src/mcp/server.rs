@@ -4418,16 +4418,17 @@ mod tests {
             &mut notification,
             &Redactions::new([("API_TOKEN".to_owned(), "SuperSecretValue123".to_owned())]),
         );
-        let LspNotification::PublishDiagnostics(params) = notification else {
+        let LspNotification::PublishDiagnostics(publish) = notification else {
             panic!("expected publishDiagnostics");
         };
+        let (uri, _, diagnostics) = publish.into_parts();
         {
             let mut cache = server.context.notification_cache.lock().await;
             cache.store_diagnostics(
                 &crate::config::ServerId::from_static("rust"),
-                &params.uri,
+                uri.uri(),
                 None,
-                params.diagnostics,
+                diagnostics,
             );
         }
 

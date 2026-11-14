@@ -257,12 +257,6 @@ impl BoundedUri {
         &self.0
     }
 
-    /// The URI, no longer known to be bounded.
-    #[must_use]
-    pub fn into_uri(self) -> Uri {
-        self.0
-    }
-
     /// The URI of a JSON `uri` member, if it is a valid URI within the bound.
     /// The one reading of a publish's `uri`, shared by every path that looks
     /// at one.
@@ -439,7 +433,7 @@ impl InboundMessage {
 #[non_exhaustive]
 pub enum LspNotification {
     /// textDocument/publishDiagnostics
-    PublishDiagnostics(PublishDiagnosticsParams),
+    PublishDiagnostics(DecodedPublish),
     /// A `textDocument/publishDiagnostics` whose params did not decode.
     LostPublish(LostPublish),
     /// window/logMessage
@@ -457,6 +451,92 @@ pub enum LspNotification {
     },
 }
 
+/// A decoded `textDocument/publishDiagnostics` whose URI is within
+/// [`BoundedUri::MAX_BYTES`].
+///
+/// The bound is proved once, when the frame is decoded, so no later stage
+/// (mailbox, cache key, resolver) has to check it again.
+///
+/// # Examples
+///
+/// ```
+/// use lsp_types::{PublishDiagnosticsParams, Uri};
+/// use mcpls_core::lsp::DecodedPublish;
+///
+/// let params = PublishDiagnosticsParams {
+///     uri: Uri::from("file:///workspace/main.rs".to_owned()),
+///     diagnostics: Vec::new(),
+///     version: Some(3),
+/// };
+/// let publish = DecodedPublish::try_from(params).unwrap();
+/// assert_eq!(publish.version(), Some(3));
+/// ```
+#[derive(Debug)]
+pub struct DecodedPublish {
+    uri: BoundedUri,
+    version: Option<i32>,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+impl DecodedPublish {
+    /// The file the server published for, exactly as it spelled it.
+    #[must_use]
+    pub const fn uri(&self) -> &BoundedUri {
+        &self.uri
+    }
+
+    /// The document version the diagnostics are for, if the server said.
+    #[must_use]
+    pub const fn version(&self) -> Option<i32> {
+        self.version
+    }
+
+    /// The diagnostics as published.
+    #[must_use]
+    pub fn diagnostics(&self) -> &[lsp_types::Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// The diagnostics, for in-place redaction before they are retained.
+    pub fn diagnostics_mut(&mut self) -> &mut [lsp_types::Diagnostic] {
+        &mut self.diagnostics
+    }
+
+    /// The URI, version and diagnostics.
+    #[must_use]
+    pub fn into_parts(self) -> (BoundedUri, Option<i32>, Vec<lsp_types::Diagnostic>) {
+        (self.uri, self.version, self.diagnostics)
+    }
+}
+
+impl TryFrom<PublishDiagnosticsParams> for DecodedPublish {
+    type Error = UriTooLong;
+
+    /// The publish, unless its URI is past [`BoundedUri::MAX_BYTES`].
+    fn try_from(params: PublishDiagnosticsParams) -> Result<Self, UriTooLong> {
+        let PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version,
+        } = params;
+        Ok(Self {
+            uri: BoundedUri::try_from(uri)?,
+            version,
+            diagnostics,
+        })
+    }
+}
+
+impl LspNotification {
+    /// A `publishDiagnostics` for `params`, whose URI the test keeps in bound.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(params: PublishDiagnosticsParams) -> Self {
+        Self::PublishDiagnostics(
+            DecodedPublish::try_from(params).expect("test publish URI is within the bound"),
+        )
+    }
+}
+
 /// The members of `publishDiagnostics` params other than `uri`.
 #[derive(Deserialize)]
 struct PublishBody {
@@ -467,7 +547,7 @@ struct PublishBody {
 /// Decodes `publishDiagnostics` params without copying them: the `uri` is
 /// moved out first, so a body that fails to decode still names its file. A
 /// `uri` past [`BoundedUri::MAX_BYTES`] is unidentified, never cached.
-fn decode_publish(params: Option<Value>) -> Result<PublishDiagnosticsParams, LostPublish> {
+fn decode_publish(params: Option<Value>) -> Result<DecodedPublish, LostPublish> {
     let Some(Value::Object(mut members)) = params else {
         return Err(LostPublish::Unidentified);
     };
@@ -479,8 +559,8 @@ fn decode_publish(params: Option<Value>) -> Result<PublishDiagnosticsParams, Los
         Ok(PublishBody {
             diagnostics,
             version,
-        }) => Ok(PublishDiagnosticsParams {
-            uri: uri.into_uri(),
+        }) => Ok(DecodedPublish {
+            uri,
             version,
             diagnostics,
         }),
@@ -814,11 +894,11 @@ mod tests {
 
         match notification {
             super::LspNotification::PublishDiagnostics(diag) => {
-                assert_eq!(diag.uri.to_string(), "file:///test.rs");
-                assert_eq!(diag.version, Some(1));
-                assert_eq!(diag.diagnostics.len(), 1);
+                assert_eq!(diag.uri().uri().to_string(), "file:///test.rs");
+                assert_eq!(diag.version(), Some(1));
+                assert_eq!(diag.diagnostics().len(), 1);
                 assert_eq!(
-                    diag.diagnostics[0].message,
+                    diag.diagnostics()[0].message,
                     lsp_types::Message::String("unused variable".to_string())
                 );
             }
@@ -1011,6 +1091,22 @@ mod tests {
     }
 
     #[test]
+    fn test_decoded_publish_refuses_a_uri_past_the_bound() {
+        let params = |bytes| PublishDiagnosticsParams {
+            uri: uri_of_len(bytes),
+            diagnostics: Vec::new(),
+            version: None,
+        };
+        assert!(DecodedPublish::try_from(params(BoundedUri::MAX_BYTES)).is_ok());
+        assert_eq!(
+            DecodedPublish::try_from(params(BoundedUri::MAX_BYTES + 1)).unwrap_err(),
+            UriTooLong {
+                bytes: BoundedUri::MAX_BYTES + 1
+            }
+        );
+    }
+
+    #[test]
     fn test_publish_params_that_are_not_an_object_are_unidentified() {
         for params in [json!([]), json!("s"), json!(null), json!(7)] {
             let notification =
@@ -1030,12 +1126,12 @@ mod tests {
             Some(json!({"uri": "file:///a.rs", "version": 3, "diagnostics": []})),
         );
 
-        let super::LspNotification::PublishDiagnostics(params) = notification else {
+        let super::LspNotification::PublishDiagnostics(publish) = notification else {
             panic!("expected a decoded publish");
         };
-        assert_eq!(params.uri.as_ref(), "file:///a.rs");
-        assert_eq!(params.version, Some(3));
-        assert_eq!(params.diagnostics, Vec::new());
+        assert_eq!(publish.uri().uri().as_ref(), "file:///a.rs");
+        assert_eq!(publish.version(), Some(3));
+        assert_eq!(publish.diagnostics(), []);
     }
 
     #[test]

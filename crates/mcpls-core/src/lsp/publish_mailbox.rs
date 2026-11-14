@@ -15,12 +15,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use lsp_types::{LogMessageParams, PublishDiagnosticsParams, ShowMessageParams};
+use lsp_types::{LogMessageParams, ShowMessageParams};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::bridge::{BoundedDiagnostics, DiagnosticsKey, MAX_DIAGNOSTIC_ENTRIES};
-use crate::lsp::types::{BoundedUri, LostPublish};
+use crate::lsp::types::{BoundedUri, DecodedPublish, LostPublish};
 use crate::util::{DropCounter, MAX_LOG_STRING_BYTES, escape_bounded, lock_std};
 
 /// Most files with an undelivered publish; as many as the cache holds, so the
@@ -66,26 +66,20 @@ pub struct BoundedPublish {
 }
 
 impl BoundedPublish {
-    /// `None` when the URI is past [`BoundedUri::MAX_BYTES`].
-    fn new(params: PublishDiagnosticsParams) -> Option<(Self, usize)> {
-        let PublishDiagnosticsParams {
-            uri,
-            diagnostics,
-            version,
-        } = params;
-        let uri = BoundedUri::try_from(uri).ok()?;
+    fn new(publish: DecodedPublish) -> (Self, usize) {
+        let (uri, version, diagnostics) = publish.into_parts();
         let diagnostics = BoundedDiagnostics::new(uri.uri(), diagnostics);
         let bytes = diagnostics
             .buffered_bytes()
             .saturating_add(AsRef::<str>::as_ref(uri.uri()).len());
-        Some((
+        (
             Self {
                 uri,
                 version,
                 diagnostics,
             },
             bytes,
-        ))
+        )
     }
 
     /// The file the server published for, exactly as it spelled it.
@@ -344,11 +338,8 @@ impl PublishWriter {
     /// recorded as lost; when a replacement does not fit, the older pending
     /// publish of the file is withdrawn too, so the file never reads as
     /// published with content older than what the server last said.
-    pub fn publish(&self, params: PublishDiagnosticsParams) {
-        let Some((publish, bytes)) = BoundedPublish::new(params) else {
-            self.lose(LostPublish::Unidentified);
-            return;
-        };
+    pub fn publish(&self, publish: DecodedPublish) {
+        let (publish, bytes) = BoundedPublish::new(publish);
         let key = DiagnosticsKey::of(publish.uri().uri());
         let limits = self.shared.limits;
         let mut state = lock_std(&self.shared.state);
@@ -638,7 +629,7 @@ impl DropLog {
 mod tests {
     use std::assert_matches;
 
-    use lsp_types::{Diagnostic, Uri};
+    use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
 
     use super::*;
     use crate::test_support::uri_of_len;
@@ -651,19 +642,24 @@ mod tests {
         BoundedUri::try_from(uri(n)).unwrap()
     }
 
-    fn publish_of(n: usize, message: &str) -> PublishDiagnosticsParams {
-        PublishDiagnosticsParams {
-            uri: uri(n),
+    fn publish_at(uri: Uri, message: &str) -> DecodedPublish {
+        DecodedPublish::try_from(PublishDiagnosticsParams {
+            uri,
             diagnostics: vec![Diagnostic {
                 message: message.to_owned().into(),
                 ..Diagnostic::default()
             }],
             version: None,
-        }
+        })
+        .unwrap()
+    }
+
+    fn publish_of(n: usize, message: &str) -> DecodedPublish {
+        publish_at(uri(n), message)
     }
 
     fn bytes_of(n: usize, message: &str) -> usize {
-        BoundedPublish::new(publish_of(n, message)).unwrap().1
+        BoundedPublish::new(publish_of(n, message)).1
     }
 
     /// #738: the method of a dropped frame is escaped and bounded in the log.
@@ -691,8 +687,8 @@ mod tests {
     /// #738: the URI text counts toward the byte budget.
     #[test]
     fn publish_bytes_include_the_uri() {
-        let params = publish_of(1, "x");
-        let diagnostics = BoundedDiagnostics::new(&params.uri, params.diagnostics.clone());
+        let (uri, _, raw) = publish_of(1, "x").into_parts();
+        let diagnostics = BoundedDiagnostics::new(uri.uri(), raw);
 
         assert_eq!(
             bytes_of(1, "x"),
@@ -958,49 +954,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_publish_with_a_uri_past_the_bound_is_an_unidentified_loss_not_a_pending_one() {
-        let (writer, mut reader) = mailbox(MailboxLimits::default());
-        writer.publish(publish_of(1, "old"));
-        let mut over = publish_of(2, "e");
-        over.uri = uri_of_len(BoundedUri::MAX_BYTES + 1);
-
-        writer.publish(over);
-        drop(writer);
-
-        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
-        assert!(reader.recv().await.is_none());
-    }
-
-    #[tokio::test]
     async fn a_publish_with_a_uri_at_the_bound_is_buffered() {
         let (writer, mut reader) = mailbox(MailboxLimits::default());
-        let mut at = publish_of(2, "e");
-        at.uri = uri_of_len(BoundedUri::MAX_BYTES);
 
-        writer.publish(at);
+        writer.publish(publish_at(uri_of_len(BoundedUri::MAX_BYTES), "e"));
         drop(writer);
 
         assert_eq!(
             next_publish(&mut reader).await.uri().uri().as_ref().len(),
             BoundedUri::MAX_BYTES
         );
-    }
-
-    #[tokio::test]
-    async fn a_capacity_drop_never_stores_a_uri_past_the_bound() {
-        let (writer, mut reader) = mailbox(small(0, usize::MAX));
-        let mut over = publish_of(1, "e");
-        over.uri = uri_of_len(BoundedUri::MAX_BYTES + 1);
-
-        writer.publish(over);
-        writer.publish(publish_of(2, "e"));
-        drop(writer);
-
-        let Some(PublishDelivery::Lost(lost)) = reader.recv().await else {
-            panic!("expected the named loss of the second file");
-        };
-        assert_eq!(lost.uris(), [bounded(2)]);
-        assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
     }
 
     #[tokio::test]

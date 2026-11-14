@@ -465,8 +465,8 @@ impl PumpFeed {
     ) -> Result<(), tokio::sync::mpsc::error::SendError<crate::lsp::ServerMessage>> {
         use crate::lsp::{LspNotification, ServerMessage};
         match notification {
-            LspNotification::PublishDiagnostics(params) => {
-                self.publishes.publish(params);
+            LspNotification::PublishDiagnostics(publish) => {
+                self.publishes.publish(publish);
                 Ok(())
             }
             LspNotification::LostPublish(lost) => {

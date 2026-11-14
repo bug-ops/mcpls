@@ -1509,7 +1509,7 @@ async fn test_http_sessions_receive_updates_only_for_own_subscriptions() {
         crate::test_lsp::spawn_test_pump(registry, WorkspaceRoots::from_paths(&[root]).unwrap());
     let publish = |file: &std::path::Path| {
         let notification =
-            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+            crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: crate::bridge::path_to_uri(file).unwrap(),
                 diagnostics: vec![],
                 version: None,
@@ -1622,7 +1622,7 @@ async fn spawn_idle_test_server(
 }
 
 fn publish_notification(file: &std::path::Path) -> crate::lsp::LspNotification {
-    crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+    crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
         uri: crate::bridge::path_to_uri(file).unwrap(),
         diagnostics: vec![],
         version: None,
@@ -2350,7 +2350,7 @@ async fn test_http_pull_notifies_only_subscribers_of_the_pulled_file() {
         crate::test_lsp::spawn_test_pump_with_cache(registry, roots, Arc::clone(&cache));
     let publish = |file: &std::path::Path| {
         let notification =
-            crate::lsp::LspNotification::PublishDiagnostics(lsp_types::PublishDiagnosticsParams {
+            crate::lsp::LspNotification::publish_for_test(lsp_types::PublishDiagnosticsParams {
                 uri: crate::bridge::path_to_uri(file).unwrap(),
                 diagnostics: vec![],
                 version: None,
