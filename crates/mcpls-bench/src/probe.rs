@@ -187,7 +187,7 @@ impl Probe {
                     definition
                         .locations
                         .iter()
-                        .any(|l| l.inner.location.uri.ends_with(uri_suffix.as_str())),
+                        .any(|l| l.inner.location.uri.as_ref().ends_with(uri_suffix.as_str())),
                     || format!("no definition uri ends with `{uri_suffix}`"),
                 )
             }

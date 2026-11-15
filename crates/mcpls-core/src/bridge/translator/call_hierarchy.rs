@@ -257,7 +257,7 @@ mod tests {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
-            uri: uri.to_string(),
+            uri: uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -551,7 +551,7 @@ mod tests {
             name: "queried_method".to_string(),
             kind: 6, // SymbolKind::Method
             detail: None,
-            uri: queried_uri,
+            uri: queried_uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -638,7 +638,7 @@ mod tests {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
-            uri: queried_uri,
+            uri: queried_uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -741,7 +741,7 @@ mod tests {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
-            uri: queried_uri,
+            uri: queried_uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -840,7 +840,7 @@ mod tests {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
-            uri: queried_uri,
+            uri: queried_uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -907,7 +907,7 @@ mod tests {
             1,
             "an out-of-workspace caller must be returned, not dropped"
         );
-        assert_eq!(result.calls[0].from.uri, outside_uri);
+        assert_eq!(result.calls[0].from.uri.as_ref(), outside_uri);
         assert!(
             result.calls[0].from.out_of_workspace,
             "an out-of-workspace caller must be marked out_of_workspace"
@@ -936,7 +936,7 @@ mod tests {
             name: "queried_fn".to_string(),
             kind: 12,
             detail: None,
-            uri: queried_uri,
+            uri: queried_uri.into(),
             range: Range {
                 start: Position2D::at(1, 1),
                 end: Position2D::at(1, 4),
@@ -1003,7 +1003,7 @@ mod tests {
             1,
             "an out-of-workspace callee must be returned, not dropped"
         );
-        assert_eq!(result.calls[0].to.uri, outside_uri);
+        assert_eq!(result.calls[0].to.uri.as_ref(), outside_uri);
         assert!(
             result.calls[0].to.out_of_workspace,
             "an out-of-workspace callee must be marked out_of_workspace"
@@ -1083,7 +1083,7 @@ mod tests {
             .result;
         assert_eq!(prepare_result.items.len(), 1);
         let item = prepare_result.items[0].clone();
-        assert!(item.uri.contains("%20"));
+        assert!(item.uri.as_ref().contains("%20"));
 
         let incoming_handle = {
             let translator = Arc::clone(&translator);

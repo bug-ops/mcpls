@@ -593,7 +593,8 @@ pub struct Range {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Location {
     /// URI of the document.
-    pub uri: String,
+    #[schemars(with = "String")]
+    pub uri: lsp_types::Uri,
     /// Range within the document.
     pub range: Range,
     /// Whether this location is not provably inside a configured workspace root (stdlib, a dependency).
@@ -717,7 +718,8 @@ pub struct TextEdit {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DocumentChanges {
     /// URI of the document.
-    pub uri: String,
+    #[schemars(with = "String")]
+    pub uri: lsp_types::Uri,
     /// List of edits to apply.
     pub edits: Vec<TextEdit>,
 }
@@ -1272,7 +1274,8 @@ pub struct HierarchyItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// URI of the document.
-    pub uri: String,
+    #[schemars(with = "String")]
+    pub uri: lsp_types::Uri,
     /// Range of the symbol.
     pub range: Range,
     /// Selection range (identifier location).
@@ -1335,7 +1338,7 @@ pub struct CheckedHierarchyItem {
     pub(super) name: String,
     pub(super) kind: u32,
     pub(super) detail: Option<String>,
-    pub(super) uri: String,
+    pub(super) uri: lsp_types::Uri,
     pub(super) range: PositionRange,
     pub(super) selection_range: PositionRange,
     pub(super) data: Option<serde_json::Value>,
@@ -1365,7 +1368,7 @@ impl CheckedHierarchyItem {
 
     /// The item's document URI, as the client sent it.
     #[must_use]
-    pub fn uri(&self) -> &str {
+    pub const fn uri(&self) -> &lsp_types::Uri {
         &self.uri
     }
 }
@@ -1648,7 +1651,7 @@ impl ServerText for Location {
             range: _,
             out_of_workspace: _,
         } = self;
-        redactions.note_payload(uri);
+        redactions.note_payload(uri.as_ref());
     }
 }
 
@@ -1730,7 +1733,7 @@ impl ServerText for TextEdit {
 impl ServerText for DocumentChanges {
     fn redact_server_text(&mut self, redactions: &Redactions) {
         let Self { uri, edits } = self;
-        redactions.note_payload(uri);
+        redactions.note_payload(uri.as_ref());
         edits.redact_server_text(redactions);
     }
 }
@@ -2037,7 +2040,7 @@ impl ServerText for HierarchyItem {
         if let Some(detail) = detail {
             redactions.note_payload(detail);
         }
-        redactions.note_payload(uri);
+        redactions.note_payload(uri.as_ref());
         if let Some(data) = data {
             redactions.note_payload_json(data);
         }
@@ -2140,7 +2143,34 @@ mod tests {
     #[test]
     fn checked_hierarchy_item_accepts_valid_ranges() {
         let item = CheckedHierarchyItem::from_client(hierarchy_wire([1, 1, 2, 1], [1, 7, 1, 9]));
-        assert_eq!(item.unwrap().uri(), "file:///a.rs");
+        assert_eq!(item.unwrap().uri().as_ref(), "file:///a.rs");
+    }
+
+    #[test]
+    fn uri_fields_serialize_as_plain_json_strings() {
+        let at = |line, character| serde_json::json!({"line": line, "character": character});
+        let range = serde_json::json!({"start": at(1, 1), "end": at(1, 2)});
+        let location: Location =
+            serde_json::from_value(serde_json::json!({"uri": "file:///a.rs", "range": range}))
+                .unwrap();
+        let changes = DocumentChanges {
+            uri: lsp_types::Uri::from("file:///a.rs"),
+            edits: Vec::new(),
+        };
+        let item = hierarchy_wire([1, 1, 2, 1], [1, 7, 1, 9]);
+
+        for value in [
+            serde_json::to_value(&location).unwrap(),
+            serde_json::to_value(&changes).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+        ] {
+            assert_eq!(value["uri"], serde_json::json!("file:///a.rs"));
+        }
+
+        let reparsed: HierarchyItem =
+            serde_json::from_value(serde_json::to_value(&item).unwrap()).unwrap();
+        let checked = CheckedHierarchyItem::from_client(reparsed).unwrap();
+        assert_eq!(checked.uri().as_ref(), "file:///a.rs");
     }
 
     #[test]
@@ -2257,7 +2287,7 @@ mod tests {
             }],
             edit: Some(WorkspaceEditDescription {
                 changes: vec![DocumentChanges {
-                    uri: format!("file:///{SECRET}.rs"),
+                    uri: format!("file:///{SECRET}.rs").into(),
                     edits: vec![TextEdit {
                         range: range(),
                         new_text: format!("let k = \"{SECRET}\";"),
@@ -2279,7 +2309,7 @@ mod tests {
             Some("E-[redacted:API_TOKEN]")
         );
         let changes = &action.edit.as_ref().unwrap().changes[0];
-        assert!(changes.uri.contains(SECRET));
+        assert!(changes.uri.as_ref().contains(SECRET));
         assert!(changes.edits[0].new_text.contains(SECRET));
     }
 
@@ -2390,7 +2420,7 @@ mod tests {
             name: format!("call_{SECRET}"),
             kind: 12,
             detail: Some(format!("detail {SECRET}")),
-            uri: format!("file:///{SECRET}.rs"),
+            uri: format!("file:///{SECRET}.rs").into(),
             range: range(),
             selection_range: range(),
             data: Some(serde_json::json!({ "id": SECRET })),
@@ -2400,7 +2430,7 @@ mod tests {
             name: format!("type_{SECRET}"),
             kind: 5,
             detail: None,
-            uri: format!("file:///{SECRET}.rs"),
+            uri: format!("file:///{SECRET}.rs").into(),
             range: range(),
             selection_range: range(),
             data: None,

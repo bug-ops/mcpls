@@ -341,9 +341,9 @@ pub(super) fn outcome_for(tree: &DocumentSymbolTree, item: &Range) -> EnclosingS
     )
 }
 
-/// An item to resolve: the URI string of its file and its normalized range.
+/// An item to resolve: the URI of its file and its normalized range.
 pub(super) struct Hit<'a> {
-    pub(super) uri: &'a str,
+    pub(super) uri: &'a lsp_types::Uri,
     pub(super) range: &'a Range,
     /// The link target range of a go-to answer, when the source pass needs it.
     pub(super) target_range: Option<Range>,
@@ -432,7 +432,7 @@ impl Translator {
     /// `context` asks for it.
     pub(super) async fn contextualize_diagnostics(
         &self,
-        uri: &str,
+        uri: &lsp_types::Uri,
         diagnostics: Vec<Diagnostic>,
         context: ResultContext,
         positions_degraded: Option<PositionDegradation>,
@@ -501,7 +501,7 @@ impl Translator {
         let started = Instant::now();
         let mut attempted = 0_usize;
         let mut positions_degraded = None;
-        let mut files: HashMap<&str, FileResolution> = HashMap::new();
+        let mut files: HashMap<&lsp_types::Uri, FileResolution> = HashMap::new();
         let mut pass = source_rule.map(|rule| SourcePass::new(rule, hits.len()));
 
         for hit in hits {
@@ -562,7 +562,7 @@ impl Translator {
     /// is validated against the workspace roots before the file is opened.
     async fn resolve_file<'a>(
         &self,
-        uri: &str,
+        uri: &lsp_types::Uri,
         cap: usize,
         attempted: &mut usize,
         started: Instant,
@@ -576,7 +576,7 @@ impl Translator {
         if remaining.is_zero() {
             return not_computed(NotComputedReason::Deadline);
         }
-        let Ok(path) = self.parse_file_uri(&lsp_types::Uri::from(uri)).await else {
+        let Ok(path) = self.parse_file_uri(uri).await else {
             return not_computed(NotComputedReason::OutOfWorkspace);
         };
         *attempted = attempted.saturating_add(1);

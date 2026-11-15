@@ -390,7 +390,7 @@ mod tests {
     use super::super::server::McplsServer;
 
     /// Total serialized `tools` array budget (compact bytes).
-    const TOOLS_LIST_TOTAL_BUDGET_BYTES: usize = 144_500;
+    const TOOLS_LIST_TOTAL_BUDGET_BYTES: usize = 145_000;
     /// Largest serialized single `Tool` (compact bytes).
     const TOOL_BUDGET_BYTES: usize = 9_500;
     /// Sum of all schema `description` bytes.

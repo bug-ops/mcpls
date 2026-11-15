@@ -381,12 +381,7 @@ impl Translator {
             enrichment,
             positions_degraded,
         } = self
-            .contextualize_diagnostics(
-                uri.as_ref(),
-                merged.diagnostics,
-                context,
-                merged.positions_degraded,
-            )
+            .contextualize_diagnostics(uri, merged.diagnostics, context, merged.positions_degraded)
             .await;
         Ok(DiagnosticsAnswer {
             result: DocumentDiagnosticsResult {
@@ -811,6 +806,7 @@ mod tests {
         cache.store_log(LogLevel::Error, "error msg".to_string());
         cache.store_log(LogLevel::Warning, "warning msg".to_string());
         cache.store_log(LogLevel::Info, "info msg".to_string());
+        cache.store_log(LogLevel::Log, "log msg".to_string());
         cache.store_log(LogLevel::Debug, "debug msg".to_string());
 
         // Test with error filter
@@ -822,24 +818,26 @@ mod tests {
         let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Warning));
         assert_eq!(logs.logs.len(), 2);
 
-        // Test with info filter (excludes debug)
+        // Test with info filter (excludes log and debug)
         let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Info));
         assert_eq!(logs.logs.len(), 3);
 
+        // Test with log filter (excludes debug)
+        let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Log));
+        assert_eq!(logs.logs.len(), 4);
+
         // Test with debug filter (includes all)
         let logs = Translator::handle_server_logs(&cache, 10, Some(LogLevel::Debug));
-        assert_eq!(logs.logs.len(), 4);
+        assert_eq!(logs.logs.len(), 5);
     }
 
     #[test]
     fn test_handle_server_messages_limit() {
-        use crate::bridge::notifications::MessageType;
-
         let mut cache = NotificationCache::new();
 
         // Add some messages
         for i in 0..10 {
-            cache.store_message(MessageType::Info, format!("message {i}"));
+            cache.store_message(LogLevel::Info, format!("message {i}"));
         }
 
         // Test limit
@@ -1223,14 +1221,12 @@ mod tests {
 
     #[test]
     fn test_handle_server_messages_with_different_types() {
-        use crate::bridge::notifications::MessageType;
-
         let mut cache = NotificationCache::new();
 
-        cache.store_message(MessageType::Error, "error".to_string());
-        cache.store_message(MessageType::Warning, "warning".to_string());
-        cache.store_message(MessageType::Info, "info".to_string());
-        cache.store_message(MessageType::Log, "log".to_string());
+        cache.store_message(LogLevel::Error, "error".to_string());
+        cache.store_message(LogLevel::Warning, "warning".to_string());
+        cache.store_message(LogLevel::Info, "info".to_string());
+        cache.store_message(LogLevel::Log, "log".to_string());
 
         let result = Translator::handle_server_messages(&cache, 10);
         assert!(result.is_ok());
@@ -1240,15 +1236,23 @@ mod tests {
         assert_eq!(messages.messages[1].message, "warning");
         assert_eq!(messages.messages[2].message, "info");
         assert_eq!(messages.messages[3].message, "log");
+        let types: Vec<LogLevel> = messages.messages.iter().map(|m| m.message_type).collect();
+        assert_eq!(
+            types,
+            [
+                LogLevel::Error,
+                LogLevel::Warning,
+                LogLevel::Info,
+                LogLevel::Log
+            ]
+        );
     }
 
     #[test]
     fn test_handle_server_messages_zero_limit() {
-        use crate::bridge::notifications::MessageType;
-
         let mut cache = NotificationCache::new();
 
-        cache.store_message(MessageType::Info, "test".to_string());
+        cache.store_message(LogLevel::Info, "test".to_string());
 
         let result = Translator::handle_server_messages(&cache, 0);
         assert!(result.is_ok());

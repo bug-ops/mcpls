@@ -52,6 +52,9 @@ winapi-util = "0.1.11"
 unsafe_code = "forbid"
 missing_docs = "warn"
 
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

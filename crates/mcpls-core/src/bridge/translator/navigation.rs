@@ -256,9 +256,9 @@ async fn normalize_locations(
         };
         locations.push(NormalizedLocation {
             location: Location {
-                uri: loc.uri.to_string(),
                 range: ctx.normalize_range(&loc.uri, loc.range).await,
                 out_of_workspace: ctx.is_out_of_workspace(&loc.uri),
+                uri: loc.uri,
             },
             target_range,
         });
@@ -1532,7 +1532,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.locations.len(), 1);
-        assert_eq!(result.locations[0].inner.location.uri, target_uri);
+        assert_eq!(result.locations[0].inner.location.uri.as_ref(), target_uri);
         assert!(
             !result.locations[0].inner.location.out_of_workspace,
             "a definition location inside the workspace root must not be marked out_of_workspace"
@@ -1602,7 +1602,7 @@ mod tests {
             "an out-of-workspace definition location (e.g. stdlib/a dependency) must be \
              returned, not dropped"
         );
-        assert_eq!(result.locations[0].inner.location.uri, outside_uri);
+        assert_eq!(result.locations[0].inner.location.uri.as_ref(), outside_uri);
         assert!(
             result.locations[0].inner.location.out_of_workspace,
             "a definition location outside every workspace root must be marked out_of_workspace"
@@ -1692,7 +1692,7 @@ mod tests {
                 .locations
                 .iter()
                 .map(|l| &l.inner.location)
-                .find(|l| l.uri == uri)
+                .find(|l| l.uri.as_ref() == uri)
                 .unwrap()
         };
         assert!(
@@ -1845,8 +1845,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.locations.len(), 2);
-        assert_eq!(result.locations[0].inner.location.uri, first_impl_uri);
-        assert_eq!(result.locations[1].inner.location.uri, second_impl_uri);
+        assert_eq!(
+            result.locations[0].inner.location.uri.as_ref(),
+            first_impl_uri
+        );
+        assert_eq!(
+            result.locations[1].inner.location.uri.as_ref(),
+            second_impl_uri
+        );
     }
 
     /// `handle_declaration` flattens a plain `Declaration::LocationList` and
@@ -1904,7 +1910,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.locations.len(), 1);
-        assert_eq!(result.locations[0].inner.location.uri, decl_uri);
+        assert_eq!(result.locations[0].inner.location.uri.as_ref(), decl_uri);
     }
 
     /// `handle_declaration` maps `DeclarationLink[]` through `targetSelectionRange`.
@@ -2118,7 +2124,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.locations.len(), 1);
-        assert_eq!(result.locations[0].inner.location.uri, target_uri);
+        assert_eq!(result.locations[0].inner.location.uri.as_ref(), target_uri);
         assert_eq!(
             result.locations[0]
                 .inner

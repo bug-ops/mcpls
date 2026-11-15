@@ -804,8 +804,7 @@ impl Translator {
         R: ItemRequest,
         R::Params: FromItem,
     {
-        let item_uri = lsp_types::Uri::from(item.uri());
-        let path = self.parse_file_uri(&item_uri).await?;
+        let path = self.parse_file_uri(item.uri()).await?;
         let doc = self
             .prepare_gated_document_for_path(&path, IndexingGate::Required(R::CAPABILITY))
             .await?;
