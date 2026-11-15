@@ -920,18 +920,22 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Log severity level.
+/// Severity of a server log or message, mirroring the LSP `MessageType` levels.
+///
+/// Ordered from most to least severe: `Error`, `Warning`, `Info`, `Log`, `Debug`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[schemars(inline)]
 pub enum LogLevel {
-    /// Error log level.
+    /// Error level.
     Error,
-    /// Warning log level.
+    /// Warning level.
     Warning,
-    /// Info log level.
+    /// Info level.
     Info,
-    /// Debug log level.
+    /// LSP `Log` level.
+    Log,
+    /// Debug level; also used for unrecognized LSP message types.
     Debug,
 }
 
@@ -941,7 +945,8 @@ impl LogLevel {
             Self::Error => 0,
             Self::Warning => 1,
             Self::Info => 2,
-            Self::Debug => 3,
+            Self::Log => 3,
+            Self::Debug => 4,
         }
     }
 
@@ -953,7 +958,8 @@ impl LogLevel {
     /// use mcpls_core::bridge::LogLevel;
     ///
     /// assert!(LogLevel::Error.meets(LogLevel::Warning));
-    /// assert!(!LogLevel::Debug.meets(LogLevel::Info));
+    /// assert!(!LogLevel::Log.meets(LogLevel::Info));
+    /// assert!(LogLevel::Log.meets(LogLevel::Debug));
     /// assert!(LogLevel::Debug.meets(LogLevel::Debug));
     /// ```
     #[must_use]
@@ -968,8 +974,8 @@ impl From<lsp_types::MessageType> for LogLevel {
             lsp_types::MessageType::Error => Self::Error,
             lsp_types::MessageType::Warning => Self::Warning,
             lsp_types::MessageType::Info => Self::Info,
-            // LOG and unknown message types default to Debug
-            _ => Self::Debug,
+            lsp_types::MessageType::Log => Self::Log,
+            lsp_types::MessageType::Debug | lsp_types::MessageType::Custom(_) => Self::Debug,
         }
     }
 }
@@ -978,37 +984,11 @@ impl From<lsp_types::MessageType> for LogLevel {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerMessage {
     /// Message type.
-    pub message_type: MessageType,
+    pub message_type: LogLevel,
     /// Message content.
     pub message: String,
     /// Timestamp when the message was received.
     pub timestamp: DateTime<Utc>,
-}
-
-/// Server message type.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum MessageType {
-    /// Error message.
-    Error,
-    /// Warning message.
-    Warning,
-    /// Info message.
-    Info,
-    /// Log message.
-    Log,
-}
-
-impl From<lsp_types::MessageType> for MessageType {
-    fn from(msg_type: lsp_types::MessageType) -> Self {
-        match msg_type {
-            lsp_types::MessageType::Error => Self::Error,
-            lsp_types::MessageType::Warning => Self::Warning,
-            lsp_types::MessageType::Info => Self::Info,
-            // LOG and unknown message types default to Log
-            _ => Self::Log,
-        }
-    }
 }
 
 /// Cache for LSP server notifications.
@@ -2125,7 +2105,7 @@ impl NotificationCache {
     ///
     /// Maintains a maximum of `MAX_SERVER_MESSAGES` entries, removing oldest when full.
     /// `message` is truncated to `MAX_ENTRY_TEXT_BYTES` before storing.
-    pub(crate) fn store_message(&mut self, message_type: MessageType, message: String) {
+    pub(crate) fn store_message(&mut self, message_type: LogLevel, message: String) {
         let msg = ServerMessage {
             message_type,
             message: truncate_string(message, MAX_ENTRY_TEXT_BYTES),
@@ -3308,14 +3288,14 @@ mod tests {
     fn test_store_and_get_messages() {
         let mut cache = NotificationCache::new();
 
-        cache.store_message(MessageType::Error, "error msg".to_string());
-        cache.store_message(MessageType::Warning, "warning msg".to_string());
+        cache.store_message(LogLevel::Error, "error msg".to_string());
+        cache.store_message(LogLevel::Warning, "warning msg".to_string());
 
         let messages = cache.messages();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].message_type, MessageType::Error);
+        assert_eq!(messages[0].message_type, LogLevel::Error);
         assert_eq!(messages[0].message, "error msg");
-        assert_eq!(messages[1].message_type, MessageType::Warning);
+        assert_eq!(messages[1].message_type, LogLevel::Warning);
         assert_eq!(messages[1].message, "warning msg");
     }
 
@@ -3325,7 +3305,7 @@ mod tests {
 
         // Add more than MAX_SERVER_MESSAGES
         for i in 0..MAX_SERVER_MESSAGES + 10 {
-            cache.store_message(MessageType::Info, format!("message {i}"));
+            cache.store_message(LogLevel::Info, format!("message {i}"));
         }
 
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
@@ -3345,7 +3325,7 @@ mod tests {
         let mut cache = NotificationCache::new();
         let oversized = "a".repeat(MAX_ENTRY_TEXT_BYTES + 100);
 
-        cache.store_message(MessageType::Info, oversized.clone());
+        cache.store_message(LogLevel::Info, oversized.clone());
 
         let stored = &cache.messages()[0].message;
         assert!(stored.len() < oversized.len());
@@ -3372,16 +3352,64 @@ mod tests {
     fn test_message_types() {
         let mut cache = NotificationCache::new();
 
-        cache.store_message(MessageType::Error, "error".to_string());
-        cache.store_message(MessageType::Warning, "warning".to_string());
-        cache.store_message(MessageType::Info, "info".to_string());
-        cache.store_message(MessageType::Log, "log".to_string());
+        cache.store_message(LogLevel::Error, "error".to_string());
+        cache.store_message(LogLevel::Warning, "warning".to_string());
+        cache.store_message(LogLevel::Info, "info".to_string());
+        cache.store_message(LogLevel::Log, "log".to_string());
 
         let messages = cache.messages();
-        assert_eq!(messages[0].message_type, MessageType::Error);
-        assert_eq!(messages[1].message_type, MessageType::Warning);
-        assert_eq!(messages[2].message_type, MessageType::Info);
-        assert_eq!(messages[3].message_type, MessageType::Log);
+        assert_eq!(messages[0].message_type, LogLevel::Error);
+        assert_eq!(messages[1].message_type, LogLevel::Warning);
+        assert_eq!(messages[2].message_type, LogLevel::Info);
+        assert_eq!(messages[3].message_type, LogLevel::Log);
+    }
+
+    #[test]
+    fn test_log_level_from_lsp_message_type() {
+        use lsp_types::MessageType as Lsp;
+        assert_eq!(LogLevel::from(Lsp::Error), LogLevel::Error);
+        assert_eq!(LogLevel::from(Lsp::Warning), LogLevel::Warning);
+        assert_eq!(LogLevel::from(Lsp::Info), LogLevel::Info);
+        assert_eq!(LogLevel::from(Lsp::Log), LogLevel::Log);
+        assert_eq!(LogLevel::from(Lsp::Debug), LogLevel::Debug);
+        assert_eq!(LogLevel::from(Lsp::Custom(99)), LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_log_level_meets_ordering() {
+        let ordered = [
+            LogLevel::Error,
+            LogLevel::Warning,
+            LogLevel::Info,
+            LogLevel::Log,
+            LogLevel::Debug,
+        ];
+        for (i, level) in ordered.iter().enumerate() {
+            for (j, min) in ordered.iter().enumerate() {
+                assert_eq!(level.meets(*min), i <= j, "{level:?} vs {min:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_entry_and_server_message_serialize_levels_lowercase() {
+        let mut cache = NotificationCache::new();
+        cache.store_log(LogLevel::Log, "l".to_string());
+        cache.store_message(LogLevel::Debug, "m".to_string());
+
+        let entry = serde_json::to_value(&cache.logs()[0]).unwrap();
+        assert_eq!(entry["level"], "log");
+        let message = serde_json::to_value(&cache.messages()[0]).unwrap();
+        assert_eq!(message["message_type"], "debug");
+    }
+
+    #[test]
+    fn test_log_level_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&LogLevel::Log).unwrap(), "\"log\"");
+        assert_eq!(
+            serde_json::from_str::<LogLevel>("\"debug\"").unwrap(),
+            LogLevel::Debug
+        );
     }
 
     #[test]
@@ -3484,11 +3512,11 @@ mod tests {
         let mut cache = NotificationCache::new();
 
         for i in 0..MAX_SERVER_MESSAGES {
-            cache.store_message(MessageType::Info, format!("message {i}"));
+            cache.store_message(LogLevel::Info, format!("message {i}"));
         }
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
 
-        cache.store_message(MessageType::Info, "overflow".to_string());
+        cache.store_message(LogLevel::Info, "overflow".to_string());
         assert_eq!(cache.messages_count(), MAX_SERVER_MESSAGES);
         assert_eq!(cache.messages().front().unwrap().message, "message 1");
     }

@@ -139,7 +139,7 @@ impl WorkspaceEditConverter<'_> {
 
     /// An entry whose edits were all dropped is left out; one that arrived
     /// empty still round-trips.
-    fn push_entry(&mut self, uri: String, edits: Vec<TextEdit>, entry_dropped: usize) {
+    fn push_entry(&mut self, uri: lsp_types::Uri, edits: Vec<TextEdit>, entry_dropped: usize) {
         if edits.is_empty() && entry_dropped > 0 {
             return;
         }
@@ -151,7 +151,7 @@ impl WorkspaceEditConverter<'_> {
         changes_map: HashMap<lsp_types::Uri, Vec<lsp_types::TextEdit>>,
     ) {
         let mut entries: Vec<_> = changes_map.into_iter().collect();
-        entries.sort_by_cached_key(|(uri, _)| uri.to_string());
+        entries.sort_by(|(a, _), (b, _)| AsRef::<str>::as_ref(a).cmp(AsRef::<str>::as_ref(b)));
         for (uri, edits) in entries {
             if !self.check_in_workspace(&uri).await {
                 continue;
@@ -166,7 +166,7 @@ impl WorkspaceEditConverter<'_> {
                     new_text: e.new_text,
                 });
             }
-            self.push_entry(uri.to_string(), text_edits, 0);
+            self.push_entry(uri, text_edits, 0);
         }
     }
 
@@ -224,7 +224,7 @@ impl WorkspaceEditConverter<'_> {
                 };
                 text_edits.push(text_edit);
             }
-            self.push_entry(edit_uri.to_string(), text_edits, entry_dropped);
+            self.push_entry(edit_uri, text_edits, entry_dropped);
         }
     }
 
@@ -1005,7 +1005,7 @@ mod tests {
             1,
             "the out-of-workspace entry must be dropped, not forwarded"
         );
-        assert_eq!(result.changes[0].uri, inside_uri);
+        assert_eq!(result.changes[0].uri.as_ref(), inside_uri);
         assert_eq!(
             result.dropped.out_of_workspace, 1,
             "the dropped out-of-workspace entry must be tallied so callers can tell the rename is incomplete"
@@ -1340,7 +1340,7 @@ mod tests {
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
-        assert_eq!(edit.changes[0].uri, uri_string);
+        assert_eq!(edit.changes[0].uri.as_ref(), uri_string);
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
@@ -1407,7 +1407,7 @@ mod tests {
             .await;
 
             assert_eq!(changes.len(), 1);
-            assert_eq!(changes[0].uri, alias_uri.as_ref());
+            assert_eq!(changes[0].uri.as_ref(), alias_uri.as_ref());
             assert_eq!(dropped.out_of_workspace, 1);
         }
     }
@@ -1575,7 +1575,7 @@ mod tests {
         assert!(result.edit.is_some());
         let edit = result.edit.unwrap();
         assert_eq!(edit.changes.len(), 1);
-        assert_eq!(edit.changes[0].uri, uri_string);
+        assert_eq!(edit.changes[0].uri.as_ref(), uri_string);
         assert_eq!(edit.changes[0].edits.len(), 1);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert!(result.is_preferred);
@@ -1676,7 +1676,7 @@ mod tests {
             1,
             "only the `changes` entry should be present"
         );
-        assert_eq!(edit.changes[0].uri, changes_uri_string);
+        assert_eq!(edit.changes[0].uri.as_ref(), changes_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "from_changes");
         assert_eq!(
             edit.dropped.shadowed_by_changes, 1,
@@ -1755,7 +1755,7 @@ mod tests {
             1,
             "the out-of-workspace entry must be dropped, not forwarded"
         );
-        assert_eq!(edit.changes[0].uri, inside_uri_string);
+        assert_eq!(edit.changes[0].uri.as_ref(), inside_uri_string);
         assert_eq!(edit.changes[0].edits[0].new_text, "fixed");
         assert_eq!(
             edit.dropped.out_of_workspace, 1,
@@ -1837,7 +1837,7 @@ mod tests {
             1,
             "the plain TextDocumentEdit must survive alongside the dropped file operations"
         );
-        assert_eq!(changes[0].uri, uri_string);
+        assert_eq!(changes[0].uri.as_ref(), uri_string);
         assert_eq!(
             dropped.unsupported_file_operation, 3,
             "CreateFile, RenameFile, and DeleteFile must each be tallied"
@@ -2156,7 +2156,7 @@ mod tests {
             "an empty-but-present `changes` map must not be treated as authoritative over a \
              populated documentChanges"
         );
-        assert_eq!(changes[0].uri, uri_string);
+        assert_eq!(changes[0].uri.as_ref(), uri_string);
         assert!(dropped.is_empty());
     }
 
@@ -2994,7 +2994,7 @@ mod tests {
         .await;
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].uri, in_changes);
+        assert_eq!(changes[0].uri.as_ref(), in_changes);
         assert_eq!(dropped.shadowed_by_changes, 1);
         assert_eq!(dropped.unsupported_file_operation, 2);
         assert_eq!(dropped.out_of_workspace, 0);
@@ -3042,7 +3042,7 @@ mod tests {
         .await;
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].uri, empty_on_arrival);
+        assert_eq!(changes[0].uri.as_ref(), empty_on_arrival);
         assert_eq!(dropped.unsupported_snippet_edit, 2);
     }
 
@@ -3070,7 +3070,7 @@ mod tests {
         .await;
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].uri, first);
+        assert_eq!(changes[0].uri.as_ref(), first);
         assert_eq!(changes[0].edits.len(), per_file);
         assert_eq!(dropped.exceeds_item_cap, per_file);
     }
@@ -3197,7 +3197,7 @@ mod tests {
         .await;
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].uri, full);
+        assert_eq!(changes[0].uri.as_ref(), full);
         assert_eq!(dropped.exceeds_item_cap, 2);
     }
 }

@@ -776,7 +776,7 @@ impl RawWorkspaceSymbol {
             name: self.name,
             kind: lsp_kind_to_u32(self.kind),
             location: Location {
-                uri: self.uri.to_string(),
+                uri: self.uri,
                 range,
                 out_of_workspace: self.out_of_workspace,
             },

@@ -190,7 +190,7 @@ pub(super) struct SourcePass<'a> {
     remaining: usize,
     scan_remaining: usize,
     cuts: usize,
-    seen: HashMap<(&'a str, Range), SpanSeen>,
+    seen: HashMap<(&'a lsp_types::Uri, Range), SpanSeen>,
     outcomes: Vec<SourceOutcome>,
 }
 
@@ -347,7 +347,7 @@ mod tests {
         DocumentTracker::new(ResourceLimits::default(), HashMap::new())
     }
 
-    fn hits<'a>(uri: &'a str, ranges: &'a [Range]) -> Vec<Hit<'a>> {
+    fn hits<'a>(uri: &'a lsp_types::Uri, ranges: &'a [Range]) -> Vec<Hit<'a>> {
         ranges
             .iter()
             .map(|range| Hit {
@@ -370,9 +370,11 @@ mod tests {
             DocumentSymbolTree::Hierarchical((1..=4).map(|l| line_symbol(l, 20_000)).collect());
         let b_tree = DocumentSymbolTree::Hierarchical(vec![line_symbol(1, 1)]);
         let a_ranges: Vec<Range> = (1..=4).map(|l| span(l, 2, 4)).collect();
-        let a_hits = hits("file:///test/a.rs", &a_ranges);
+        let a_hits_uri = lsp_types::Uri::from("file:///test/a.rs");
+        let a_hits = hits(&a_hits_uri, &a_ranges);
         let b_ranges = [span(1, 1, 2)];
-        let b_hits = hits("file:///test/b.rs", &b_ranges);
+        let b_hits_uri = lsp_types::Uri::from("file:///test/b.rs");
+        let b_hits = hits(&b_hits_uri, &b_ranges);
         let mut pass = SourcePass::new(SpanRule::EnclosingBody, 5);
 
         pass.fill_file(
@@ -482,7 +484,8 @@ mod tests {
             .iter()
             .map(|&from| span(1, from + 1, from + 2))
             .collect();
-        let all_hits = hits("file:///test/wide.rs", &ranges);
+        let all_hits_uri = lsp_types::Uri::from("file:///test/wide.rs");
+        let all_hits = hits(&all_hits_uri, &ranges);
         let mut pass = SourcePass::new(SpanRule::EnclosingBody, all_hits.len());
 
         pass.fill_file(
@@ -539,7 +542,8 @@ mod tests {
             .iter()
             .map(|&from| span(5, from + 1, from + 2))
             .collect();
-        let all_hits = hits("file:///test/eof.rs", &ranges);
+        let all_hits_uri = lsp_types::Uri::from("file:///test/eof.rs");
+        let all_hits = hits(&all_hits_uri, &ranges);
         let mut pass = SourcePass::new(SpanRule::EnclosingBody, all_hits.len());
 
         pass.fill_file(
@@ -570,7 +574,8 @@ mod tests {
         let (path, server) = open(&tracker, "/test/many.rs", &"x\n".repeat(300));
         let tree = DocumentSymbolTree::Hierarchical((1..=300).map(|l| line_symbol(l, 1)).collect());
         let ranges: Vec<Range> = (1..=300).map(|l| span(l, 1, 2)).collect();
-        let all_hits = hits("file:///test/many.rs", &ranges);
+        let all_hits_uri = lsp_types::Uri::from("file:///test/many.rs");
+        let all_hits = hits(&all_hits_uri, &ranges);
         let mut pass = SourcePass::new(SpanRule::EnclosingBody, all_hits.len());
 
         pass.fill_file(

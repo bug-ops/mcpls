@@ -111,7 +111,7 @@ where
         name: item.name,
         kind: lsp_kind_to_u32(item.kind),
         detail: item.detail,
-        uri: item.uri.to_string(),
+        uri: item.uri,
         range,
         selection_range,
         data: item.data,

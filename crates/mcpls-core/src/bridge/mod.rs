@@ -31,8 +31,8 @@ pub(crate) use notifications::{
     on_lifecycle,
 };
 pub use notifications::{
-    DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, MessageType, NotificationCache,
-    ReportedSeverity, ServerMessage, apply_lifecycle_notification,
+    DiagnosticInfo, DiagnosticSources, LogEntry, LogLevel, NotificationCache, ReportedSeverity,
+    ServerMessage, apply_lifecycle_notification,
 };
 #[cfg(test)]
 pub(crate) use published_uri::resolve_one;

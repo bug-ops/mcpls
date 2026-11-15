@@ -46,7 +46,7 @@ A tool that is sent to several servers at once, today `workspace_symbol_search` 
 
 ## get_server_logs
 
-Returns recent log messages from the language servers. Arguments: `limit` (default 50) and `min_level`, exactly one of `error`, `warning`, `info` or `debug` in lowercase.
+Returns recent log messages from the language servers. Arguments: `limit` (default 50) and `min_level`, exactly one of `error`, `warning`, `info`, `log` or `debug` in lowercase.
 
 ```json
 { "limit": 20, "min_level": "warning" }

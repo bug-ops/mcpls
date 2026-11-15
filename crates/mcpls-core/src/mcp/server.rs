@@ -1272,7 +1272,7 @@ impl McplsServer {
 
     /// Get recent LSP server log messages.
     #[tool(
-        description = "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
+        description = "Recent server log messages. Filter by level (error, warning, info, log, debug) for debugging.",
         title = "Server Logs"
     )]
     async fn get_server_logs(
@@ -5100,6 +5100,9 @@ sleep 0.3
         let parsed: ServerLogsParams =
             serde_json::from_value(serde_json::json!({"min_level": "warning"})).unwrap();
         assert_eq!(parsed.min_level, Some(LogLevel::Warning));
+        let parsed: ServerLogsParams =
+            serde_json::from_value(serde_json::json!({"min_level": "log"})).unwrap();
+        assert_eq!(parsed.min_level, Some(LogLevel::Log));
     }
 
     #[tokio::test]
@@ -7032,7 +7035,7 @@ sleep 0.3
                     name: "T".to_string(),
                     kind: 5,
                     detail: None,
-                    uri,
+                    uri: uri.into(),
                     range: crate::bridge::Range {
                         start: at(1),
                         end: at(11),

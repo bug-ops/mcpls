@@ -763,7 +763,7 @@ impl From<HierarchyItemInput> for HierarchyItem {
             name: item.name,
             kind: item.kind,
             detail: item.detail,
-            uri: item.uri,
+            uri: item.uri.into(),
             range: item.range.into(),
             selection_range: item.selection_range.into(),
             data: item.data,
@@ -893,8 +893,8 @@ pub struct ServerLogsParams {
     #[schemars(description = "Maximum number of log entries to return (default: 50).")]
     #[serde(default = "default_log_limit")]
     pub limit: usize,
-    /// Minimum log level to include: error, warning, info, debug.
-    #[schemars(description = "Minimum log level to include: error, warning, info, debug.")]
+    /// Minimum log level to include: error, warning, info, log, debug.
+    #[schemars(description = "Minimum log level to include: error, warning, info, log, debug.")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_level: Option<LogLevel>,
 }

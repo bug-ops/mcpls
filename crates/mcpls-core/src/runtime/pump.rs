@@ -2106,6 +2106,64 @@ mod pump_tests {
         assert!(!cache.lock().await.has_diagnostics(&uri));
     }
 
+    /// LSP `Log` and `Debug` message types reach the cache as the matching
+    /// `LogLevel`, for both `logMessage` and `showMessage`.
+    #[tokio::test]
+    async fn test_pump_maps_lsp_message_types_to_log_levels() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(workspace.path()).unwrap();
+        let cache = make_cache();
+        let (tx, rx) = pump_feed();
+        let (_lifecycle_tx, lifecycle_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        tokio::spawn(diagnostics_pump_with_resolver(
+            ServerId::from_static("rust"),
+            rx,
+            lifecycle_rx,
+            cancel.clone(),
+            watch::channel(DiagnosticsRole::Authoritative).1,
+            None,
+            PumpShared {
+                roles: DiagnosticsRoles::default(),
+                notification_cache: Arc::clone(&cache),
+                subs: make_subs(),
+                workspace_roots: WorkspaceRoots::from_paths(std::slice::from_ref(&root)).unwrap(),
+            },
+            PublishedPathResolver::new(),
+        ));
+        for kind in [lsp_types::MessageType::Log, lsp_types::MessageType::Debug] {
+            tx.send(LspNotification::LogMessage(lsp_types::LogMessageParams {
+                kind,
+                message: "log".to_owned(),
+            }))
+            .await
+            .unwrap();
+            tx.send(LspNotification::ShowMessage(lsp_types::ShowMessageParams {
+                kind,
+                message: "show".to_owned(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache.lock().await.logs_count() < 2 || cache.lock().await.messages_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both log and show messages must be applied");
+        cancel.cancel();
+
+        let guard = cache.lock().await;
+        let expected = [crate::bridge::LogLevel::Log, crate::bridge::LogLevel::Debug];
+        let logs: Vec<_> = guard.logs().iter().map(|l| l.level).collect();
+        let shown: Vec<_> = guard.messages().iter().map(|m| m.message_type).collect();
+        drop(guard);
+        assert_eq!(logs, expected);
+        assert_eq!(shown, expected);
+    }
+
     /// Cancellation must end the pump even while a canonicalization is
     /// stuck on a hung filesystem.
     #[tokio::test]

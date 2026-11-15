@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Update rmcp and rmcp-macros to 3.10.0 and refresh lockfile patch versions (#925, #937).
+- The cargo `unused_dependencies` workspace lint is `deny`, so an unused `[dependencies]` entry fails the build (#926, #937).
+- **Breaking:** `get_server_logs` and `get_server_messages` share one five-level `LogLevel` (`error`, `warning`, `info`, `log`, `debug`), LSP `Log` entries read `log` instead of `debug`, `min_level` accepts `log`, `get_server_messages` reports LSP `Debug` and custom show-message types as `debug` instead of `log`, and `bridge::MessageType` is removed (#934, #937).
+- **Breaking:** `Location`, `DocumentChanges` and `HierarchyItem` hold `uri` as `lsp_types::Uri` instead of `String`; JSON output is unchanged (#935, #937).
+- `tools/list` size budget raised to 145,000 B total for the `log` level value (#934, #937).
 - **Breaking:** `handle_workspace_symbol` takes a bounded `WorkspaceQuery`, and an over-long query fails with a -32602 error naming `query` (#930, #936).
 - **Breaking:** `Error::InvalidToolParams` is removed in favour of typed `InvalidTextField`, `InvalidKindFilter` and `NotFileUri` errors, and `KindFilterInput::into_known` returns `InvalidKindFilter` (#932, #936).
 - **Breaking:** `SourceOutcome`, `SourceSkipReason` and `LocationContext` are `#[non_exhaustive]`, and `ServerColumn`, `LabelOffsets` and the `Excerpt*` types are crate-private (#933, #936).

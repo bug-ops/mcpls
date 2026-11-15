@@ -4035,7 +4035,7 @@
   {
     "name": "get_server_logs",
     "title": "Server Logs",
-    "description": "Recent server log messages. Filter by level (error, warning, info, debug) for debugging.",
+    "description": "Recent server log messages. Filter by level (error, warning, info, log, debug) for debugging.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4050,26 +4050,31 @@
         "min_level": {
           "anyOf": [
             {
-              "description": "Log severity level.",
+              "description": "Severity of a server log or message, mirroring the LSP `MessageType` levels.",
               "oneOf": [
                 {
                   "const": "error",
-                  "description": "Error log level.",
+                  "description": "Error level.",
                   "type": "string"
                 },
                 {
                   "const": "warning",
-                  "description": "Warning log level.",
+                  "description": "Warning level.",
                   "type": "string"
                 },
                 {
                   "const": "info",
-                  "description": "Info log level.",
+                  "description": "Info level.",
+                  "type": "string"
+                },
+                {
+                  "const": "log",
+                  "description": "LSP `Log` level.",
                   "type": "string"
                 },
                 {
                   "const": "debug",
-                  "description": "Debug log level.",
+                  "description": "Debug level; also used for unrecognized LSP message types.",
                   "type": "string"
                 }
               ]
@@ -4078,7 +4083,7 @@
               "type": "null"
             }
           ],
-          "description": "Minimum log level to include: error, warning, info, debug."
+          "description": "Minimum log level to include: error, warning, info, log, debug."
         }
       },
       "type": "object"
@@ -4093,22 +4098,27 @@
               "oneOf": [
                 {
                   "const": "error",
-                  "description": "Error log level.",
+                  "description": "Error level.",
                   "type": "string"
                 },
                 {
                   "const": "warning",
-                  "description": "Warning log level.",
+                  "description": "Warning level.",
                   "type": "string"
                 },
                 {
                   "const": "info",
-                  "description": "Info log level.",
+                  "description": "Info level.",
+                  "type": "string"
+                },
+                {
+                  "const": "log",
+                  "description": "LSP `Log` level.",
                   "type": "string"
                 },
                 {
                   "const": "debug",
-                  "description": "Debug log level.",
+                  "description": "Debug level; also used for unrecognized LSP message types.",
                   "type": "string"
                 }
               ]
@@ -4173,31 +4183,6 @@
     },
     "outputSchema": {
       "$defs": {
-        "MessageType": {
-          "description": "Server message type.",
-          "oneOf": [
-            {
-              "const": "error",
-              "description": "Error message.",
-              "type": "string"
-            },
-            {
-              "const": "warning",
-              "description": "Warning message.",
-              "type": "string"
-            },
-            {
-              "const": "info",
-              "description": "Info message.",
-              "type": "string"
-            },
-            {
-              "const": "log",
-              "description": "Log message.",
-              "type": "string"
-            }
-          ]
-        },
         "ServerMessage": {
           "description": "A message from the LSP server.",
           "properties": {
@@ -4206,8 +4191,34 @@
               "type": "string"
             },
             "message_type": {
-              "$ref": "#/$defs/MessageType",
-              "description": "Message type."
+              "description": "Message type.",
+              "oneOf": [
+                {
+                  "const": "error",
+                  "description": "Error level.",
+                  "type": "string"
+                },
+                {
+                  "const": "warning",
+                  "description": "Warning level.",
+                  "type": "string"
+                },
+                {
+                  "const": "info",
+                  "description": "Info level.",
+                  "type": "string"
+                },
+                {
+                  "const": "log",
+                  "description": "LSP `Log` level.",
+                  "type": "string"
+                },
+                {
+                  "const": "debug",
+                  "description": "Debug level; also used for unrecognized LSP message types.",
+                  "type": "string"
+                }
+              ]
             },
             "timestamp": {
               "description": "Timestamp when the message was received.",

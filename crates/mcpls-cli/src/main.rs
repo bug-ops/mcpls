@@ -17,6 +17,9 @@ mod args;
 mod logging;
 
 use args::Args;
+// Integration-only dev-dependencies are flagged by `unused_dependencies` under `--lib --bins`.
+#[cfg(test)]
+use {assert_cmd as _, tempfile as _};
 
 /// Grace period for the blocking pool to wind down after a panic; bounds the
 /// wait on the stdin reader thread, which cannot be cancelled.

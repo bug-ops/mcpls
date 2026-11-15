@@ -169,7 +169,7 @@ mod tests {
             name: "Derived".to_string(),
             kind: 5,
             detail: None,
-            uri: uri.to_string(),
+            uri: uri.into(),
             range: Range {
                 start: at(1, 1),
                 end: at(1, 5),

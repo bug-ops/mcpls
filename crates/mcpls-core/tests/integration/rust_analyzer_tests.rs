@@ -435,7 +435,7 @@ async fn test_definition_user_struct() {
         def_json
             .locations
             .iter()
-            .any(|loc| loc.inner.location.uri.ends_with("lib.rs")
+            .any(|loc| loc.inner.location.uri.as_ref().ends_with("lib.rs")
                 && loc.inner.location.range.start.line().get() == 18
                 && loc.inner.location.range.start.character().get() == 12
                 && loc.inner.location.range.end.character().get() == 16),
