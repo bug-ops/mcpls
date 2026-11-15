@@ -82,6 +82,7 @@ SO THAT one call cannot flood my context or the mcpls process
 | FR-004 | THE rename `new_name` parameter SHALL be a `NewName`: a blank or whitespace-only value and a value longer than `MAX_NEW_NAME_LENGTH` (1,000 bytes) SHALL fail deserialization, and surrounding whitespace of an accepted value SHALL be kept | must |
 | FR-005 | THE completion trigger and symbol-addressing targets SHALL be parsed by serde into typed values at the MCP boundary, with typed errors in place of strings: `NewName`, `CompletionTrigger` and `SymbolName` are built with `new` and report `InvalidTextField`/`TextField`, and an empty completion `trigger` is rejected while parsing, as invalid params (#745) | must |
 | FR-006 | THE code action kind filters SHALL be closed enums shared with the kinds advertised to servers, and SHALL include `source.fixAll` and `refactor.move` | should |
+| FR-018 | THE `workspace_symbol_search` `query` SHALL be a `WorkspaceQuery` holding at most `MAX_WORKSPACE_QUERY_BYTES` (1,000) bytes, verbatim (an empty query is valid); a longer one is rejected before any server is asked. Client-input failures are typed, with no free-text variant: `InvalidTextField` (names the `TextField` and the reason: blank or too long), `InvalidKindFilter` (names the `KindFilterField` and the rejection) and `NotFileUri` replace the former `InvalidToolParams(String)`, all mapped to invalid params (`-32602`) with the message stated once | must |
 
 ### Results
 

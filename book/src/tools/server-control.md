@@ -27,7 +27,7 @@ Per tool, `coverage` is `all`, `some`, `none`, `unknown` (a server is still init
 | `unavailable` | Only in a per-server route: the member failed to start or its process died; the check never restarts it, so call `restart_server` |
 | `no_server` | No server is routed for this tool |
 
-A tool that is sent to several servers at once, today `workspace_symbol_search` when two or more servers are eligible, lists one route per eligible server in config order instead of grouping by language. Each route names its `server` and has the status `supported`, `capability_not_advertised`, `initializing` or `unavailable`:
+A tool that is sent to several servers at once, today `workspace_symbol_search` when two or more servers are eligible, lists one route per eligible server in config order instead of grouping by language. Each route names its `server`, carries no `languages` list (a grouped route lists its `languages`), and has the status `supported`, `capability_not_advertised`, `initializing` or `unavailable`:
 
 ```json
 {
@@ -46,7 +46,7 @@ A tool that is sent to several servers at once, today `workspace_symbol_search` 
 
 ## get_server_logs
 
-Returns recent log messages from the language servers. Arguments: `limit` (default 50) and `min_level`, exactly one of `error`, `warning`, `info`, `log` or `debug` in lowercase.
+Returns recent log messages from the language servers. Arguments: `limit` (default 50) and `min_level`, exactly one of `error`, `warning`, `info`, `log` or `debug` in lowercase. Levels run from most to least severe in that order, and `min_level` keeps entries at least as severe as the value you give. Each entry reports its `level` in the same five spellings: LSP `Log` messages read `log`, and an unrecognized message type reads `debug`.
 
 ```json
 { "limit": 20, "min_level": "warning" }
@@ -56,7 +56,7 @@ Use it when completion or hover fails, to see messages such as a project that co
 
 ## get_server_messages
 
-Returns the user-facing messages servers sent with `window/showMessage`, such as status updates and prompts. Argument: `limit` (default 20).
+Returns the user-facing messages servers sent with `window/showMessage`, such as status updates and prompts. Argument: `limit` (default 20). It has no `min_level`. Each message's `message_type` uses the same five levels as the server logs; an LSP `Debug` message or a custom type reads `debug`.
 
 ```json
 { "limit": 10 }

@@ -86,7 +86,7 @@ Use it to understand a file before reading it, or to find the exact name for a `
 
 Searches symbol names across the whole workspace, with partial and fuzzy matching. It needs no file, so it is the way in when you only know a name.
 
-Arguments: `query` (required), `limit` (default 100, capped by the server) and `kind_filter` (a kind name such as `function` or `class`, or the numeric LSP kind).
+Arguments: `query` (required, at most 1,000 bytes; a longer one fails with `-32602` naming `query`), `limit` (default 100, capped by the server) and `kind_filter` (a kind name such as `function` or `class`, or the numeric LSP kind).
 
 ```json
 { "query": "SessionManager", "kind_filter": "struct" }

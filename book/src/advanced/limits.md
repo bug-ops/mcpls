@@ -38,6 +38,9 @@ In this chapter you find every boundary mcpls enforces or cannot cross, in one p
 | Concurrent `subscriptions/listen` streams | 100 |
 | Enclosing-symbol enrichment | 16 files (or `max_documents / 4` when `max_documents` is below 64), 30 s |
 | Per-response disk read for position conversion | 4 times `max_file_size`, at most 256 MiB |
+| `symbol_source` | 200 lines and 16 KiB per item; per call 64 KiB of text, 256 distinct spans and 16 MiB of document text examined; the rest is `call_budget` |
+| Text arguments | `new_name`, `query` 1,000 bytes; `symbol_name` 256 bytes; `trigger` 8 bytes; line and character 1 to 1,000,000 |
+| `workspace/configuration` reply to a server | 256 items and 4 MiB; more items are answered `-32602`, a larger reply `-32603` |
 | Result lists | Capped per tool; `truncated: true` marks a cut |
 | Stdio line | 4 MiB; see [Message size limit](transports.md#message-size-limit) |
 | LSP frame from a server | Up to 10 MiB is read; 10 to 256 MiB is skipped; above 256 MiB the connection closes |

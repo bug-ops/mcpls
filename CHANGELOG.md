@@ -7,60 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-15
+
 ### Added
 
-- `context: "symbol_source"` on `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and `go_to_declaration` adds each item's bounded source text (#909, #923).
-- The release workflow runs `scripts/check-release-bump.sh` and fails a Cargo-compatible version bump that carries breaking changes (#905, #923).
+- `context: "symbol_source"` on `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and `go_to_declaration` adds each item's bounded source text, picks the innermost of overlapping sibling symbols and spends at most a 16 MiB scan budget per call (later items report `call_budget`) (#909, #923, #927, #931, #936).
+- The release workflow runs `cargo semver-checks` and `scripts/check-release-bump.sh`, and fails a Cargo-compatible bump that carries breaking changes (#879, #905, #908, #923).
+- CI rejects interpolated `tracing` messages via `scripts/check-tracing-messages.py` (#904, #915, #920).
 
 ### Changed
 
-- Update rmcp and rmcp-macros to 3.10.0 and refresh lockfile patch versions (#925, #937).
-- The cargo `unused_dependencies` workspace lint is `deny`, so an unused `[dependencies]` entry fails the build (#926, #937).
-- **Breaking:** `get_server_logs` and `get_server_messages` share one five-level `LogLevel` (`error`, `warning`, `info`, `log`, `debug`), LSP `Log` entries read `log` instead of `debug`, `min_level` accepts `log`, `get_server_messages` reports LSP `Debug` and custom show-message types as `debug` instead of `log`, and `bridge::MessageType` is removed (#934, #937).
-- **Breaking:** `Location`, `DocumentChanges` and `HierarchyItem` hold `uri` as `lsp_types::Uri` instead of `String`; JSON output is unchanged (#935, #937).
-- `tools/list` size budget raised to 145,000 B total for the `log` level value (#934, #937).
+- **Breaking:** `get_server_logs` and `get_server_messages` share one five-level `LogLevel` (`error`, `warning`, `info`, `log`, `debug`): LSP `Log` entries read `log`, `min_level` accepts `log`, LSP `Debug` and custom show-message types read `debug`, and `bridge::MessageType` is removed (#934, #937).
+- **Breaking:** `Location`, `DocumentChanges` and `HierarchyItem` hold `uri` as `lsp_types::Uri`; JSON output is unchanged (#935, #937).
+- **Breaking:** `Position2D` is non-zero (`NonZeroU32`), ordered and has private fields (use `from_mcp`, `line()`, `character()`); `lsp_character` returns `Utf16Column`, `Position::lsp_line()` returns `LspLine`, `DocumentTracker::line_text` takes `LspLine`, and a zero line or character nested in a range or hierarchy item fails with serde's error text instead of `must be >= 1` (#882, #913, #908, #923).
+- **Breaking:** `ContextualLocation` is now `Contextual<NavigationLocation>` (`.inner.uri` becomes `.inner.location.uri`), and the `context` parameter of the location tools is `LocationContext` (#909, #923).
+- **Breaking:** `BoundedUri::new` is replaced by `TryFrom<Uri>` (error `UriTooLong`), `BoundedUri::into_uri` is removed, `BoundedPublish::uri()` returns `&BoundedUri`, and `LspNotification::PublishDiagnostics` carries `DecodedPublish` (#881, #885, #908).
 - **Breaking:** `handle_workspace_symbol` takes a bounded `WorkspaceQuery`, and an over-long query fails with a -32602 error naming `query` (#930, #936).
-- **Breaking:** `Error::InvalidToolParams` is removed in favour of typed `InvalidTextField`, `InvalidKindFilter` and `NotFileUri` errors, and `KindFilterInput::into_known` returns `InvalidKindFilter` (#932, #936).
-- **Breaking:** `SourceOutcome`, `SourceSkipReason` and `LocationContext` are `#[non_exhaustive]`, and `ServerColumn`, `LabelOffsets` and the `Excerpt*` types are crate-private (#933, #936).
-- `symbol_source` picks the innermost of overlapping sibling symbols, like `enclosing_symbol` (#931, #936).
-- Internal: location link targets live on `NormalizedLocation` instead of parallel vectors, and UTF-16/UTF-8 column scanning is owned by `bridge/encoding.rs` (#928, #929, #936).
-- Internal: disk-sweep and workspace-root task panics are logged through `PanicMessage` with a single `panic` field at `error` level (#933, #936).
-- Internal: `LabelOffsets::new` and `substring` take `ServerColumn` offsets that carry their encoding, and the separate `encoding` parameter is removed (#921, #924).
-- Internal: `mcpls-core` `error.rs` is split into `error/{codes,echo,launch,stderr,symbols}` submodules, with `mcpls_core::error::*` paths unchanged (#914, #924).
-- **Breaking:** `Position2D` is non-zero by construction (`NonZeroU32`) and ordered, and `Position2D::lsp_character` and `Position::lsp_character` return the new `Utf16Column` (#913, #923).
-- **Breaking:** a zero line or character in a client-supplied hierarchy item or position now fails with serde's error text instead of `must be >= 1` (#913, #923).
-- **Breaking:** `ContextualLocation` is now `Contextual<NavigationLocation>` (`.inner.uri` becomes `.inner.location.uri`), and the `context` parameter of the location tools (`ReferencesParams`, `NavigationParams`, `DeclarationParams`) is now `LocationContext`, which accepts `symbol_source` (#909, #923).
-- **Breaking:** `FoldingKind` is `#[non_exhaustive]` (#919, #923).
-- `tools/list` size budget raised to 144,500 B total and 9,500 B per tool for `symbol_source` and closed-enum schemas (#909, #919, #923).
-- Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#904).
-- Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#904).
-- **Breaking:** `BoundedUri::new` is replaced by `TryFrom<Uri>` (error `UriTooLong`), and `BoundedPublish::uri()` returns `&BoundedUri` (#885, #908).
-- **Breaking:** `LspNotification::PublishDiagnostics` carries `DecodedPublish` (URI bounded at decode) instead of `PublishDiagnosticsParams`, and `BoundedUri::into_uri` is removed (#881, #908).
-- **Breaking:** `Position2D` fields are private (use `Position2D::from_mcp` and the `line()` / `character()` getters), `Position::lsp_line()` returns `LspLine`, and `DocumentTracker::line_text` takes `LspLine` (#882, #908).
-- Internal: `EncodingConverter` conversions fail with a typed `OffsetError` instead of a `String` and no longer truncate silently (#883, #908).
-- The release workflow runs `cargo semver-checks` against crates.io before publishing (#879, #908).
-- **Breaking:** `DroppedEdits` gains an `invalid_path` field and is `#[non_exhaustive]`, and `workspace_edit` results report over-long path components under a new `dropped.invalid_path` counter instead of `out_of_workspace` (#916, #920).
-- Internal: panic payloads in the background-task restart log are escaped and bounded, and the delivery and session supervisors share one `util::supervise` loop (#907, #911, #920).
-- Internal: the diagnostics size cap measures serialized length with a shared non-allocating `util::json_len` (#912, #920).
-- Repository hygiene: unused `[workspace.package]` fields removed, test-crate suppressions use `#[expect]`, and `scripts/check-tracing-messages.py` has a CI self-test (#915, #903, #920).
+- **Breaking:** `Error::InvalidToolParams` is replaced by `InvalidTextField`, `InvalidKindFilter` and `NotFileUri`, and `KindFilterInput::into_known` returns `InvalidKindFilter` (#932, #936).
+- **Breaking:** `SourceOutcome`, `SourceSkipReason`, `LocationContext` and `FoldingKind` are `#[non_exhaustive]`, and `ServerColumn`, `LabelOffsets` and the `Excerpt*` types are crate-private (#919, #923, #933, #936).
+- **Breaking:** `DroppedEdits` gains an `invalid_path` field and is `#[non_exhaustive]`; `workspace_edit` reports over-long path components under `dropped.invalid_path` instead of `out_of_workspace` (#916, #920).
+- `tools/list` size budget raised to 145,000 B total and 9,500 B per tool for `symbol_source` and closed-enum schemas (#909, #919, #923, #934, #937).
+- Update `rmcp` to 3.10, `toml` to 1.2, `nix` to 0.32 and `process-wrap` to 10.0, and refresh lockfile patch versions (#925, #937).
+- Lint hygiene: the `unused_dependencies` workspace lint is `deny`, and suppressions are `#[expect]` with `clippy::allow_attributes` enabled (#904, #926, #937).
+- Internal: `NormalizedLocation` owns link targets, `bridge/encoding.rs` owns column scanning with `ServerColumn` offsets and a typed `OffsetError`, `error.rs` is split into submodules, and the diagnostics cap uses a shared `util::json_len` (#883, #912, #914, #921, #924, #928, #929, #936).
 
 ### Fixed
 
-- `symbol_source` spends at most a 16 MiB scan budget per call, and later items report `call_budget` instead of blocking a worker on long lines (#927, #936).
-- A process-wide panic hook in `mcpls` logs one escaped, bounded line (new public `PanicMessage`) instead of printing the raw payload to stderr (#922, #924).
-- Panic payloads at the six background-task log sites are escaped and bounded once, where the panic is caught (#918, #923).
-- `get_tool_support` output schema lists every `Capability` spelling as an `enum`, and `FoldingKind` shares the same schema helper (#919, #923).
-- Published-URI resolution treats NUL bytes, symlink loops and permission-denied paths as permanent refusals, so they no longer delay a server's other diagnostics (#910, #920).
-- The first undecodable-LSP-message warning no longer claims other messages were dropped, and the `workspace/configuration` reply cap has boundary tests (#917, #906, #920).
-- Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#904).
-- `get_tool_support` omits `languages` on workspace routes consistently with its output schema (#888, #908).
+- Panic payloads are escaped and bounded where caught and logged through `PanicMessage`, and a process-wide panic hook in `mcpls` logs one bounded line instead of the raw payload (#907, #911, #918, #920, #922, #923, #924, #933, #936).
+- Published-URI resolution treats NUL bytes, symlink loops, permission-denied paths and invalid filenames (e.g. `ENAMETOOLONG`) as permanent refusals, so they no longer delay a server's other diagnostics (#890, #908, #910, #920).
+- `workspace/configuration` replies are capped at 256 items and 4 MiB, and the first undecodable-LSP-message warning no longer claims other messages were dropped (#887, #906, #908, #917, #920).
 - The `resources/updated` delivery task of a session is restarted after a panic, and a closed doorbell logs one warning per session (#880, #908).
-- `workspace/configuration` replies are capped at 256 items and 4 MiB (#887, #908).
-- Published-URI resolution treats an invalid filename (e.g. `ENAMETOOLONG`) as a permanent refusal: resolved once, never retried or cached, publish dropped (#890, #908).
+- `get_tool_support` lists every `Capability` spelling as an `enum` in its output schema and omits `languages` on workspace routes (#888, #908, #919, #923).
+- Clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI gate (#904).
 
 ### Security
 
-- Bump `rmcp` to 3.9 to fix RUSTSEC-2026-0462; tool `outputSchema` now marks always-serialized nullable fields as `required` (#900).
+- Bump `rmcp` to 3.9 to fix RUSTSEC-2026-0462; tool `outputSchema` marks always-serialized nullable fields as `required` (#900).
 
 ## [0.9.1] - 2026-11-01
 
@@ -998,7 +980,8 @@ Add to `~/.claude/mcp.json`:
 - Workspace auto-discovery
 - LSP server auto-detection and installation
 
-[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/bug-ops/mcpls/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/bug-ops/mcpls/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/bug-ops/mcpls/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/bug-ops/mcpls/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bug-ops/mcpls/compare/v0.7.0...v0.8.0

@@ -83,6 +83,7 @@ Rust projects need no configuration. Other languages and clients are covered in 
 - **Cross-references, definitions, implementations** across the whole workspace
 - **Real diagnostics** from the compiler, not guesses
 - **Rename and code-action edits** returned for the client to apply
+- **Opt-in context on locations**: the enclosing symbol or its bounded source text (`context: "symbol_source"`) next to each reference, definition or implementation
 - **Call and type hierarchies**, formatting, inlay hints, selection and folding ranges
 - **Workspace symbol search across every language server** of a polyglot project, with each symbol tagged by its server
 - **Address code by symbol name** as well as by position, and restart language servers on demand

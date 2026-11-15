@@ -8,9 +8,9 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4.13"
+libfuzzer-sys = "0.4"
 mcpls-core = { path = "../crates/mcpls-core" }
-tokio = { version = "1.53", features = ["io-util", "rt"] }
+tokio = { version = "1.54", features = ["io-util", "rt"] }
 
 [[bin]]
 name = "lsp_frame"

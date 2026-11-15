@@ -47,6 +47,8 @@ Every diagnostics answer carries `availability`, because an empty list is ambigu
 
 A server restart returns every file to `pending`.
 
+When mcpls cannot resolve the file a server published for, it drops that publish and never retries or caches it. This covers a name the filesystem rejects (such as one that is too long), a NUL byte, a symlink loop and a permission-denied path. The refusal never delays the diagnostics of the server's other files.
+
 ## Diagnostics as MCP resources
 
 Each file's diagnostics are also available as an MCP resource:
