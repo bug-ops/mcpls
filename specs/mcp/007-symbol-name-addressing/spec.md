@@ -109,6 +109,7 @@ symbol other than the one it named without being told so.
   precise, unambiguous form and the fallback when name resolution cannot answer.
 - Semantic or fuzzy search over code bodies (returning symbol bodies, pattern search by content),
   and symbol-level *editing* tools (insert before/after symbol, replace symbol body).
+  Returning bounded symbol source text on the five location tools is covered by the opt-in `symbol_source` level of [[bridge/018-symbol-source-context/spec|bridge/018]]; the rest stays out of scope.
 - Changes to how LSP servers are discovered, spawned, or routed
   ([[mcp/001-mcp-tool-surface-and-routing/spec|mcp/001]]).
 - Gating `workspace_symbol_search` on indexing readiness as a general fix (tracked separately

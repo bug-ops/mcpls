@@ -413,7 +413,7 @@ async fn test_definition_user_struct() {
         translator.lock().await.handle_definition(
             client_path(types_file.to_string_lossy().into_owned()),
             Position::from_client(9, 16).unwrap(),
-            mcpls_core::bridge::ResultContext::None,
+            mcpls_core::bridge::LocationContext::None,
         ),
     )
     .await;
@@ -434,10 +434,10 @@ async fn test_definition_user_struct() {
         def_json
             .locations
             .iter()
-            .any(|loc| loc.uri.ends_with("lib.rs")
-                && loc.range.start.line() == 18
-                && loc.range.start.character() == 12
-                && loc.range.end.character() == 16),
+            .any(|loc| loc.inner.location.uri.ends_with("lib.rs")
+                && loc.inner.location.range.start.line().get() == 18
+                && loc.inner.location.range.start.character().get() == 12
+                && loc.inner.location.range.end.character().get() == 16),
         "Definition should reference User struct in lib.rs, got: {:?}",
         def_json.locations
     );
@@ -461,7 +461,7 @@ async fn test_definition_across_files() {
         translator.lock().await.handle_definition(
             client_path(functions_file.to_string_lossy().into_owned()),
             Position::from_client(3, 24).unwrap(),
-            mcpls_core::bridge::ResultContext::None,
+            mcpls_core::bridge::LocationContext::None,
         ),
     )
     .await;
@@ -500,7 +500,7 @@ async fn test_references_create_repo_function() {
             client_path(functions_file.to_string_lossy().into_owned()),
             Position::from_client(7, 12).unwrap(),
             true, // Include declaration
-            mcpls_core::bridge::ResultContext::None,
+            mcpls_core::bridge::LocationContext::None,
         ),
     )
     .await;
@@ -541,7 +541,7 @@ async fn test_references_user_struct() {
             client_path(lib_file.to_string_lossy().into_owned()),
             Position::from_client(18, 15).unwrap(),
             true,
-            mcpls_core::bridge::ResultContext::None,
+            mcpls_core::bridge::LocationContext::None,
         ),
     )
     .await;

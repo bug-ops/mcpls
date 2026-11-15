@@ -58,6 +58,14 @@ mod routing;
 mod save_support;
 mod selection_range;
 mod servers;
+mod source;
+#[cfg(test)]
+#[expect(
+    clippy::future_not_send,
+    clippy::format_collect,
+    reason = "protected acceptance test file; its helpers trip these pedantic lints"
+)]
+mod source_acceptance_tests;
 mod support;
 mod symbols;
 #[cfg(test)]
@@ -78,7 +86,8 @@ pub use diagnostics::{
 pub use dto::*;
 pub use enclosing::{
     Contextual, ContextualDiagnostic, ContextualLocation, EnclosingSymbol, EnclosingSymbolOutcome,
-    EnrichmentSummary, NotComputedReason, ResultContext, SymbolFidelity, UnavailableReason,
+    EnrichmentSummary, LocationContext, NotComputedReason, ResultContext, SymbolFidelity,
+    UnavailableReason,
 };
 pub use kind_filter::{
     CodeActionKindFilter, KindFilter, KindFilterField, KindFilterInput, RejectedKindFilter,
@@ -90,6 +99,7 @@ pub use restart::{
     ServerIds, ServerIdsError, ServerRestartEntry,
 };
 pub use routing::Capability;
+pub use source::{ItemIndex, NavigationLocation, SourceOutcome, SourceSkipReason};
 pub use support::{MemberStatus, MemberSupport, RouteSupport, ToolSupportSnapshot};
 
 /// Translator handles MCP tool calls by converting them to LSP requests.

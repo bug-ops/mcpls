@@ -2119,7 +2119,7 @@ mod tests {
     use super::*;
     use crate::bridge::resources::ResourceSubscriptions;
     use crate::bridge::{
-        Capability, IndexingSignal, LogLevel, NewName, ResultContext, RouteSignals,
+        Capability, IndexingSignal, LocationContext, LogLevel, NewName, ResultContext, RouteSignals,
     };
     use crate::config::{
         FileExtension, LanguageId, McpDescription, McpInstructions, McpTitle, ServerCommand,
@@ -2653,7 +2653,7 @@ mod tests {
         }
     }
 
-    /// #636: a hierarchy item with a zero, oversized or reversed range is
+    /// #636: a hierarchy item with an oversized or reversed range is
     /// `-32602` for every walking tool, before any server is asked.
     #[tokio::test]
     async fn test_hierarchy_tools_reject_out_of_range_item_as_invalid_params() {
@@ -2668,11 +2668,7 @@ mod tests {
             .unwrap()
         };
         for (range, selection) in [
-            ((0, 1), (1, 1)),
-            ((1, 0), (1, 1)),
             ((1, 1_000_001), (1, 1)),
-            ((1, 1), (0, 1)),
-            ((1, 1), (1, 0)),
             ((1, 1), (1, 1_000_001)),
             ((1, 1), (4_294_967_295, 1)),
             ((1, 1), (1, 4_294_967_295)),
@@ -2919,7 +2915,7 @@ mod tests {
                     .get_references(Parameters(ReferencesParams {
                         target: position(line, character).into(),
                         include_declaration: false,
-                        context: crate::bridge::ResultContext::None,
+                        context: crate::bridge::LocationContext::None,
                     }))
                     .await
                     .map(|_| ()),
@@ -3236,7 +3232,7 @@ mod tests {
             }
             .into(),
             include_declaration: false,
-            context: ResultContext::None,
+            context: LocationContext::None,
         });
 
         let result = server.get_references(params).await;
@@ -4356,8 +4352,8 @@ mod tests {
             .structured_result(Ok(FormatDocumentResult {
                 edits: vec![TextEdit {
                     range: Range {
-                        start: Position2D::from_mcp(1, 1),
-                        end: Position2D::from_mcp(1, 2),
+                        start: Position2D::at(1, 1),
+                        end: Position2D::at(1, 2),
                     },
                     new_text: "SuperSecretValue123".to_owned(),
                 }],
@@ -6765,8 +6761,8 @@ sleep 0.3
         assert!(schema.contains("enclosing_symbol") && schema.contains("\"none\""));
     }
 
-    /// `context` accepts the two closed values, defaults to `none`, and
-    /// rejects anything else before a handler runs.
+    /// `context` accepts its closed values (`symbol_source` only on the location
+    /// tools), defaults to `none`, and rejects anything else before a handler runs.
     #[test]
     fn test_context_param_deserialization() {
         let base = |context: Option<&str>| {
@@ -6778,13 +6774,24 @@ sleep 0.3
         };
         let parse = |value| serde_json::from_value::<NavigationParams>(value);
 
-        assert_eq!(parse(base(None)).unwrap().context, ResultContext::None);
+        assert_eq!(parse(base(None)).unwrap().context, LocationContext::None);
         assert_eq!(
             parse(base(Some("enclosing_symbol"))).unwrap().context,
-            ResultContext::EnclosingSymbol
+            LocationContext::EnclosingSymbol
+        );
+        assert_eq!(
+            parse(base(Some("symbol_source"))).unwrap().context,
+            LocationContext::SymbolSource
         );
         assert!(parse(base(Some("bogus"))).is_err());
         assert!(serde_json::from_value::<ReferencesParams>(base(Some("bogus"))).is_err());
+        assert!(
+            serde_json::from_value::<DiagnosticsParams>(serde_json::json!({
+                "file_path": "/a.rs",
+                "context": "symbol_source",
+            }))
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<DiagnosticsParams>(serde_json::json!({
                 "file_path": "/a.rs",
@@ -6960,7 +6967,7 @@ sleep 0.3
         };
         let type_item = || {
             let uri = url::Url::from_file_path(file).unwrap().to_string();
-            let at = |character| crate::bridge::Position2D::from_mcp(1, character);
+            let at = |character| crate::bridge::Position2D::at(1, character);
             TypeHierarchyWalkParams {
                 item: crate::bridge::HierarchyItem {
                     name: "T".to_string(),
@@ -6993,7 +7000,7 @@ sleep 0.3
                 .get_references(Parameters(ReferencesParams {
                     target: position().into(),
                     include_declaration: false,
-                    context: ResultContext::None,
+                    context: crate::bridge::LocationContext::None,
                 }))
                 .await
                 .map(|_| ()),

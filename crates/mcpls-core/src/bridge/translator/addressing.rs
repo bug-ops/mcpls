@@ -17,7 +17,7 @@ use super::dto::{Position, Position2D};
 use super::encoding_ctx::EncodingCtx;
 use super::routing::Capability;
 use crate::bridge::ClientPath;
-use crate::bridge::encoding::{EncodingConverter, LspLine, PositionEncoding};
+use crate::bridge::encoding::{LspLine, Utf16Column};
 use crate::bridge::state::uri_to_path;
 use crate::config::text_newtype::impl_text_newtype;
 use crate::config::{BoundedText, InvalidBoundedText};
@@ -427,9 +427,8 @@ enum IdentifierPosition {
 }
 
 /// Whether the document text spells `word` at the MCP `position`.
-fn spells_at(line_text: &str, position: &Position2D, word: &str) -> bool {
-    let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
-    let Ok(byte) = utf16.character_to_byte_offset(line_text, position.lsp_character()) else {
+fn spells_at(line_text: &str, position: Position2D, word: &str) -> bool {
+    let Ok(byte) = position.lsp_character().byte_offset_in(line_text) else {
         return false;
     };
     whole_word_occurrences(line_text, word).contains(&byte)
@@ -451,7 +450,7 @@ async fn locate_identifier(
         let position = ctx.to_mcp(uri, selection.start).await;
         let spelled = tracker
             .line_text(&path, position.lsp_line())
-            .is_some_and(|text| spells_at(&text, &position, &simple));
+            .is_some_and(|text| spells_at(&text, position, &simple));
         if spelled {
             return IdentifierPosition::Verified(position, PositionSource::SelectionRange);
         }
@@ -464,7 +463,6 @@ async fn locate_identifier(
         .lsp_line()
         .get()
         .min(first_line.get().saturating_add(MAX_WINDOW_LINES - 1));
-    let utf16 = EncodingConverter::new(PositionEncoding::Utf16);
     let window = usize::try_from(last_line.saturating_sub(first_line.get()).saturating_add(1))
         .unwrap_or(usize::MAX);
     let text = tracker
@@ -473,14 +471,11 @@ async fn locate_identifier(
     let mut found = Vec::new();
     for (line, text) in (first_line.get()..).map(LspLine::new).zip(text.split('\n')) {
         for byte in whole_word_occurrences(text, &simple) {
-            let Ok(column) = utf16.byte_offset_to_character(text, byte) else {
+            let Ok(column) = Utf16Column::at_byte(text, byte) else {
                 continue;
             };
             let at = Position2D::from_lsp(line, column);
-            let key = (at.line(), at.character());
-            let after_start = key >= (start.line(), start.character());
-            let before_end = key < (end.line(), end.character());
-            if after_start && before_end {
+            if at >= start && at < end {
                 found.push(at);
             }
         }
@@ -494,14 +489,14 @@ async fn locate_identifier(
     }
 }
 
-fn candidate(entry: &SymbolEntry, position: &Position2D) -> SymbolCandidate {
+fn candidate(entry: &SymbolEntry, position: Position2D) -> SymbolCandidate {
     SymbolCandidate {
         name: entry.name.clone(),
         kind: u32::from(entry.kind),
         kind_name: format!("{:?}", entry.kind),
         container: entry.container.clone(),
-        line: position.line(),
-        character: position.character(),
+        line: position.line().get(),
+        character: position.character().get(),
     }
 }
 
@@ -579,7 +574,7 @@ impl Translator {
                 let located = locate_identifier(self, &fetched.ctx, &uri, entry).await;
                 match located {
                     IdentifierPosition::Verified(position, source) => Ok(ResolvedTarget {
-                        position: Position::from_server_output(&position),
+                        position: Position::from_server_output(position),
                         resolved: Some(ResolvedSymbol {
                             name: entry.name.clone(),
                             kind: u32::from(entry.kind),
@@ -591,7 +586,7 @@ impl Translator {
                     IdentifierPosition::Unverified(position) => {
                         Err(resolution_error(SymbolResolutionData::PositionUnverified {
                             name: query.name.as_str().to_string(),
-                            candidate: candidate(entry, &position),
+                            candidate: candidate(entry, position),
                         }))
                     }
                 }
@@ -600,7 +595,7 @@ impl Translator {
                 let mut candidates = Vec::with_capacity(many.len().min(MAX_CANDIDATES));
                 for entry in many.iter().take(MAX_CANDIDATES) {
                     let located = locate_identifier(self, &fetched.ctx, &uri, entry).await;
-                    candidates.push(candidate(entry, identifier_position(&located)));
+                    candidates.push(candidate(entry, *identifier_position(&located)));
                 }
                 Err(resolution_error(SymbolResolutionData::Ambiguous {
                     name: query.name.as_str().to_string(),
@@ -930,9 +925,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(spells_at(line, &Position2D::from_mcp(1, col + 1), "foo"));
-        assert!(!spells_at(line, &Position2D::from_mcp(1, col), "foo"));
-        assert!(!spells_at(line, &Position2D::from_mcp(1, 999), "foo"));
+        assert!(spells_at(line, Position2D::at(1, col + 1), "foo"));
+        assert!(!spells_at(line, Position2D::at(1, col), "foo"));
+        assert!(!spells_at(line, Position2D::at(1, 999), "foo"));
     }
 }
 
@@ -1456,7 +1451,7 @@ mod server_text_tests {
                 name: format!("sym_{SECRET}"),
                 kind: 12,
                 container: Some(format!("c_{SECRET}")),
-                position: Position2D::from_mcp(1, 1),
+                position: Position2D::at(1, 1),
                 position_source: PositionSource::SelectionRange,
             }),
         };

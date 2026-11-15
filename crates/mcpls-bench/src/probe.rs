@@ -48,11 +48,11 @@ fn file_path(repo: &Path, file: &RepoPath) -> String {
     file.in_repo(repo).to_string_lossy().into_owned()
 }
 
-fn position_args(repo: &Path, file: &RepoPath, at: &Position2D) -> PositionArgs {
+fn position_args(repo: &Path, file: &RepoPath, at: Position2D) -> PositionArgs {
     PositionArgs {
         file_path: file_path(repo, file),
-        line: at.line(),
-        character: at.character(),
+        line: at.line().get(),
+        character: at.character().get(),
     }
 }
 
@@ -139,16 +139,16 @@ impl Probe {
     pub fn request(&self, repo: &Path) -> Result<CallToolRequestParams> {
         let (tool, arguments) = match self {
             Self::Hover { file, position, .. } => {
-                ("get_hover", object(&position_args(repo, file, position))?)
+                ("get_hover", object(&position_args(repo, file, *position))?)
             }
             Self::Definition { file, position, .. } => (
                 "get_definition",
-                object(&position_args(repo, file, position))?,
+                object(&position_args(repo, file, *position))?,
             ),
             Self::References { file, position, .. } => (
                 "get_references",
                 object(&ReferencesArgs {
-                    position: position_args(repo, file, position),
+                    position: position_args(repo, file, *position),
                     include_declaration: true,
                 })?,
             ),
@@ -187,7 +187,7 @@ impl Probe {
                     definition
                         .locations
                         .iter()
-                        .any(|l| l.uri.ends_with(uri_suffix.as_str())),
+                        .any(|l| l.inner.location.uri.ends_with(uri_suffix.as_str())),
                     || format!("no definition uri ends with `{uri_suffix}`"),
                 )
             }
@@ -266,10 +266,14 @@ mod tests {
     use super::*;
     use crate::scenario::RepoPath;
 
+    fn nz(value: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(value).expect("fixture value is non-zero")
+    }
+
     fn hover_probe(contains: &str) -> Probe {
         Probe::Hover {
             file: RepoPath::try_from("src/lib.rs".to_owned()).unwrap(),
-            position: Position2D::from_mcp(1, 1),
+            position: Position2D::from_mcp(nz(1), nz(1)),
             contains: contains.to_owned(),
             symbol: None,
         }
@@ -288,7 +292,7 @@ mod tests {
     fn structured_content_is_preferred() {
         let probe = Probe::References {
             file: RepoPath::try_from("src/lib.rs".to_owned()).unwrap(),
-            position: Position2D::from_mcp(1, 1),
+            position: Position2D::from_mcp(nz(1), nz(1)),
             min_count: 1,
             symbol: None,
         };

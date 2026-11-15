@@ -137,6 +137,8 @@ as it is today.
   one comparable bridge). Returning the enclosing symbol's *range* lets the agent fetch text itself; body retrieval is a
   separate, larger output-size problem. Source-snippet context of the hit line itself is an open
   question (section 9), not committed scope.
+  > [!note] Superseded for one opt-in level
+  > [[bridge/018-symbol-source-context/spec|bridge/018]] adds the opt-in `symbol_source` level on the five location tools, which returns bounded symbol source text. This exclusion still holds for `none`, `enclosing_symbol` and `get_diagnostics`.
 - New standalone tools (for example a dedicated "find referencing symbols" tool). This spec
   concerns enriching the output of existing tools.
 - Changing `get_document_symbols` output, `workspace_symbol_search` output, or the document-symbol

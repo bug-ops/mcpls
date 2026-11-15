@@ -7,15 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::{
     CodeActionKindFilter, CompletionTrigger, FoldingKindFilter, HierarchyItem, InvalidTextField,
-    KindFilterField, KindFilterInput, LogLevel, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES,
-    NewName, Position, Position2D, Range, RestartTarget, ResultContext, ServerIds, ServerIdsError,
-    SymbolKindFilter, SymbolName, SymbolQuery, SymbolTarget, TabSize, TextField,
+    KindFilterField, KindFilterInput, LocationContext, LogLevel, MAX_RESTART_SERVER_IDS,
+    MAX_SERVER_ID_BYTES, NewName, Position, Position2D, Range, RestartTarget, ResultContext,
+    ServerIds, ServerIdsError, SymbolKindFilter, SymbolName, SymbolQuery, SymbolTarget, TabSize,
+    TextField,
 };
 use crate::error::Error;
 
 /// Schema description of the opt-in `context` input shared by every tool that
 /// can attach enclosing symbols.
 const CONTEXT_DESCRIPTION: &str = "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file).\n\nAttaches the name path, kind and range of the innermost containing symbol. Costs one documentSymbol request per distinct file, capped per call.";
+
+/// `context` description of the five location tools, which also accept `symbol_source`.
+const LOCATION_CONTEXT_DESCRIPTION: &str = "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`.\n\nAttaches the name path, kind and range of the innermost containing symbol; `symbol_source` adds its bounded text as `source`. Costs one documentSymbol request per distinct file, capped per call.";
 
 /// Declares a wire struct whose first fields are a file path and a 1-based
 /// position, followed by the tool's own fields.
@@ -350,9 +354,9 @@ target_wire! {
         #[schemars(description = "Whether to include the declaration in the results.")]
         #[serde(default)]
         include_declaration: bool,
-        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[schemars(description = LOCATION_CONTEXT_DESCRIPTION)]
         #[serde(default)]
-        context: ResultContext,
+        context: LocationContext,
     }
 }
 
@@ -366,7 +370,7 @@ pub struct ReferencesParams {
     /// Whether to include the declaration in the results.
     pub include_declaration: bool,
     /// Optional extra context for each returned item.
-    pub context: ResultContext,
+    pub context: LocationContext,
 }
 
 impl TryFrom<ReferencesWire> for ReferencesParams {
@@ -385,9 +389,9 @@ target_wire! {
     /// Wire form of [`NavigationParams`].
     #[schemars(description = "Parameters for navigating from a symbol to related locations.")]
     NavigationWire {
-        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[schemars(description = LOCATION_CONTEXT_DESCRIPTION)]
         #[serde(default)]
-        context: ResultContext,
+        context: LocationContext,
     }
 }
 
@@ -400,7 +404,7 @@ pub struct NavigationParams {
     /// The symbol to navigate from.
     pub target: SymbolTargetParams,
     /// Optional extra context for each returned item.
-    pub context: ResultContext,
+    pub context: LocationContext,
 }
 
 impl TryFrom<NavigationWire> for NavigationParams {
@@ -419,7 +423,7 @@ impl From<PositionParams> for NavigationParams {
     fn from(position: PositionParams) -> Self {
         Self {
             target: position.into(),
-            context: ResultContext::None,
+            context: LocationContext::None,
         }
     }
 }
@@ -428,9 +432,9 @@ position_wire! {
     /// Wire form of [`DeclarationParams`].
     #[schemars(description = "Parameters for navigating from a position to its declaration.")]
     DeclarationWire {
-        #[schemars(description = CONTEXT_DESCRIPTION)]
+        #[schemars(description = LOCATION_CONTEXT_DESCRIPTION)]
         #[serde(default)]
-        context: ResultContext,
+        context: LocationContext,
     }
 }
 
@@ -442,7 +446,7 @@ pub struct DeclarationParams {
     /// The position to navigate from.
     pub position: PositionParams,
     /// Optional extra context for each returned item.
-    pub context: ResultContext,
+    pub context: LocationContext,
 }
 
 impl From<DeclarationWire> for DeclarationParams {
@@ -463,7 +467,7 @@ impl From<PositionParams> for DeclarationParams {
     fn from(position: PositionParams) -> Self {
         Self {
             position,
-            context: ResultContext::None,
+            context: LocationContext::None,
         }
     }
 }
@@ -684,9 +688,9 @@ fn without_default(schema: &mut schemars::Schema) {
 )]
 struct Position2DInput {
     /// Line number (1-based).
-    line: u32,
+    line: std::num::NonZeroU32,
     /// Character offset (1-based).
-    character: u32,
+    character: std::num::NonZeroU32,
 }
 
 /// Input form of [`Range`]: the same schema under the same name, closed to
@@ -1412,7 +1416,7 @@ mod tests {
     /// item must come back unchanged when a client passes it to a walking tool.
     #[test]
     fn hierarchy_item_input_round_trips_a_full_output_item() {
-        let at = |line, character| Position2D::from_mcp(line, character);
+        let at = |line, character| Position2D::at(line, character);
         let item = HierarchyItem {
             name: "Base".into(),
             kind: 5,

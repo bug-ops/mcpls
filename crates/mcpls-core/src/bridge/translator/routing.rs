@@ -483,10 +483,12 @@ impl schemars::JsonSchema for Capability {
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "string",
-            "description": "LSP server capability the tool is gated on."
-        })
+        let mut schema = crate::spelling::spelled_schema::<Self>();
+        schema.insert(
+            "description".to_owned(),
+            "LSP server capability the tool is gated on.".into(),
+        );
+        schema
     }
 }
 
@@ -1476,7 +1478,7 @@ mod tests {
     use super::*;
     use crate::bridge::translator::dto::Position;
     use crate::bridge::translator::testing::*;
-    use crate::bridge::{NotificationCache, ResultContext, WorkspaceRoots};
+    use crate::bridge::{LocationContext, NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
         DocumentLimit, FileExtension, FilePattern, IndexingReadyTimeoutSecs, LanguageId,
         LanguageMap, LspServerConfig, PositionEncodings, SearchDepth, ServerCommand, SizeLimit,
@@ -3588,7 +3590,7 @@ mod tests {
             .handle_definition(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                ResultContext::None,
+                LocationContext::None,
             )
             .await;
 
@@ -3619,7 +3621,7 @@ mod tests {
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
                 false,
-                ResultContext::None,
+                LocationContext::None,
             )
             .await;
 
@@ -3728,7 +3730,7 @@ mod tests {
             .handle_implementation(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                ResultContext::None,
+                LocationContext::None,
             )
             .await;
 
@@ -3758,7 +3760,7 @@ mod tests {
             .handle_type_definition(
                 client_path(path.to_string_lossy().into_owned()),
                 Position::at(1, 1),
-                ResultContext::None,
+                LocationContext::None,
             )
             .await;
 
@@ -3788,7 +3790,7 @@ mod tests {
             .handle_declaration(
                 client_path(&path),
                 Position::at(1, 1),
-                crate::bridge::ResultContext::None,
+                crate::bridge::LocationContext::None,
             )
             .await;
 

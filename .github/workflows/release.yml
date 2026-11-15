@@ -37,10 +37,28 @@ jobs:
       - name: Check mcpls-core version bump against crates.io
         run: cargo semver-checks check-release -p mcpls-core
 
+  # Breaking changes need a bump of the leftmost non-zero version component
+  bump-check:
+    name: Bump Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the version bump against breaking changes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/check-release-bump.sh "${TAG#v}"
+
   # Create GitHub Release
   create-release:
     name: Create Release
-    needs: semver-check
+    needs: [semver-check, bump-check]
     runs-on: ubuntu-latest
     permissions:
       contents: write

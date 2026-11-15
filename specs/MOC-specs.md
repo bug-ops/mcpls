@@ -81,6 +81,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | implemented (rule (i), typed `index_coverage` note) | #796 |
 | 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
 | 017 | [[bridge/017-workspace-symbol-multi-server-fanout/spec\|workspace-symbol-multi-server-fanout]] | enhancement (competitor-gap) | P3 | implemented | #844; #851, #852, #864 (per-server `get_tool_support`, indexing flag) |
+| 018 | [[bridge/018-symbol-source-context/spec\|symbol-source-context]] | enhancement (competitor-gap) | P4 | implemented | #909 |
 
 ## runtime
 

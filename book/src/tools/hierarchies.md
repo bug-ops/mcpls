@@ -8,7 +8,7 @@ In this chapter you learn the tools that follow relationships: implementations, 
 
 ## Jump tools
 
-These three take a position (and the first two also accept `symbol_name`) and return a list of locations with `uri`, `range` and `out_of_workspace`. All accept `context: "enclosing_symbol"`.
+These three take a position (and the first two also accept `symbol_name`) and return a list of locations with `uri`, `range` and `out_of_workspace`. All accept `context: "enclosing_symbol"` or `"symbol_source"`.
 
 | Tool | Answers | Typical use |
 |------|---------|-------------|

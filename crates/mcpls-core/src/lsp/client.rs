@@ -1149,7 +1149,7 @@ impl LspClient {
         match route {
             Route::Mailbox(sink, publish) => {
                 debug!(
-                    uri = publish.uri().uri().as_ref(),
+                    uri = publish.file_uri().as_ref(),
                     items = publish.diagnostics().len(),
                     "Forwarding diagnostics"
                 );

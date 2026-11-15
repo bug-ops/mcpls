@@ -134,46 +134,29 @@ struct ProbeContext<'a> {
 
 impl ProbeContext<'_> {
     /// `None` when the probe has nothing for the placeholder (no position, no symbol).
-    fn fill(&self, placeholder: Placeholder) -> Result<Option<Value>> {
+    fn fill(&self, placeholder: Placeholder) -> Option<Value> {
         let file = self.probe.file();
         let position = self.probe.position();
-        Ok(match placeholder {
+        match placeholder {
             Placeholder::Repo => Some(path_value(self.repo)),
             Placeholder::File => Some(path_value(&file.in_repo(self.repo))),
             Placeholder::RelativeFile => Some(Value::from(file.as_str())),
-            Placeholder::Line1 => position.map(|p| Value::from(p.line())),
-            Placeholder::Line0 => position
-                .map(|p| {
-                    ensure_one_based(p.line(), "line")?;
-                    Ok::<_, anyhow::Error>(Value::from(p.lsp_line().get()))
-                })
-                .transpose()?,
-            Placeholder::Character1 => position.map(|p| Value::from(p.character())),
-            Placeholder::Character0 => position
-                .map(|p| {
-                    ensure_one_based(p.character(), "character")?;
-                    Ok::<_, anyhow::Error>(Value::from(p.lsp_character()))
-                })
-                .transpose()?,
+            Placeholder::Line1 => position.map(|p| Value::from(p.line().get())),
+            Placeholder::Line0 => position.map(|p| Value::from(p.lsp_line().get())),
+            Placeholder::Character1 => position.map(|p| Value::from(p.character().get())),
+            Placeholder::Character0 => position.map(|p| Value::from(p.lsp_character().get())),
             Placeholder::Symbol => self.probe.symbol().map(Value::from),
-        })
+        }
     }
 
-    fn resolve(&self, value: &ArgValue) -> Result<Option<Value>> {
+    fn resolve(&self, value: &ArgValue) -> Option<Value> {
         match value {
-            ArgValue::Text(text) => Ok(Some(Value::from(text.as_str()))),
-            ArgValue::Number(number) => Ok(Some(Value::from(*number))),
-            ArgValue::Flag(flag) => Ok(Some(Value::from(*flag))),
+            ArgValue::Text(text) => Some(Value::from(text.as_str())),
+            ArgValue::Number(number) => Some(Value::from(*number)),
+            ArgValue::Flag(flag) => Some(Value::from(*flag)),
             ArgValue::Placeholder(placeholder) => self.fill(*placeholder),
         }
     }
-}
-
-fn ensure_one_based(value: u32, what: &str) -> Result<()> {
-    if value == 0 {
-        bail!("{what} is 1-based and cannot be 0");
-    }
-    Ok(())
 }
 
 fn path_value(path: &Path) -> Value {
@@ -365,21 +348,14 @@ impl ExternalTarget {
 
     /// The call for `probe`, or `None` when the target has no tool for it or the
     /// probe lacks something a placeholder needs.
-    fn request(&self, probe: &Probe, repo: &Path) -> Result<Option<CallToolRequestParams>> {
-        let Some(binding) = self.tools.for_probe(probe) else {
-            return Ok(None);
-        };
+    fn request(&self, probe: &Probe, repo: &Path) -> Option<CallToolRequestParams> {
+        let binding = self.tools.for_probe(probe)?;
         let context = ProbeContext { repo, probe };
         let mut arguments = JsonObject::new();
         for (name, value) in &binding.arguments {
-            let Some(value) = context.resolve(value)? else {
-                return Ok(None);
-            };
-            arguments.insert(name.clone(), value);
+            arguments.insert(name.clone(), context.resolve(value)?);
         }
-        Ok(Some(
-            CallToolRequestParams::new(binding.tool.clone()).with_arguments(arguments),
-        ))
+        Some(CallToolRequestParams::new(binding.tool.clone()).with_arguments(arguments))
     }
 
     fn verdict(&self, probe: &Probe, result: &CallToolResult) -> Result<(), Incorrect> {
@@ -480,7 +456,7 @@ impl Target {
         match self {
             Self::Mcpls { .. } => probe.request(repo).map(ProbeCall::Call),
             Self::External(target) => Ok(target
-                .request(probe, repo)?
+                .request(probe, repo)
                 .map_or(ProbeCall::Unsupported, ProbeCall::Call)),
         }
     }
@@ -508,6 +484,10 @@ mod tests {
     use super::*;
     use crate::scenario::DiagnosticsExpect;
 
+    fn nz(value: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(value).expect("fixture value is non-zero")
+    }
+
     const SERENA: &str = include_str!("../targets/serena.toml");
     const LSMCP: &str = include_str!("../targets/lsmcp.toml");
 
@@ -518,7 +498,7 @@ mod tests {
     fn definition(symbol: Option<&str>) -> Probe {
         Probe::Definition {
             file: file(),
-            position: Position2D::from_mcp(5, 10),
+            position: Position2D::from_mcp(nz(5), nz(10)),
             uri_suffix: "src/utils/deepEqual.ts".to_owned(),
             symbol: symbol.map(str::to_owned),
         }
@@ -567,10 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn zero_based_placeholders_shift_and_refuse_a_zero_position() {
+    fn zero_based_placeholders_shift_a_one_based_position() {
         let at = |line, character| Probe::Hover {
             file: file(),
-            position: Position2D::from_mcp(line, character),
+            position: Position2D::from_mcp(nz(line), nz(character)),
             contains: "x".to_owned(),
             symbol: None,
         };
@@ -583,20 +563,8 @@ mod tests {
         };
 
         let probe = at(5, 10);
-        assert_eq!(
-            fill(&probe, Placeholder::Line0).unwrap(),
-            Some(Value::from(4))
-        );
-        assert_eq!(
-            fill(&probe, Placeholder::Character0).unwrap(),
-            Some(Value::from(9))
-        );
-        assert!(fill(&at(0, 1), Placeholder::Line0).is_err());
-        assert!(fill(&at(1, 0), Placeholder::Character0).is_err());
-        assert_eq!(
-            fill(&at(0, 0), Placeholder::Line1).unwrap(),
-            Some(Value::from(0))
-        );
+        assert_eq!(fill(&probe, Placeholder::Line0), Some(Value::from(4)));
+        assert_eq!(fill(&probe, Placeholder::Character0), Some(Value::from(9)));
     }
 
     #[test]
@@ -613,7 +581,7 @@ mod tests {
         let target = Target::External(Box::new(ExternalTarget::parse(SERENA).unwrap()));
         let hover = Probe::Hover {
             file: file(),
-            position: Position2D::from_mcp(1, 1),
+            position: Position2D::from_mcp(nz(1), nz(1)),
             contains: "x".to_owned(),
             symbol: Some("x".to_owned()),
         };
@@ -670,7 +638,7 @@ mod tests {
 
         let references = Probe::References {
             file: file(),
-            position: Position2D::from_mcp(1, 1),
+            position: Position2D::from_mcp(nz(1), nz(1)),
             min_count: 2,
             symbol: None,
         };

@@ -316,7 +316,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Shellcheck scripts
-        run: shellcheck --shell=sh scripts/install.sh scripts/check-server-json-version.sh scripts/test-check-server-json-version.sh scripts/test-check-tracing-messages.sh
+        run: shellcheck --shell=sh scripts/install.sh scripts/check-server-json-version.sh scripts/test-check-server-json-version.sh scripts/test-check-tracing-messages.sh scripts/check-release-bump.sh scripts/test-check-release-bump.sh
 
   server-json:
     name: Registry Manifest
@@ -332,6 +332,8 @@ jobs:
         run: scripts/check-server-json-version.sh
       - name: Check that broken manifests are rejected
         run: scripts/test-check-server-json-version.sh
+      - name: Check that breaking changes under a compatible version are rejected
+        run: scripts/test-check-release-bump.sh
 
   security:
     name: Security Audit

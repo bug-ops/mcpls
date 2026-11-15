@@ -262,15 +262,7 @@ impl BoundedUri {
 
     /// The URI of a JSON `uri` member, if it is a valid URI within the bound.
     /// The one reading of a publish's `uri`, shared by every path that looks
-    /// at one.
-    fn of_value(value: Value) -> Option<Self> {
-        serde_json::from_value::<Uri>(value)
-            .ok()
-            .and_then(|uri| Self::try_from(uri).ok())
-    }
-
-    /// As [`Self::of_value`] for a borrowed member: the bound is checked on the
-    /// string before anything is copied.
+    /// at one: the bound is checked on the string before anything is copied.
     fn of_value_ref(value: &Value) -> Option<Self> {
         if value.as_str()?.len() > Self::MAX_BYTES {
             return None;
@@ -488,6 +480,12 @@ impl DecodedPublish {
         &self.uri
     }
 
+    /// The published file URI.
+    #[must_use]
+    pub const fn file_uri(&self) -> &lsp_types::Uri {
+        self.uri.uri()
+    }
+
     /// The document version the diagnostics are for, if the server said.
     #[must_use]
     pub const fn version(&self) -> Option<i32> {
@@ -556,7 +554,8 @@ fn decode_publish(params: Option<Value>) -> Result<DecodedPublish, LostPublish> 
     };
     let uri = members
         .remove("uri")
-        .and_then(BoundedUri::of_value)
+        .as_ref()
+        .and_then(BoundedUri::of_value_ref)
         .ok_or(LostPublish::Unidentified)?;
     match serde_json::from_value::<PublishBody>(Value::Object(members)) {
         Ok(PublishBody {
@@ -897,7 +896,7 @@ mod tests {
 
         match notification {
             super::LspNotification::PublishDiagnostics(diag) => {
-                assert_eq!(diag.uri().uri().to_string(), "file:///test.rs");
+                assert_eq!(diag.file_uri().to_string(), "file:///test.rs");
                 assert_eq!(diag.version(), Some(1));
                 assert_eq!(diag.diagnostics().len(), 1);
                 assert_eq!(
@@ -1132,7 +1131,7 @@ mod tests {
         let super::LspNotification::PublishDiagnostics(publish) = notification else {
             panic!("expected a decoded publish");
         };
-        assert_eq!(publish.uri().uri().as_ref(), "file:///a.rs");
+        assert_eq!(publish.file_uri().as_ref(), "file:///a.rs");
         assert_eq!(publish.version(), Some(3));
         assert_eq!(publish.diagnostics(), []);
     }

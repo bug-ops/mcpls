@@ -16,7 +16,7 @@ pub(crate) use translator::MAX_NORMALIZED_LOCATIONS;
 mod workspace_roots;
 
 pub use client_path::{ClientPath, InvalidClientPath};
-pub use encoding::{InvalidPositionEncoding, LspLine, PositionEncoding};
+pub use encoding::{InvalidPositionEncoding, LspLine, OffsetError, PositionEncoding, Utf16Column};
 // Not part of the crate's public API surface (unlike `IndexingPolicy`/`IndexingState`
 // above, both referenced from public signatures) -- these three exist only
 // for `config`'s default-value/validation wiring, so `pub(crate)` avoids
@@ -55,17 +55,18 @@ pub use translator::{
     EnclosingSymbolOutcome, EnrichmentSummary, FoldingKind, FoldingKindFilter, FoldingRangesResult,
     FoldingRegion, FormatDocumentResult, HierarchyItem, HoverResult, IndexCoverage,
     InvalidHierarchyItem, InvalidPosition, InvalidRange, InvalidTabSize, InvalidTextField,
-    KindFilter, KindFilterField, KindFilterInput, Location, LocationsResult,
-    MAX_COLLAPSED_TEXT_BYTES, MAX_NEW_NAME_LENGTH, MAX_POSITION_VALUE, MAX_RANGE_LINES,
-    MAX_RESTART_SERVER_IDS, MAX_SELECTION_CHAIN, MAX_SERVER_ID_BYTES, MAX_SYMBOL_NAME_BYTES,
-    MAX_TAB_SIZE, MAX_TRIGGER_CHARACTER_BYTES, MemberStatus, MemberSupport, NewName,
-    NotComputedReason, Position, Position2D, PositionDegradation, PositionRange, PositionSource,
-    PrepareRenameOutcome, PrepareRenameResult, Range, ReferencesResult, RejectedKindFilter,
-    Rejection, RenameResult, ResolvedSymbol, ResolvedTarget, RestartFailure, RestartOutcome,
-    RestartServerResult, RestartTarget, ResultContext, RouteSupport, SelectionRangesResult,
-    ServerIds, ServerIdsError, ServerRestartEntry, Symbol, SymbolFidelity, SymbolKindFilter,
-    SymbolName, SymbolQuery, SymbolTarget, TabSize, TextEdit, TextField, Translator,
-    TypeHierarchyResult, UnavailableReason,
+    ItemIndex, KindFilter, KindFilterField, KindFilterInput, Location, LocationContext,
+    LocationsResult, MAX_COLLAPSED_TEXT_BYTES, MAX_NEW_NAME_LENGTH, MAX_POSITION_VALUE,
+    MAX_RANGE_LINES, MAX_RESTART_SERVER_IDS, MAX_SELECTION_CHAIN, MAX_SERVER_ID_BYTES,
+    MAX_SYMBOL_NAME_BYTES, MAX_TAB_SIZE, MAX_TRIGGER_CHARACTER_BYTES, MemberStatus, MemberSupport,
+    NavigationLocation, NewName, NotComputedReason, Position, Position2D, PositionDegradation,
+    PositionRange, PositionSource, PrepareRenameOutcome, PrepareRenameResult, Range,
+    ReferencesResult, RejectedKindFilter, Rejection, RenameResult, ResolvedSymbol, ResolvedTarget,
+    RestartFailure, RestartOutcome, RestartServerResult, RestartTarget, ResultContext,
+    RouteSupport, SelectionRangesResult, ServerIds, ServerIdsError, ServerRestartEntry,
+    SourceOutcome, SourceSkipReason, Symbol, SymbolFidelity, SymbolKindFilter, SymbolName,
+    SymbolQuery, SymbolTarget, TabSize, TextEdit, TextField, Translator, TypeHierarchyResult,
+    UnavailableReason,
 };
 pub(crate) use translator::{
     CallHierarchyPrepareResult, CodeActionsResult, DiagnosticsRole, IncomingCallsResult,

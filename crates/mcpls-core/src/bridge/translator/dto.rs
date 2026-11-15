@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use super::enclosing::{ContextualDiagnostic, ContextualLocation, EnrichmentSummary};
 use super::kind_filter::{self, KindFilter};
-use crate::bridge::encoding::{LspLine, lsp_column, mcp_column};
+use crate::bridge::encoding::{LspLine, Utf16Column};
 use crate::bridge::notifications::ReportedSeverity;
 use crate::config::text_newtype::impl_text_newtype;
 use crate::config::{BoundedText, InvalidBoundedText, ServerId};
@@ -25,12 +25,14 @@ pub(super) fn lsp_kind_to_u32<T: Into<u32>>(kind: T) -> u32 {
 }
 
 /// Position in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct Position2D {
     /// Line number (1-based).
-    line: u32,
+    line: NonZeroU32,
     /// Character offset (1-based).
-    character: u32,
+    character: NonZeroU32,
 }
 
 impl Position2D {
@@ -39,35 +41,39 @@ impl Position2D {
     /// # Examples
     ///
     /// ```
-    /// use mcpls_core::bridge::Position2D;
+    /// use std::num::NonZeroU32;
     ///
-    /// let position = Position2D::from_mcp(3, 5);
-    /// assert_eq!((position.line(), position.character()), (3, 5));
-    /// assert_eq!((position.lsp_line().get(), position.lsp_character()), (2, 4));
+    /// use mcpls_core::bridge::{Position2D, Utf16Column};
+    ///
+    /// let nz = |value| NonZeroU32::new(value).unwrap();
+    /// let position = Position2D::from_mcp(nz(3), nz(5));
+    /// assert_eq!((position.line(), position.character()), (nz(3), nz(5)));
+    /// assert_eq!(position.lsp_line().get(), 2);
+    /// assert_eq!(position.lsp_character(), Utf16Column::new(4));
     /// ```
     #[must_use]
-    pub const fn from_mcp(line: u32, character: u32) -> Self {
+    pub const fn from_mcp(line: NonZeroU32, character: NonZeroU32) -> Self {
         Self { line, character }
     }
 
     /// Builds a position from a 0-based LSP line and a 0-based UTF-16 column.
     #[must_use]
-    pub(crate) const fn from_lsp(line: LspLine, utf16_column: u32) -> Self {
+    pub(crate) const fn from_lsp(line: LspLine, column: Utf16Column) -> Self {
         Self {
             line: line.to_mcp(),
-            character: mcp_column(utf16_column),
+            character: column.to_mcp(),
         }
     }
 
     /// Line number (1-based).
     #[must_use]
-    pub const fn line(&self) -> u32 {
+    pub const fn line(&self) -> NonZeroU32 {
         self.line
     }
 
     /// Character offset (1-based).
     #[must_use]
-    pub const fn character(&self) -> u32 {
+    pub const fn character(&self) -> NonZeroU32 {
         self.character
     }
 
@@ -79,8 +85,17 @@ impl Position2D {
 
     /// The 0-based character offset, still in UTF-16 units.
     #[must_use]
-    pub const fn lsp_character(&self) -> u32 {
-        lsp_column(self.character)
+    pub const fn lsp_character(&self) -> Utf16Column {
+        Utf16Column::from_mcp(self.character)
+    }
+
+    /// Builds a fixture position, panicking on a zero.
+    #[cfg(test)]
+    pub(crate) const fn at(line: u32, character: u32) -> Self {
+        Self::from_mcp(
+            NonZeroU32::new(line).expect("fixture line is 1-based"),
+            NonZeroU32::new(character).expect("fixture character is 1-based"),
+        )
     }
 }
 
@@ -408,25 +423,23 @@ impl Position {
     /// Zero-based LSP line.
     #[must_use]
     pub const fn lsp_line(self) -> LspLine {
-        LspLine::from_mcp(self.line.get())
+        LspLine::from_mcp(self.line)
     }
 
     /// Zero-based character offset, still in UTF-16 units.
     #[must_use]
-    pub const fn lsp_character(self) -> u32 {
-        lsp_column(self.character.get())
+    pub const fn lsp_character(self) -> Utf16Column {
+        Utf16Column::from_mcp(self.character)
     }
 
     /// Reuses a position taken from server output, which is already 1-based
     /// MCP form, as a handler input position. Deliberately not a `From`
     /// impl: a position typed by a client must go through
-    /// [`Self::from_client`]. A zero, which converted LSP output never
-    /// carries, clamps to 1.
-    pub(crate) fn from_server_output(position: &Position2D) -> Self {
-        let clamp = |value: u32| NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN);
+    /// [`Self::from_client`].
+    pub(crate) const fn from_server_output(position: Position2D) -> Self {
         Self {
-            line: clamp(position.line),
-            character: clamp(position.character),
+            line: position.line,
+            character: position.character,
         }
     }
 
@@ -521,7 +534,7 @@ impl TryFrom<PositionRange> for BoundedRange {
 }
 
 /// Range in a document (1-based for MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct Range {
     /// Start position.
     pub start: Position2D,
@@ -1245,7 +1258,7 @@ pub enum InvalidHierarchyItem {
 
 /// A [`HierarchyItem`] whose ranges passed client-input validation.
 ///
-/// Taken by the walking handlers instead of the raw wire DTO, so a zero,
+/// Taken by the walking handlers instead of the raw wire DTO, so an
 /// oversized or reversed range cannot reach the LSP conversion. Built only by
 /// [`Self::from_client`].
 ///
@@ -1266,7 +1279,7 @@ pub enum InvalidHierarchyItem {
 /// };
 /// assert!(CheckedHierarchyItem::from_client(wire(1)).is_ok());
 /// assert_matches!(
-///     CheckedHierarchyItem::from_client(wire(0)),
+///     CheckedHierarchyItem::from_client(wire(3)),
 ///     Err(InvalidHierarchyItem::Range(_))
 /// );
 /// ```
@@ -1312,8 +1325,8 @@ impl CheckedHierarchyItem {
 
 fn checked_range(range: &Range) -> Result<PositionRange, InvalidRange> {
     PositionRange::from_client(
-        (range.start.line, range.start.character),
-        (range.end.line, range.end.character),
+        (range.start.line.get(), range.start.character.get()),
+        (range.end.line.get(), range.end.character.get()),
     )
 }
 
@@ -1447,18 +1460,20 @@ pub struct SelectionRangesResult {
 /// truncation marker.
 pub const MAX_COLLAPSED_TEXT_BYTES: usize = 256;
 
-/// What a folding region covers, from the LSP's open-string kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FoldingKind {
-    /// A comment block.
-    Comment,
-    /// An import group.
-    Imports,
-    /// A marked region.
-    Region,
-    /// No kind, or a server-defined one.
-    Unspecified,
+spelled_enum! {
+    /// What a folding region covers, from the LSP's open-string kind.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    FoldingKind {
+        /// A comment block.
+        Comment => "comment",
+        /// An import group.
+        Imports => "imports",
+        /// A marked region.
+        Region => "region",
+        /// No kind, or a server-defined one.
+        Unspecified => "unspecified",
+    }
 }
 
 spelled_enum! {
@@ -1486,10 +1501,7 @@ impl JsonSchema for FoldingKind {
     }
 
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "string",
-            "enum": ["comment", "imports", "region", "unspecified"],
-        })
+        crate::spelling::spelled_schema::<Self>()
     }
 }
 
@@ -2086,13 +2098,7 @@ mod tests {
 
     #[test]
     fn checked_hierarchy_item_rejects_bad_range_and_names_it() {
-        for bad in [
-            [0, 1, 1, 1],
-            [1, 0, 1, 1],
-            [1, 1, 1, 1_000_001],
-            [1, 1, u32::MAX, 1],
-            [2, 1, 1, 1],
-        ] {
+        for bad in [[1, 1, 1, 1_000_001], [1, 1, u32::MAX, 1], [2, 1, 1, 1]] {
             let err =
                 CheckedHierarchyItem::from_client(hierarchy_wire(bad, [1, 1, 1, 1])).unwrap_err();
             assert_matches!(err, InvalidHierarchyItem::Range(_), "{bad:?}");
@@ -2155,8 +2161,8 @@ mod tests {
 
     fn range() -> Range {
         Range {
-            start: Position2D::from_mcp(1, 1),
-            end: Position2D::from_mcp(1, 2),
+            start: Position2D::at(1, 1),
+            end: Position2D::at(1, 2),
         }
     }
 
@@ -2251,7 +2257,7 @@ mod tests {
     fn test_server_text_redacts_inlay_label_and_tooltip() {
         let set = Redactions::new([("API_TOKEN".to_owned(), SECRET.to_owned())]);
         let mut hint = InlayHintEntry {
-            position: Position2D::from_mcp(1, 1),
+            position: Position2D::at(1, 1),
             label: format!(": {SECRET}"),
             kind: None,
             padding_left: None,
@@ -2463,18 +2469,15 @@ mod tests {
         );
         let max = Position::from_client(MAX_POSITION_VALUE, MAX_POSITION_VALUE).unwrap();
         assert_eq!(
-            (max.lsp_line().get(), max.lsp_character()),
+            (max.lsp_line().get(), max.lsp_character().get()),
             (999_999, 999_999)
         );
     }
 
     #[test]
-    fn test_position_from_output_position_is_not_capped_and_clamps_zero() {
-        let big =
-            Position::from_server_output(&Position2D::from_mcp(MAX_POSITION_VALUE + 7, 2_000_000));
+    fn test_position_from_output_position_is_not_capped() {
+        let big = Position::from_server_output(Position2D::at(MAX_POSITION_VALUE + 7, 2_000_000));
         assert_eq!(big.line().get(), MAX_POSITION_VALUE + 7);
-        let clamped = Position::from_server_output(&Position2D::from_mcp(0, 0));
-        assert_eq!((clamped.line().get(), clamped.character().get()), (1, 1));
     }
 
     #[test]
