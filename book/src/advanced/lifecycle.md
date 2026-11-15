@@ -63,7 +63,7 @@ On `SIGTERM`, `SIGINT`, or when the client closes the connection, mcpls shuts do
 2. For each server it sends the LSP `shutdown` request (5 second timeout), then `exit`.
 3. It waits a short grace period (3 seconds) for the process to leave, then kills it together with its process group ([Process Lifetime](process-lifetime.md)).
 
-A second signal while cleanup is stuck forces an immediate exit. The exit code is `0` on success, `1` on an error and `101` if mcpls itself panicked, in which case the servers are still reaped.
+A second signal while cleanup is stuck forces an immediate exit. The exit code is `0` on success, `1` on an error and `101` if mcpls itself panicked, in which case the servers are still reaped. A panic is logged as one `error` line, `mcpls panicked`, with the location and the escaped, bounded payload, so a payload cannot forge log lines. With `--log-level off` the same line goes to stderr as plain text.
 
 ## What's Next
 

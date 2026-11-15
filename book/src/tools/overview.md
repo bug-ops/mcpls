@@ -31,6 +31,8 @@ Position-based tools use two integers:
 
 Range tools take `start_line`, `start_character`, `end_line` and `end_character` the same way. The end line must exist in the file.
 
+Positions are 1-based everywhere, so `0` is invalid. A flat `line` or `character` of `0`, or above 1,000,000, is rejected with `-32602` before any server is asked. Inside a nested object, such as the `range` of a call or type hierarchy `item` you pass back, a `0` fails deserialization instead and the error text comes from the parser, not from mcpls.
+
 ### Addressing a symbol by name
 
 `get_hover`, `get_definition`, `get_references`, `go_to_implementation`, `go_to_type_definition`, `prepare_call_hierarchy` and `rename_symbol` accept a symbol name instead of a position:
@@ -116,13 +118,15 @@ With `context: "symbol_source"`, each location from `get_references`, `get_defin
 | `same_as` | The span equals that of the earlier item `item` (an index into `locations`), which carries the text; 30 references inside one function cost one copy |
 | `not_computed` | No text, with a `reason`: `no_span`, `call_budget`, `document_changed` or `symbol_lookup_skipped` |
 
-For `get_references` the span is the symbol the reference sits in; a top-level reference has `no_span`. For the go-to tools it is the symbol the location names, else the `targetRange` of the server's link answer (local variables and parameters), else `no_span`. One call returns at most 64 KiB of `included` text and cuts at most 256 distinct spans; an item that does not fit is `call_budget` (later, smaller ones can still fit). `document_changed` means the document changed after the symbol lookup, so the ranges no longer describe its text. `symbol_lookup_skipped` means the file's symbol lookup was skipped or failed; the item's `enclosing_symbol` says why. The text is server-influenced content, passed through verbatim.
+For `get_references` the span is the symbol the reference sits in; a top-level reference has `no_span`. For the go-to tools it is the symbol the location names, else the `targetRange` of the server's link answer (local variables and parameters), else `no_span`. One call returns at most 64 KiB of `included` text, cuts at most 256 distinct spans and examines at most 16 MiB of document text, so many cuts in very long lines cannot stall a worker. An item that does not fit any of these budgets is `call_budget` (later, smaller ones can still fit). `document_changed` means the document changed after the symbol lookup, so the ranges no longer describe its text. `symbol_lookup_skipped` means the file's symbol lookup was skipped or failed; the item's `enclosing_symbol` says why. The text is server-influenced content, passed through verbatim.
 
 ### Key naming
 
 Keys that mcpls defines are `snake_case`. Objects passed through from the language server keep LSP's casing, such as the `Diagnostic` items and `selectionRange` on call hierarchy items.
 
 ### Arguments
+
+A tool's `outputSchema` lists a field as `required` when mcpls always serializes it, even when its value can be `null`, so a schema-validating client can rely on the key being present.
 
 A tool accepts only the arguments its schema declares. An argument name the tool does not declare, such as `kinds` instead of `kind_filter`, is rejected with an error that names the first unknown field and lists the accepted ones, instead of being ignored. Every `tools/list` input schema carries `additionalProperties: false`, so a schema-validating client sees the same rule. The `data` field of a call or type hierarchy item stays open, because it is opaque by contract.
 
@@ -135,7 +139,7 @@ Failures are returned as MCP errors with a code and a message, except malformed 
 | Situation | What to do |
 |-----------|-----------|
 | No server for the file's language | Add an `[[lsp_servers]]` entry, or install the server |
-| `-32602` invalid params | Fix the path or parameters; a path outside every root is rejected |
+| `-32602` invalid params | Fix the path or parameters; a path outside every root is rejected, and so is a text argument that is blank or too long (`new_name` or `query` above 1,000 bytes, `symbol_name` above 256 bytes, `trigger` above 8 bytes). The message names the offending field, for example `` `query` `` |
 | Tool result with `isError: true` and `failed to deserialize parameters: ...` (unknown field, wrong type, `null` for a defaulted argument) | Use only the arguments the tool declares, with the declared types; the message names the field and lists the accepted ones |
 | Server still starting (`ServerInitializing`, `-32051`, retryable) | Wait and retry |
 | Server still indexing (`-32050`, retryable) | Wait and retry, or raise `workspace.indexing_ready_timeout_seconds` |

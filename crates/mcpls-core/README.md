@@ -14,14 +14,14 @@ User documentation: <https://bug-ops.github.io/mcpls/>. API documentation: <http
 
 ```toml
 [dependencies]
-mcpls-core = "0.9"
+mcpls-core = "0.10"
 ```
 
 Enable the `transport-http` feature to serve over Streamable HTTP:
 
 ```toml
 [dependencies]
-mcpls-core = { version = "0.9", features = ["transport-http"] }
+mcpls-core = { version = "0.10", features = ["transport-http"] }
 ```
 
 ## Usage
@@ -47,6 +47,7 @@ async fn main() {
 - Lazy document tracking and a diagnostics cache for push-based notifications, refreshed from disk edits for subscribed resources; files of dropped or undecodable publishes are marked `evicted`, with per-server bounds
 - TOML configuration, server discovery by project markers, and trust controls (untrusted launcher, open-then-verify file access)
 - Cancellation of in-flight tool calls, forwarded to the language server as `$/cancelRequest`
+- Opt-in `symbol_source` context for location results, bounded per item and per call
 - Fan-out workspace symbol search across all eligible servers, with per-server outcomes and indexing status
 - stdio and optional HTTP transports; stdio requests over 4 MiB or undecodable are answered with `-32600` or `-32700`; an oversized LSP frame (10-256 MiB) fails only its own request
 

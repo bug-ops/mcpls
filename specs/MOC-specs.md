@@ -29,22 +29,22 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 007 | [[lsp/007-lsp-child-process-lifetime/spec\|lsp-child-process-lifetime]] | enhancement | P2 | implemented (#546) | #526 |
 | 008 | [[lsp/008-lsp317-method-coverage-gaps/spec\|lsp317-method-coverage-gaps]] | enhancement | P3 (declaration), P4 (rest) | implemented (declaration #567, type hierarchy, prepare rename, highlights, range formatting); semanticTokens and others non-goals | #567, #568, #569 |
 | 009 | [[lsp/009-incremental-server-registration/spec\|incremental-server-registration]] | bug | P2 | implemented | #572; #588, #589 (FR-019, FR-021) |
-| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve); #868 (datetime in `initialization_options` rejected) |
+| 010 | [[lsp/010-workspace-configuration-push/spec\|workspace-configuration-push]] | bug | P1 | implemented | #578; #598 (settings push and serve); #868 (datetime in `initialization_options` rejected); #908 (reply caps: 256 items, 4 MiB) |
 | 011 | [[lsp/011-selection-folding-range-tools/spec\|selection-folding-range-tools]] | enhancement | P4 | implemented | #616; #642 (deep response recovery); #850 (FR-020, oversized frames) |
 | 012 | [[lsp/012-client-publish-diagnostics-capability/spec\|client-publish-diagnostics-capability]] | bug | P1 | implemented | #665 |
 | 013 | [[lsp/013-diagnostics-publish-burst-drops/spec\|diagnostics-publish-burst-drops]] | bug | P2 | implemented (per-client publish mailbox, lost files read evicted) | #704 |
-| 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | implemented (lost publish evicts its file or the server's files; marks bounded per server, #869; `BoundedUri` 16 KiB, #874) | #863; #868; #869; #874 |
+| 014 | [[lsp/014-dropped-publish-diagnostics-frame-stale-cache/spec\|dropped-publish-diagnostics-frame-stale-cache]] | bug | P2 | implemented (lost publish evicts its file or the server's files; marks bounded per server, #869; `BoundedUri` 16 KiB, #874; bound checked once at construction via `TryFrom<Uri>` and `DecodedPublish`, FR-020, #908) | #863; #868; #869; #874; #908 |
 | 015 | [[lsp/015-workspace-did-change-watched-files/spec\|workspace-did-change-watched-files]] | enhancement (competitor-gap) | P3 | draft | #889 |
 
 ## mcp
 
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
-| 001 | [[mcp/001-mcp-tool-surface-and-routing/spec\|mcp-tool-surface-and-routing]] | enhancement | P1 | implemented (retroactive) | — |
-| 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | implemented | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012) |
+| 001 | [[mcp/001-mcp-tool-surface-and-routing/spec\|mcp-tool-surface-and-routing]] | enhancement | P1 | implemented (retroactive; FR-013 five-level `LogLevel`, FR-014 typed `Uri` DTO fields) | #934, #937 |
+| 002 | [[mcp/002-mcp-resources-diagnostics/spec\|mcp-resources-diagnostics]] | enhancement | P3 | implemented | #115; #468 (FR-006, FR-007); #521 (FR-008); #535 (FR-009); #544, #545 (FR-009..FR-012); #908, #920 (FR-014 permanent refusals, FR-016 supervised delivery) |
 | 003 | [[mcp/003-mcp-2026-stateless-adoption/spec\|mcp-2026-stateless-adoption]] | research | P3 | draft | #298; #493 (stateless subscriptions, closed as research); #522 (subscriptions/listen implemented); #593 (paced replay, bounded eviction record) |
 | 004 | [[mcp/004-mcp-tasks-sep2663-adoption/spec\|mcp-tasks-sep2663-adoption]] | research | P4 | draft | #119 |
-| 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461; #851 (FR-007) |
+| 005 | [[mcp/005-tool-capability-discoverability/spec\|tool-capability-discoverability]] | research | P4 | implemented (#540) | #461; #851 (FR-007); #908 (FR-008, schema-conformant routes) |
 | 006 | [[mcp/006-http-stream-liveness/spec\|http-stream-liveness]] | enhancement | P3 | implemented | #543 |
 | 007 | [[mcp/007-symbol-name-addressing/spec\|symbol-name-addressing]] | research | P2 | implemented (MVP, signature help deferred) | #563 |
 | 008 | [[mcp/008-manual-lsp-server-restart/spec\|manual-lsp-server-restart]] | enhancement | P2 | implemented | #564 |
@@ -53,18 +53,18 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 011 | [[mcp/011-client-path-boundary-parsing/spec\|client-path-boundary-parsing]] | bug | P2 | implemented (#580) | #575 |
 | 012 | [[mcp/012-http-typed-limits-origins-stream-deadline/spec\|http-typed-limits-origins-stream-deadline]] | enhancement | P3 | implemented | #584, #585, #587; #597, #600, #602 |
 | 013 | [[mcp/013-http-allowed-host-default-port-rejection/spec\|http-allowed-host-default-port-rejection]] | enhancement | P3 | implemented | #629 |
-| 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (139,000 B tools/list budget, #654 kind filter schemas, #705 closed input schemas) | #630; #654 |
+| 014 | [[mcp/014-tools-list-payload-size/spec\|tools-list-payload-size]] | enhancement | P3 | implemented (145,000 B total and 9,500 B per-tool tools/list budgets, #654 kind filter schemas, #705 closed input schemas) | #630; #654; #909, #919, #934 |
 | 015 | [[mcp/015-request-cancellation-propagation/spec\|request-cancellation-propagation]] | enhancement | P3 | implemented | #687 |
 | 016 | [[mcp/016-reject-unknown-tool-arguments/spec\|reject-unknown-tool-arguments]] | enhancement | P3 | implemented | #705 |
 | 017 | [[mcp/017-bounded-client-string-echoes/spec\|bounded-client-string-echoes]] | enhancement (hardening) | P3 | implemented | #749 |
-| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730; #845 (FR-013), #848 (FR-014..FR-016); #857 (FR-017, undecodable stdio requests) |
+| 018 | [[mcp/018-bounded-tool-inputs-and-results/spec\|bounded-tool-inputs-and-results]] | enhancement (retroactive) | P3 | implemented | #519, #606, #607, #730; #845 (FR-013), #848 (FR-014..FR-016); #857 (FR-017, undecodable stdio requests); #930, #932 (FR-018, `WorkspaceQuery` and typed input errors) |
 | 019 | [[mcp/019-mcp-registry-listing/spec\|mcp-registry-listing]] | research (competitor-gap) | P4 | implemented (publish-registry job disabled until first publication is confirmed) | #813; #843 |
 
 ## bridge
 
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
-| 001 | [[bridge/001-position-encoding-layer/spec\|position-encoding-layer]] | enhancement | P1 | implemented (retroactive) | — |
+| 001 | [[bridge/001-position-encoding-layer/spec\|position-encoding-layer]] | enhancement | P1 | implemented (retroactive; typed columns and private `Position2D` fields, FR-015..FR-018, #913, #921, #929, #908) | — |
 | 002 | [[bridge/002-document-tracker-synchronization/spec\|document-tracker-synchronization]] | enhancement | P1 | implemented (retroactive) | — |
 | 003 | [[bridge/003-rwlock-translator/spec\|rwlock-translator]] | enhancement | P2 | superseded | #114 |
 | 004 | [[bridge/004-get-diagnostics-flycheck-gap/spec\|get-diagnostics-flycheck-gap]] | bug | P1 | implemented | — |
@@ -81,7 +81,7 @@ rather than one subsystem). Numbering restarts at 001 within each block.
 | 015 | [[bridge/015-empty-result-index-coverage-caveat/spec\|empty-result-index-coverage-caveat]] | enhancement (competitor-gap) | P4 | implemented (rule (i), typed `index_coverage` note) | #796 |
 | 016 | [[bridge/016-sweep-stall-on-unanswered-pull/spec\|sweep-stall-on-unanswered-pull]] | bug | P2 | implemented (patience then background, cap 2 per server) | #806 (related #798, #791) |
 | 017 | [[bridge/017-workspace-symbol-multi-server-fanout/spec\|workspace-symbol-multi-server-fanout]] | enhancement (competitor-gap) | P3 | implemented | #844; #851, #852, #864 (per-server `get_tool_support`, indexing flag) |
-| 018 | [[bridge/018-symbol-source-context/spec\|symbol-source-context]] | enhancement (competitor-gap) | P4 | implemented | #909 |
+| 018 | [[bridge/018-symbol-source-context/spec\|symbol-source-context]] | enhancement (competitor-gap) | P4 | implemented (16 MiB scan cap, shared symbol descent, link targets on `NormalizedLocation`) | #909; #927, #928, #931 |
 
 ## runtime
 
@@ -95,6 +95,7 @@ neither belongs to a single `config`/`lsp`/`mcp`/`bridge` module.
 | 003 | [[runtime/003-workspace-supplied-code-execution/spec\|workspace-supplied-code-execution]] | research | P3 | implemented (tsserver pin, docs, SECURITY.md, untrusted-workspace mode, launcher refusals, untrusted working directory) | #566; #652, #653, #657 |
 | 004 | [[runtime/004-server-text-hygiene/spec\|server-text-hygiene]] | bug | P3 | implemented | #581, #582, #583; #599; #842 (FR-017) |
 | 005 | [[runtime/005-untrusted-unlisted-wrapper-workspace-program/spec\|untrusted-unlisted-wrapper-workspace-program]] | enhancement | P3 | implemented (#724) | #724 |
+| 006 | [[runtime/006-panic-reporting/spec\|panic-reporting]] | enhancement (hardening, retroactive) | P3 | implemented | #918, #922, #933 |
 
 ## testing
 
@@ -104,6 +105,7 @@ subsystem.
 | # | Slug | Type | Priority | Status | Issue |
 |---|------|------|----------|--------|-------|
 | 001 | [[testing/001-e2e-rust-analyzer-testing/spec\|e2e-rust-analyzer-testing]] | enhancement | P2 | implemented (#125, #126, #139, #225) | — |
+| 002 | [[testing/002-release-and-ci-gates/spec\|release-and-ci-gates]] | enhancement (retroactive) | P3 | implemented | #904, #905 |
 
 ## Project Foundation
 
