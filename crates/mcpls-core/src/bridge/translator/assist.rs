@@ -10,7 +10,7 @@ use super::dto::{
 use super::navigation::ItemBudget;
 use super::positioned::Positioned;
 use super::routing::{Capability, IndexingGate};
-use crate::bridge::encoding::{LabelOffsets, PositionEncoding, Utf16Column};
+use crate::bridge::encoding::{LabelOffsets, PositionEncoding, ServerColumn, Utf16Column};
 use crate::bridge::{ClientPath, Indexed};
 use crate::error::Result;
 
@@ -120,6 +120,17 @@ const MAX_SIGNATURE_PARAMETERS: usize = 256;
 /// spans (variadic or default-value ranges), bounded against amplification.
 const RESOLVED_LABEL_BUDGET_MULTIPLE: usize = 4;
 
+/// Pairs a wire offset pair with the negotiated encoding it is expressed in.
+const fn label_columns(
+    (start, end): (u32, u32),
+    encoding: PositionEncoding,
+) -> (ServerColumn, ServerColumn) {
+    (
+        ServerColumn::new(start, encoding),
+        ServerColumn::new(end, encoding),
+    )
+}
+
 /// Converts a signature's LSP parameters to their MCP form, resolving
 /// offset-pair labels against `signature_label` in `encoding`'s code units.
 ///
@@ -147,13 +158,12 @@ fn signature_parameters(
             .iter()
             .take(MAX_SIGNATURE_PARAMETERS)
             .filter_map(|p| match p.label {
-                lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
-                    Some(<[u32; 2]>::from((start, end)))
+                lsp_types::ParameterInformationLabel::Tuple(pair) => {
+                    Some(<[ServerColumn; 2]>::from(label_columns(pair, encoding)))
                 }
                 lsp_types::ParameterInformationLabel::String(_) => None,
             })
             .flatten(),
-        encoding,
     );
     let mut resolved_budget = signature_label
         .len()
@@ -165,8 +175,9 @@ fn signature_parameters(
             let label = match param.label {
                 lsp_types::ParameterInformationLabel::String(s) => Some(s),
                 lsp_types::ParameterInformationLabel::Tuple((start, end)) => {
+                    let (from, to) = label_columns((start, end), encoding);
                     let resolved = offsets
-                        .substring(start, end)
+                        .substring(from, to)
                         .filter(|text| text.len() <= resolved_budget);
                     if let Some(text) = resolved {
                         resolved_budget = resolved_budget.saturating_sub(text.len());

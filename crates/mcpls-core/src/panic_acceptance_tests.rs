@@ -89,3 +89,18 @@ async fn test_after_panic_logs_a_long_payload_with_a_single_marker() {
         .expect("error field");
     assert_eq!(error.matches(TRUNCATION_MARKER).count(), 1, "{error}");
 }
+
+#[test]
+fn test_panic_message_escapes_bounds_and_names_non_string_payloads() {
+    let long: Box<dyn std::any::Any + Send> = Box::new("a\n".repeat(500));
+    let message = crate::PanicMessage::from_payload(long.as_ref());
+    assert!(!message.as_str().contains('\n'));
+    assert!(message.as_str().len() <= MAX_LOG_STRING_BYTES + TRUNCATION_MARKER.len());
+    assert!(message.as_str().ends_with(TRUNCATION_MARKER));
+
+    let other: Box<dyn std::any::Any + Send> = Box::new(7_u32);
+    assert_eq!(
+        crate::PanicMessage::from_payload(other.as_ref()).to_string(),
+        "non-string panic payload"
+    );
+}

@@ -4,12 +4,13 @@
 //! enabling AI agents to access semantic code intelligence.
 
 use std::future::Future;
-use std::panic::{self, AssertUnwindSafe};
+use std::io::Write;
+use std::panic::{self, AssertUnwindSafe, Location, PanicHookInfo};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mcpls_core::config::ConfigOrigin;
-use mcpls_core::{ProjectConfigTrust, WorkspaceTrust};
+use mcpls_core::{PanicMessage, ProjectConfigTrust, WorkspaceTrust};
 use tokio::runtime::Runtime;
 
 mod args;
@@ -56,6 +57,8 @@ fn main() {
         std::process::exit(Outcome::Failure.exit_code());
     }
 
+    install_panic_hook();
+
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting mcpls");
 
     // Loaded before the runtime exists: it reads and may create files, which
@@ -88,6 +91,59 @@ fn main() {
     });
 
     std::process::exit(outcome.exit_code());
+}
+
+/// Replaces the default panic hook, which prints the raw payload to stderr
+/// and so can forge a log line (CWE-117).
+///
+/// The record is one line carrying the location and the escaped, bounded
+/// payload. It goes through tracing, or, when the active filter or a missing
+/// subscriber would drop it (`--log-level off`), straight to stderr. Panics
+/// before logging is initialised keep the default hook; their input is the
+/// operator's own command line.
+///
+/// The hook prints no `RUST_BACKTRACE` output, and the stderr fallback line is
+/// plain text even under `--log-format json`.
+fn install_panic_hook() {
+    panic::set_hook(Box::new(log_panic));
+}
+
+fn log_panic(info: &PanicHookInfo<'_>) {
+    let message = PanicMessage::from_payload(info.payload());
+    report_panic(
+        tracing::enabled!(tracing::Level::ERROR),
+        info.location(),
+        &message,
+        &mut std::io::stderr().lock(),
+    );
+}
+
+/// Logs the panic through tracing when `tracing_enabled`, otherwise writes one
+/// line to `fallback`. A failed write is ignored: the hook must never panic.
+fn report_panic(
+    tracing_enabled: bool,
+    location: Option<&Location<'_>>,
+    message: &PanicMessage,
+    fallback: &mut impl Write,
+) {
+    if tracing_enabled {
+        tracing::error!(
+            file = location.map(Location::file),
+            line = location.map(Location::line),
+            column = location.map(Location::column),
+            payload = %message,
+            "mcpls panicked"
+        );
+    } else {
+        let _ = writeln!(fallback, "{}", panic_line(location, message));
+    }
+}
+
+fn panic_line(location: Option<&Location<'_>>, message: &PanicMessage) -> String {
+    location.map_or_else(
+        || format!("mcpls panicked: {message}"),
+        |at| format!("mcpls panicked at {at}: {message}"),
+    )
 }
 
 /// Drives `future` to completion on `runtime`, turning a panic into
@@ -172,9 +228,150 @@ async fn run(config: mcpls_core::ServerConfig, transport: mcpls_core::Transport)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use super::*;
+
+    static HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Panics with `payload` under the installed hook and a plain (non-escaping)
+    /// fmt layer, so only the hook can make the output safe.
+    fn hooked_panic_output(payload: &str) -> String {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let builder = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false);
+        hooked_panic_with(builder.finish(), &buf, payload)
+    }
+
+    fn hooked_panic_with(
+        subscriber: impl tracing::Subscriber + Send + Sync,
+        buf: &SharedBuf,
+        payload: &str,
+    ) -> String {
+        let _serial = HOOK_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = panic::take_hook();
+        install_panic_hook();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = panic::catch_unwind(|| panic!("{payload}"));
+        });
+        panic::set_hook(previous);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn test_panic_hook_json_has_a_single_escaped_bounded_payload_field() {
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let output = hooked_panic_with(subscriber, &buf, &format!("a\nforged{}", "x".repeat(5000)));
+
+        assert_eq!(output.lines().count(), 1, "got {output:?}");
+        assert_eq!(output.matches("\"payload\"").count(), 1, "got {output:?}");
+        assert_eq!(output.matches("\"message\"").count(), 1, "got {output:?}");
+        assert!(output.contains("a\\\\nforged"), "got {output:?}");
+        assert!(output.contains("... (truncated)"), "got {output:?}");
+        assert!(output.len() < 1000, "got {} bytes", output.len());
+    }
+
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_report_panic_without_tracing_writes_one_escaped_line_to_the_fallback() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("c\nERROR forged");
+        let message = PanicMessage::from_payload(payload.as_ref());
+        let mut sink = Vec::new();
+
+        report_panic(false, Some(Location::caller()), &message, &mut sink);
+
+        let line = String::from_utf8(sink).unwrap();
+        assert_eq!(line.lines().count(), 1, "got {line:?}");
+        assert!(line.ends_with("c\\nERROR forged\n"), "got {line:?}");
+    }
+
+    #[test]
+    fn test_report_panic_with_tracing_leaves_the_fallback_untouched() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("d");
+        let message = PanicMessage::from_payload(payload.as_ref());
+        let mut sink = Vec::new();
+
+        report_panic(true, None, &message, &mut sink);
+
+        assert_eq!(sink, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_report_panic_ignores_a_broken_fallback_pipe() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("e");
+        let message = PanicMessage::from_payload(payload.as_ref());
+
+        report_panic(false, None, &message, &mut BrokenPipe);
+    }
+
+    #[test]
+    fn test_panic_hook_logs_one_escaped_line_with_location() {
+        let output = hooked_panic_output("a\nERROR forged");
+
+        assert_eq!(output.lines().count(), 1, "got {output:?}");
+        assert!(output.contains("a\\nERROR forged"), "got {output:?}");
+        assert!(output.contains("main.rs"), "got {output:?}");
+    }
+
+    #[test]
+    fn test_panic_hook_bounds_a_long_payload() {
+        let output = hooked_panic_output(&"x".repeat(5000));
+
+        assert_eq!(output.lines().count(), 1, "got {output:?}");
+        assert!(output.contains("... (truncated)"), "got {output:?}");
+        assert!(output.len() < 1000, "got {} bytes", output.len());
+    }
+
+    #[test]
+    fn test_panic_line_is_one_escaped_line() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("b\r\nERROR forged");
+        let message = PanicMessage::from_payload(payload.as_ref());
+
+        let line = panic_line(Some(Location::caller()), &message);
+
+        assert_eq!(line.lines().count(), 1, "got {line:?}");
+        assert!(line.ends_with("b\\r\\nERROR forged"), "got {line:?}");
+        assert_eq!(
+            panic_line(None, &message),
+            "mcpls panicked: b\\r\\nERROR forged"
+        );
+    }
 
     fn test_runtime() -> Runtime {
         tokio::runtime::Builder::new_multi_thread()
