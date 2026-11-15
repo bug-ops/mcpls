@@ -505,11 +505,54 @@ pub fn run_detached<T: Send + 'static>(
     }
 }
 
+/// The text of a panic payload, escaped and bounded like every other
+/// logged attacker-influenced string (a truncation marker follows a cut).
+///
+/// The invariant holds by construction: the only constructor is
+/// [`Self::from_payload`], so the text is safe to log verbatim on one line.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::PanicMessage;
+///
+/// let payload: Box<dyn std::any::Any + Send> = Box::new("a\nERROR forged");
+/// assert_eq!(PanicMessage::from_payload(payload.as_ref()).as_str(), "a\\nERROR forged");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanicMessage(String);
+
+impl PanicMessage {
+    /// Builds the message from a panic payload; a payload that is neither
+    /// `&str` nor `String` is named as non-string.
+    #[must_use]
+    pub fn from_payload(payload: &(dyn std::any::Any + Send)) -> Self {
+        let text = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        Self(escape_bounded(text, MAX_LOG_STRING_BYTES))
+    }
+
+    /// The escaped, bounded text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PanicMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A future that panicked while being driven by [`catch_panic`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("task panicked: {message}")]
 pub struct TaskPanicked {
-    message: String,
+    message: PanicMessage,
 }
 
 impl TaskPanicked {
@@ -517,17 +560,12 @@ impl TaskPanicked {
     /// [`MAX_LOG_STRING_BYTES`] when the panic was caught, so it is safe to log verbatim.
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.message
+        self.message.as_str()
     }
 
     fn from_payload(payload: &(dyn std::any::Any + Send)) -> Self {
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-string panic payload");
         Self {
-            message: escape_bounded(message, MAX_LOG_STRING_BYTES),
+            message: PanicMessage::from_payload(payload),
         }
     }
 }

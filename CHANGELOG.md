@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Internal: `LabelOffsets::new` and `substring` take `ServerColumn` offsets that carry their encoding, and the separate `encoding` parameter is removed (#921, #PR).
+- Internal: `mcpls-core` `error.rs` is split into `error/{codes,echo,launch,stderr,symbols}` submodules, with `mcpls_core::error::*` paths unchanged (#914, #PR).
 - **Breaking:** `Position2D` is non-zero by construction (`NonZeroU32`) and ordered, and `Position2D::lsp_character` and `Position::lsp_character` return the new `Utf16Column` (#913, #923).
 - **Breaking:** a zero line or character in a client-supplied hierarchy item or position now fails with serde's error text instead of `must be >= 1` (#913, #923).
 - **Breaking:** `ContextualLocation` is now `Contextual<NavigationLocation>` (`.inner.uri` becomes `.inner.location.uri`), and the `context` parameter of the location tools (`ReferencesParams`, `NavigationParams`, `DeclarationParams`) is now `LocationContext`, which accepts `symbol_source` (#909, #923).
@@ -33,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A process-wide panic hook in `mcpls` logs one escaped, bounded line (new public `PanicMessage`) instead of printing the raw payload to stderr (#922, #PR).
 - Panic payloads at the six background-task log sites are escaped and bounded once, where the panic is caught (#918, #923).
 - `get_tool_support` output schema lists every `Capability` spelling as an `enum`, and `FoldingKind` shares the same schema helper (#919, #923).
 - Published-URI resolution treats NUL bytes, symlink loops and permission-denied paths as permanent refusals, so they no longer delay a server's other diagnostics (#910, #920).

@@ -83,9 +83,9 @@ protocol SDK's default `on_custom_request`.
 | Part | Where | Role |
 |------|-------|------|
 | `escape_bounded(text, max_bytes)` | `crates/mcpls-core/src/util.rs` | Escapes control and deceptive characters, then bounds the escaped text between characters and appends `TRUNCATION_MARKER` |
-| `EchoedPath` | `crates/mcpls-core/src/error.rs` | Typed echo of a path, bounded to `MAX_ECHOED_PATH_BYTES` (1024, in `util.rs`) |
-| `EchoedArgument` | `crates/mcpls-core/src/error.rs` | Typed echo of an option or program name, bounded to `MAX_ECHOED_NAME_BYTES` (256, in `util.rs`) |
-| `MAX_ECHOED_NAME_BYTES`, `MAX_ECHOED_PATH_BYTES` | `crates/mcpls-core/src/util.rs` | The two echo bounds, shared by `error.rs`, `bridge/` and `mcp/` |
+| `EchoedPath` | `crates/mcpls-core/src/error/echo.rs` | Typed echo of a path, bounded to `MAX_ECHOED_PATH_BYTES` (1024, in `util.rs`) |
+| `EchoedArgument` | `crates/mcpls-core/src/error/echo.rs` | Typed echo of an option or program name, bounded to `MAX_ECHOED_NAME_BYTES` (256, in `util.rs`) |
+| `MAX_ECHOED_NAME_BYTES`, `MAX_ECHOED_PATH_BYTES` | `crates/mcpls-core/src/util.rs` | The two echo bounds, shared by `error/`, `bridge/` and `mcp/` |
 | `MAX_ERROR_MESSAGE_CALLER_BYTES` | `crates/mcpls-core/src/util.rs` | 4 KiB cap on a whole message forwarded to the caller |
 | `<N-byte name>` replacement | `crates/mcpls-core/src/mcp/parameters.rs` | Shows the original byte length instead of the text |
 
@@ -282,7 +282,7 @@ No new persistent data. Entities touched:
 
 - **Original length next to the marker (FR-008).** Not added. `escape_bounded` keeps appending only `TRUNCATION_MARKER`, so the refusal messages that use it (`EchoedPath`, `EchoedArgument`) do not change and one cut routine serves every echo.
 - **Bound for resource URIs.** One bound, `MAX_ECHOED_PATH_BYTES` (1024), for paths and URIs alike; a URI is measured on the escaped text like a path.
-- **Where the bounds live.** `MAX_ECHOED_PATH_BYTES` and `MAX_ECHOED_NAME_BYTES` are constants in `util.rs` next to `escape_bounded`; `error.rs`, `bridge/` and `mcp/` all use them, so `MAX_SYMBOL_NAME_BYTES` stays the bound of symbol names and kind filters only.
+- **Where the bounds live.** `MAX_ECHOED_PATH_BYTES` and `MAX_ECHOED_NAME_BYTES` are constants in `util.rs` next to `escape_bounded`; `error/`, `bridge/` and `mcp/` all use them, so `MAX_SYMBOL_NAME_BYTES` stays the bound of symbol names and kind filters only.
 - **Which requests reach `on_custom_request`.** Every request that does not decode into its typed form reaches the hook, including a served method with malformed params. A request whose `params` is not a JSON object (for example an array) is rejected earlier by the protocol layer as `-32600` with no echo. The override answers `-32601` with the escaped, bounded method name for a method mcpls does not serve, and `-32602` for a served method whose params do not decode (issue #750).
 - **Repeated `initialize` (FR-017, issue #776).** A well-formed repeat is `-32600`; a malformed repeat still reaches `on_custom_request` and stays `-32602`, as before. The claim is per `SessionState`, so stateless per-request HTTP instances, which get fresh state for every request, are never "repeated". Residual: a 2026-07-28 session opened without `initialize` (by `server/discover` or inline `_meta`) is not claimed by the handshake, so a later `initialize` on it is the first claim and is answered by the SDK's own lifecycle rules, not by FR-017. With the SDK's default supported versions `negotiate_initialize` cannot fail (an unknown version is negotiated down), so the retry-after-failure guarantee of FR-018 is by construction and has no wire test; the single-winner guarantee is tested on the claim itself.
 - **Other `String` variants.** `Error::InvalidToolParams(String)` and the remaining `String`-carrying variants are not audited here; only the variants of section 1 are bounded.
@@ -304,4 +304,4 @@ No new persistent data. Entities touched:
 - [[mcp/002-mcp-resources-diagnostics/spec|mcp/002]] — resource URIs, subscriptions and pagination
 - [[runtime/004-server-text-hygiene/spec|runtime/004]] — escaping and bounding of attacker-influenced text
 - [[runtime/005-untrusted-unlisted-wrapper-workspace-program/spec|runtime/005]] — `EchoedPath` in untrusted refusals
-- Code: `crates/mcpls-core/src/util.rs` (`escape_bounded`, `MAX_ERROR_MESSAGE_CALLER_BYTES`), `crates/mcpls-core/src/error.rs` (`EchoedPath`, `EchoedArgument`, path-bearing variants, `ErrorChain`), `crates/mcpls-core/src/bridge/resources.rs` (`ResourceUriError`), `crates/mcpls-core/src/mcp/server.rs` (`paginate_resource_paths`, `map_bridge_error`), `crates/mcpls-core/src/mcp/parameters.rs` (`<N-byte name>`)
+- Code: `crates/mcpls-core/src/util.rs` (`escape_bounded`, `MAX_ERROR_MESSAGE_CALLER_BYTES`), `crates/mcpls-core/src/error/echo.rs` (`EchoedPath`, `EchoedArgument`), `crates/mcpls-core/src/error.rs` (path-bearing variants, `ErrorChain`), `crates/mcpls-core/src/bridge/resources.rs` (`ResourceUriError`), `crates/mcpls-core/src/mcp/server.rs` (`paginate_resource_paths`, `map_bridge_error`), `crates/mcpls-core/src/mcp/parameters.rs` (`<N-byte name>`)

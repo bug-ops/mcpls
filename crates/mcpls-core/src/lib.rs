@@ -87,7 +87,7 @@ pub use transport::{
     StreamLiveness, WriteStallTimeout,
 };
 use transport::{ShutdownSignal, run_stdio};
-pub use util::{escape_control, needs_control_escape};
+pub use util::{PanicMessage, escape_control, needs_control_escape};
 
 /// Start the MCPLS server with the given configuration over stdio.
 ///

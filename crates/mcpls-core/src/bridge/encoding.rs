@@ -526,81 +526,100 @@ fn exact_character(
         .map(|converted| converted.units)
 }
 
-/// Byte offsets for a chosen set of code-unit offsets into one label,
-/// resolved in a single pass over the label.
+/// Byte offsets for a chosen set of [`ServerColumn`]s into one label,
+/// resolved in a single pass over the label per encoding.
 ///
 /// Resolves signature-help parameter labels given as offset pairs
-/// (`ParameterInformationLabel::Tuple`) in the negotiated encoding's units.
-/// Per-pair scans would cost O(label) each, which a server naming many
-/// parameters could amplify; a full per-unit table would cost memory
-/// proportional to the label. This keeps one entry per distinct requested
-/// offset.
+/// (`ParameterInformationLabel::Tuple`). Each offset carries its encoding, so
+/// units of one encoding are never read as another's. Per-pair scans would
+/// cost O(label) each, which a server naming many parameters could amplify; a
+/// full per-unit table would cost memory proportional to the label. This keeps
+/// one entry per distinct requested offset.
 #[derive(Debug)]
 pub struct LabelOffsets<'a> {
     label: &'a str,
-    /// `(unit offset, byte offset)` sorted by unit; the byte offset is `None`
-    /// for an offset out of range or inside a multi-unit character.
-    resolved: Vec<(u32, Option<usize>)>,
+    /// One table per encoding that has requested offsets.
+    resolved: Vec<(PositionEncoding, UnitTable)>,
 }
 
-impl<'a> LabelOffsets<'a> {
-    /// Resolves each of `offsets` (code units in `encoding`) against `label`.
-    #[must_use]
-    pub fn new(
-        label: &'a str,
-        offsets: impl IntoIterator<Item = u32>,
-        encoding: PositionEncoding,
-    ) -> Self {
-        let mut wanted: Vec<u32> = offsets.into_iter().collect();
-        wanted.sort_unstable();
-        wanted.dedup();
+/// `(unit offset, byte offset)` sorted by unit; the byte offset is `None` for
+/// an offset out of range or inside a multi-unit character.
+type UnitTable = Vec<(u32, Option<usize>)>;
 
-        let mut resolved = Vec::with_capacity(wanted.len());
-        let mut next = 0;
-        let mut settle = |unit: usize, byte: usize| {
-            while let Some(&offset) = wanted.get(next) {
-                if offset as usize > unit {
-                    break;
-                }
-                resolved.push((offset, (offset as usize == unit).then_some(byte)));
-                next = next.saturating_add(1);
-            }
-        };
-        let mut unit = 0;
-        for (byte, ch) in label.char_indices() {
-            settle(unit, byte);
-            unit = unit.saturating_add(match encoding {
-                PositionEncoding::Utf8 => ch.len_utf8(),
-                PositionEncoding::Utf16 => ch.len_utf16(),
-                PositionEncoding::Utf32 => 1,
-            });
-        }
-        settle(unit, label.len());
-        resolved.extend(
-            wanted
-                .get(next..)
-                .unwrap_or_default()
-                .iter()
-                .map(|&offset| (offset, None)),
-        );
+impl<'a> LabelOffsets<'a> {
+    /// Resolves each of `offsets` against `label` in its own encoding.
+    #[must_use]
+    pub fn new(label: &'a str, offsets: impl IntoIterator<Item = ServerColumn>) -> Self {
+        let offsets: Vec<ServerColumn> = offsets.into_iter().collect();
+        let resolved = PositionEncoding::ALL
+            .into_iter()
+            .filter_map(|encoding| {
+                let mut wanted: Vec<u32> = offsets
+                    .iter()
+                    .filter(|column| column.encoding == encoding)
+                    .map(|column| column.units)
+                    .collect();
+                wanted.sort_unstable();
+                wanted.dedup();
+                (!wanted.is_empty())
+                    .then(|| (encoding, resolve_label_units(label, &wanted, encoding)))
+            })
+            .collect();
         Self { label, resolved }
     }
 
-    /// The substring of the indexed label between
-    /// `start` (inclusive) and `end` (exclusive) code units. `None` when
-    /// either offset was not among those requested, is out of range or inside
-    /// a multi-unit character, or `start > end`.
+    /// The substring of the indexed label between `start` (inclusive) and
+    /// `end` (exclusive). `None` when either column was not among those
+    /// requested, is out of range or inside a multi-unit character, or
+    /// `start` is after `end`.
     #[must_use]
-    pub fn substring(&self, start: u32, end: u32) -> Option<&'a str> {
-        let at = |unit: u32| {
-            let index = self
+    pub fn substring(&self, start: ServerColumn, end: ServerColumn) -> Option<&'a str> {
+        let at = |column: ServerColumn| {
+            let (_, table) = self
                 .resolved
-                .binary_search_by_key(&unit, |&(offset, _)| offset)
+                .iter()
+                .find(|(encoding, _)| *encoding == column.encoding)?;
+            let index = table
+                .binary_search_by_key(&column.units, |&(offset, _)| offset)
                 .ok()?;
-            self.resolved.get(index)?.1
+            table.get(index)?.1
         };
         self.label.get(at(start)?..at(end)?)
     }
+}
+
+/// Resolves the sorted, deduplicated `wanted` unit offsets of `label` in
+/// `encoding` to byte offsets in one pass.
+fn resolve_label_units(label: &str, wanted: &[u32], encoding: PositionEncoding) -> UnitTable {
+    let mut resolved = Vec::with_capacity(wanted.len());
+    let mut next = 0;
+    let mut settle = |unit: usize, byte: usize| {
+        while let Some(&offset) = wanted.get(next) {
+            if offset as usize > unit {
+                break;
+            }
+            resolved.push((offset, (offset as usize == unit).then_some(byte)));
+            next = next.saturating_add(1);
+        }
+    };
+    let mut unit = 0;
+    for (byte, ch) in label.char_indices() {
+        settle(unit, byte);
+        unit = unit.saturating_add(match encoding {
+            PositionEncoding::Utf8 => ch.len_utf8(),
+            PositionEncoding::Utf16 => ch.len_utf16(),
+            PositionEncoding::Utf32 => 1,
+        });
+    }
+    settle(unit, label.len());
+    resolved.extend(
+        wanted
+            .get(next..)
+            .unwrap_or_default()
+            .iter()
+            .map(|&offset| (offset, None)),
+    );
+    resolved
 }
 
 /// Why an offset has no counterpart in the other unit.
@@ -657,7 +676,23 @@ mod tests {
         end: u32,
         encoding: PositionEncoding,
     ) -> Option<&str> {
-        LabelOffsets::new(label, [start, end], encoding).substring(start, end)
+        let start = ServerColumn::new(start, encoding);
+        let end = ServerColumn::new(end, encoding);
+        LabelOffsets::new(label, [start, end]).substring(start, end)
+    }
+
+    #[test]
+    fn test_label_substring_resolves_mixed_encodings_per_column() {
+        let label = "é𝄞xy";
+        let utf8 = ServerColumn::new(6, PositionEncoding::Utf8);
+        let utf16 = ServerColumn::new(5, PositionEncoding::Utf16);
+        let utf32 = ServerColumn::new(4, PositionEncoding::Utf32);
+        let offsets = LabelOffsets::new(label, [utf8, utf16, utf32]);
+        assert_eq!(offsets.substring(utf8, utf16), Some("xy"));
+        assert_eq!(offsets.substring(utf8, utf32), Some("xy"));
+        assert_eq!(offsets.substring(utf16, utf16), Some(""));
+        let unrequested = ServerColumn::new(6, PositionEncoding::Utf16);
+        assert_eq!(offsets.substring(utf8, unrequested), None);
     }
 
     #[test]
