@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::Instant;
 use url::Url;
 
+use super::encoding::ColumnBoundary;
 use super::notifications::DocumentStamp;
 use super::{LspLine, Utf16Column, WorkspacePath, WorkspaceRoots};
 use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
@@ -186,12 +187,29 @@ impl DocumentText {
     }
 
     fn line_start(&self, n: u32) -> Option<usize> {
+        self.line_start_walked(n).0
+    }
+
+    /// The byte offset where the 0-based line `n` starts (`None` past the
+    /// last line), and the bytes read walking from the nearest checkpoint,
+    /// including a walk that ran to the end of the text without finding it.
+    fn line_start_walked(&self, n: u32) -> (Option<usize>, usize) {
         let n = n as usize;
-        let mut start = *self.checkpoints.get(n.checked_div(self.stride)?)?;
-        for _ in 0..n.checked_rem(self.stride)? {
-            start = line_bounds(&self.content, start).1?;
+        let checkpoint = n
+            .checked_div(self.stride)
+            .and_then(|index| self.checkpoints.get(index).copied());
+        let (Some(checkpoint), Some(steps)) = (checkpoint, n.checked_rem(self.stride)) else {
+            return (None, 0);
+        };
+        let mut start = checkpoint;
+        for _ in 0..steps {
+            let (end, after) = line_bounds(&self.content, start);
+            let Some(next) = after else {
+                return (None, end.saturating_sub(checkpoint));
+            };
+            start = next;
         }
-        Some(start)
+        (Some(start), start.saturating_sub(checkpoint))
     }
 
     /// The lines from the 0-based `n`'th on, without terminators; empty if
@@ -2035,25 +2053,28 @@ const EXCERPT_INITIAL_CAPACITY: usize = 1024;
 
 /// Bounds on one source excerpt.
 #[derive(Debug, Clone, Copy)]
-pub struct ExcerptLimits {
+pub(super) struct ExcerptLimits {
     /// Most lines an excerpt may span.
-    pub max_lines: NonZeroU32,
+    pub(super) max_lines: NonZeroU32,
     /// Most bytes an excerpt may hold.
-    pub max_bytes: std::num::NonZeroUsize,
+    pub(super) max_bytes: std::num::NonZeroUsize,
 }
 
 /// Text cut out of a tracked document.
 #[derive(Debug)]
-pub struct Excerpt {
+pub(super) struct Excerpt {
     /// The excerpted text, lines joined with `\n`.
-    pub text: String,
+    pub(super) text: String,
     /// Whether a limit cut the text short.
-    pub truncated: bool,
+    pub(super) truncated: bool,
+    /// Bytes of document text examined to cut it: each line read up to its
+    /// terminator, plus the walk to the first line.
+    pub(super) scanned: usize,
 }
 
 /// Why no excerpt could be cut.
 #[derive(Debug)]
-pub enum ExcerptError {
+pub(super) enum ExcerptError {
     /// The document is not tracked.
     Untracked,
     /// The document is not the one the span was computed on.
@@ -2077,7 +2098,7 @@ impl DocumentTracker {
     ///
     /// [`ExcerptError::Untracked`] when `path` is not tracked and
     /// [`ExcerptError::Changed`] when the stamp no longer matches.
-    pub(crate) fn excerpt(
+    pub(super) fn excerpt(
         &self,
         path: &Path,
         server: &ServerId,
@@ -2102,90 +2123,22 @@ impl DocumentTracker {
     }
 }
 
-/// A character boundary of a line with the UTF-16 units before it.
-#[derive(Clone, Copy)]
-struct Boundary {
-    byte: usize,
-    units: u32,
-}
-
-/// The start of the character of `line` that contains `column` (a column past
-/// the end is the line end), found in one pass over the units before it.
-fn floor_boundary(line: &str, column: Utf16Column) -> Boundary {
-    let mut units = 0_u32;
-    for (byte, character) in line.char_indices() {
-        let next = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
-        if column.get() < next {
-            return Boundary { byte, units };
-        }
-        units = next;
-    }
-    Boundary {
-        byte: line.len(),
-        units,
-    }
-}
-
-/// Where a cut ends on its line.
-enum End {
-    /// At this byte offset.
-    At(usize),
-    /// Further than the byte cap from the start, so the scan stopped.
-    Beyond,
-}
-
-/// The first boundary of `line` at or after `column` units, scanning forward
-/// from `start` and giving up once more than `max_bytes` lie between them; a
-/// column past the line end (or `u32::MAX`) is the line end.
-fn ceil_end(line: &str, start: Boundary, column: Utf16Column, max_bytes: usize) -> End {
-    let mut units = start.units;
-    if units >= column.get() {
-        return End::At(start.byte);
-    }
-    let rest = line.get(start.byte..).unwrap_or_default();
-    for (offset, character) in rest.char_indices() {
-        units = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
-        let byte = start
-            .byte
-            .saturating_add(offset)
-            .saturating_add(character.len_utf8());
-        if units >= column.get() {
-            return End::At(byte);
-        }
-        if byte.saturating_sub(start.byte) > max_bytes {
-            return End::Beyond;
-        }
-    }
-    End::At(line.len())
-}
-
-/// Most bytes one UTF-16 unit can take in UTF-8 (a BMP character is 3 bytes for 1 unit).
-const MAX_BYTES_PER_UNIT: usize = 3;
-
-fn cut_excerpt(text: &DocumentText, span: &super::Range, limits: ExcerptLimits) -> Excerpt {
-    cut_excerpt_scanned(text, span, limits).0
-}
-
-/// [`cut_excerpt`] plus the bytes of text it looked at.
+/// Cuts `span` out of `text`, counting the bytes it examines in
+/// [`Excerpt::scanned`].
 ///
 /// Every line is examined through a view of at most
 /// `3 * start column + max_bytes + 4` bytes, so a line is never scanned to its
 /// terminator beyond what the cut needs: the work is bounded by the start
 /// column and `max_bytes` per line, not by the line length.
-fn cut_excerpt_scanned(
-    text: &DocumentText,
-    span: &super::Range,
-    limits: ExcerptLimits,
-) -> (Excerpt, usize) {
+fn cut_excerpt(text: &DocumentText, span: &super::Range, limits: ExcerptLimits) -> Excerpt {
     let first = span.start.lsp_line();
     let wanted = first.lines_through(span.end.lsp_line());
     let take = wanted.min(limits.max_lines.get());
     let mut truncated = wanted > take;
     let max_bytes = limits.max_bytes.get();
     let mut out = String::with_capacity(max_bytes.min(EXCERPT_INITIAL_CAPACITY));
-    let mut scanned = 0_usize;
     let content = text.as_str();
-    let mut next_start = text.line_start(first.get());
+    let (mut next_start, mut scanned) = text.line_start_walked(first.get());
 
     for index in 0..take {
         let Some(start) = next_start else {
@@ -2194,17 +2147,16 @@ fn cut_excerpt_scanned(
         let is_first = index == 0;
         let is_last = !truncated && index.saturating_add(1) == take;
         let skip = if is_first {
-            usize::try_from(span.start.lsp_character().get())
-                .unwrap_or(usize::MAX)
-                .saturating_mul(MAX_BYTES_PER_UNIT)
+            span.start.lsp_character().max_utf8_prefix_bytes()
         } else {
             0
         };
         let reach = skip.saturating_add(max_bytes).saturating_add(4);
         let view_end = content.floor_char_boundary(start.saturating_add(reach).min(content.len()));
         let view = content.get(start..view_end).unwrap_or_default();
-        scanned = scanned.saturating_add(view.len());
         let terminator = view.bytes().position(is_line_terminator);
+        scanned =
+            scanned.saturating_add(terminator.map_or(view.len(), |end| end.saturating_add(1)));
         let line = &view[..terminator.unwrap_or(view.len())];
         let view_cut = terminator.is_none() && view_end < content.len();
         next_start = terminator.map(|offset| {
@@ -2215,24 +2167,28 @@ fn cut_excerpt_scanned(
         });
 
         let from = if is_first {
-            floor_boundary(line, span.start.lsp_character())
+            span.start.lsp_character().floor_byte_in(line)
         } else {
-            Boundary { byte: 0, units: 0 }
+            ColumnBoundary {
+                byte: 0,
+                column: Utf16Column::new(0),
+            }
         };
+        // `None`: the cut ends further than the byte cap from its start, so
+        // the scan stopped.
         let end = if is_last {
-            match ceil_end(line, from, span.end.lsp_character(), max_bytes) {
-                End::At(to) if view_cut && to >= line.len() => End::Beyond,
+            match span.end.lsp_character().ceil_byte_in(line, from, max_bytes) {
+                Some(to) if view_cut && to >= line.len() => None,
                 other => other,
             }
         } else {
-            End::At(line.len())
+            Some(line.len())
         };
         let separator = usize::from(!is_first);
-        let segment = match end {
-            End::At(to) => line.get(from.byte..to.max(from.byte)).unwrap_or_default(),
-            End::Beyond => line.get(from.byte..).unwrap_or_default(),
-        };
-        let fits = matches!(end, End::At(_))
+        let segment = line
+            .get(from.byte..end.map_or(line.len(), |to| to.max(from.byte)))
+            .unwrap_or_default();
+        let fits = end.is_some()
             && out
                 .len()
                 .saturating_add(separator)
@@ -2250,13 +2206,11 @@ fn cut_excerpt_scanned(
         }
         out.push_str(segment);
     }
-    (
-        Excerpt {
-            text: out,
-            truncated,
-        },
+    Excerpt {
+        text: out,
+        truncated,
         scanned,
-    )
+    }
 }
 
 #[cfg(test)]

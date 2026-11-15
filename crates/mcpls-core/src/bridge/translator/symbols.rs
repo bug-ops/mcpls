@@ -10,8 +10,8 @@ use lsp_types::{
 
 use super::Translator;
 use super::dto::{
-    DocumentSymbolsResult, Location, ServerOutcome, ServerStatus, Symbol, WorkspaceSymbol,
-    WorkspaceSymbolResult, lsp_kind_to_u32,
+    DocumentSymbolsResult, Location, ServerOutcome, ServerStatus, Symbol, WorkspaceQuery,
+    WorkspaceSymbol, WorkspaceSymbolResult, lsp_kind_to_u32,
 };
 use super::encoding_ctx::EncodingCtx;
 use super::kind_filter::SymbolKindFilter;
@@ -26,24 +26,10 @@ use crate::config::{ServerId, ToolKind};
 use crate::error::{Error, Result, ServerSpawnFailure};
 use crate::util::lock_std;
 
-/// Validate `query`'s length for `handle_workspace_symbol`.
-fn validate_query_length(query: &str) -> Result<()> {
-    const MAX_QUERY_LENGTH: usize = 1000;
-
-    if query.len() > MAX_QUERY_LENGTH {
-        return Err(Error::InvalidToolParams(format!(
-            "Query too long: {} bytes (max {MAX_QUERY_LENGTH})",
-            query.len()
-        )));
-    }
-
-    Ok(())
-}
-
 /// The `workspace/symbol` request for `query`.
-fn workspace_symbol_params(query: String) -> LspWorkspaceSymbolParams {
+fn workspace_symbol_params(query: WorkspaceQuery) -> LspWorkspaceSymbolParams {
     LspWorkspaceSymbolParams {
-        query,
+        query: String::from(query),
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: PartialResultParams::default(),
     }
@@ -248,12 +234,10 @@ impl Translator {
     /// the routed server does not advertise `workspaceSymbolProvider` support.
     pub async fn handle_workspace_symbol(
         &self,
-        query: String,
+        query: WorkspaceQuery,
         kind_filter: Option<SymbolKindFilter>,
         limit: u32,
     ) -> Result<WorkspaceSymbolResult> {
-        validate_query_length(&query)?;
-
         if let Some(members) = self.fan_out_members() {
             return self
                 .workspace_symbol_fan_out(query, kind_filter, limit, members)
@@ -332,7 +316,7 @@ impl Translator {
     /// symbols are kept; only when no server answered does the call fail.
     async fn workspace_symbol_fan_out(
         &self,
-        query: String,
+        query: WorkspaceQuery,
         kind_filter: Option<SymbolKindFilter>,
         limit: u32,
         members: FanOutMembers,
@@ -945,7 +929,7 @@ mod tests {
     async fn test_handle_workspace_symbol_no_server() {
         let translator = Translator::new();
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
         assert_matches!(result, Err(Error::NoServerConfigured));
     }
@@ -961,7 +945,7 @@ mod tests {
         translator.set_expected_servers(HashSet::from([ServerId::from_static("pyright")]));
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
         assert_matches!(result, Err(Error::WorkspaceServersInitializing));
     }
@@ -979,7 +963,7 @@ mod tests {
         }]);
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
 
         let Err(Error::AllServersFailedToInit { failures }) = result else {
@@ -1013,7 +997,7 @@ mod tests {
         translator.clear_expected_servers();
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
 
         assert_matches!(&result, Err(Error::ServerFailedToStart(f)) if f.server_id == failing_id,
@@ -1034,7 +1018,7 @@ mod tests {
         }]);
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
 
         assert_matches!(result, Err(Error::WorkspaceServersInitializing));
@@ -1066,7 +1050,7 @@ mod tests {
         let translator = Translator::new().with_router(router);
 
         let result = translator
-            .handle_workspace_symbol("test".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("test").unwrap(), None, 100)
             .await;
         assert_matches!(
             result,
@@ -1320,7 +1304,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .handle_workspace_symbol(WorkspaceQuery::new("foo").unwrap(), None, 100)
                     .await
             })
         };
@@ -1392,7 +1376,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .handle_workspace_symbol(WorkspaceQuery::new("foo").unwrap(), None, 100)
                     .await
             })
         };
@@ -1435,7 +1419,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_workspace_symbol("foo".to_string(), None, 0)
+                    .handle_workspace_symbol(WorkspaceQuery::new("foo").unwrap(), None, 0)
                     .await
             })
         };
@@ -1489,7 +1473,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_workspace_symbol("foo".to_string(), None, 100)
+                    .handle_workspace_symbol(WorkspaceQuery::new("foo").unwrap(), None, 100)
                     .await
             })
         };
@@ -1585,7 +1569,7 @@ mod tests {
             let translator = Arc::clone(&translator);
             tokio::spawn(async move {
                 translator
-                    .handle_workspace_symbol("foo".to_string(), None, u32::MAX)
+                    .handle_workspace_symbol(WorkspaceQuery::new("foo").unwrap(), None, u32::MAX)
                     .await
             })
         };
@@ -1815,7 +1799,7 @@ mod fan_out_tests {
         async fn search(&self, kind: Option<&str>, limit: u32) -> Result<WorkspaceSymbolResult> {
             let filter = kind.map(|name| SymbolKindFilter::parse(name).expect("a known kind"));
             self.translator
-                .handle_workspace_symbol("q".to_owned(), filter, limit)
+                .handle_workspace_symbol(WorkspaceQuery::new("q").unwrap(), filter, limit)
                 .await
         }
     }
@@ -2504,7 +2488,7 @@ mod fan_out_tests {
         let translator = Arc::clone(&p.translator);
         let call = tokio::spawn(async move {
             translator
-                .handle_workspace_symbol("q".to_owned(), None, 100)
+                .handle_workspace_symbol(WorkspaceQuery::new("q").unwrap(), None, 100)
                 .await
         });
 

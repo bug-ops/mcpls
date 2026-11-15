@@ -56,7 +56,8 @@ use crate::bridge::{
     NotificationCache, OutgoingCallsResult, Position, PositionEncoding, PositionRange,
     PrepareRenameResult, ReferencesResult, RenameResult, RestartServerResult, RouteSignals,
     SelectionRangesResult, ServerLogsResult, ServerMessagesResult, SignatureHelpResult,
-    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceRoots, WorkspaceSymbolResult,
+    SymbolTarget, Translator, TypeHierarchyResult, WorkspaceQuery, WorkspaceRoots,
+    WorkspaceSymbolResult,
 };
 use crate::config::{McpConfig, ProjectConfigStatus, ToolPrefix};
 use crate::redaction::{Redactions, ServerText};
@@ -970,6 +971,7 @@ impl McplsServer {
         }): Parameters<WorkspaceSymbolParams>,
     ) -> Result<Json<WorkspaceSymbolResult>, McpError> {
         let kind_filter = parse_kind_filter(kind_filter, KindFilterField::KindFilter)?;
+        let query = WorkspaceQuery::new(query).map_err(client_input_error)?;
         self.structured_result(
             self.context
                 .translator
@@ -2319,7 +2321,7 @@ mod tests {
     #[test]
     fn test_map_bridge_error_caller_fault_variants_use_invalid_params() {
         let caller_fault_errors = vec![
-            crate::error::Error::InvalidToolParams("bad params".to_string()),
+            crate::error::Error::NotFileUri(crate::error::EchoedUri::new("bad params")),
             crate::error::Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
             crate::error::Error::NotARegularFile(PathBuf::from("/dev/null")),
             crate::error::Error::NoResolvableListenUris,
@@ -2467,7 +2469,7 @@ mod tests {
         assert!(!data.contains("bravo-secret-222"), "{data}");
 
         let plain = render_error(
-            crate::error::Error::InvalidToolParams("nothing secret".into()),
+            crate::error::Error::NotFileUri(crate::error::EchoedUri::new("nothing secret")),
             &redactions,
         );
         assert!(
@@ -2491,8 +2493,8 @@ mod tests {
             ProjectConfigStatus::NotIgnored,
             McpConfig::default(),
         );
-        let rendered = server.render_error(crate::error::Error::InvalidToolParams(
-            "token bravo-secret-222".to_owned(),
+        let rendered = server.render_error(crate::error::Error::NotFileUri(
+            crate::error::EchoedUri::new("token bravo-secret-222"),
         ));
         assert!(
             !rendered.message.contains("bravo-secret-222"),
@@ -2708,6 +2710,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An over-long workspace symbol query is `-32602` naming `query`, before
+    /// any server is asked; an empty one is accepted by the boundary.
+    #[tokio::test]
+    async fn test_workspace_symbol_search_rejects_over_long_query_as_invalid_params() {
+        let server = create_test_server();
+        let params = |query: String| {
+            Parameters(WorkspaceSymbolParams {
+                query,
+                kind_filter: None,
+                limit: 10,
+            })
+        };
+        let err = server
+            .workspace_symbol_search(params(
+                "q".repeat(crate::bridge::MAX_WORKSPACE_QUERY_BYTES + 1),
+            ))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("query"), "{}", err.message);
+
+        let err = server
+            .workspace_symbol_search(params(String::new()))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+    }
+
+    /// The `-32602` text of a typed client-input error names its cause once,
+    /// not again as the error's source.
+    #[test]
+    fn test_typed_input_errors_state_their_message_once_on_the_wire() {
+        let too_long = crate::bridge::WorkspaceQuery::new("q".repeat(2_000)).unwrap_err();
+        assert_eq!(
+            map_bridge_error(too_long.into()).message,
+            "invalid tool parameters: `query` exceeds the maximum of 1000 bytes (2000 given)"
+        );
+
+        let unknown = crate::bridge::KindFilterInput::<crate::bridge::SymbolKindFilter>::from(
+            "nope".to_owned(),
+        )
+        .into_known(KindFilterField::KindFilter)
+        .unwrap_err();
+        let inner = unknown.to_string();
+        let message = map_bridge_error(unknown.into()).message;
+        assert_eq!(message, format!("invalid tool parameters: {inner}"));
+        assert_eq!(message.matches("Valid values").count(), 1, "{message}");
+
+        let uri = crate::error::Error::NotFileUri(crate::error::EchoedUri::new("untitled:x"));
+        assert_eq!(
+            map_bridge_error(uri).message,
+            "invalid tool parameters: Invalid URI, expected an absolute file:// URI but got: untitled:x"
+        );
     }
 
     /// An unknown `kind_filter` keeps its `-32602` class, in any case a known

@@ -535,6 +535,15 @@ impl PanicMessage {
         Self(escape_bounded(text, MAX_LOG_STRING_BYTES))
     }
 
+    /// The panic text of a failed task, or `None` when it was cancelled
+    /// instead.
+    pub(crate) fn from_join_error(error: tokio::task::JoinError) -> Option<Self> {
+        error
+            .try_into_panic()
+            .ok()
+            .map(|payload| Self::from_payload(payload.as_ref()))
+    }
+
     /// The escaped, bounded text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -664,7 +673,7 @@ impl RestartBackoff {
         }
         if self.limiter.due(now.into_std(), self.delays.max) {
             tracing::error!(
-                error = %panicked.message(),
+                panic = %panicked.message(),
                 operation = %what,
                 delay = ?self.delay,
                 "task panicked; restarting it after the delay, it is not running until then"
@@ -796,12 +805,12 @@ mod tests {
             .await;
         assert!(flow.is_break());
         let fields = logs.fields_at(tracing::Level::ERROR);
-        let error = fields
+        let panic = fields
             .iter()
-            .find(|f| f.starts_with("error="))
-            .expect("error field");
-        assert!(!error.contains('\n'), "{error}");
-        assert!(error.contains("ok\\nERROR forged"), "{error}");
+            .find(|f| f.starts_with("panic="))
+            .expect("panic field");
+        assert!(!panic.contains('\n'), "{panic}");
+        assert!(panic.contains("ok\\nERROR forged"), "{panic}");
     }
 
     #[test]

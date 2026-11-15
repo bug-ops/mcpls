@@ -101,6 +101,39 @@ impl EchoedPath {
     }
 }
 
+/// A client-supplied URI shown whole, escaped and bounded.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::error::EchoedUri;
+///
+/// assert_eq!(EchoedUri::new("untitled:x").as_str(), "untitled:x");
+/// assert_eq!(EchoedUri::new("a\nb").as_str(), "a\\nb");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoedUri(String);
+
+impl EchoedUri {
+    /// `uri`, escaped and bounded to 1024 bytes of escaped text.
+    #[must_use]
+    pub fn new(uri: &str) -> Self {
+        Self(escape_bounded(uri, MAX_ECHOED_PATH_BYTES))
+    }
+
+    /// The echoed text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for EchoedUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Renders a path as `{path:?}` does, cut after about 1024 bytes of that text.
 ///
 /// The quoted form is for the paths a caller supplied or a file operation

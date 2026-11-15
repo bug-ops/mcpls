@@ -14,8 +14,8 @@ use std::path::Path;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::dto::{Location, Range, Symbol};
-use super::enclosing::{EnclosingSymbolOutcome, Hit, outcome_for};
+use super::dto::{Location, Range};
+use super::enclosing::{Containment, EnclosingSymbolOutcome, Hit, descend_path, outcome_for};
 use super::symbols::DocumentSymbolTree;
 use crate::bridge::notifications::DocumentStamp;
 use crate::bridge::state::{DocumentTracker, ExcerptError, ExcerptLimits};
@@ -31,13 +31,18 @@ const ITEM_MAX_BYTES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16 * 1024 
 /// Most bytes of `included` text one call may return (64 KiB).
 const CALL_BUDGET_BYTES: usize = 64 * 1024;
 
+/// Most bytes of document text one call may examine while cutting (16 MiB),
+/// so many cuts deep into one long line cannot make the call cost
+/// `cuts x line length`.
+const MAX_SCANNED_BYTES_PER_CALL: usize = 16 * 1024 * 1024;
+
 /// Most distinct spans one call cuts; later new spans are `call_budget`, so a
 /// call with many tiny spans cannot make unbounded cuts.
 const MAX_SOURCE_CUTS_PER_CALL: usize = 256;
 
 /// Position of an earlier item in the same `locations` list.
 ///
-/// Built only by the source pass, so it always names an `included` item.
+/// In mcpls output it names an earlier `included` item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(inline)]
@@ -58,6 +63,7 @@ impl ItemIndex {
 /// Why an item has no source text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SourceSkipReason {
     /// No symbol or link range names a span for this item.
     NoSpan,
@@ -83,6 +89,7 @@ pub enum SourceSkipReason {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SourceOutcome {
     /// The symbol's text, at most 200 lines and 16 KiB.
     Included {
@@ -181,6 +188,7 @@ pub(super) struct SourceFile<'a> {
 pub(super) struct SourcePass<'a> {
     rule: SpanRule,
     remaining: usize,
+    scan_remaining: usize,
     cuts: usize,
     seen: HashMap<(&'a str, Range), SpanSeen>,
     outcomes: Vec<SourceOutcome>,
@@ -192,15 +200,20 @@ impl<'a> SourcePass<'a> {
         Self {
             rule,
             remaining: CALL_BUDGET_BYTES,
+            scan_remaining: MAX_SCANNED_BYTES_PER_CALL,
             cuts: 0,
             seen: HashMap::with_capacity(items.min(MAX_SOURCE_CUTS_PER_CALL)),
             outcomes: vec![SourceOutcome::skipped(SourceSkipReason::SymbolLookupSkipped); items],
         }
     }
 
-    /// The outcome of every item, in input order.
-    pub(super) fn into_outcomes(self) -> Vec<SourceOutcome> {
-        self.outcomes
+    /// The outcome of item `index`; an item no file filled is skipped.
+    pub(super) fn take(&mut self, index: usize) -> SourceOutcome {
+        let unfilled = SourceOutcome::skipped(SourceSkipReason::SymbolLookupSkipped);
+        match self.outcomes.get_mut(index) {
+            Some(slot) => std::mem::replace(slot, unfilled),
+            None => unfilled,
+        }
     }
 
     /// Cuts the source of `hits` (index, hit), all in `file` and in item order.
@@ -238,7 +251,8 @@ impl<'a> SourcePass<'a> {
         let Some(stamp) = file.stamp else {
             return SourceOutcome::skipped(SourceSkipReason::DocumentChanged);
         };
-        if self.remaining == 0 || self.cuts >= MAX_SOURCE_CUTS_PER_CALL {
+        if self.remaining == 0 || self.scan_remaining == 0 || self.cuts >= MAX_SOURCE_CUTS_PER_CALL
+        {
             return SourceOutcome::skipped(SourceSkipReason::CallBudget);
         }
         self.cuts = self.cuts.saturating_add(1);
@@ -246,10 +260,13 @@ impl<'a> SourcePass<'a> {
             max_lines: ITEM_MAX_LINES,
             max_bytes: ITEM_MAX_BYTES,
         };
-        match file
+        let excerpt = file
             .tracker
-            .excerpt(file.path, file.server, stamp, &span, limits)
-        {
+            .excerpt(file.path, file.server, stamp, &span, limits);
+        if let Ok(excerpt) = &excerpt {
+            self.scan_remaining = self.scan_remaining.saturating_sub(excerpt.scanned);
+        }
+        match excerpt {
             Err(ExcerptError::Changed | ExcerptError::Untracked) => {
                 SourceOutcome::skipped(SourceSkipReason::DocumentChanged)
             }
@@ -280,31 +297,24 @@ impl<'a> SourcePass<'a> {
     }
 }
 
-fn contains(outer: &Range, inner: &Range) -> bool {
-    outer.start <= inner.start && inner.end <= outer.end
-}
-
 /// The `range` of the innermost hierarchical symbol whose `selection_range`
-/// contains `item`; a flat symbol list never matches.
+/// contains `item`, descending by the enclosing-symbol sibling rule; a flat
+/// symbol list never matches.
 fn definition_span(tree: &DocumentSymbolTree, item: &Range) -> Option<Range> {
     let DocumentSymbolTree::Hierarchical(symbols) = tree else {
         return None;
     };
-    let mut level: &[Symbol] = symbols;
-    let mut found = None;
-    while let Some(symbol) = level.iter().find(|symbol| contains(&symbol.range, item)) {
-        if contains(&symbol.selection_range, item) {
-            found = Some(symbol.range);
-        }
-        level = symbol.children.as_deref().unwrap_or_default();
-    }
-    found
+    descend_path(symbols, *item, Containment::Whole)
+        .filter(|symbol| Containment::Whole.admits(&symbol.selection_range, item))
+        .last()
+        .map(|symbol| symbol.range)
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use super::super::dto::Symbol;
     use super::*;
     use crate::bridge::{Position2D, ResourceLimits};
 
@@ -386,7 +396,7 @@ mod tests {
             b_hits.iter().map(|hit| (4, hit)),
         );
 
-        let outcomes = pass.into_outcomes();
+        let outcomes: Vec<SourceOutcome> = (0..5).map(|index| pass.take(index)).collect();
         assert!(
             outcomes[..4]
                 .iter()
@@ -396,6 +406,161 @@ mod tests {
             outcomes[4],
             SourceOutcome::skipped(SourceSkipReason::CallBudget),
             "a stale stamp would read document_changed if an excerpt were cut"
+        );
+    }
+
+    #[test]
+    fn test_an_item_no_file_filled_is_symbol_lookup_skipped() {
+        let mut pass = SourcePass::new(SpanRule::EnclosingBody, 2);
+        let skipped = SourceOutcome::skipped(SourceSkipReason::SymbolLookupSkipped);
+        assert_eq!(pass.take(1), skipped);
+        assert_eq!(pass.take(99), skipped);
+    }
+
+    fn lines_symbol(name: &str, from: u32, to: u32, selection_line: u32) -> Symbol {
+        Symbol {
+            name: name.to_owned(),
+            kind: 12,
+            range: Range {
+                start: Position2D::at(from, 1),
+                end: Position2D::at(to, 1),
+            },
+            selection_range: span(selection_line, 1, 2),
+            children: None,
+        }
+    }
+
+    /// #931: overlapping siblings resolve to the innermost one, in any server
+    /// order, and agree with the enclosing-symbol rule.
+    #[test]
+    fn test_definition_span_picks_the_innermost_overlapping_sibling() {
+        let outer = lines_symbol("A", 1, 10, 1);
+        let inner = lines_symbol("B", 5, 6, 5);
+        let item = span(5, 1, 2);
+        let inner_range = inner.range;
+        for symbols in [vec![outer.clone(), inner.clone()], vec![inner, outer]] {
+            let tree = DocumentSymbolTree::Hierarchical(symbols);
+            assert_eq!(definition_span(&tree, &item), Some(inner_range));
+            assert_eq!(
+                outcome_for(&tree, &item),
+                EnclosingSymbolOutcome::Resolved(crate::bridge::EnclosingSymbol {
+                    name_path: vec!["B".to_owned()],
+                    kind: 12,
+                    range: inner_range,
+                    fidelity: crate::bridge::SymbolFidelity::Hierarchical,
+                })
+            );
+        }
+    }
+
+    /// #927: 256 spans at deep columns of one multi-megabyte line cost the
+    /// per-call scan budget plus one cut, not `256 x line length`.
+    #[test]
+    fn test_spans_deep_in_one_huge_line_stop_at_the_scan_budget() {
+        const LINE_UNITS: u32 = 2_000_000;
+        let tracker = tracker();
+        let line_bytes = "\u{e9}".len() * LINE_UNITS as usize;
+        let (path, server) = open(
+            &tracker,
+            "/test/wide.rs",
+            &"\u{e9}".repeat(LINE_UNITS as usize),
+        );
+        let columns: Vec<u32> = (0..300).map(|i| LINE_UNITS / 2 + i * 1_000).collect();
+        let tree = DocumentSymbolTree::Hierarchical(
+            columns
+                .iter()
+                .map(|&from| Symbol {
+                    name: format!("s{from}"),
+                    kind: 12,
+                    range: span(1, from, from + 10),
+                    selection_range: span(1, from, from + 1),
+                    children: None,
+                })
+                .collect(),
+        );
+        let ranges: Vec<Range> = columns
+            .iter()
+            .map(|&from| span(1, from + 1, from + 2))
+            .collect();
+        let all_hits = hits("file:///test/wide.rs", &ranges);
+        let mut pass = SourcePass::new(SpanRule::EnclosingBody, all_hits.len());
+
+        pass.fill_file(
+            &SourceFile {
+                tracker: &tracker,
+                path: &path,
+                server: &server,
+                stamp: tracker.stamp(&path, &server),
+            },
+            &tree,
+            all_hits.iter().enumerate(),
+        );
+
+        let outcomes: Vec<SourceOutcome> = (0..all_hits.len()).map(|i| pass.take(i)).collect();
+        let included = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, SourceOutcome::Included { .. }))
+            .count();
+        let budgeted = outcomes
+            .iter()
+            .filter(|outcome| **outcome == SourceOutcome::skipped(SourceSkipReason::CallBudget))
+            .count();
+        let most_cuts = MAX_SCANNED_BYTES_PER_CALL / (line_bytes / 2) + 1;
+        assert!(
+            included <= most_cuts,
+            "{included} cuts for {line_bytes} bytes"
+        );
+        assert!(included >= 1, "the budget must not cut every item");
+        assert!(budgeted > 0, "the budget must stop later items");
+        assert_eq!(included + budgeted, all_hits.len());
+        assert!(pass.cuts <= most_cuts, "{}", pass.cuts);
+    }
+
+    /// A span whose first line is past the end of the text still costs the
+    /// walk to the end, so it spends the scan budget too.
+    #[test]
+    fn test_spans_on_a_line_past_eof_spend_the_scan_budget() {
+        let tracker = tracker();
+        let (path, server) = open(&tracker, "/test/eof.rs", &"a".repeat(2_000_000));
+        let columns: Vec<u32> = (1..=300).collect();
+        let tree = DocumentSymbolTree::Hierarchical(
+            columns
+                .iter()
+                .map(|&from| Symbol {
+                    name: format!("s{from}"),
+                    kind: 12,
+                    range: span(5, from, from + 10),
+                    selection_range: span(5, from, from + 1),
+                    children: None,
+                })
+                .collect(),
+        );
+        let ranges: Vec<Range> = columns
+            .iter()
+            .map(|&from| span(5, from + 1, from + 2))
+            .collect();
+        let all_hits = hits("file:///test/eof.rs", &ranges);
+        let mut pass = SourcePass::new(SpanRule::EnclosingBody, all_hits.len());
+
+        pass.fill_file(
+            &SourceFile {
+                tracker: &tracker,
+                path: &path,
+                server: &server,
+                stamp: tracker.stamp(&path, &server),
+            },
+            &tree,
+            all_hits.iter().enumerate(),
+        );
+
+        assert!(
+            pass.cuts <= MAX_SCANNED_BYTES_PER_CALL / 2_000_000 + 1,
+            "{}",
+            pass.cuts
+        );
+        assert_eq!(
+            pass.take(all_hits.len() - 1),
+            SourceOutcome::skipped(SourceSkipReason::CallBudget)
         );
     }
 
@@ -419,7 +584,8 @@ mod tests {
             all_hits.iter().enumerate(),
         );
 
-        let outcomes = pass.into_outcomes();
+        let outcomes: Vec<SourceOutcome> =
+            (0..all_hits.len()).map(|index| pass.take(index)).collect();
         assert!(matches!(outcomes[255], SourceOutcome::Included { .. }));
         assert_eq!(
             outcomes[256],

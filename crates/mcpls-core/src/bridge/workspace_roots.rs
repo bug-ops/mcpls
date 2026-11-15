@@ -849,7 +849,17 @@ impl WorkspaceRoots {
             Ok(Err(Unresolved::InvalidName(_))) => EditUriVerdict::InvalidPath,
             Ok(_) => EditUriVerdict::OutOfWorkspace,
             Err(error) => {
-                tracing::warn!(%error, uri = uri.as_ref(), "edit URI canonicalization task failed; dropping the edit");
+                match crate::util::PanicMessage::from_join_error(error) {
+                    Some(panic) => {
+                        tracing::error!(%panic, uri = uri.as_ref(), "edit URI canonicalization task panicked; dropping the edit");
+                    }
+                    None => {
+                        tracing::warn!(
+                            uri = uri.as_ref(),
+                            "edit URI canonicalization task was cancelled; dropping the edit"
+                        );
+                    }
+                }
                 EditUriVerdict::OutOfWorkspace
             }
         }

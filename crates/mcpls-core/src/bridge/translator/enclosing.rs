@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::Translator;
-use super::dto::{Diagnostic, Location, PositionDegradation, Range, Symbol};
+use super::dto::{Diagnostic, PositionDegradation, Range, Symbol};
+use super::navigation::NormalizedLocation;
 use super::routing::{FileLocalCapability, IndexingGate};
 use super::source::{NavigationLocation, SourceFile, SourceOutcome, SourcePass, SpanRule};
 use super::symbols::{DocumentSymbolTree, FetchedSymbols, FlatSymbol, symbol_tree};
@@ -73,6 +74,7 @@ pub enum ResultContext {
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LocationContext {
     /// Return the plain result with no extra lookups.
     #[default]
@@ -212,10 +214,16 @@ impl<T> Deref for Contextual<T> {
 /// Items after the optional enrichment pass.
 pub(super) struct Contextualized<T> {
     pub(super) items: Vec<Contextual<T>>,
-    /// One source per item when the source pass ran, else empty.
-    pub(super) sources: Vec<SourceOutcome>,
     pub(super) enrichment: Option<EnrichmentSummary>,
     pub(super) positions_degraded: Option<PositionDegradation>,
+}
+
+impl<T> Contextualized<T> {
+    /// Folds in the degradation the items' own normalization already found.
+    fn with_input_degradation(mut self, degraded: Option<PositionDegradation>) -> Self {
+        self.positions_degraded = degraded.max(self.positions_degraded);
+        self
+    }
 }
 
 /// Number of distinct files one call may enrich: 16 when the tracker limit is
@@ -229,7 +237,7 @@ pub(super) fn enrichment_file_cap(max_documents: DocumentLimit) -> usize {
 
 /// How strictly a symbol must contain an item to enclose it.
 #[derive(Clone, Copy)]
-enum Containment {
+pub(super) enum Containment {
     /// The symbol contains the whole item range.
     Whole,
     /// The symbol contains the item's start; used when none contains it whole.
@@ -237,7 +245,7 @@ enum Containment {
 }
 
 impl Containment {
-    fn admits(self, symbol: &Range, item: &Range) -> bool {
+    pub(super) fn admits(self, symbol: &Range, item: &Range) -> bool {
         let starts_inside = symbol.start <= item.start;
         match self {
             Self::Whole => starts_inside && item.end <= symbol.end,
@@ -254,30 +262,49 @@ pub(super) fn innermost_hierarchical(symbols: &[Symbol], item: &Range) -> Option
         .find_map(|rule| descend(symbols, item, rule))
 }
 
-fn descend(symbols: &[Symbol], item: &Range, rule: Containment) -> Option<EnclosingSymbol> {
-    let mut name_path = Vec::new();
-    let mut level = symbols;
-    let mut found: Option<&Symbol> = None;
-    while let Some(symbol) = level
+/// Which of several siblings admitting an item is the innermost: the latest
+/// start, then the earliest end, then the name and kind, so the choice does
+/// not depend on the server's sibling order.
+fn sibling_order(symbol: &Symbol) -> impl Ord {
+    (
+        symbol.range.start,
+        Reverse(symbol.range.end),
+        Reverse(symbol.name.as_str()),
+        Reverse(symbol.kind),
+    )
+}
+
+fn innermost_sibling<'s>(
+    level: &'s [Symbol],
+    item: &Range,
+    rule: Containment,
+) -> Option<&'s Symbol> {
+    level
         .iter()
         .filter(|symbol| rule.admits(&symbol.range, item))
-        .max_by_key(|symbol| {
-            (
-                symbol.range.start,
-                Reverse(symbol.range.end),
-                Reverse(symbol.name.as_str()),
-                Reverse(symbol.kind),
-            )
-        })
-    {
-        name_path.push(symbol.name.clone());
-        found = Some(symbol);
-        level = symbol.children.as_deref().unwrap_or_default();
-    }
-    found.map(|symbol| EnclosingSymbol {
-        name_path,
-        kind: symbol.kind,
-        range: symbol.range,
+        .max_by_key(|symbol| sibling_order(symbol))
+}
+
+/// The chain of nested symbols admitting `item` under `rule`, outermost first:
+/// the innermost admitting sibling at each level, then the same inside its
+/// children. Empty when no top-level symbol admits `item`.
+pub(super) fn descend_path(
+    symbols: &[Symbol],
+    item: Range,
+    rule: Containment,
+) -> impl Iterator<Item = &Symbol> {
+    std::iter::successors(innermost_sibling(symbols, &item, rule), move |symbol| {
+        innermost_sibling(symbol.children.as_deref().unwrap_or_default(), &item, rule)
+    })
+}
+
+fn descend(symbols: &[Symbol], item: &Range, rule: Containment) -> Option<EnclosingSymbol> {
+    let path: Vec<&Symbol> = descend_path(symbols, *item, rule).collect();
+    let innermost = path.last()?;
+    Some(EnclosingSymbol {
+        name_path: path.iter().map(|symbol| symbol.name.clone()).collect(),
+        kind: innermost.kind,
+        range: innermost.range,
         fidelity: SymbolFidelity::Hierarchical,
     })
 }
@@ -287,15 +314,7 @@ pub(super) fn innermost_flat(symbols: &[FlatSymbol], item: &Range) -> Option<Enc
         symbols
             .iter()
             .filter(|flat| rule.admits(&flat.symbol.range, item))
-            .max_by_key(|flat| {
-                let symbol = &flat.symbol;
-                (
-                    symbol.range.start,
-                    Reverse(symbol.range.end),
-                    Reverse(symbol.name.as_str()),
-                    Reverse(symbol.kind),
-                )
-            })
+            .max_by_key(|flat| sibling_order(&flat.symbol))
             .map(|flat| EnclosingSymbol {
                 name_path: flat
                     .container_name
@@ -336,10 +355,16 @@ enum FileResolution {
     Skipped(EnclosingSymbolOutcome),
 }
 
+/// What the pass found for one item: its enclosing symbol and, when the source
+/// pass ran, its source.
+struct ItemResolution {
+    enclosing: EnclosingSymbolOutcome,
+    source: Option<SourceOutcome>,
+}
+
 /// Outcomes for every hit, in input order, plus the call-level summary.
 struct Resolution {
-    outcomes: Vec<EnclosingSymbolOutcome>,
-    sources: Vec<SourceOutcome>,
+    outcomes: Vec<ItemResolution>,
     summary: EnrichmentSummary,
     positions_degraded: Option<PositionDegradation>,
 }
@@ -369,12 +394,10 @@ impl Translator {
     /// Attaches enclosing symbols, and for [`LocationContext::SymbolSource`]
     /// source text, to `locations` when `context` asks for it.
     ///
-    /// `target_ranges` is parallel to `locations` or empty; `rule` picks the
-    /// span a source is cut from.
+    /// `rule` picks the span a source is cut from.
     pub(super) async fn contextualize_locations(
         &self,
-        locations: Vec<Location>,
-        target_ranges: &[Option<Range>],
+        locations: Vec<NormalizedLocation>,
         context: LocationContext,
         rule: SpanRule,
         positions_degraded: Option<PositionDegradation>,
@@ -386,29 +409,23 @@ impl Translator {
             }
         };
         let source_rule = (context == LocationContext::SymbolSource).then_some(rule);
-        let items = locations
-            .into_iter()
-            .map(NavigationLocation::from)
-            .collect();
-        let mut contextualized = self
-            .contextualize_items(
-                items,
-                target_ranges,
-                enclosing,
-                source_rule,
-                positions_degraded,
-                |targets, index, item| Hit {
-                    uri: &item.location.uri,
-                    range: &item.location.range,
-                    target_range: targets.get(index).copied().flatten(),
-                },
-            )
-            .await;
-        let sources = std::mem::take(&mut contextualized.sources);
-        for (item, source) in contextualized.items.iter_mut().zip(sources) {
-            item.inner.source = Some(source);
-        }
-        contextualized
+        self.contextualize_items(
+            locations,
+            &(),
+            enclosing,
+            source_rule,
+            |(), item| Hit {
+                uri: &item.location.uri,
+                range: &item.location.range,
+                target_range: item.target_range,
+            },
+            |item, source| NavigationLocation {
+                location: item.location,
+                source,
+            },
+        )
+        .await
+        .with_input_degradation(positions_degraded)
     }
 
     /// Attaches enclosing symbols to the diagnostics of the file `uri` when
@@ -425,55 +442,53 @@ impl Translator {
             uri,
             context,
             None,
-            positions_degraded,
-            |uri, _, diagnostic| Hit {
+            |uri, diagnostic| Hit {
                 uri,
                 range: &diagnostic.range,
                 target_range: None,
             },
+            |diagnostic, _| diagnostic,
         )
         .await
+        .with_input_degradation(positions_degraded)
     }
 
     /// `shared` is data every hit borrows from besides its own item, such as
-    /// the one URI of a file's diagnostics. With a `source_rule` the result
-    /// also carries one [`SourceOutcome`] per item.
-    async fn contextualize_items<T: Send, S: Sync + ?Sized>(
+    /// the one URI of a file's diagnostics. `finish` builds each output item
+    /// from its input and, when `source_rule` is set, its [`SourceOutcome`].
+    async fn contextualize_items<I: Send, T, S: Sync + ?Sized>(
         &self,
-        items: Vec<T>,
+        items: Vec<I>,
         shared: &S,
         context: ResultContext,
         source_rule: Option<SpanRule>,
-        positions_degraded: Option<PositionDegradation>,
-        hit: impl for<'a> Fn(&'a S, usize, &'a T) -> Hit<'a> + Sync,
+        hit: impl for<'a> Fn(&'a S, &'a I) -> Hit<'a> + Sync,
+        finish: impl Fn(I, Option<SourceOutcome>) -> T,
     ) -> Contextualized<T> {
         if context == ResultContext::None || items.is_empty() {
             return Contextualized {
-                items: items.into_iter().map(Contextual::from).collect(),
-                sources: Vec::new(),
+                items: items
+                    .into_iter()
+                    .map(|item| Contextual::from(finish(item, None)))
+                    .collect(),
                 enrichment: None,
-                positions_degraded,
+                positions_degraded: None,
             };
         }
-        let hits: Vec<Hit<'_>> = items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| hit(shared, index, item))
-            .collect();
+        let hits: Vec<Hit<'_>> = items.iter().map(|item| hit(shared, item)).collect();
         let resolution = self.resolve_enclosing(&hits, source_rule).await;
         let items = items
             .into_iter()
             .zip(resolution.outcomes)
-            .map(|(inner, outcome)| Contextual {
-                inner,
-                enclosing_symbol: Some(outcome),
+            .map(|(item, resolved)| Contextual {
+                inner: finish(item, resolved.source),
+                enclosing_symbol: Some(resolved.enclosing),
             })
             .collect();
         Contextualized {
             items,
-            sources: resolution.sources,
             enrichment: Some(resolution.summary),
-            positions_degraded: positions_degraded.max(resolution.positions_degraded),
+            positions_degraded: resolution.positions_degraded,
         }
     }
 
@@ -507,12 +522,16 @@ impl Translator {
 
         let outcomes = hits
             .iter()
-            .map(|hit| match files.get(hit.uri) {
-                Some(FileResolution::Tree(tree)) => outcome_for(tree, hit.range),
-                Some(FileResolution::Skipped(outcome)) => outcome.clone(),
-                None => EnclosingSymbolOutcome::Unavailable {
-                    reason: UnavailableReason::RequestFailed,
+            .enumerate()
+            .map(|(index, hit)| ItemResolution {
+                enclosing: match files.get(hit.uri) {
+                    Some(FileResolution::Tree(tree)) => outcome_for(tree, hit.range),
+                    Some(FileResolution::Skipped(outcome)) => outcome.clone(),
+                    None => EnclosingSymbolOutcome::Unavailable {
+                        reason: UnavailableReason::RequestFailed,
+                    },
                 },
+                source: pass.as_mut().map(|pass| pass.take(index)),
             })
             .collect();
 
@@ -530,7 +549,6 @@ impl Translator {
         });
         Resolution {
             outcomes,
-            sources: pass.map_or_default(SourcePass::into_outcomes),
             summary: EnrichmentSummary {
                 files_enriched,
                 files_skipped: files.len().saturating_sub(files_enriched),

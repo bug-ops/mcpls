@@ -354,7 +354,7 @@ mod tests {
     /// the real `handle_incoming_calls`/`handle_outgoing_calls` handlers, and
     /// pins the actual resulting error: `Error::FileIo` from
     /// `validate_path`'s `canonicalize()` call, not the old construction-time
-    /// `Error::InvalidToolParams`.
+    /// `Error::NotFileUri`.
     #[tokio::test]
     async fn test_handle_incoming_calls_with_nonexistent_file_uri_returns_file_io_not_invalid_uri()
     {
@@ -371,7 +371,7 @@ mod tests {
         );
         // `Url::to_file_path` on Windows requires a drive-letter first path
         // segment; a Unix-style path with none fails to convert at all
-        // (`uri_to_path` returns `None`, i.e. `Error::InvalidToolParams`)
+        // (`uri_to_path` returns `None`, i.e. `Error::NotFileUri`)
         // before ever reaching `canonicalize()`, trivially failing this
         // assertion for the wrong reason. Use a drive-letter path so the
         // test exercises the intended `FileIo` path on every platform.
@@ -430,9 +430,10 @@ mod tests {
             .handle_incoming_calls(checked_hierarchy_item(item))
             .await;
 
-        let Err(Error::InvalidToolParams(message)) = result else {
-            panic!("expected InvalidToolParams, got {result:?}");
+        let Err(Error::NotFileUri(echoed)) = result else {
+            panic!("expected NotFileUri, got {result:?}");
         };
+        let message = echoed.as_str();
         assert!(
             message.len() <= 2 * crate::util::MAX_ECHOED_PATH_BYTES,
             "{}",

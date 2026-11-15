@@ -378,7 +378,6 @@ impl Translator {
 
         let Contextualized {
             items: diagnostics,
-            sources: _,
             enrichment,
             positions_degraded,
         } = self

@@ -241,7 +241,9 @@ impl RestartFailure {
             | Error::InvalidHierarchyItemInput(_)
             | Error::PositionBeyondDocument { .. }
             | Error::ServerUnavailable { .. }
-            | Error::InvalidToolParams(_)
+            | Error::InvalidKindFilter(_)
+            | Error::NotFileUri(_)
+            | Error::InvalidTextField(_)
             | Error::FileIo { .. }
             | Error::PathOutsideWorkspace(_)
             | Error::NoWorkspaceRoots(_)

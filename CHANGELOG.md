@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `handle_workspace_symbol` takes a bounded `WorkspaceQuery`, and an over-long query fails with a -32602 error naming `query` (#930, #PR).
+- **Breaking:** `Error::InvalidToolParams` is removed in favour of typed `InvalidTextField`, `InvalidKindFilter` and `NotFileUri` errors, and `KindFilterInput::into_known` returns `InvalidKindFilter` (#932, #PR).
+- **Breaking:** `SourceOutcome`, `SourceSkipReason` and `LocationContext` are `#[non_exhaustive]`, and `ServerColumn`, `LabelOffsets` and the `Excerpt*` types are crate-private (#933, #PR).
+- `symbol_source` picks the innermost of overlapping sibling symbols, like `enclosing_symbol` (#931, #PR).
+- Internal: location link targets live on `NormalizedLocation` instead of parallel vectors, and UTF-16/UTF-8 column scanning is owned by `bridge/encoding.rs` (#928, #929, #PR).
+- Internal: disk-sweep and workspace-root task panics are logged through `PanicMessage` with a single `panic` field at `error` level (#933, #PR).
 - Internal: `LabelOffsets::new` and `substring` take `ServerColumn` offsets that carry their encoding, and the separate `encoding` parameter is removed (#921, #924).
 - Internal: `mcpls-core` `error.rs` is split into `error/{codes,echo,launch,stderr,symbols}` submodules, with `mcpls_core::error::*` paths unchanged (#914, #924).
 - **Breaking:** `Position2D` is non-zero by construction (`NonZeroU32`) and ordered, and `Position2D::lsp_character` and `Position::lsp_character` return the new `Utf16Column` (#913, #923).
@@ -35,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `symbol_source` spends at most a 16 MiB scan budget per call, and later items report `call_budget` instead of blocking a worker on long lines (#927, #PR).
 - A process-wide panic hook in `mcpls` logs one escaped, bounded line (new public `PanicMessage`) instead of printing the raw payload to stderr (#922, #924).
 - Panic payloads at the six background-task log sites are escaped and bounded once, where the panic is caught (#918, #923).
 - `get_tool_support` output schema lists every `Capability` spelling as an `enum`, and `FoldingKind` shares the same schema helper (#919, #923).

@@ -1035,7 +1035,7 @@ mod tests {
             .await;
         // Will fail due to no LSP server, but validates kind is accepted
         assert!(result.is_err());
-        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+        assert!(!matches!(result, Err(Error::InvalidKindFilter(_))));
     }
 
     #[tokio::test]
@@ -1058,7 +1058,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+        assert!(!matches!(result, Err(Error::InvalidKindFilter(_))));
     }
 
     #[tokio::test]
@@ -1081,7 +1081,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+        assert!(!matches!(result, Err(Error::InvalidKindFilter(_))));
     }
 
     #[tokio::test]
@@ -1104,7 +1104,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+        assert!(!matches!(result, Err(Error::InvalidKindFilter(_))));
     }
 
     #[tokio::test]
@@ -1129,7 +1129,7 @@ mod tests {
             .await;
         // Will fail due to no LSP server, but validates range is accepted
         assert!(result.is_err());
-        assert!(!matches!(result, Err(Error::InvalidToolParams(_))));
+        assert!(!matches!(result, Err(Error::InvalidKindFilter(_))));
     }
 
     #[tokio::test]
