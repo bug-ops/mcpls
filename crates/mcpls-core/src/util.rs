@@ -513,7 +513,8 @@ pub struct TaskPanicked {
 }
 
 impl TaskPanicked {
-    /// Best-effort text of the panic payload.
+    /// Best-effort text of the panic payload, escaped and bounded to
+    /// [`MAX_LOG_STRING_BYTES`] when the panic was caught, so it is safe to log verbatim.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -526,7 +527,7 @@ impl TaskPanicked {
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("non-string panic payload");
         Self {
-            message: message.to_owned(),
+            message: escape_bounded(message, MAX_LOG_STRING_BYTES),
         }
     }
 }
@@ -625,7 +626,7 @@ impl RestartBackoff {
         }
         if self.limiter.due(now.into_std(), self.delays.max) {
             tracing::error!(
-                error = %escape_bounded(panicked.message(), MAX_LOG_STRING_BYTES),
+                error = %panicked.message(),
                 operation = %what,
                 delay = ?self.delay,
                 "task panicked; restarting it after the delay, it is not running until then"

@@ -380,12 +380,12 @@ macro_rules! reject {
 /// end of the tracked document as invalid params, before any LSP request.
 #[tokio::test]
 async fn every_positioned_tool_rejects_a_line_beyond_the_document() {
-    use crate::bridge::ResultContext;
+    use crate::bridge::LocationContext;
 
     let dir = TempDir::new().unwrap();
     let (translator, path, _server) = tracked_translator(&dir, all_positioned_caps(), "a\nb\n");
     let file = || client_path(path.to_string_lossy().into_owned());
-    let (beyond, ctx) = (pos(99, 1), ResultContext::None);
+    let (beyond, ctx) = (pos(99, 1), LocationContext::None);
     let t = &translator;
 
     reject!("hover", t.handle_hover(file(), beyond));
@@ -769,7 +769,7 @@ async fn format_range_sends_zero_based_range_and_options() {
     assert_eq!(params["options"]["tabSize"], 2);
     assert_eq!(params["options"]["insertSpaces"], false);
     assert_eq!(result.edits.len(), 1);
-    assert_eq!(result.edits[0].range.start, Position2D::from_mcp(2, 2));
+    assert_eq!(result.edits[0].range.start, Position2D::at(2, 2));
 }
 
 #[tokio::test]
@@ -787,7 +787,7 @@ async fn format_range_converts_utf8_edit_columns() {
         }]),
     )
     .await;
-    assert_eq!(result.edits[0].range.start.character(), 3);
+    assert_eq!(result.edits[0].range.start.character().get(), 3);
     assert_eq!(result.positions_degraded, None);
 }
 

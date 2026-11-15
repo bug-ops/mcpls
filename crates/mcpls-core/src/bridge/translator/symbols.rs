@@ -143,7 +143,7 @@ pub(super) async fn symbol_tree(
             let mut result = Vec::with_capacity(symbols.len());
             for sym in symbols {
                 let range = ctx.normalize_range(uri, sym.location.range).await;
-                let selection_range = range.clone();
+                let selection_range = range;
                 result.push(FlatSymbol {
                     symbol: Symbol {
                         name: sym.base_symbol_information.name,
@@ -1212,7 +1212,7 @@ mod tests {
 
         assert_eq!(result.symbols.len(), 1);
         assert_eq!(
-            result.symbols[0].range.end.character(),
+            result.symbols[0].range.end.character().get(),
             3,
             "must convert against the queried document's own content (\"aöb\"), not fail to \
              read the entry's own (nonexistent, out-of-workspace) location.uri and fall back to \

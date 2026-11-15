@@ -88,6 +88,12 @@ impl BoundedPublish {
         &self.uri
     }
 
+    /// The published file URI, exactly as the server spelled it.
+    #[must_use]
+    pub const fn file_uri(&self) -> &lsp_types::Uri {
+        self.uri.uri()
+    }
+
     /// The document version the diagnostics are for, if the server said.
     #[must_use]
     pub const fn version(&self) -> Option<i32> {
@@ -340,12 +346,12 @@ impl PublishWriter {
     /// published with content older than what the server last said.
     pub fn publish(&self, publish: DecodedPublish) {
         let (publish, bytes) = BoundedPublish::new(publish);
-        let key = DiagnosticsKey::of(publish.uri().uri());
+        let key = DiagnosticsKey::of(publish.file_uri());
         let limits = self.shared.limits;
         let mut state = lock_std(&self.shared.state);
         if state.reader_gone {
             debug!(
-                uri = publish.uri().uri().as_ref(),
+                uri = publish.file_uri().as_ref(),
                 "dropping a publish: nobody reads the mailbox"
             );
             return;
@@ -720,8 +726,8 @@ mod tests {
             panic!("expected the lost file first");
         };
         assert_eq!(lost.uris(), [bounded(1)]);
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(2));
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(1));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(2));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(1));
         assert!(reader.recv().await.is_none());
     }
 
@@ -748,7 +754,7 @@ mod tests {
         drop(writer);
 
         for n in 0..10 {
-            assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(n));
+            assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(n));
         }
         assert!(reader.recv().await.is_none());
     }
@@ -784,8 +790,8 @@ mod tests {
             panic!("the loss must be handed over first");
         };
         assert_eq!(lost.uris(), [bounded(2), bounded(3)]);
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(0));
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(1));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(0));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(1));
     }
 
     /// A replacement that does not fit withdraws the older pending publish
@@ -837,7 +843,7 @@ mod tests {
             }
         }
         let delivered = delivered.expect("the replaced publish must reach the reader");
-        assert_eq!(delivered.uri().uri(), &uri(100));
+        assert_eq!(delivered.file_uri(), &uri(100));
         assert_eq!(
             delivered
                 .diagnostics()
@@ -927,7 +933,7 @@ mod tests {
             panic!("expected the lost file first");
         };
         assert_eq!(lost.uris(), [bounded(1)]);
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(2));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(2));
         assert!(reader.recv().await.is_none());
     }
 
@@ -942,7 +948,7 @@ mod tests {
         drop(writer);
 
         assert_matches!(reader.recv().await, Some(PublishDelivery::LostUnidentified));
-        assert_eq!(next_publish(&mut reader).await.uri().uri(), &uri(3));
+        assert_eq!(next_publish(&mut reader).await.file_uri(), &uri(3));
         assert!(reader.recv().await.is_none());
     }
 
@@ -969,7 +975,7 @@ mod tests {
         drop(writer);
 
         assert_eq!(
-            next_publish(&mut reader).await.uri().uri().as_ref().len(),
+            next_publish(&mut reader).await.file_uri().as_ref().len(),
             BoundedUri::MAX_BYTES
         );
     }

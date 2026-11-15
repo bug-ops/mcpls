@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `context: "symbol_source"` on `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and `go_to_declaration` adds each item's bounded source text (#909, #923).
+- The release workflow runs `scripts/check-release-bump.sh` and fails a Cargo-compatible version bump that carries breaking changes (#905, #923).
+
 ### Changed
 
+- **Breaking:** `Position2D` is non-zero by construction (`NonZeroU32`) and ordered, and `Position2D::lsp_character` and `Position::lsp_character` return the new `Utf16Column` (#913, #923).
+- **Breaking:** a zero line or character in a client-supplied hierarchy item or position now fails with serde's error text instead of `must be >= 1` (#913, #923).
+- **Breaking:** `ContextualLocation` is now `Contextual<NavigationLocation>` (`.inner.uri` becomes `.inner.location.uri`), and the `context` parameter of the location tools (`ReferencesParams`, `NavigationParams`, `DeclarationParams`) is now `LocationContext`, which accepts `symbol_source` (#909, #923).
+- **Breaking:** `FoldingKind` is `#[non_exhaustive]` (#919, #923).
+- `tools/list` size budget raised to 144,500 B total and 9,500 B per tool for `symbol_source` and closed-enum schemas (#909, #919, #923).
 - Production `tracing` events in `mcpls-core` carry values as structured fields under a constant message, and CI rejects interpolated messages via `scripts/check-tracing-messages.py` (#904).
 - Lint suppressions are `#[expect]` instead of `#[allow]` and `clippy::allow_attributes` is enabled workspace-wide, so stale suppressions fail the build (#904).
 - **Breaking:** `BoundedUri::new` is replaced by `TryFrom<Uri>` (error `UriTooLong`), and `BoundedPublish::uri()` returns `&BoundedUri` (#885, #908).
@@ -23,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Panic payloads at the six background-task log sites are escaped and bounded once, where the panic is caught (#918, #923).
+- `get_tool_support` output schema lists every `Capability` spelling as an `enum`, and `FoldingKind` shares the same schema helper (#919, #923).
 - Published-URI resolution treats NUL bytes, symlink loops and permission-denied paths as permanent refusals, so they no longer delay a server's other diagnostics (#910, #920).
 - The first undecodable-LSP-message warning no longer claims other messages were dropped, and the `workspace/configuration` reply cap has boundary tests (#917, #906, #920).
 - Three clippy 1.100 lints (`empty_enums`, `map_unwrap_or`) that failed the CI clippy gate (#904).

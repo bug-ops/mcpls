@@ -81,7 +81,7 @@ Results that depend on the server's index carry `indexing_in_progress`, which is
 
 ### Enclosing-symbol context
 
-`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition`, `go_to_declaration` and `get_diagnostics` accept `context`: `"none"` (the default, no extra work) or `"enclosing_symbol"`. With the second value, each location or diagnostic gains an `enclosing_symbol` naming the innermost symbol that contains it:
+`get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition`, `go_to_declaration` and `get_diagnostics` accept `context`: `"none"` (the default, no extra work) or `"enclosing_symbol"`. With the second value, each location or diagnostic gains an `enclosing_symbol` naming the innermost symbol that contains it. The five location tools also accept `"symbol_source"`, which adds the symbol's source text (see [symbol source](#symbol-source)); `get_diagnostics` accepts only the first two values.
 
 ```json
 {
@@ -105,6 +105,18 @@ Results that depend on the server's index carry `indexing_in_progress`, which is
 | `unavailable` | Attempted and failed, with a `reason`: `capability_absent`, `request_failed` or `timed_out` |
 
 `not_computed` and `unavailable` mean nothing is known; never read them as top level. The lookup costs one `documentSymbol` request per distinct file, capped at 16 files (or `max_documents / 4` when `workspace.max_documents` is below 64) and a 30 second budget. An `enrichment` object reports `files_enriched`, `files_skipped` and `cut_short`. The primary result is never affected.
+
+### Symbol source
+
+With `context: "symbol_source"`, each location from `get_references`, `get_definition`, `go_to_implementation`, `go_to_type_definition` and `go_to_declaration` carries the enclosing-symbol lookup above plus a `source` taken from the document text mcpls already tracks, so it adds no request; the text comes from that tracked document, and converting a position may read a line from disk, as for any location:
+
+| `source.status` | Meaning |
+|-----------------|---------|
+| `included` | `text` of the symbol, lines joined with `\n`, with `truncated: true` when it was cut at 200 lines or 16 KiB |
+| `same_as` | The span equals that of the earlier item `item` (an index into `locations`), which carries the text; 30 references inside one function cost one copy |
+| `not_computed` | No text, with a `reason`: `no_span`, `call_budget`, `document_changed` or `symbol_lookup_skipped` |
+
+For `get_references` the span is the symbol the reference sits in; a top-level reference has `no_span`. For the go-to tools it is the symbol the location names, else the `targetRange` of the server's link answer (local variables and parameters), else `no_span`. One call returns at most 64 KiB of `included` text and cuts at most 256 distinct spans; an item that does not fit is `call_budget` (later, smaller ones can still fit). `document_changed` means the document changed after the symbol lookup, so the ranges no longer describe its text. `symbol_lookup_skipped` means the file's symbol lookup was skipped or failed; the item's `enclosing_symbol` says why. The text is server-influenced content, passed through verbatim.
 
 ### Key naming
 

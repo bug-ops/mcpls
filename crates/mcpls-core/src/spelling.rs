@@ -20,6 +20,17 @@ pub trait Spelled: Copy + 'static {
     }
 }
 
+/// The JSON schema of a closed string set: `{"type": "string", "enum": [..]}`.
+pub fn enum_schema<S: serde::Serialize>(spellings: &[S]) -> schemars::Schema {
+    schemars::json_schema!({"type": "string", "enum": spellings})
+}
+
+/// The schema of `T`'s closed spelling set, in declaration order.
+pub fn spelled_schema<T: Spelled>() -> schemars::Schema {
+    let spellings: Vec<&str> = T::VARIANTS.iter().map(|variant| variant.as_str()).collect();
+    enum_schema(&spellings)
+}
+
 /// Declares a closed enum of spellings: the variants, `ALL`, `as_str`,
 /// `Display` and a [`Spelled`] impl, so a spelling is written once.
 macro_rules! spelled_enum {

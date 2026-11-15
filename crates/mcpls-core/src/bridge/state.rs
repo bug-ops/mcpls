@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use super::notifications::DocumentStamp;
-use super::{LspLine, WorkspacePath, WorkspaceRoots};
+use super::{LspLine, Utf16Column, WorkspacePath, WorkspaceRoots};
 use crate::config::{DocumentLimit, LanguageId, LanguageMap, ServerId, SizeLimit};
 use crate::error::{BackgroundTask, Error, Result};
 use crate::lsp::LspClient;
@@ -2030,6 +2030,235 @@ impl Drop for PathLockGuard<'_> {
     }
 }
 
+/// Bytes an excerpt reserves up front; the cap itself is usually far larger.
+const EXCERPT_INITIAL_CAPACITY: usize = 1024;
+
+/// Bounds on one source excerpt.
+#[derive(Debug, Clone, Copy)]
+pub struct ExcerptLimits {
+    /// Most lines an excerpt may span.
+    pub max_lines: NonZeroU32,
+    /// Most bytes an excerpt may hold.
+    pub max_bytes: std::num::NonZeroUsize,
+}
+
+/// Text cut out of a tracked document.
+#[derive(Debug)]
+pub struct Excerpt {
+    /// The excerpted text, lines joined with `\n`.
+    pub text: String,
+    /// Whether a limit cut the text short.
+    pub truncated: bool,
+}
+
+/// Why no excerpt could be cut.
+#[derive(Debug)]
+pub enum ExcerptError {
+    /// The document is not tracked.
+    Untracked,
+    /// The document is not the one the span was computed on.
+    Changed,
+}
+
+impl DocumentTracker {
+    /// Cuts `span` out of the pinned text of `path`, provided the document is
+    /// still the one `stamp` describes.
+    ///
+    /// In one lock acquisition it requires the same opening, the tracked
+    /// version to equal the stamped one, and `server` to have been told that
+    /// version, so a reload `server` has not seen never yields text its ranges
+    /// do not describe. A start column inside a character rounds down, an end
+    /// column inside one rounds up, and an end past the line end (or
+    /// `u32::MAX`) is the line end. Lines are joined with `\n`; at most
+    /// `limits.max_lines` lines and `limits.max_bytes` bytes are copied, cut
+    /// on a line boundary where one fits and on a character boundary else.
+    ///
+    /// # Errors
+    ///
+    /// [`ExcerptError::Untracked`] when `path` is not tracked and
+    /// [`ExcerptError::Changed`] when the stamp no longer matches.
+    pub(crate) fn excerpt(
+        &self,
+        path: &Path,
+        server: &ServerId,
+        stamp: DocumentStamp,
+        span: &super::Range,
+        limits: ExcerptLimits,
+    ) -> std::result::Result<Excerpt, ExcerptError> {
+        let documents = lock_std(&self.documents);
+        let excerpt = match documents.get(path) {
+            None => Err(ExcerptError::Untracked),
+            Some(state)
+                if Some(state.opened) == stamp.opening()
+                    && state.version == stamp.version()
+                    && state.synced_version(server) == Some(stamp.version()) =>
+            {
+                Ok(cut_excerpt(&state.text, span, limits))
+            }
+            Some(_) => Err(ExcerptError::Changed),
+        };
+        drop(documents);
+        excerpt
+    }
+}
+
+/// A character boundary of a line with the UTF-16 units before it.
+#[derive(Clone, Copy)]
+struct Boundary {
+    byte: usize,
+    units: u32,
+}
+
+/// The start of the character of `line` that contains `column` (a column past
+/// the end is the line end), found in one pass over the units before it.
+fn floor_boundary(line: &str, column: Utf16Column) -> Boundary {
+    let mut units = 0_u32;
+    for (byte, character) in line.char_indices() {
+        let next = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
+        if column.get() < next {
+            return Boundary { byte, units };
+        }
+        units = next;
+    }
+    Boundary {
+        byte: line.len(),
+        units,
+    }
+}
+
+/// Where a cut ends on its line.
+enum End {
+    /// At this byte offset.
+    At(usize),
+    /// Further than the byte cap from the start, so the scan stopped.
+    Beyond,
+}
+
+/// The first boundary of `line` at or after `column` units, scanning forward
+/// from `start` and giving up once more than `max_bytes` lie between them; a
+/// column past the line end (or `u32::MAX`) is the line end.
+fn ceil_end(line: &str, start: Boundary, column: Utf16Column, max_bytes: usize) -> End {
+    let mut units = start.units;
+    if units >= column.get() {
+        return End::At(start.byte);
+    }
+    let rest = line.get(start.byte..).unwrap_or_default();
+    for (offset, character) in rest.char_indices() {
+        units = units.saturating_add(u32::try_from(character.len_utf16()).unwrap_or(2));
+        let byte = start
+            .byte
+            .saturating_add(offset)
+            .saturating_add(character.len_utf8());
+        if units >= column.get() {
+            return End::At(byte);
+        }
+        if byte.saturating_sub(start.byte) > max_bytes {
+            return End::Beyond;
+        }
+    }
+    End::At(line.len())
+}
+
+/// Most bytes one UTF-16 unit can take in UTF-8 (a BMP character is 3 bytes for 1 unit).
+const MAX_BYTES_PER_UNIT: usize = 3;
+
+fn cut_excerpt(text: &DocumentText, span: &super::Range, limits: ExcerptLimits) -> Excerpt {
+    cut_excerpt_scanned(text, span, limits).0
+}
+
+/// [`cut_excerpt`] plus the bytes of text it looked at.
+///
+/// Every line is examined through a view of at most
+/// `3 * start column + max_bytes + 4` bytes, so a line is never scanned to its
+/// terminator beyond what the cut needs: the work is bounded by the start
+/// column and `max_bytes` per line, not by the line length.
+fn cut_excerpt_scanned(
+    text: &DocumentText,
+    span: &super::Range,
+    limits: ExcerptLimits,
+) -> (Excerpt, usize) {
+    let first = span.start.lsp_line();
+    let wanted = first.lines_through(span.end.lsp_line());
+    let take = wanted.min(limits.max_lines.get());
+    let mut truncated = wanted > take;
+    let max_bytes = limits.max_bytes.get();
+    let mut out = String::with_capacity(max_bytes.min(EXCERPT_INITIAL_CAPACITY));
+    let mut scanned = 0_usize;
+    let content = text.as_str();
+    let mut next_start = text.line_start(first.get());
+
+    for index in 0..take {
+        let Some(start) = next_start else {
+            break;
+        };
+        let is_first = index == 0;
+        let is_last = !truncated && index.saturating_add(1) == take;
+        let skip = if is_first {
+            usize::try_from(span.start.lsp_character().get())
+                .unwrap_or(usize::MAX)
+                .saturating_mul(MAX_BYTES_PER_UNIT)
+        } else {
+            0
+        };
+        let reach = skip.saturating_add(max_bytes).saturating_add(4);
+        let view_end = content.floor_char_boundary(start.saturating_add(reach).min(content.len()));
+        let view = content.get(start..view_end).unwrap_or_default();
+        scanned = scanned.saturating_add(view.len());
+        let terminator = view.bytes().position(is_line_terminator);
+        let line = &view[..terminator.unwrap_or(view.len())];
+        let view_cut = terminator.is_none() && view_end < content.len();
+        next_start = terminator.map(|offset| {
+            let end = start.saturating_add(offset);
+            let crlf = content.as_bytes().get(end) == Some(&b'\r')
+                && content.as_bytes().get(end.saturating_add(1)) == Some(&b'\n');
+            end.saturating_add(1).saturating_add(usize::from(crlf))
+        });
+
+        let from = if is_first {
+            floor_boundary(line, span.start.lsp_character())
+        } else {
+            Boundary { byte: 0, units: 0 }
+        };
+        let end = if is_last {
+            match ceil_end(line, from, span.end.lsp_character(), max_bytes) {
+                End::At(to) if view_cut && to >= line.len() => End::Beyond,
+                other => other,
+            }
+        } else {
+            End::At(line.len())
+        };
+        let separator = usize::from(!is_first);
+        let segment = match end {
+            End::At(to) => line.get(from.byte..to.max(from.byte)).unwrap_or_default(),
+            End::Beyond => line.get(from.byte..).unwrap_or_default(),
+        };
+        let fits = matches!(end, End::At(_))
+            && out
+                .len()
+                .saturating_add(separator)
+                .saturating_add(segment.len())
+                <= max_bytes;
+        if !fits {
+            truncated = true;
+            if is_first {
+                out.push_str(&segment[..segment.floor_char_boundary(max_bytes)]);
+            }
+            break;
+        }
+        if !is_first {
+            out.push('\n');
+        }
+        out.push_str(segment);
+    }
+    (
+        Excerpt {
+            text: out,
+            truncated,
+        },
+        scanned,
+    )
+}
+
 #[cfg(test)]
 impl DocumentTracker {
     /// Opens `path` as a tool call would, with the parent directory as the
@@ -2265,6 +2494,10 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     url.to_file_path().ok()
 }
 
+#[cfg(test)]
+mod excerpt_acceptance_tests;
+#[cfg(test)]
+mod excerpt_bounds_tests;
 #[cfg(test)]
 mod tests {
     use std::assert_matches;

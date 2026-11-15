@@ -93,7 +93,7 @@ macro_rules! closed_kind_filter {
             }
 
             fn schema() -> schemars::Schema {
-                schemars::json_schema!({"type": "string", "enum": Self::spellings()})
+                crate::spelling::enum_schema(&Self::spellings())
             }
         }
     };

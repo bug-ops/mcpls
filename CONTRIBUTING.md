@@ -153,7 +153,9 @@ Major architectural decisions are documented in `docs/adr/`. When proposing sign
 
 Maintainers bump the workspace `version` in the root `Cargo.toml` and the `version` fields of `server.json` (top level and the package entry) in the same change. `scripts/check-server-json-version.sh` enforces this in CI and in the release workflow before anything is published.
 
-Release archives carry build-provenance attestations. The `publish-registry` job of the release workflow is disabled until the first registry publication is confirmed (#813); once enabled it publishes `server.json` to the official MCP registry through GitHub OIDC, after the crate is on crates.io, and can be re-run for the same tag.
+`scripts/check-release-bump.sh <version>` runs in the release workflow (`bump-check`) and locally (`scripts/check-release-bump.sh 0.9.2 CHANGELOG.md HEAD` before tagging; it needs full history and tags). It fails a release when the version is semver-compatible with the previous stable release by Cargo's rules (same major from 1.0, same minor within 0.x; `0.0.x` is never checked) and there is breaking evidence: a `BREAKING CHANGE:` footer or a `!` type in a commit since that release, or a `**Breaking:**` entry in the version's CHANGELOG section. Prerelease tags never serve as the previous release, a prerelease tag is checked like any other version, and every tag, prerelease included, needs its own CHANGELOG section named exactly like the version (for example `## [0.10.0-rc.1]`).
+
+Release archives carry build-provenance attestations. The `publish-registry` job of the release workflow runs for every non-prerelease tag and publishes `server.json` to the official MCP registry through GitHub OIDC, after the crate is on crates.io, and can be re-run for the same tag.
 
 ## Getting Help
 

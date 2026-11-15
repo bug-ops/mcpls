@@ -54,6 +54,8 @@ pub mod transport;
 mod util;
 
 #[cfg(test)]
+mod panic_acceptance_tests;
+#[cfg(test)]
 mod test_lsp;
 #[cfg(test)]
 mod test_support;

@@ -59,7 +59,8 @@ async fn character(
     Some(
         ctx.to_mcp(uri, lsp_types::Position { line, character })
             .await
-            .character(),
+            .character()
+            .get(),
     )
 }
 
@@ -70,8 +71,8 @@ async fn region(
     range: lsp_types::FoldingRange,
 ) -> FoldingRegion {
     FoldingRegion {
-        start_line: LspLine::new(range.start_line).to_mcp(),
-        end_line: LspLine::new(range.end_line).to_mcp(),
+        start_line: LspLine::new(range.start_line).to_mcp().get(),
+        end_line: LspLine::new(range.end_line).to_mcp().get(),
         start_character: character(ctx, uri, range.start_line, range.start_character).await,
         end_character: character(ctx, uri, range.end_line, range.end_character).await,
         kind,

@@ -107,7 +107,7 @@ response, so that request would wait out the client's timeout)
 **Acceptance criteria:**
 ```
 GIVEN a byte offset that lands inside a multi-byte character (not on a UTF-8 char boundary)
-WHEN byte_offset_to_character/character_to_byte_offset is called with that offset
+WHEN a column type's at_byte or byte_offset_in is called with that offset
 THEN the function returns an Err, never panics
 
 GIVEN an MCP character column past the end of the target line's text
@@ -125,15 +125,18 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | FR-003 | WHEN the negotiated encoding is `Utf8` or `Utf32` AND `line_text` is available THE SYSTEM SHALL re-derive the column in the target encoding's units from the line's actual text, not a fixed arithmetic offset | must |
 | FR-004 | WHEN `line_text` is unavailable (e.g. the file could not be read) THE SYSTEM SHALL fall back to the raw, unconverted MCP/LSP character, reported as `PassedThrough`, rather than failing the request (except column 0, which is always `Exact`) | must |
 | FR-005 | WHEN a re-derived character offset does not round-trip exactly (lands inside a multi-unit character, e.g. a UTF-16 surrogate pair or a multi-byte UTF-8 sequence) THE SYSTEM SHALL fall back to the raw value, reported as `PassedThrough`, rather than silently rounding forward to the next character boundary | must |
-| FR-006 | WHEN `byte_offset_to_character`/`character_to_byte_offset` is given a byte offset that is not on a UTF-8 character boundary THE SYSTEM SHALL return an `Err`, never panic | must |
+| FR-006 | WHEN `Utf16Column::at_byte`/`ServerColumn::at_byte` is given a byte offset that is not on a UTF-8 character boundary, or `byte_offset_in` is given a UTF-8 column that is not on one, THE SYSTEM SHALL return an `Err(OffsetError)`, never panic | must |
 | FR-007 | THE SYSTEM SHALL support parsing (`PositionEncoding::from_lsp`) and serializing (`PositionEncoding::to_lsp`) the three LSP-defined encoding kind strings: `"utf-8"`, `"utf-16"`, `"utf-32"` | must |
-| FR-008 | WHEN `line.saturating_sub(1)` or `character.saturating_sub(1)` would underflow (an MCP position of `0`) THE SYSTEM SHALL clamp to `0` rather than wrapping or panicking | must |
+| FR-008 | WHEN an MCP position is converted to the 0-based LSP base THE SYSTEM SHALL subtract 1 from a `NonZeroU32` line and character, so an MCP position of `0` is unrepresentable (FR-015) and the subtraction cannot underflow | must |
 | FR-009 | WHEN a column is past the end of the line text THE SYSTEM SHALL clamp it to the line length in the target units; the result is `Exact` for an MCP column and `PassedThrough` for a server column (the server's text differs from ours) | must |
 | FR-010 | THE SYSTEM SHALL treat column 0, the UTF-16 fast path, and the LSP `u32::MAX` end-of-line sentinel (server to MCP) as `Exact` without consulting `line_text` | must |
 | FR-011 | THE SYSTEM SHALL split `line_text` and disk reads into lines per the LSP 3.17 line model (`\n`, `\r\n` and a lone `\r` end a line, the terminator is excluded, the empty line after a final terminator exists); servers that split only on `\n`/`\r\n` disagree on files containing a lone `\r` | must |
 | FR-012 | THE SYSTEM SHALL bound a tracked-document line lookup by line checkpoints (`DocumentText`), not a whole-document scan | must |
 | FR-013 | THE SYSTEM SHALL cap one response's disk-read I/O for position conversion at 4 times `workspace.max_file_size` (4 times the default when the limit is `0`) and at most 256 MiB, and reject `workspace.max_file_size` above 1 GiB | must |
 | FR-014 | THE SYSTEM SHALL reject a client-supplied line or character that is 0 or above 1,000,000 with invalid parameters (`-32602`) for every position- or range-taking tool, before any server is asked. `Position` holds non-zero integers and is built from client input only by `Position::from_client`; a `PositionRange` has `start <= end`, and `format_range` and `get_code_actions` additionally take a `BoundedRange` of at most 10,000 lines | must |
+| FR-015 | THE SYSTEM SHALL represent every 1-based MCP position as `NonZeroU32` line and character: `Position2D` (the output and hierarchy-item position) has non-zero fields, so a zero is unrepresentable. Deserializing a `Position2D`, a `Range` or a client-supplied `HierarchyItem` with a zero line or character fails with the serde error, and the generated schema declares `minimum: 1`. `Position2D` is `Ord` (line first, then character) and `Hash` | must |
+| FR-016 | THE SYSTEM SHALL keep the three column meanings in distinct types in `bridge/encoding.rs`, the only place that shifts between bases and units: `LspLine` (0-based line), `Utf16Column` (0-based UTF-16 column, the MCP unit) and `ServerColumn` (0-based column in the units of the encoding a server negotiated, carrying that encoding). Converting a column to a byte offset (`byte_offset_in`) and back (`at_byte`) is a method of the column type, so a column cannot be resolved with a mismatched encoding; there is no free-standing converter object and no raw `u32` column helper. `convert_column` stays the one private `u32` core with no other caller; its callers' surface is the typed wrappers `to_server_column` and `to_utf16_column`, which take and return column types | must |
+| FR-017 | THE SYSTEM SHALL resolve `byte_offset_in` to the first character boundary at or after the column (`OffsetError::PastEnd` beyond the end of the text, `InsideCharacter` for a UTF-8 column not on a boundary) and `at_byte` to the column of a boundary byte offset (`PastEnd`, `InsideCharacter`, `TooLong`); for any boundary column `at_byte(byte_offset_in(c)) == c` | must |
 
 ## 4. Non-Functional Requirements
 
@@ -149,8 +152,10 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
 | `PositionEncoding` | The three LSP-negotiable character-counting conventions | `Utf8`, `Utf16` (default), `Utf32` |
-| `EncodingConverter` | Stateless converter bound to one `PositionEncoding`, converting between byte offsets and character offsets in a given line of text | `byte_offset_to_character(text, byte_offset) -> Result<u32, OffsetError>`, `character_to_byte_offset(text, character_offset) -> Result<usize, OffsetError>` |
-| MCP position | 1-based `(line, character)`, character always in UTF-16 units | `line: u32`, `character: u32` |
+| `LspLine` | 0-based line, the LSP base; the only conversions to and from the 1-based MCP line are `from_mcp(NonZeroU32)` and `to_mcp() -> NonZeroU32` | `new(u32)`, `get()`, `lines_through(last)`, `saturating_add(u32)` |
+| `Utf16Column` | 0-based UTF-16 column, the MCP unit | `new(u32)`, `get()`, `from_mcp(NonZeroU32)`, `to_mcp() -> NonZeroU32`, `byte_offset_in(text) -> Result<usize, OffsetError>`, `at_byte(text, byte) -> Result<Self, OffsetError>` |
+| `ServerColumn` | 0-based column in the negotiated encoding's units, bound to that encoding (crate-internal) | `new(units, encoding)`, `byte_offset_in(text)`, `at_byte(text, byte, encoding)` |
+| MCP position | 1-based `(line, character)`, character always in UTF-16 units | `line: NonZeroU32`, `character: NonZeroU32` (`Position`, `Position2D`) |
 | LSP `Position` (`lsp_types::Position`) | 0-based `(line, character)`, character in the negotiated encoding's units | `line: u32`, `character: u32` |
 
 ## 6. Edge Cases and Error Handling
@@ -162,14 +167,14 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | Negotiated encoding is `Utf8`, line contains a 2-byte character (e.g. `é`) before the target column | Column re-derived in bytes, one further than a naive UTF-16-based offset (`test_mcp_to_lsp_position_utf8_negotiated_multibyte`) |
 | Negotiated encoding is `Utf8`, line contains an astral character (e.g. `𝄞`, 4 UTF-8 bytes / 2 UTF-16 units) | Column correctly re-derived across the surrogate pair (`test_mcp_to_lsp_position_utf8_negotiated_astral_char`) |
 | MCP character offset lands mid-surrogate-pair (client miscounted an astral character) | Falls back to the raw offset, flagged `PassedThrough`, rather than rounding forward past the whole character (`test_mcp_to_lsp_position_mid_surrogate_falls_back`) |
-| Byte offset lands mid-character (not a char boundary) | `Err`, not a panic (`test_byte_offset_to_character_mid_char_boundary_does_not_panic`) — a documented regression fix, since `text[..byte_offset]` would otherwise panic the handler |
+| Byte offset lands mid-character (not a char boundary) | `Err`, not a panic (the column-type `at_byte` mid-character tests) — a documented regression fix, since `text[..byte_offset]` would otherwise panic the handler |
 | MCP character far past the end of a short line | Clamped to the line length in target units, `Exact` (`test_mcp_to_lsp_position_past_end_of_line_clamps_exactly`) |
 | Server character past the end of its line text | Clamped but `PassedThrough` (`test_lsp_to_mcp_position_past_end_of_line_clamps_but_is_flagged_as_stale_text`) |
 | `line_text` is `None` (file unreadable) | Falls back to the raw value, `PassedThrough` (`test_mcp_to_lsp_position_missing_line_text_passes_through_flagged`) |
 | Column 0, either direction, no `line_text` | `Exact` (`test_column_zero_is_exact_without_line_text_in_both_directions`) |
 | Server `character == u32::MAX` | `Exact`, returned unchanged (`test_lsp_to_mcp_position_character_max_is_exact_for_non_utf16`) |
 | Negotiated encoding is `Utf16`, any column | Always `Exact` (`test_utf16_is_always_exact`) |
-| MCP position `(0, 0)` | Clamped to `(0, 0)` via `saturating_sub`, no underflow (`test_saturating_sub_zero`) |
+| MCP position `(0, 0)` | Unrepresentable: `Position2D`, `Position` and the hierarchy-item input reject a zero line or character at deserialization (FR-015) |
 | CRLF-terminated source line | No column shift — `line_text` never includes the terminator (`test_mcp_to_lsp_position_utf8_negotiated_crlf_line_text`) |
 | rust-analyzer itself rejects a position as out-of-range (its own internal `"Invalid offset LineCol { .. }"` error, distinct from this module's own conversion fallbacks) | Sanitized to a clean `"position out of range for this document"` message by `Error::LspServerError`'s `Display` impl (`crates/mcpls-core/src/error.rs`, #399) before reaching the MCP caller — out of this module's scope (it never sees LSP server-reported errors), but worth cross-referencing since both concern "position out of range" |
 
@@ -178,8 +183,10 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 | ID | Metric | Target |
 |----|--------|--------|
 | SC-001 | `cargo nextest run -E 'package(mcpls-core) and test(encoding)'` | All existing unit tests in `bridge/encoding.rs` pass |
-| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D::from_mcp(l, c)` for the `Utf16` fast path | Holds for `line`/`char` in `1..100` (`test_roundtrip`) |
+| SC-002 | Round-trip property: `lsp_to_mcp_position(mcp_to_lsp_position(Position { line: l, character: c }, ...), ...) == Position2D::from_mcp(l, c)` for the `Utf16` fast path, with `l` and `c` non-zero | Holds for `line`/`char` in `1..100` (`test_roundtrip`); a zero cannot be constructed |
 | SC-003 | No panic on any fuzzed/adversarial byte offset within `0..=text.len()` | Every offset either succeeds or returns `Err`, never panics |
+| SC-004 | Column round trip per encoding: `at_byte(byte_offset_in(c)) == c` for every boundary column of strings with astral characters and CRLF, for `Utf16Column` and `ServerColumn` in all three encodings | Holds (property tests in `bridge/encoding/column_acceptance_tests.rs`) |
+| SC-005 | Every `Position2D` definition in the golden `tools/list` schema declares `minimum: 1` | Holds (`tests/position_acceptance.rs`) |
 
 ## 8. Agent Boundaries
 
@@ -196,7 +203,7 @@ THEN the column is clamped to the line's length in the target encoding (LSP 3.17
 
 ### Never
 - Slice `text` at a byte offset without first checking `text.is_char_boundary(offset)` — this is
-  exactly the panic class `byte_offset_to_character`'s guard exists to prevent, and such a
+  exactly the panic class the column types' boundary checks exist to prevent, and such a
   panic leaves that request without a response
 
 ## 9. Open Questions

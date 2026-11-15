@@ -511,10 +511,10 @@ mod tests {
         };
 
         let mcp_range = test_ctx().normalize_range(&test_uri(), lsp_range).await;
-        assert_eq!(mcp_range.start.line(), 1);
-        assert_eq!(mcp_range.start.character(), 1);
-        assert_eq!(mcp_range.end.line(), 3);
-        assert_eq!(mcp_range.end.character(), 6);
+        assert_eq!(mcp_range.start.line().get(), 1);
+        assert_eq!(mcp_range.start.character().get(), 1);
+        assert_eq!(mcp_range.end.line().get(), 3);
+        assert_eq!(mcp_range.end.character().get(), 6);
     }
 
     /// End-to-end proof that a non-UTF-16 `EncodingCtx` is actually wired to
@@ -631,12 +631,12 @@ mod tests {
         let range_b = ctx.normalize_range(&uri_b, lsp_range).await;
 
         assert_eq!(
-            range_a.end.character(),
+            range_a.end.character().get(),
             3,
             "must convert against a.rs's own content"
         );
         assert_eq!(
-            range_b.end.character(),
+            range_b.end.character().get(),
             4,
             "must convert against b.rs's own content"
         );
@@ -808,7 +808,10 @@ mod tests {
         let before = lock_std(&ctx.line_cache).bytes_remaining;
 
         assert_eq!(ctx.to_lsp(&uri, pos(3, 1)).await.character, 0);
-        assert_eq!(ctx.to_mcp(&uri, lsp_position(2, 0)).await.character(), 1);
+        assert_eq!(
+            ctx.to_mcp(&uri, lsp_position(2, 0)).await.character().get(),
+            1
+        );
 
         assert_eq!(ctx.positions_degraded(), None);
         assert_eq!(lock_std(&ctx.line_cache).bytes_remaining, before);
@@ -898,7 +901,8 @@ mod tests {
         assert_eq!(
             ctx.to_mcp(&uri, lsp_position(0, u32::MAX))
                 .await
-                .character(),
+                .character()
+                .get(),
             u32::MAX
         );
         assert_eq!(ctx.positions_degraded(), None);

@@ -395,8 +395,7 @@ impl Pump {
         let items: Vec<BatchItem> = batch
             .into_iter()
             .map(|publish| {
-                if publication_admitted(publish.uri().uri(), admission_role, &self.workspace_roots)
-                {
+                if publication_admitted(publish.file_uri(), admission_role, &self.workspace_roots) {
                     BatchItem::Resolve(publish)
                 } else {
                     BatchItem::Skip(publish)

@@ -13,8 +13,8 @@ use url::Url;
 
 use super::dto::{Position2D, Range, Symbol};
 use super::enclosing::{
-    EnclosingSymbol, EnclosingSymbolOutcome, NotComputedReason, ResultContext, SymbolFidelity,
-    UnavailableReason, innermost_flat, innermost_hierarchical,
+    EnclosingSymbol, EnclosingSymbolOutcome, LocationContext, NotComputedReason, ResultContext,
+    SymbolFidelity, UnavailableReason, innermost_flat, innermost_hierarchical,
 };
 use super::symbols::FlatSymbol;
 use super::testing::*;
@@ -24,7 +24,7 @@ use crate::config::{DocumentLimit, ServerId};
 use crate::test_lsp::client_path;
 
 fn at(line: u32, character: u32) -> Position2D {
-    Position2D::from_mcp(line, character)
+    Position2D::at(line, character)
 }
 
 fn range(start: (u32, u32), end: (u32, u32)) -> Range {
@@ -38,7 +38,7 @@ fn symbol(name: &str, span: Range, children: Option<Vec<Symbol>>) -> Symbol {
     Symbol {
         name: name.to_string(),
         kind: 12,
-        selection_range: span.clone(),
+        selection_range: span,
         range: span,
         children,
     }
@@ -86,11 +86,8 @@ fn test_hierarchical_straddling_range_falls_back_to_start_containment() {
 #[test]
 fn test_identical_ranges_resolve_independently_of_server_order() {
     let span = range((1, 1), (3, 1));
-    let forward = vec![
-        symbol("a", span.clone(), None),
-        symbol("b", span.clone(), None),
-    ];
-    let backward = vec![symbol("b", span.clone(), None), symbol("a", span, None)];
+    let forward = vec![symbol("a", span, None), symbol("b", span, None)];
+    let backward = vec![symbol("b", span, None), symbol("a", span, None)];
     let hit = range((2, 1), (2, 2));
 
     assert_eq!(
@@ -205,7 +202,7 @@ async fn expect_request(wire: &mut BufReader<&mut tokio::io::DuplexStream>, meth
 async fn run_references(
     fx: &mut Fixture,
     main: &std::path::Path,
-    context: ResultContext,
+    context: LocationContext,
     references: Value,
     symbol_answers: Vec<(&str, Option<Value>)>,
 ) -> crate::bridge::LocationsResult {
@@ -283,7 +280,7 @@ async fn test_references_enclosing_symbol_one_request_per_file() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location(&uri, 1), location(&uri, 2), location(&uri, 4)]),
         vec![("main.rs", Some(symbols))],
     )
@@ -294,7 +291,7 @@ async fn test_references_enclosing_symbol_one_request_per_file() {
     };
     assert_eq!(first.name_path, ["S", "a"]);
     assert_eq!(first.fidelity, SymbolFidelity::Hierarchical);
-    assert_eq!(first.range.start.line(), 2);
+    assert_eq!(first.range.start.line().get(), 2);
     let EnclosingSymbolOutcome::Resolved(second) = outcome(&result, 1) else {
         panic!("expected a resolved symbol");
     };
@@ -321,7 +318,7 @@ async fn test_references_default_output_is_unchanged_and_issues_no_symbol_reques
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::None,
+        LocationContext::None,
         json!([location(&uri, 0)]),
         vec![],
     )
@@ -355,7 +352,7 @@ async fn test_references_without_document_symbol_capability_is_unavailable() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location(&uri, 0)]),
         vec![],
     )
@@ -381,7 +378,7 @@ async fn test_references_out_of_workspace_location_is_not_opened() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location("file:///outside/workspace/lib.rs", 0)]),
         vec![],
     )
@@ -412,7 +409,7 @@ async fn test_references_file_cap_skips_later_files_and_reports_cut_short() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([
             location(&file_uri(&first), 0),
             location(&file_uri(&second), 0)
@@ -456,7 +453,7 @@ async fn test_references_flat_symbol_information_uses_container_name() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location(&uri, 1)]),
         vec![("main.rs", Some(flat))],
     )
@@ -478,7 +475,7 @@ async fn test_references_failed_symbol_request_keeps_primary_result() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location(&uri, 0)]),
         vec![("main.rs", None)],
     )
@@ -557,7 +554,7 @@ async fn test_references_symlink_escaping_workspace_is_not_opened() {
     let result = run_references(
         &mut fx,
         &main,
-        ResultContext::EnclosingSymbol,
+        LocationContext::EnclosingSymbol,
         json!([location(&file_uri(&link), 0)]),
         vec![],
     )
@@ -615,7 +612,7 @@ async fn run_goto(
     fx: &mut Fixture,
     main: &std::path::Path,
     goto: Goto,
-    context: ResultContext,
+    context: LocationContext,
     response: Value,
     symbols: Option<Value>,
 ) -> Value {
@@ -679,7 +676,7 @@ async fn test_goto_default_output_is_unchanged_and_issues_no_symbol_request() {
             &mut fx,
             &main,
             goto,
-            ResultContext::None,
+            LocationContext::None,
             json!([location(&uri, 0)]),
             None,
         )
@@ -713,7 +710,7 @@ async fn test_goto_enclosing_symbol_resolves_for_every_tool() {
             &mut fx,
             &main,
             goto,
-            ResultContext::EnclosingSymbol,
+            LocationContext::EnclosingSymbol,
             json!([location(&uri, 0)]),
             Some(symbols),
         )
@@ -794,7 +791,7 @@ async fn test_enrichment_deadline_skips_remaining_files() {
                     client_path(path),
                     pos(1, 1),
                     true,
-                    ResultContext::EnclosingSymbol,
+                    LocationContext::EnclosingSymbol,
                 )
                 .await
         })

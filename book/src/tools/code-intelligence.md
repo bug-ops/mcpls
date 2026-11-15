@@ -32,7 +32,7 @@ The result is `null` when the server has no hover information for that position.
 
 Returns where a symbol is defined, across files and crates.
 
-Arguments: the same addressing as `get_hover`, plus optional `context` (see [enclosing-symbol context](overview.md#enclosing-symbol-context)).
+Arguments: the same addressing as `get_hover`, plus optional `context` (see [enclosing-symbol context](overview.md#enclosing-symbol-context) and [symbol source](overview.md#symbol-source)).
 
 ```json
 { "file_path": "/work/app/src/billing.rs", "symbol_name": "process_payment" }
@@ -68,7 +68,7 @@ Arguments: addressing as above, plus `include_declaration` (default `false`) and
 }
 ```
 
-Each location has `uri`, `range`, `out_of_workspace` and, with `context`, the `enclosing_symbol`. Searching a very common symbol can be slow, and the list is capped (`truncated: true`).
+Each location has `uri`, `range`, `out_of_workspace` and, with `context`, the `enclosing_symbol` (and, with `symbol_source`, the `source` of the enclosing symbol). Searching a very common symbol can be slow, and the list is capped (`truncated: true`).
 
 An empty result carries `index_coverage`: `synced_documents` is how many documents are currently synced to the server process (eviction of old documents lowers it), and `server_restarted` is `true` after a restart or respawn and stays `true` for the rest of the session. Some servers index only documents opened in the session, so the empty answer covers only what the server has indexed and is not proof that the symbol is unused. `get_definition` can still resolve such a symbol; touching the files of interest widens the answer.
 

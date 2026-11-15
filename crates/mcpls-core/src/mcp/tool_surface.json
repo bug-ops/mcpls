@@ -42,13 +42,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -212,13 +212,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -405,13 +405,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -752,13 +752,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -1012,8 +1012,8 @@
     "description": "Definition location of a symbol. Returns file path, line, and character where declared. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
-        "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.",
+        "LocationContext": {
+          "description": "What extra to attach to each returned location.",
           "oneOf": [
             {
               "const": "none",
@@ -1021,6 +1021,10 @@
             },
             {
               "const": "enclosing_symbol",
+              "type": "string"
+            },
+            {
+              "const": "symbol_source",
               "type": "string"
             }
           ]
@@ -1048,9 +1052,9 @@
           ]
         },
         "context": {
-          "$ref": "#/$defs/ResultContext",
+          "$ref": "#/$defs/LocationContext",
           "default": "none",
-          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
+          "description": "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -1140,6 +1144,9 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "source": {
+              "$ref": "#/$defs/SourceOutcome"
             },
             "uri": {
               "description": "URI of the document.",
@@ -1296,13 +1303,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -1387,6 +1394,86 @@
             "position_source"
           ],
           "type": "object"
+        },
+        "SourceOutcome": {
+          "description": "The source of one location.",
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "included",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "status",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "item": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "same_as",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "item"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceSkipReason"
+                },
+                "status": {
+                  "const": "not_computed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceSkipReason": {
+          "description": "Why an item has no source text.",
+          "oneOf": [
+            {
+              "const": "no_span",
+              "type": "string"
+            },
+            {
+              "const": "call_budget",
+              "type": "string"
+            },
+            {
+              "const": "document_changed",
+              "type": "string"
+            },
+            {
+              "const": "symbol_lookup_skipped",
+              "type": "string"
+            }
+          ]
         },
         "SymbolFidelity": {
           "description": "How much ancestry an [`EnclosingSymbol`] name path carries.",
@@ -1475,10 +1562,12 @@
           "oneOf": [
             {
               "const": "none",
+              "description": "Return the plain result with no extra lookups.",
               "type": "string"
             },
             {
               "const": "enclosing_symbol",
+              "description": "Attach the innermost enclosing symbol to each item, one documentSymbol request per file.",
               "type": "string"
             }
           ]
@@ -1744,13 +1833,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -1949,13 +2038,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -2052,13 +2141,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -2414,13 +2503,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -2616,13 +2705,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -2736,13 +2825,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -2922,13 +3011,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -3050,13 +3139,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -3170,13 +3259,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -3261,8 +3350,8 @@
     "description": "References to a symbol, across workspace. Capped at a fixed maximum for an extremely common symbol; `truncated: true` on the result means more references exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory). On an empty result, `index_coverage` gives `synced_documents` (documents currently synced) and `server_restarted` (once true, stays true); the server may not index other files, so not proof of absence.",
     "inputSchema": {
       "$defs": {
-        "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.",
+        "LocationContext": {
+          "description": "What extra to attach to each returned location.",
           "oneOf": [
             {
               "const": "none",
@@ -3270,6 +3359,10 @@
             },
             {
               "const": "enclosing_symbol",
+              "type": "string"
+            },
+            {
+              "const": "symbol_source",
               "type": "string"
             }
           ]
@@ -3297,9 +3390,9 @@
           ]
         },
         "context": {
-          "$ref": "#/$defs/ResultContext",
+          "$ref": "#/$defs/LocationContext",
           "default": "none",
-          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
+          "description": "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -3394,6 +3487,9 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "source": {
+              "$ref": "#/$defs/SourceOutcome"
             },
             "uri": {
               "description": "URI of the document.",
@@ -3567,13 +3663,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -3658,6 +3754,86 @@
             "position_source"
           ],
           "type": "object"
+        },
+        "SourceOutcome": {
+          "description": "The source of one location.",
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "included",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "status",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "item": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "same_as",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "item"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceSkipReason"
+                },
+                "status": {
+                  "const": "not_computed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceSkipReason": {
+          "description": "Why an item has no source text.",
+          "oneOf": [
+            {
+              "const": "no_span",
+              "type": "string"
+            },
+            {
+              "const": "call_budget",
+              "type": "string"
+            },
+            {
+              "const": "document_changed",
+              "type": "string"
+            },
+            {
+              "const": "symbol_lookup_skipped",
+              "type": "string"
+            }
+          ]
         },
         "SymbolFidelity": {
           "description": "How much ancestry an [`EnclosingSymbol`] name path carries.",
@@ -3778,13 +3954,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -4277,13 +4453,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -4376,13 +4552,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -4510,13 +4686,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -4609,13 +4785,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -4709,6 +4885,29 @@
       "$defs": {
         "Capability": {
           "description": "LSP server capability the tool is gated on.",
+          "enum": [
+            "completionProvider",
+            "signatureHelpProvider",
+            "inlayHintProvider",
+            "hoverProvider",
+            "definitionProvider",
+            "referencesProvider",
+            "implementationProvider",
+            "typeDefinitionProvider",
+            "callHierarchyProvider",
+            "renameProvider",
+            "documentFormattingProvider",
+            "codeActionProvider",
+            "documentSymbolProvider",
+            "workspaceSymbolProvider",
+            "declarationProvider",
+            "typeHierarchyProvider",
+            "renameProvider.prepareProvider",
+            "documentHighlightProvider",
+            "documentRangeFormattingProvider",
+            "selectionRangeProvider",
+            "foldingRangeProvider"
+          ],
           "type": "string"
         },
         "RouteShape": {
@@ -4936,8 +5135,8 @@
     "description": "Declaration location of the symbol at position. Differs from go-to-definition for languages that separate declaration from definition (C/C++ headers, interface members); servers without a declaration concept may return the definition. An empty result is valid. Capped at a fixed maximum; `truncated: true` on the result means more locations exist than are returned. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
-        "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.",
+        "LocationContext": {
+          "description": "What extra to attach to each returned location.",
           "oneOf": [
             {
               "const": "none",
@@ -4945,6 +5144,10 @@
             },
             {
               "const": "enclosing_symbol",
+              "type": "string"
+            },
+            {
+              "const": "symbol_source",
               "type": "string"
             }
           ]
@@ -4960,9 +5163,9 @@
           "type": "integer"
         },
         "context": {
-          "$ref": "#/$defs/ResultContext",
+          "$ref": "#/$defs/LocationContext",
           "default": "none",
-          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
+          "description": "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -4995,6 +5198,9 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "source": {
+              "$ref": "#/$defs/SourceOutcome"
             },
             "uri": {
               "description": "URI of the document.",
@@ -5151,13 +5357,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -5197,6 +5403,86 @@
             "end"
           ],
           "type": "object"
+        },
+        "SourceOutcome": {
+          "description": "The source of one location.",
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "included",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "status",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "item": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "same_as",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "item"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceSkipReason"
+                },
+                "status": {
+                  "const": "not_computed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceSkipReason": {
+          "description": "Why an item has no source text.",
+          "oneOf": [
+            {
+              "const": "no_span",
+              "type": "string"
+            },
+            {
+              "const": "call_budget",
+              "type": "string"
+            },
+            {
+              "const": "document_changed",
+              "type": "string"
+            },
+            {
+              "const": "symbol_lookup_skipped",
+              "type": "string"
+            }
+          ]
         },
         "SymbolFidelity": {
           "description": "How much ancestry an [`EnclosingSymbol`] name path carries.",
@@ -5269,8 +5555,8 @@
     "description": "Implementation locations of a trait method or interface member. Capped at a fixed maximum for an extremely common trait/interface; `truncated: true` on the result means more implementations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
-        "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.",
+        "LocationContext": {
+          "description": "What extra to attach to each returned location.",
           "oneOf": [
             {
               "const": "none",
@@ -5278,6 +5564,10 @@
             },
             {
               "const": "enclosing_symbol",
+              "type": "string"
+            },
+            {
+              "const": "symbol_source",
               "type": "string"
             }
           ]
@@ -5305,9 +5595,9 @@
           ]
         },
         "context": {
-          "$ref": "#/$defs/ResultContext",
+          "$ref": "#/$defs/LocationContext",
           "default": "none",
-          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
+          "description": "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -5398,6 +5688,9 @@
             "range": {
               "$ref": "#/$defs/Range"
             },
+            "source": {
+              "$ref": "#/$defs/SourceOutcome"
+            },
             "uri": {
               "description": "URI of the document.",
               "type": "string"
@@ -5553,13 +5846,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -5644,6 +5937,86 @@
             "position_source"
           ],
           "type": "object"
+        },
+        "SourceOutcome": {
+          "description": "The source of one location.",
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "included",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "status",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "item": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "same_as",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "item"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceSkipReason"
+                },
+                "status": {
+                  "const": "not_computed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceSkipReason": {
+          "description": "Why an item has no source text.",
+          "oneOf": [
+            {
+              "const": "no_span",
+              "type": "string"
+            },
+            {
+              "const": "call_budget",
+              "type": "string"
+            },
+            {
+              "const": "document_changed",
+              "type": "string"
+            },
+            {
+              "const": "symbol_lookup_skipped",
+              "type": "string"
+            }
+          ]
         },
         "SymbolFidelity": {
           "description": "How much ancestry an [`EnclosingSymbol`] name path carries.",
@@ -5727,8 +6100,8 @@
     "description": "Type definition location of an expression or symbol. Distinct from go-to-definition for variable bindings. Capped at a fixed maximum for a pathological case; `truncated: true` on the result means more locations exist than are returned. Aim it with `line` + `character`, or with `symbol_name` (optionally narrowed by `symbol_kind` and `container`) for a symbol defined in the file: the result then carries `resolved_symbol` with the position that was queried. A name matching several symbols, none, or an unverifiable position fails with the candidates or the reason instead of guessing. `positions_degraded` (non-UTF-16 servers only): `\"request\"` means the queried position was sent unconverted, so the result may describe a different symbol and should not be trusted; `\"response\"` means only returned `character` offsets may be inexact. Pass `context: \"enclosing_symbol\"` to attach `enclosing_symbol` to each item: `status` `resolved` (with `name_path`, `kind`, `range`, `fidelity`), `top_level` (no symbol contains it), `not_computed` or `unavailable` (with a `reason`; nothing is known, never read as top level). Costs one documentSymbol request per distinct file, capped per call; `enrichment` reports files enriched or skipped and `cut_short`. `out_of_workspace: true` means not provably inside a configured workspace root (lexical, advisory).",
     "inputSchema": {
       "$defs": {
-        "ResultContext": {
-          "description": "Extra context a tool can attach to each returned item.",
+        "LocationContext": {
+          "description": "What extra to attach to each returned location.",
           "oneOf": [
             {
               "const": "none",
@@ -5736,6 +6109,10 @@
             },
             {
               "const": "enclosing_symbol",
+              "type": "string"
+            },
+            {
+              "const": "symbol_source",
               "type": "string"
             }
           ]
@@ -5763,9 +6140,9 @@
           ]
         },
         "context": {
-          "$ref": "#/$defs/ResultContext",
+          "$ref": "#/$defs/LocationContext",
           "default": "none",
-          "description": "Extra context: `none` (default) or `enclosing_symbol` (innermost symbol, one request per file)."
+          "description": "Extra context: `none` (default), `enclosing_symbol` (one request per file) or `symbol_source`."
         },
         "file_path": {
           "description": "Absolute path to the file.",
@@ -5855,6 +6232,9 @@
             },
             "range": {
               "$ref": "#/$defs/Range"
+            },
+            "source": {
+              "$ref": "#/$defs/SourceOutcome"
             },
             "uri": {
               "description": "URI of the document.",
@@ -6011,13 +6391,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -6102,6 +6482,86 @@
             "position_source"
           ],
           "type": "object"
+        },
+        "SourceOutcome": {
+          "description": "The source of one location.",
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "included",
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "status",
+                "text",
+                "truncated"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "item": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "status": {
+                  "const": "same_as",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "item"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/SourceSkipReason"
+                },
+                "status": {
+                  "const": "not_computed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "SourceSkipReason": {
+          "description": "Why an item has no source text.",
+          "oneOf": [
+            {
+              "const": "no_span",
+              "type": "string"
+            },
+            {
+              "const": "call_budget",
+              "type": "string"
+            },
+            {
+              "const": "document_changed",
+              "type": "string"
+            },
+            {
+              "const": "symbol_lookup_skipped",
+              "type": "string"
+            }
+          ]
         },
         "SymbolFidelity": {
           "description": "How much ancestry an [`EnclosingSymbol`] name path carries.",
@@ -6330,13 +6790,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -6515,13 +6975,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -6721,13 +7181,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -6973,13 +7433,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -7511,13 +7971,13 @@
           "properties": {
             "character": {
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             },
             "line": {
               "description": "Line number (1-based).",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": "integer"
             }
           },
