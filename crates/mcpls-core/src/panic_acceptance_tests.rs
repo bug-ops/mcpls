@@ -85,8 +85,8 @@ async fn test_after_panic_logs_a_long_payload_with_a_single_marker() {
     let fields = logs.fields_at(tracing::Level::ERROR);
     let error = fields
         .iter()
-        .find(|f| f.starts_with("error="))
-        .expect("error field");
+        .find(|f| f.starts_with("panic="))
+        .expect("panic field");
     assert_eq!(error.matches(TRUNCATION_MARKER).count(), 1, "{error}");
 }
 
@@ -103,4 +103,18 @@ fn test_panic_message_escapes_bounds_and_names_non_string_payloads() {
         crate::PanicMessage::from_payload(other.as_ref()).to_string(),
         "non-string panic payload"
     );
+}
+
+#[tokio::test]
+async fn test_panic_message_from_join_error_is_some_only_for_a_panic() {
+    let panicked = tokio::spawn(async { panic!("a\nforged") })
+        .await
+        .unwrap_err();
+    let message = crate::PanicMessage::from_join_error(panicked).expect("a panic");
+    assert_eq!(message.as_str(), "a\\nforged");
+
+    let handle = tokio::spawn(std::future::pending::<()>());
+    handle.abort();
+    let cancelled = handle.await.unwrap_err();
+    assert!(crate::PanicMessage::from_join_error(cancelled).is_none());
 }

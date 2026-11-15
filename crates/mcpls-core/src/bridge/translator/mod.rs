@@ -90,8 +90,8 @@ pub use enclosing::{
     UnavailableReason,
 };
 pub use kind_filter::{
-    CodeActionKindFilter, KindFilter, KindFilterField, KindFilterInput, RejectedKindFilter,
-    Rejection, SymbolKindFilter,
+    CodeActionKindFilter, InvalidKindFilter, KindFilter, KindFilterField, KindFilterInput,
+    RejectedKindFilter, Rejection, SymbolKindFilter,
 };
 pub use restart::{
     DiagnosticsRole, MAX_RESTART_SERVER_IDS, MAX_SERVER_ID_BYTES, NotificationReceivers,

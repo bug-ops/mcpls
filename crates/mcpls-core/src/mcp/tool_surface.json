@@ -7916,7 +7916,7 @@
           "type": "integer"
         },
         "query": {
-          "description": "Search query for symbol names (supports partial matching).",
+          "description": "Search query for symbol names (partial matching, at most 1000 bytes).",
           "type": "string"
         }
       },

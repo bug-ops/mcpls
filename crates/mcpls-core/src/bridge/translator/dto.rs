@@ -133,6 +133,8 @@ spelled_enum! {
         SymbolName => "symbol_name",
         /// `container` of a name-addressed tool.
         Container => "container",
+        /// `query` of `workspace_symbol_search`.
+        Query => "query",
     }
 }
 
@@ -266,6 +268,51 @@ impl CompletionTrigger {
 }
 
 impl_text_newtype!(CompletionTrigger, InvalidTextField);
+
+/// Longest accepted `workspace_symbol_search` `query`, in bytes.
+pub const MAX_WORKSPACE_QUERY_BYTES: usize = 1_000;
+
+/// A `workspace_symbol_search` query: at most [`MAX_WORKSPACE_QUERY_BYTES`]
+/// bytes, so an over-long query is refused before any language server is asked.
+///
+/// The empty string is valid: LSP defines it as "all symbols", so unlike
+/// [`BoundedText`] this type refuses only over-long text.
+///
+/// # Examples
+///
+/// ```
+/// use mcpls_core::bridge::{MAX_WORKSPACE_QUERY_BYTES, WorkspaceQuery};
+///
+/// assert_eq!(WorkspaceQuery::new("Foo")?.as_str(), "Foo");
+/// assert!(WorkspaceQuery::new("").is_ok());
+/// assert!(WorkspaceQuery::new("x".repeat(MAX_WORKSPACE_QUERY_BYTES + 1)).is_err());
+/// # Ok::<(), mcpls_core::bridge::InvalidTextField>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceQuery(String);
+
+impl WorkspaceQuery {
+    /// Validates `raw`, keeping it verbatim.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidTextField`] naming `query` when `raw` is longer than
+    /// [`MAX_WORKSPACE_QUERY_BYTES`].
+    pub fn new(raw: impl Into<String>) -> Result<Self, InvalidTextField> {
+        let raw = raw.into();
+        if raw.len() > MAX_WORKSPACE_QUERY_BYTES {
+            return Err(InvalidTextField::of(TextField::Query)(
+                InvalidBoundedText::TooLong {
+                    len: raw.len(),
+                    max: MAX_WORKSPACE_QUERY_BYTES,
+                },
+            ));
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl_text_newtype!(WorkspaceQuery, InvalidTextField);
 
 /// Largest tab size a client may request for formatting.
 pub const MAX_TAB_SIZE: u32 = 32;
@@ -2106,6 +2153,36 @@ mod tests {
                 CheckedHierarchyItem::from_client(hierarchy_wire([1, 1, 9, 1], bad)).unwrap_err();
             assert_matches!(err, InvalidHierarchyItem::SelectionRange(_), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn workspace_query_bounds_length_but_allows_empty_and_blank() {
+        assert_eq!(WorkspaceQuery::new("").unwrap().as_str(), "");
+        assert_eq!(WorkspaceQuery::new("  ").unwrap().as_str(), "  ");
+        assert!(WorkspaceQuery::new("x".repeat(MAX_WORKSPACE_QUERY_BYTES)).is_ok());
+        let error = WorkspaceQuery::new("x".repeat(MAX_WORKSPACE_QUERY_BYTES + 1)).unwrap_err();
+        assert_eq!(error.field, TextField::Query);
+        assert_eq!(
+            error.reason,
+            InvalidBoundedText::TooLong {
+                len: MAX_WORKSPACE_QUERY_BYTES + 1,
+                max: MAX_WORKSPACE_QUERY_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_query_bound_counts_bytes_not_characters() {
+        let at_cap = "\u{e9}".repeat(MAX_WORKSPACE_QUERY_BYTES / 2);
+        assert!(WorkspaceQuery::new(at_cap).is_ok());
+        let over = "\u{e9}".repeat(MAX_WORKSPACE_QUERY_BYTES / 2 + 1);
+        assert_eq!(
+            WorkspaceQuery::new(over).unwrap_err().reason,
+            InvalidBoundedText::TooLong {
+                len: MAX_WORKSPACE_QUERY_BYTES + 2,
+                max: MAX_WORKSPACE_QUERY_BYTES,
+            }
+        );
     }
 
     #[test]

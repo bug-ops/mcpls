@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use mcpls_core::bridge::{
     ClientPath, IndexingState, KindFilterField, KindFilterInput, NotificationCache, Position,
-    SymbolKindFilter, TabSize, Translator, WorkspaceRoots, apply_lifecycle_notification,
+    SymbolKindFilter, TabSize, Translator, WorkspaceQuery, WorkspaceRoots,
+    apply_lifecycle_notification,
 };
 use mcpls_core::config::{
     FileExtension, FilePattern, LanguageId, LspServerConfig, PositionEncodings, ServerCommand,
@@ -932,10 +933,11 @@ async fn test_workspace_symbol_search_basic() {
     // Search for "User" struct
     let result = timeout(
         Duration::from_secs(10),
-        translator
-            .lock()
-            .await
-            .handle_workspace_symbol("User".to_string(), None, 100),
+        translator.lock().await.handle_workspace_symbol(
+            WorkspaceQuery::new("User").unwrap(),
+            None,
+            100,
+        ),
     )
     .await;
 
@@ -975,7 +977,7 @@ async fn test_workspace_symbol_search_with_kind_filter() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
-            String::new(), // Empty query to get all symbols
+            WorkspaceQuery::new("").unwrap(), // Empty query to get all symbols
             Some(symbol_kind_filter("Struct")),
             100,
         ),
@@ -1014,7 +1016,7 @@ async fn test_workspace_symbol_search_max_results() {
         translator
             .lock()
             .await
-            .handle_workspace_symbol(String::new(), None, 5),
+            .handle_workspace_symbol(WorkspaceQuery::new("").unwrap(), None, 5),
     )
     .await;
 
@@ -1043,7 +1045,7 @@ async fn test_workspace_symbol_search_function() {
     let result = timeout(
         Duration::from_secs(10),
         translator.lock().await.handle_workspace_symbol(
-            "create".to_string(),
+            WorkspaceQuery::new("create").unwrap(),
             Some(symbol_kind_filter("Function")),
             100,
         ),

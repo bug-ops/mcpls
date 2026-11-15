@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::warn;
+use tracing::error;
 
 use crate::bridge::resources::DiagnosticsResourceUri;
 use crate::bridge::{
@@ -39,6 +39,7 @@ use crate::bridge::{
 };
 use crate::config::ServerId;
 use crate::mcp::SubscriptionRegistry;
+use crate::util::PanicMessage;
 
 /// Most companions one sweep visits; the rest follow on later ticks.
 const MAX_COMPANION_FILES_PER_TICK: usize = 32;
@@ -95,9 +96,10 @@ pub fn spawn_disk_sweep(
 /// resync did not finish is resynced by the next call that needs it.
 pub async fn stop_disk_sweep(handle: DiskSweepHandle) {
     handle.stop.cancel();
-    match handle.task.await {
-        Err(error) if error.is_panic() => warn!(%error, "disk sweep panicked"),
-        Ok(()) | Err(_) => {}
+    if let Err(failed) = handle.task.await
+        && let Some(panic) = PanicMessage::from_join_error(failed)
+    {
+        error!(%panic, "disk sweep panicked");
     }
 }
 
@@ -199,10 +201,10 @@ impl DiskSweep {
                 Ok((id, ())) => {
                     self.running.remove(&id);
                 }
-                Err(error) => {
-                    self.running.remove(&error.id());
-                    if error.is_panic() {
-                        warn!(%error, "disk sweep job panicked");
+                Err(failed) => {
+                    self.running.remove(&failed.id());
+                    if let Some(panic) = PanicMessage::from_join_error(failed) {
+                        error!(%panic, "disk sweep job panicked");
                     }
                 }
             }

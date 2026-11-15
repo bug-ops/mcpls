@@ -212,42 +212,70 @@ async fn lsp_locations_to_mcp(
     ctx: &EncodingCtx,
 ) -> NormalizedLocations {
     let locs = locs.into_iter().map(|location| (location, None)).collect();
-    normalize_locations(locs, ctx, false).await
+    normalize_locations(locs, ctx, TargetRanges::Skip).await
+}
+
+/// Whether a link's raw `targetRange` is normalized along with its location.
+///
+/// Only the source pass reads it, so the default output does no extra
+/// conversion work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetRanges {
+    /// Leave the target range out.
+    Skip,
+    /// Normalize it with the request's `ctx`.
+    Normalize,
+}
+
+impl From<LocationContext> for TargetRanges {
+    fn from(context: LocationContext) -> Self {
+        match context {
+            LocationContext::SymbolSource => Self::Normalize,
+            LocationContext::None | LocationContext::EnclosingSymbol => Self::Skip,
+        }
+    }
 }
 
 /// [`lsp_locations_to_mcp`] for locations that may carry a link's raw
-/// `targetRange`; the target ranges are normalized, with the request's
-/// `ctx`, only when `with_targets` is set, so the default output does no
-/// extra conversion work.
+/// `targetRange`, normalized as `targets` says.
 async fn normalize_locations(
     locs: Vec<(lsp_types::Location, Option<lsp_types::Range>)>,
     ctx: &EncodingCtx,
-    with_targets: bool,
+    targets: TargetRanges,
 ) -> NormalizedLocations {
     let mut budget = ItemBudget::new();
     let locs = budget.admit(locs);
     let truncated = budget.truncated();
     let mut locations = Vec::with_capacity(locs.len());
-    let mut target_ranges = Vec::new();
     for (loc, target) in locs {
-        locations.push(Location {
-            uri: loc.uri.to_string(),
-            range: ctx.normalize_range(&loc.uri, loc.range).await,
-            out_of_workspace: ctx.is_out_of_workspace(&loc.uri),
+        let target_range = match (targets, target) {
+            (TargetRanges::Normalize, Some(range)) => {
+                Some(ctx.normalize_range(&loc.uri, range).await)
+            }
+            (TargetRanges::Normalize | TargetRanges::Skip, _) => None,
+        };
+        locations.push(NormalizedLocation {
+            location: Location {
+                uri: loc.uri.to_string(),
+                range: ctx.normalize_range(&loc.uri, loc.range).await,
+                out_of_workspace: ctx.is_out_of_workspace(&loc.uri),
+            },
+            target_range,
         });
-        if with_targets {
-            target_ranges.push(match target {
-                Some(range) => Some(ctx.normalize_range(&loc.uri, range).await),
-                None => None,
-            });
-        }
     }
     NormalizedLocations {
         locations,
-        target_ranges,
         truncated,
         positions_degraded: ctx.positions_degraded(),
     }
+}
+
+/// One normalized location with the link target range the source pass reads.
+pub(super) struct NormalizedLocation {
+    pub(super) location: Location,
+    /// The go-to link's `targetRange`; `None` without a link or under
+    /// [`TargetRanges::Skip`].
+    pub(super) target_range: Option<Range>,
 }
 
 /// [`lsp_locations_to_mcp`]'s result: the normalized locations plus whether
@@ -260,9 +288,7 @@ async fn normalize_locations(
 /// past EOF, or invalid UTF-8 -- see `ctx.positions_degraded()`), surfaced
 /// via each result DTO's `positions_degraded` field (#497).
 struct NormalizedLocations {
-    locations: Vec<Location>,
-    /// Parallel to `locations` when the source pass asked for them, else empty.
-    target_ranges: Vec<Option<Range>>,
+    locations: Vec<NormalizedLocation>,
     truncated: bool,
     positions_degraded: Option<PositionDegradation>,
 }
@@ -331,12 +357,12 @@ impl GotoResponse for lsp_types::DeclarationResponse {
 /// Normalize a go-to-X response (`textDocument/definition`,
 /// `textDocument/implementation`, `textDocument/typeDefinition`, or
 /// `textDocument/declaration`) into a
-/// flat list of MCP `Location` values, keeping a link's `targetRange` when
-/// `with_targets` is set.
+/// flat list of MCP `Location` values, keeping a link's `targetRange` as
+/// `targets` says.
 async fn goto_response_to_locations<R: GotoResponse>(
     response: Option<R>,
     ctx: &EncodingCtx,
-    with_targets: bool,
+    targets: TargetRanges,
 ) -> NormalizedLocations {
     let lsp_locs = match response.map(GotoResponse::into_kind) {
         Some(GotoKind::Locations(locs)) => locs.into_iter().map(|loc| (loc, None)).collect(),
@@ -349,7 +375,7 @@ async fn goto_response_to_locations<R: GotoResponse>(
             .collect(),
         None => vec![],
     };
-    normalize_locations(lsp_locs, ctx, with_targets).await
+    normalize_locations(lsp_locs, ctx, targets).await
 }
 
 /// Extracts hover contents as a plain string.
@@ -520,13 +546,11 @@ impl Translator {
         let truncated = normalized.truncated;
         let Contextualized {
             items: locations,
-            sources: _,
             enrichment,
             positions_degraded,
         } = self
             .contextualize_locations(
                 normalized.locations,
-                &normalized.target_ranges,
                 context,
                 rule,
                 normalized.positions_degraded,
@@ -557,7 +581,7 @@ impl Translator {
         &self,
         file_path: &ClientPath,
         position: Position,
-        with_targets: bool,
+        targets: TargetRanges,
     ) -> Result<NormalizedLocations>
     where
         R: GotoRequest + lsp_types::Request<Result = Option<T>>,
@@ -577,7 +601,7 @@ impl Translator {
             )
             .await?;
 
-        Ok(goto_response_to_locations(response, &ctx, with_targets).await)
+        Ok(goto_response_to_locations(response, &ctx, targets).await)
     }
 
     /// Handle definition request.
@@ -595,11 +619,7 @@ impl Translator {
         context: LocationContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DefinitionRequest, _>(
-                &file_path,
-                position,
-                context == LocationContext::SymbolSource,
-            )
+            .handle_goto::<lsp_types::DefinitionRequest, _>(&file_path, position, context.into())
             .await?;
         Ok(self
             .contextualize_into(normalized, context, SpanRule::Definition)
@@ -680,7 +700,7 @@ impl Translator {
             .handle_goto::<lsp_types::ImplementationRequest, _>(
                 &file_path,
                 position,
-                context == LocationContext::SymbolSource,
+                context.into(),
             )
             .await?;
         Ok(self
@@ -709,7 +729,7 @@ impl Translator {
             .handle_goto::<lsp_types::TypeDefinitionRequest, _>(
                 &file_path,
                 position,
-                context == LocationContext::SymbolSource,
+                context.into(),
             )
             .await?;
         Ok(self
@@ -736,11 +756,7 @@ impl Translator {
         context: LocationContext,
     ) -> Result<LocationsResult> {
         let normalized = self
-            .handle_goto::<lsp_types::DeclarationRequest, _>(
-                &file_path,
-                position,
-                context == LocationContext::SymbolSource,
-            )
+            .handle_goto::<lsp_types::DeclarationRequest, _>(&file_path, position, context.into())
             .await?;
         Ok(self
             .contextualize_into(normalized, context, SpanRule::Definition)
@@ -2115,6 +2131,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_target_ranges_are_normalized_only_for_symbol_source() {
+        assert_eq!(
+            TargetRanges::from(LocationContext::SymbolSource),
+            TargetRanges::Normalize
+        );
+        assert_eq!(
+            TargetRanges::from(LocationContext::None),
+            TargetRanges::Skip
+        );
+        assert_eq!(
+            TargetRanges::from(LocationContext::EnclosingSymbol),
+            TargetRanges::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normalize_locations_keeps_each_link_target_with_its_location() {
+        let ctx = test_ctx_with(PositionEncoding::Utf8);
+        let at = |line| lsp_types::Range {
+            start: lsp_types::Position { line, character: 0 },
+            end: lsp_types::Position { line, character: 1 },
+        };
+        let uri = path_to_uri(std::path::Path::new("/nonexistent/a.rs")).unwrap();
+        let locs = vec![
+            (
+                lsp_types::Location {
+                    uri: uri.clone(),
+                    range: at(1),
+                },
+                Some(at(5)),
+            ),
+            (lsp_types::Location { uri, range: at(2) }, None),
+        ];
+
+        let kept = normalize_locations(locs.clone(), &ctx, TargetRanges::Normalize).await;
+        assert_eq!(
+            kept.locations
+                .iter()
+                .map(|l| l.target_range.is_some())
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+        let skipped = normalize_locations(locs, &ctx, TargetRanges::Skip).await;
+        assert!(skipped.locations.iter().all(|l| l.target_range.is_none()));
+    }
+
     // -----------------------------------------------------------------
     // Resource-amplification defenses (#474)
     // -----------------------------------------------------------------
@@ -2162,7 +2225,7 @@ mod tests {
             result
                 .locations
                 .iter()
-                .all(|l| l.range.end.character().get() == 4),
+                .all(|l| l.location.range.end.character().get() == 4),
             "MCP columns are 1-based, so LSP byte offset 3 in all-ASCII \"hello\" must convert \
              to 4"
         );

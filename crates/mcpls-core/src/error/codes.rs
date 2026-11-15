@@ -166,9 +166,9 @@ impl RetryableErrorData {
 /// # Examples
 ///
 /// ```
-/// use mcpls_core::error::{Error, McpErrorKind};
+/// use mcpls_core::error::{EchoedUri, Error, McpErrorKind};
 ///
-/// let err = Error::InvalidToolParams("missing `file_path`".to_string());
+/// let err = Error::NotFileUri(EchoedUri::new("untitled:x"));
 /// assert_eq!(err.mcp_error_kind(), McpErrorKind::InvalidParams);
 /// ```
 ///
@@ -205,7 +205,7 @@ mod tests {
     use crate::bridge::{Capability, InvalidClientPath};
     use crate::config::LanguageId;
     use crate::error::tests::no_server_for_language;
-    use crate::error::{BackgroundTask, Error, StdioStream};
+    use crate::error::{BackgroundTask, EchoedUri, Error, StdioStream};
     use crate::lsp::JsonRpcError;
     use crate::util::SizeExceeded;
 
@@ -214,7 +214,17 @@ mod tests {
     #[test]
     fn test_mcp_error_kind_caller_fault_variants_are_invalid_params() {
         let caller_fault_errors = vec![
-            Error::InvalidToolParams("bad params".to_string()),
+            Error::NotFileUri(EchoedUri::new("bad params")),
+            Error::InvalidKindFilter(
+                crate::bridge::KindFilterInput::<crate::bridge::SymbolKindFilter>::from(
+                    "nope".to_owned(),
+                )
+                .into_known(crate::bridge::KindFilterField::SymbolKind)
+                .unwrap_err(),
+            ),
+            Error::InvalidTextField(
+                crate::bridge::WorkspaceQuery::new("x".repeat(2_000)).unwrap_err(),
+            ),
             Error::PathOutsideWorkspace(PathBuf::from("/etc/passwd")),
             Error::NotARegularFile(PathBuf::from("/dev/null")),
             Error::NoResolvableListenUris,

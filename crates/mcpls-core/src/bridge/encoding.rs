@@ -68,6 +68,16 @@ impl PositionEncoding {
         Self::from_spelling(kind)
     }
 
+    /// Code units `ch` takes in this encoding: the one width table every
+    /// column scan of this module and its callers uses.
+    pub(crate) const fn units_of(self, ch: char) -> usize {
+        match self {
+            Self::Utf8 => ch.len_utf8(),
+            Self::Utf16 => ch.len_utf16(),
+            Self::Utf32 => 1,
+        }
+    }
+
     /// Convert to the [`lsp_types::PositionEncodingKind`] sent in `initialize`.
     #[must_use]
     pub const fn to_kind(self) -> lsp_types::PositionEncodingKind {
@@ -271,6 +281,99 @@ impl Utf16Column {
     pub fn at_byte(text: &str, byte: usize) -> Result<Self, OffsetError> {
         ServerColumn::at_byte(text, byte, PositionEncoding::Utf16).map(|column| Self(column.units))
     }
+
+    /// The start of the character of `line` that contains this column; a
+    /// column past the end is the line end. A column inside a surrogate pair
+    /// rounds down.
+    pub(super) fn floor_byte_in(self, line: &str) -> ColumnBoundary {
+        let mut total = 0;
+        for step in steps(line, PositionEncoding::Utf16) {
+            if (self.0 as usize) < step.after {
+                return ColumnBoundary {
+                    byte: step.start,
+                    column: Self::saturating(step.before),
+                };
+            }
+            total = step.after;
+        }
+        ColumnBoundary {
+            byte: line.len(),
+            column: Self::saturating(total),
+        }
+    }
+
+    /// The first character boundary of `line` at or after this column,
+    /// scanning forward from `from` and giving up (`None`) once more than
+    /// `max_bytes` lie between them. A column past the line end is the line
+    /// end; a column inside a surrogate pair rounds up.
+    pub(super) fn ceil_byte_in(
+        self,
+        line: &str,
+        from: ColumnBoundary,
+        max_bytes: usize,
+    ) -> Option<usize> {
+        let wanted = self.0 as usize;
+        let base = from.column.0 as usize;
+        if base >= wanted {
+            return Some(from.byte);
+        }
+        let rest = line.get(from.byte..).unwrap_or_default();
+        for step in steps(rest, PositionEncoding::Utf16) {
+            let byte = from.byte.saturating_add(step.end);
+            if base.saturating_add(step.after) >= wanted {
+                return Some(byte);
+            }
+            if step.end > max_bytes {
+                return None;
+            }
+        }
+        Some(line.len())
+    }
+
+    /// Most UTF-8 bytes `self` UTF-16 units can span, so a scan that must
+    /// reach this column never needs to look further.
+    pub(super) const fn max_utf8_prefix_bytes(self) -> usize {
+        (self.0 as usize).saturating_mul(MAX_UTF8_BYTES_PER_UTF16_UNIT)
+    }
+
+    fn saturating(units: usize) -> Self {
+        Self(u32::try_from(units).unwrap_or(u32::MAX))
+    }
+}
+
+/// Most bytes one UTF-16 unit can take in UTF-8 (a BMP character is 3 bytes
+/// for 1 unit).
+const MAX_UTF8_BYTES_PER_UTF16_UNIT: usize = 3;
+
+/// A character boundary of a line with the UTF-16 column before it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ColumnBoundary {
+    pub(super) byte: usize,
+    pub(super) column: Utf16Column,
+}
+
+/// One character of a scanned text with its place in bytes and units.
+struct Step {
+    start: usize,
+    end: usize,
+    before: usize,
+    after: usize,
+}
+
+/// Walks `text` once, giving each character's byte span and the units of
+/// `encoding` before and after it; the single walk every scan here shares.
+fn steps(text: &str, encoding: PositionEncoding) -> impl Iterator<Item = Step> + '_ {
+    text.char_indices()
+        .scan(0_usize, move |units, (start, ch)| {
+            let before = *units;
+            *units = before.saturating_add(encoding.units_of(ch));
+            Some(Step {
+                start,
+                end: start.saturating_add(ch.len_utf8()),
+                before,
+                after: *units,
+            })
+        })
 }
 
 /// A 0-based column in the units of the encoding a server negotiated.
@@ -278,7 +381,7 @@ impl Utf16Column {
 /// Carries its encoding, so a column cannot be resolved against text with
 /// another encoding's units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerColumn {
+pub(super) struct ServerColumn {
     units: u32,
     encoding: PositionEncoding,
 }
@@ -316,8 +419,9 @@ impl ServerColumn {
                 }
                 Ok(wanted)
             }
-            PositionEncoding::Utf16 => scan_units(text, wanted, char::len_utf16),
-            PositionEncoding::Utf32 => scan_units(text, wanted, |_| 1),
+            PositionEncoding::Utf16 | PositionEncoding::Utf32 => {
+                scan_units(text, wanted, self.encoding)
+            }
         }
     }
 
@@ -346,8 +450,9 @@ impl ServerColumn {
         };
         let units = match encoding {
             PositionEncoding::Utf8 => byte,
-            PositionEncoding::Utf16 => prefix.encode_utf16().count(),
-            PositionEncoding::Utf32 => prefix.chars().count(),
+            PositionEncoding::Utf16 | PositionEncoding::Utf32 => {
+                prefix.chars().map(|ch| encoding.units_of(ch)).sum()
+            }
         };
         let units = u32::try_from(units).map_err(|_| OffsetError::TooLong)?;
         Ok(Self::new(units, encoding))
@@ -356,17 +461,13 @@ impl ServerColumn {
 
 /// Walks `text` once, returning the first boundary at or after `wanted`
 /// units, or `text.len()` when `wanted` equals the total unit count.
-fn scan_units(
-    text: &str,
-    wanted: usize,
-    units_of: impl Fn(char) -> usize,
-) -> Result<usize, OffsetError> {
+fn scan_units(text: &str, wanted: usize, encoding: PositionEncoding) -> Result<usize, OffsetError> {
     let mut units = 0usize;
-    for (byte_idx, ch) in text.char_indices() {
-        if units >= wanted {
-            return Ok(byte_idx);
+    for step in steps(text, encoding) {
+        if step.before >= wanted {
+            return Ok(step.start);
         }
-        units = units.saturating_add(units_of(ch));
+        units = step.after;
     }
     if units == wanted {
         Ok(text.len())
@@ -536,7 +637,7 @@ fn exact_character(
 /// full per-unit table would cost memory proportional to the label. This keeps
 /// one entry per distinct requested offset.
 #[derive(Debug)]
-pub struct LabelOffsets<'a> {
+pub(super) struct LabelOffsets<'a> {
     label: &'a str,
     /// One table per encoding that has requested offsets.
     resolved: Vec<(PositionEncoding, UnitTable)>,
@@ -549,7 +650,7 @@ type UnitTable = Vec<(u32, Option<usize>)>;
 impl<'a> LabelOffsets<'a> {
     /// Resolves each of `offsets` against `label` in its own encoding.
     #[must_use]
-    pub fn new(label: &'a str, offsets: impl IntoIterator<Item = ServerColumn>) -> Self {
+    pub(super) fn new(label: &'a str, offsets: impl IntoIterator<Item = ServerColumn>) -> Self {
         let offsets: Vec<ServerColumn> = offsets.into_iter().collect();
         let resolved = PositionEncoding::ALL
             .into_iter()
@@ -573,7 +674,7 @@ impl<'a> LabelOffsets<'a> {
     /// requested, is out of range or inside a multi-unit character, or
     /// `start` is after `end`.
     #[must_use]
-    pub fn substring(&self, start: ServerColumn, end: ServerColumn) -> Option<&'a str> {
+    pub(super) fn substring(&self, start: ServerColumn, end: ServerColumn) -> Option<&'a str> {
         let at = |column: ServerColumn| {
             let (_, table) = self
                 .resolved
@@ -603,13 +704,9 @@ fn resolve_label_units(label: &str, wanted: &[u32], encoding: PositionEncoding) 
         }
     };
     let mut unit = 0;
-    for (byte, ch) in label.char_indices() {
-        settle(unit, byte);
-        unit = unit.saturating_add(match encoding {
-            PositionEncoding::Utf8 => ch.len_utf8(),
-            PositionEncoding::Utf16 => ch.len_utf16(),
-            PositionEncoding::Utf32 => 1,
-        });
+    for step in steps(label, encoding) {
+        settle(step.before, step.start);
+        unit = step.after;
     }
     settle(unit, label.len());
     resolved.extend(
@@ -1118,5 +1215,50 @@ mod tests {
             byte_of(utf32, "a\u{1F600}", 3),
             Err(OffsetError::PastEnd { offset: 3, len: 2 })
         );
+    }
+
+    #[test]
+    fn test_units_of_is_the_width_in_each_encoding() {
+        for (ch, utf8, utf16, utf32) in [
+            ('a', 1, 1, 1),
+            ('\u{e9}', 2, 1, 1),
+            ('\u{20ac}', 3, 1, 1),
+            ('\u{1F600}', 4, 2, 1),
+        ] {
+            assert_eq!(PositionEncoding::Utf8.units_of(ch), utf8, "{ch}");
+            assert_eq!(PositionEncoding::Utf16.units_of(ch), utf16, "{ch}");
+            assert_eq!(PositionEncoding::Utf32.units_of(ch), utf32, "{ch}");
+        }
+    }
+
+    #[test]
+    fn test_floor_byte_in_rounds_a_column_inside_a_surrogate_pair_down() {
+        let line = "a\u{1F600}b";
+        let at = |column| Utf16Column::new(column).floor_byte_in(line);
+        let inside = at(2);
+        assert_eq!((inside.byte, inside.column), (1, Utf16Column::new(1)));
+        let after = at(3);
+        assert_eq!((after.byte, after.column), (5, Utf16Column::new(3)));
+        let past = at(99);
+        assert_eq!((past.byte, past.column), (6, Utf16Column::new(4)));
+        let origin = at(0);
+        assert_eq!((origin.byte, origin.column), (0, Utf16Column::new(0)));
+    }
+
+    #[test]
+    fn test_ceil_byte_in_rounds_up_and_gives_up_past_the_byte_cap() {
+        let line = "a\u{1F600}b";
+        let start = ColumnBoundary {
+            byte: 0,
+            column: Utf16Column::new(0),
+        };
+        let ceil = |column, max| Utf16Column::new(column).ceil_byte_in(line, start, max);
+        assert_eq!(ceil(2, 99), Some(5));
+        assert_eq!(ceil(3, 99), Some(5));
+        assert_eq!(ceil(99, 99), Some(6));
+        assert_eq!(ceil(0, 99), Some(0));
+        assert_eq!(ceil(4, 3), None);
+        let mid = Utf16Column::new(1).floor_byte_in(line);
+        assert_eq!(Utf16Column::new(2).ceil_byte_in(line, mid, 99), Some(5));
     }
 }

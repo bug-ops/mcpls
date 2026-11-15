@@ -13,10 +13,10 @@ use crate::bridge::{
 use crate::config::{
     FileKey, LanguageId, NoServerReason, ServerId, ToolKind, ToolRouter, base_language_id,
 };
-use crate::error::{Error, ErrorChain, Result, ServerSpawnFailure, StartupFailure};
+use crate::error::{EchoedUri, Error, ErrorChain, Result, ServerSpawnFailure, StartupFailure};
 use crate::lsp::LspClient;
 use crate::spelling::spelled_enum;
-use crate::util::{MAX_ECHOED_PATH_BYTES, escape_bounded, lock_std};
+use crate::util::lock_std;
 
 /// Total time `Translator::flush_pending_closes` may spend per call.
 const FLUSH_PENDING_CLOSES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1452,12 +1452,8 @@ impl Translator {
     ///   [`crate::bridge::state::uri_to_path`])
     /// - The path is outside workspace boundaries
     pub(super) async fn parse_file_uri(&self, uri: &lsp_types::Uri) -> Result<WorkspacePath> {
-        let path = crate::bridge::state::uri_to_path(uri).ok_or_else(|| {
-            Error::InvalidToolParams(format!(
-                "Invalid URI, expected an absolute file:// URI but got: {}",
-                escape_bounded(uri.as_ref(), MAX_ECHOED_PATH_BYTES)
-            ))
-        })?;
+        let path = crate::bridge::state::uri_to_path(uri)
+            .ok_or_else(|| Error::NotFileUri(EchoedUri::new(uri.as_ref())))?;
 
         self.validate_path(&ClientPath::try_from(path)?).await
     }
@@ -1476,7 +1472,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::bridge::translator::dto::Position;
+    use crate::bridge::translator::dto::{Position, WorkspaceQuery};
     use crate::bridge::translator::testing::*;
     use crate::bridge::{LocationContext, NotificationCache, ResultContext, WorkspaceRoots};
     use crate::config::{
@@ -1962,7 +1958,13 @@ mod tests {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("http://example.com/file.rs");
         let result = translator.parse_file_uri(&uri).await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
+        let Err(error @ Error::NotFileUri(_)) = result else {
+            panic!("expected NotFileUri, got {result:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid tool parameters: Invalid URI, expected an absolute file:// URI but got: http://example.com/file.rs"
+        );
     }
 
     #[tokio::test]
@@ -2014,7 +2016,7 @@ mod tests {
         let translator = Translator::new();
         let uri: lsp_types::Uri = lsp_types::Uri::from("file://host/some/path.rs");
         let result = translator.parse_file_uri(&uri).await;
-        assert_matches!(result, Err(Error::InvalidToolParams(_)));
+        assert_matches!(result, Err(Error::NotFileUri(_)));
     }
 
     #[test]
@@ -3701,7 +3703,7 @@ mod tests {
         );
 
         let result = translator
-            .handle_workspace_symbol("main".to_string(), None, 100)
+            .handle_workspace_symbol(WorkspaceQuery::new("main").unwrap(), None, 100)
             .await;
 
         assert_matches!(

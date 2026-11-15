@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use super::{PullSupport, Translator};
 use crate::bridge::notifications::DocumentStamp;
@@ -1176,7 +1176,7 @@ impl SweepContext {
     fn spawn_contained(&self, task: SweepTask, work: impl Future<Output = ()> + Send + 'static) {
         self.pulls.spawn(async move {
             if let Err(panicked) = catch_panic(work).await {
-                warn!(?task, panic = %panicked.message(), "disk sweep task panicked");
+                error!(?task, panic = %panicked.message(), "disk sweep task panicked");
             }
         });
     }

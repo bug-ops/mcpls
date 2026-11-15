@@ -92,12 +92,13 @@ fn test_excerpt_looks_at_a_bounded_prefix_of_a_line_without_a_terminator() {
         end: Position2D::at(1, LINE_UNITS),
     };
 
-    let (excerpt, scanned) = cut_excerpt_scanned(&text, &span, limits());
+    let excerpt = cut_excerpt(&text, &span, limits());
+    let scanned = excerpt.scanned;
 
     assert!(excerpt.truncated);
     assert!(excerpt.text.len() <= CAP);
     assert!(
-        scanned <= start as usize * MAX_BYTES_PER_UNIT + CAP + 4,
+        scanned <= Utf16Column::new(start).max_utf8_prefix_bytes() + CAP + 4,
         "{scanned}"
     );
     assert!(scanned < line.len() / 100);
@@ -112,7 +113,8 @@ fn test_excerpt_scan_bound_holds_across_short_lines_and_a_wide_middle_line() {
         end: Position2D::at(4, 1_000_000),
     };
 
-    let (excerpt, scanned) = cut_excerpt_scanned(&text, &span, limits());
+    let excerpt = cut_excerpt(&text, &span, limits());
+    let scanned = excerpt.scanned;
 
     assert!(excerpt.truncated);
     assert_eq!(excerpt.text, "a\nb");
@@ -128,9 +130,54 @@ fn test_excerpt_scan_bound_holds_for_a_wide_last_line() {
         end: Position2D::at(3, 1_000_000),
     };
 
-    let (excerpt, scanned) = cut_excerpt_scanned(&text, &span, limits());
+    let excerpt = cut_excerpt(&text, &span, limits());
+    let scanned = excerpt.scanned;
 
     assert!(excerpt.truncated);
     assert_eq!(excerpt.text, "a\nb");
     assert!(scanned <= 3 * (CAP + 4), "{scanned}");
+}
+
+#[test]
+fn test_excerpt_charges_the_walk_to_the_first_line() {
+    let wide = "a".repeat(1_000_000);
+    let text = DocumentText::new(format!("{wide}\nb"));
+    let span = Range {
+        start: Position2D::at(2, 1),
+        end: Position2D::at(2, 2),
+    };
+
+    let excerpt = cut_excerpt(&text, &span, limits());
+
+    assert_eq!(excerpt.text, "b");
+    assert!(excerpt.scanned > wide.len(), "{}", excerpt.scanned);
+}
+
+#[test]
+fn test_excerpt_does_not_charge_the_view_beyond_the_terminator() {
+    let text = DocumentText::new(format!("abc\n{}", "x".repeat(100_000)));
+    let span = Range {
+        start: Position2D::at(1, 1),
+        end: Position2D::at(1, 4),
+    };
+
+    let excerpt = cut_excerpt(&text, &span, limits());
+
+    assert_eq!(excerpt.text, "abc");
+    assert_eq!(excerpt.scanned, 4);
+}
+
+#[test]
+fn test_excerpt_past_eof_charges_the_walk_to_the_end() {
+    let wide = "a".repeat(1_000_000);
+    let text = DocumentText::new(wide.clone());
+    let span = Range {
+        start: Position2D::at(5, 1),
+        end: Position2D::at(5, 2),
+    };
+
+    let excerpt = cut_excerpt(&text, &span, limits());
+
+    assert_eq!(excerpt.text, "");
+    assert!(excerpt.scanned >= wide.len(), "{}", excerpt.scanned);
 }

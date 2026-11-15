@@ -32,7 +32,8 @@ use serde::Serialize;
 
 use crate::bridge::resources::ResourceUriError;
 use crate::bridge::{
-    Capability, InvalidClientPath, InvalidHierarchyItem, InvalidPosition, InvalidRange,
+    Capability, InvalidClientPath, InvalidHierarchyItem, InvalidKindFilter, InvalidPosition,
+    InvalidRange, InvalidTextField,
 };
 use crate::config::{
     BuiltinServer, DuplicateEnvKey, EntrySummary, EnvKey, EnvTooLarge, FileKey, FilePattern,
@@ -56,7 +57,7 @@ pub use codes::{
     WORKSPACE_INDEXING_ERROR_CODE,
 };
 use echo::BoundedDebugPath;
-pub use echo::{EchoedArgument, EchoedPath};
+pub use echo::{EchoedArgument, EchoedPath, EchoedUri};
 pub use launch::{
     HomeVariable, InlineFlag, LaunchTrigger, LauncherRefusal, LongCommandName, LongInlineFlag,
     OperandKind, PowerShellParameter, ResolvedItem, RunnerSubcommand, ShellFlag, StdinSource,
@@ -926,9 +927,18 @@ pub enum Error {
         retry_in: Duration,
     },
 
-    /// Invalid tool parameters provided.
+    /// A `kind_filter` / `symbol_kind` / `kind` value names no kind or is
+    /// over-long.
     #[error("invalid tool parameters: {0}")]
-    InvalidToolParams(String),
+    InvalidKindFilter(InvalidKindFilter),
+
+    /// A client URI is not an absolute `file://` URI.
+    #[error("invalid tool parameters: Invalid URI, expected an absolute file:// URI but got: {0}")]
+    NotFileUri(EchoedUri),
+
+    /// A client-supplied text field is blank or too long.
+    #[error("invalid tool parameters: {0}")]
+    InvalidTextField(InvalidTextField),
 
     /// A client-supplied file path is empty or contains a NUL byte.
     #[error(transparent)]
@@ -1100,8 +1110,10 @@ impl Error {
     #[must_use]
     pub fn mcp_error_kind(&self) -> McpErrorKind {
         match self {
-            Self::InvalidToolParams(_)
+            Self::InvalidKindFilter(_)
+            | Self::NotFileUri(_)
             | Self::UnknownServers { .. }
+            | Self::InvalidTextField(_)
             | Self::InvalidClientPath(_)
             | Self::MalformedPath { .. }
             | Self::PathOutsideWorkspace(_)
@@ -1268,7 +1280,9 @@ impl Error {
             | Self::ShutdownTimeout
             | Self::ServerExitedDuringInit { .. }
             | Self::ServerUnavailable { .. }
-            | Self::InvalidToolParams(..)
+            | Self::InvalidKindFilter(..)
+            | Self::NotFileUri(..)
+            | Self::InvalidTextField(..)
             | Self::InvalidClientPath(..)
             | Self::DocumentLimitExceeded { .. }
             | Self::SubscriptionLimitReached { .. }
@@ -1280,6 +1294,20 @@ impl Error {
             | Self::CapabilityNotSupported { .. }
             | Self::WorkspaceIndexing { .. } => false,
         }
+    }
+}
+
+// Not `#[from]`: that would make the inner error this one's `source()`, and the
+// error chain sent to clients would then print its message twice.
+impl From<InvalidKindFilter> for Error {
+    fn from(error: InvalidKindFilter) -> Self {
+        Self::InvalidKindFilter(error)
+    }
+}
+
+impl From<InvalidTextField> for Error {
+    fn from(error: InvalidTextField) -> Self {
+        Self::InvalidTextField(error)
     }
 }
 

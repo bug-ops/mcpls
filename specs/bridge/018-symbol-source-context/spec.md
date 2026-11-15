@@ -107,16 +107,16 @@ SO THAT no output or LSP traffic changes unless I opt in
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Output size | Σ `included` bytes per call <= 64 KiB; one item <= 200 lines and 16 KiB |
-| NFR-002 | Cost | No allocation proportional to a document or a line beyond the 16 KiB item cap while slicing |
-| NFR-003 | Type safety | `SourceOutcome`, `SourceSkipReason` and `LocationContext` are closed enums; `same_as.item` is an index newtype built only by the source pass; spans are typed (`SpanRule`), not flags |
+| NFR-002 | Cost | No allocation proportional to a document or a line beyond the 16 KiB item cap while slicing. At most `MAX_SCANNED_BYTES_PER_CALL` (16 MiB) of document text is examined per call, plus the one cut that crosses it; examined means the bytes read up to each line terminator plus the line-index walk to the first line |
+| NFR-003 | Type safety | `SourceOutcome`, `SourceSkipReason` and `LocationContext` are `#[non_exhaustive]` enums; `same_as.item` is an index newtype that in mcpls output names an `included` item; spans are typed (`SpanRule`), not flags |
 | NFR-004 | Tool surface | The addition fits the `tools/list` budget after the raise recorded in [[mcp/014-tools-list-payload-size/spec|mcp/014]] (about 800 B per location tool) |
-| NFR-005 | Time | The pass reuses the `enclosing_symbol` deadline; slicing is in-memory, and the only file reads are the budgeted line reads of FR-002 |
+| NFR-005 | Time | The pass reuses the `enclosing_symbol` deadline; slicing is in-memory, and the only file reads are the budgeted line reads of FR-002. Slicing is synchronous but bounded by the per-call scan budget of NFR-002 (milliseconds), so it fits inside the deadline without cancellation points |
 
 ## 5. Rules
 
 ### Definition rule (the four go-to tools), in priority order
 
-1. The innermost **hierarchical** `documentSymbol` whose `selectionRange` contains the location's range gives that symbol's `range`. A flat (`SymbolInformation`) tree never matches.
+1. The innermost **hierarchical** `documentSymbol` whose `selectionRange` contains the location's range gives that symbol's `range`. The descent uses the enclosing-symbol sibling rule: among overlapping siblings that contain the range, the innermost wins (latest start, earliest end, then name and kind). A flat (`SymbolInformation`) tree never matches.
 2. Otherwise the raw `LocationLink.targetRange` of the answer, normalized with the go-to request's encoding context, covering locals, parameters and closure bindings. It applies only when the file's `documentSymbol` lookup succeeded, because the pin and the stamp come from that lookup's open. A failed or unsupported lookup gives `symbol_lookup_skipped` even when a link carried a `targetRange`. mcpls advertises `linkSupport` only for definition and declaration, so for implementation and type definition only rule 1 applies.
 3. Otherwise `no_span`.
 
@@ -128,6 +128,7 @@ The `range` of the item's resolved innermost enclosing symbol. A top-level refer
 
 - The budget is consumed in file first-seen order, then item order within the file.
 - Each distinct span is sliced once with the per-item cap. If the resulting text is longer than the remaining call budget the item is **skipped** (`call_budget`); it is never cut to fit.
+- Once the per-call scan budget (NFR-002) is spent, every later new span is `call_budget` without a cut.
 - The pass **continues** after a skip: a later, smaller distinct span can still be `included` (greedy skip).
 - A repeat of a span that was skipped for budget is `call_budget` too, without slicing it again, and never `same_as`. So `same_as.item` always points to an `included` item.
 
@@ -141,7 +142,7 @@ The `range` of the item's resolved innermost enclosing symbol. A top-level refer
 | Reason | Meaning |
 |--------|---------|
 | `no_span` | The rule found no span for the item |
-| `call_budget` | The span is over the remaining call budget (or repeats such a span) |
+| `call_budget` | The span is over the remaining call budget, or the per-call scan budget is spent (or it repeats such a span) |
 | `document_changed` | The stamp check of FR-006 failed or the document was no longer open |
 | `symbol_lookup_skipped` | The file's `documentSymbol` lookup was skipped or failed; the item's `enclosing_symbol` (`not_computed` or `unavailable`) states why, so file-level reasons are not mirrored. An out-of-workspace item reads `enclosing_symbol: not_computed{out_of_workspace}` and `source: not_computed{symbol_lookup_skipped}` |
 
@@ -152,7 +153,7 @@ The `range` of the item's resolved innermost enclosing symbol. A top-level refer
 | `LocationContext` | `none` \| `enclosing_symbol` \| `symbol_source`, input of the five location tools |
 | `NavigationLocation` | The LSP `Location` fields flattened, plus an optional `source`; the item type of the location tools' `Contextual` wrapper (no `Deref`; callers use `inner.location`) |
 | `SourceOutcome` | Tagged by `status`: `included{text, truncated}`, `same_as{item}`, `not_computed{reason}` |
-| `ItemIndex` | Transparent index of an earlier `included` item in the same list |
+| `ItemIndex` | Transparent index that in mcpls output names an earlier `included` item in the same list |
 | `SourceSkipReason` | The four reasons above |
 | `DocumentTracker::excerpt` | Crate-private tracker accessor performing FR-005..FR-007 in one lock, returning `Changed` or `Untracked` instead of text when the stamp no longer matches or the document is gone |
 
@@ -186,6 +187,7 @@ The `range` of the item's resolved innermost enclosing symbol. A top-level refer
 
 - Slicing lives under the pin held by the `enclosing_symbol` pass, so no new open or request exists.
 - Dedup keys are (uri, span); `Position2D` and `Range` are `Hash` for this.
+- A per-call scan budget (`MAX_SCANNED_BYTES_PER_CALL`, 16 MiB, #927) bounds the work of many cuts deep into one long line; `excerpt` reports the bytes it examined and the pass charges them. Cutting all spans of a file in one forward walk, or moving slicing to the blocking pool, was not needed at that bound.
 - `symbol_lookup_skipped` reuses the sibling `enclosing_symbol` state instead of mirroring each file-level reason, to stay inside the `get_references` size budget.
 
 ## 10. See Also

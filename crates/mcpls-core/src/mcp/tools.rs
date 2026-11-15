@@ -266,7 +266,7 @@ impl SymbolTargetInput {
     ///
     /// Returns [`Error::InvalidPositionInput`] for a position below 1 or above
     /// [`MAX_POSITION_VALUE`](crate::bridge::MAX_POSITION_VALUE), and
-    /// [`Error::InvalidToolParams`] for a `symbol_kind` that names no kind.
+    /// [`Error::InvalidKindFilter`] for a `symbol_kind` that names no kind.
     pub fn into_target(self) -> Result<SymbolTarget, Error> {
         match self {
             Self::Position { line, character } => Ok(SymbolTarget::Position(
@@ -608,8 +608,11 @@ const fn default_insert_spaces() -> bool {
 #[serde(deny_unknown_fields)]
 #[schemars(description = "Parameters for searching symbols across the workspace.")]
 pub struct WorkspaceSymbolParams {
-    /// Search query for symbol names (supports partial matching).
-    #[schemars(description = "Search query for symbol names (supports partial matching).")]
+    /// Search query for symbol names (supports partial matching), at most
+    /// `MAX_WORKSPACE_QUERY_BYTES` bytes, checked at the tool boundary.
+    #[schemars(
+        description = "Search query for symbol names (partial matching, at most 1000 bytes)."
+    )]
     pub query: String,
     /// Optional filter by symbol kind: a name (function, class, variable,
     /// etc.) or the numeric LSP `SymbolKind` value from a result's `kind`
@@ -1300,7 +1303,24 @@ mod tests {
         });
         let params: SymbolTargetParams = serde_json::from_value(json).unwrap();
         let error = params.target.into_target().unwrap_err();
-        assert_matches!(&error, Error::InvalidToolParams(message) if message.contains("Invalid symbol_kind: 'nope'"));
+        assert_matches!(&error, Error::InvalidKindFilter(invalid)
+            if invalid.field == KindFilterField::SymbolKind
+                && matches!(&invalid.rejection, crate::bridge::Rejection::Unknown(rejected) if rejected.as_str() == "nope"));
+    }
+
+    #[test]
+    fn the_workspace_query_schema_states_the_byte_bound() {
+        let schema = serde_json::to_value(schemars::schema_for!(WorkspaceSymbolParams)).unwrap();
+        let description = schema["properties"]["query"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            description.contains(&format!(
+                "{} bytes",
+                crate::bridge::MAX_WORKSPACE_QUERY_BYTES
+            )),
+            "{description}"
+        );
     }
 
     #[test]
