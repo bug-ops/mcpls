@@ -8,7 +8,10 @@ all-features = true
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # Re-evaluate by 2027-03-01; tracked in #944.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; mcpls-core uses it directly (and enables schemars chrono04), rmcp depends on it unconditionally, so the ignore is needed even if mcpls-core drops its own use" },
+]
 yanked = "deny"
 
 [licenses]

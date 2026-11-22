@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `cargo deny` passes again: `deny.toml` ignores RUSTSEC-2026-0543 (`chrono`) and `url` is updated to 2.5.9 (#942).
+- The `mcpls-bench` forced-kill process-tree test no longer races the `setsid` escapee on Linux (#943).
+
 ## [0.10.0] - 2026-11-15
 
 ### Added

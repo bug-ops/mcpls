@@ -669,8 +669,9 @@ mod tests {
             rustix::process::test_kill_process(pid).is_ok()
         }
 
+        // perl prints its pid only after setsid, so readiness implies the escape happened.
         const SETSID_SLEEP: &str =
-            "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(30)' & echo $!";
+            "perl -MPOSIX -e 'POSIX::setsid(); $| = 1; print $$, qq(\\n); exec q(sleep), q(30)' &";
 
         #[tokio::test]
         async fn clean_exit_is_clean_only_when_the_session_closed() {
@@ -708,7 +709,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_setsid_descendant_is_counted_and_killed_after_the_leader_exits() {
-            let mut group = ProcessGroup::spawn(sh(&format!("{SETSID_SLEEP}; sleep 1"))).unwrap();
+            let mut group = ProcessGroup::spawn(sh(&format!("{SETSID_SLEEP} sleep 3"))).unwrap();
             let escapee = first_line(&mut group).await;
             let mut watch = TreeWatch::new(group.leader_pid());
             let reading = watch.sample().await;
@@ -733,7 +734,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_forced_kill_still_finds_and_kills_escaped_descendants() {
-            let script = format!("{SETSID_SLEEP}; sleep 30");
+            let script = format!("{SETSID_SLEEP} sleep 30");
             let mut group = ProcessGroup::spawn(sh(&script)).unwrap();
             let escapee = first_line(&mut group).await;
             let mut watch = TreeWatch::new(group.leader_pid());
